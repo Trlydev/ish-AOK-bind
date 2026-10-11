@@ -5642,6 +5642,10 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
 // suspending us, without leaving a still-running app with a frozen guest
 // filesystem. See the dispatch_after in the expiration handler.
 static const NSTimeInterval kISHQuiesceMaxHoldSeconds = 5.0;
+// The least background time a fresh assertion must have left for the gate to be
+// lifted under it. Its expiration handler has to quiesce again before the time
+// is gone, and that drains fakefs and the pager for up to two seconds each.
+static const NSTimeInterval kISHQuiesceMinRunwaySeconds = 10.0;
 
 // Held rather than compared against UIBackgroundTaskInvalid, which is a const
 // variable and so cannot initialize a static.
@@ -5673,6 +5677,14 @@ static const char *ISHBackgroundKeepAlive(void) {
 }
 
 static void ISHBeginSuspendGuardAssertion(void);
+static void ISHQuiesceHoldElapsed(unsigned generation);
+// The gate is engaged by ISHQuiesceForSuspension and has not been lifted
+// since; which engagement, so that a look scheduled by an earlier one does
+// nothing; and whether "staying quiesced" has been logged for this one. Main
+// thread.
+static bool ishQuiesced;
+static unsigned ishQuiesceGeneration;
+static bool ishQuiesceStayLogged;
 
 // Watch for the NEXT suspension.
 //
@@ -5698,6 +5710,9 @@ static void ISHRearmSuspendGuardIfBackgrounded(void) {
 // Suspension looks imminent: park new fakefs transactions and drain the ones in
 // flight, and stop pager eviction.
 static void ISHQuiesceForSuspension(void) {
+    ishQuiesced = true;
+    ishQuiesceStayLogged = false;
+    unsigned generation = ++ishQuiesceGeneration;
     unsigned stragglers = 0;
     bool drained = fakefs_quiesce_begin(2000, &stragglers);
     // The pager writes guest memory to a file, so it needs the same treatment
@@ -5713,35 +5728,102 @@ static void ISHQuiesceForSuspension(void) {
                                   details:@{@"drained": @(drained), @"straggling": @(stragglers),
                                             @"swapDrained": @(swapDrained)}];
 
-    // Never hold the gate open indefinitely.
+    // Look again in a while, in case iOS did not suspend us after all.
     //
-    // If iOS really does suspend us, this block cannot run until we resume, so
-    // the filesystem stays quiesced across the suspension -- which is the whole
-    // point, and nothing is executing meanwhile anyway. But if iOS does NOT
-    // suspend us (something else is keeping the app alive, or it simply grants
-    // more time), then waiting for -sceneWillEnterForeground: to lift the gate
-    // freezes the guest filesystem for as long as the app sits in the
-    // background. That is not a subtle degradation: an incoming ssh session
-    // gets accepted and then blocks before it can reach a shell, because fork,
-    // exec, PAM and the home directory all need a fakefs transaction, so the
-    // device silently stops serving while looking perfectly healthy.
+    // If it does, this block cannot run until we resume, so the filesystem
+    // stays quiesced across the suspension -- which is the whole point, and
+    // nothing is executing meanwhile anyway. If it does not, see
+    // ISHQuiesceHoldElapsed.
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                  (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                   dispatch_get_main_queue(), ^{
+        ISHQuiesceHoldElapsed(generation);
+    });
+}
+
+// The gate has been engaged for kISHQuiesceMaxHoldSeconds and we are still
+// running. Main thread.
+//
+// Staying quiesced for as long as the app sits in the background is not
+// harmless: an incoming ssh session is accepted and then blocks before it can
+// reach a shell, because fork, exec, PAM and the home directory all need a
+// fakefs transaction, so the device silently stops serving while looking
+// perfectly healthy. So the gate comes off again -- but ONLY with something
+// holding off the suspension, and that is the rule this function exists for:
+//
+//     the gate is open  =>  foreground, or kept alive, or an assertion held
+//
+// It used to lift the gate first, from a background queue, and take the next
+// assertion afterwards on the main thread. Between the two nothing held iOS
+// off and the guest was writing again. iOS does not suspend the moment the
+// last assertion ends; under load it took just over the five seconds the gate
+// was held, and landed in that gap: RUNNINGBOARD 0xdead10cc on the 558
+// candidate (iPhone 12, 2026-10-10), a guest `tar` inside fakefs_open ->
+// db_commit -> sqlite3_step while the main thread was still in
+// beginBackgroundTask for the re-arm.
+//
+// An assertion taken once the background time has run out is no assertion --
+// its expiration fires at once -- so it counts only with time left on it.
+// With none to be had, iOS may suspend at any moment, and the right state for
+// that is the one we are in: stay quiesced, and look again.
+static void ISHQuiesceHoldElapsed(unsigned generation) {
+    // Lifted since (the foreground does it), or engaged again by a later
+    // quiesce, which scheduled a look of its own.
+    if (!ishQuiesced || generation != ishQuiesceGeneration)
+        return;
+    UIApplication *application = UIApplication.sharedApplication;
+    if (application.applicationState != UIApplicationStateBackground) {
+        // On the way to the foreground: ISHSuspendGuardEnterForeground lifts
+        // the gate. Lifting it here as well costs nothing and covers a
+        // transition that has not reported yet.
+        ishQuiesced = false;
         fakefs_quiesce_end();
         swap_quiesce_end();
-        // Rebuild the listeners here too. Not because they were damaged -- if
-        // this block runs, iOS never froze us -- but so the saved list does not
-        // stay populated across into the next backgrounding, where it would
-        // suppress a fresh save.
-        os_log(ISHSuspendLog(), "listening sockets rebuilt (never suspended): %{public}u",
-               sockrestart_on_resume());
-        os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded; gate lifted",
-               kISHQuiesceMaxHoldSeconds);
-        dispatch_async(dispatch_get_main_queue(), ^{
-            ISHRearmSuspendGuardIfBackgrounded();
-        });
-    });
+        return;
+    }
+    const char *keepAlive = ISHBackgroundKeepAlive();
+    if (keepAlive == NULL) {
+        bool began = !suspendGuardHeld;
+        if (began) {
+            suspendGuardHeld = true;
+            ISHBeginSuspendGuardAssertion();
+        }
+        NSTimeInterval left = application.backgroundTimeRemaining;
+        if (suspendGuardTask == UIBackgroundTaskInvalid || left < kISHQuiesceMinRunwaySeconds) {
+            if (began)
+                ISHEndSuspendGuard();
+            if (!ishQuiesceStayLogged)
+                os_log(ISHSuspendLog(), "still running after %{public}.0fs quiesced, with %{public}.1fs of background time: staying quiesced",
+                       kISHQuiesceMaxHoldSeconds, left);
+            ishQuiesceStayLogged = true;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ISHQuiesceHoldElapsed(generation);
+            });
+            return;
+        }
+    }
+    ishQuiesced = false;
+    fakefs_quiesce_end();
+    swap_quiesce_end();
+    // Rebuild the listeners here too. Not because they were damaged -- if this
+    // runs, iOS never froze us -- but so the saved list does not stay populated
+    // across into the next backgrounding, where it would suppress a fresh save.
+    os_log(ISHSuspendLog(), "listening sockets rebuilt (never suspended): %{public}u",
+           sockrestart_on_resume());
+    if (keepAlive != NULL) {
+        os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded, kept alive by %{public}s; gate lifted",
+               kISHQuiesceMaxHoldSeconds, keepAlive);
+        ISHRearmSuspendGuardIfBackgrounded();
+        return;
+    }
+    // The assertion taken above is the guard for the next suspension, and the
+    // listening sockets are recorded again because lifting the gate put them
+    // back.
+    unsigned saved = sockrestart_on_suspend();
+    os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded; gate lifted under a new assertion, %{public}u listening sockets recorded",
+           kISHQuiesceMaxHoldSeconds, saved);
 }
 
 // The save that the guard's expiration deferred to has finished, or run out of
@@ -5934,6 +6016,7 @@ void ISHSuspendGuardEnterForeground(void) {
     // to quiesce for.
     ishQuiesceDeferredForSave = false;
     // Lift the gate before anything else: guest tasks may be parked on it.
+    ishQuiesced = false;
     fakefs_quiesce_end();
     swap_quiesce_end();
     // Put the listening sockets back. A no-op unless backgrounding recorded

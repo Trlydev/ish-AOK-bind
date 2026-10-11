@@ -13,7 +13,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | § | item | state |
 |---|---|---|
 | 1 | Vector registers held across a call that can reach C | **DONE** (2026-10-11): no other gadget has it; a checker now reads the built objects in `meson test` and the gate |
-| 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | open |
+| 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | open |
 | 5 | The RISC guests at the threaded-code floor | open |
@@ -76,15 +76,44 @@ while a suite compiled and a cache push wrote into /AOK/fakefs, and iOS killed
 the app in `ISHQuiesceForSuspension -> ISHRearmSuspendGuardIfBackgrounded ->
 ISHBeginSuspendGuardAssertion`.
 
-**Established:** 556's quiesce fix (6de50726) closed the DNS-refresh and
-lapsed-gate cases. This one is a write-heavy guest at lock.
+**Done 2026-10-11.** The crash log names both halves. Thread 27 is a guest
+`tar` in `fakefs_open -> db_commit -> sqlite3_step -> pwrite`, a transaction
+open; the main thread is in `beginBackgroundTask`, called by the re-arm that
+the quiesce's five-second look dispatches. So the gate had just been lifted,
+the guest was writing again, and the assertion that should hold iOS off was
+still being asked for.
 
-**Next step:** reproduce with a write loop into fakefs and a screen lock; name
-the thread that holds the SQLite lock when the assertion lapses; make the
-quiesce wait for (or refuse) writers before the app is suspended.
+That look (`ISHQuiesceForSuspension`'s `dispatch_after`) lifted the gate from
+a background queue and only then, on the main thread, took the next assertion.
+Between the two nothing held off the suspension. It runs when the app is
+still running five seconds after it quiesced -- or straight away when a
+suspended app is resumed in the background, since a block that came due while
+frozen fires on wake.
 
-**Prove:** the repro survives N lock/unlock cycles on a device, and
-/proc/ish or the log shows the quiesce reached with no fakefs transaction open.
+The fix (`ISHQuiesceHoldElapsed`, app/AppDelegate.m) keeps one rule: the gate
+is open only in the foreground, while something keeps the app alive, or under
+an assertion with time left on it. It takes the assertion first, and lifts
+the gate only if `backgroundTimeRemaining` is at least ten seconds (the
+expiration handler has to quiesce again, up to two seconds each for fakefs and
+the pager). With no time to be had it stays quiesced and looks again in five
+seconds. A look scheduled by an earlier quiesce does nothing.
+
+**Seen on the iPhone 12** (a loop of 510 creates and 510 unlinks a pass in
+fakefs, the app sent to the background by launching Settings from the Mac,
+60 s, eleven times; the app's own log read with idevicesyslog):
+- 558's build: suspended inside the five seconds every time it was watched,
+  so the look ran only on return. Eight of eight survived: the kill needs the
+  suspension to land after the look, and it did not.
+- The new build, first trial: `quiesced for suspension` at 10:11:56.50, then
+  at 10:12:01.75 `still running after 5s quiesced, with 0.0s of background
+  time: staying quiesced`. That is the 558 crash's moment -- running, past
+  the five seconds, no background time, the write loop going -- and where the
+  old code lifted the gate. The other two were suspended first; all three
+  lifted on return `under a new assertion`.
+
+**Not shown:** the kill before and its absence after, as a rate. It did not
+reproduce on demand in eight tries; what is shown is the window opening and
+the new code holding the gate through it.
 
 ## 3. The 557 crash in `sockrestart_on_resume`
 
