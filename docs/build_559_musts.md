@@ -254,6 +254,18 @@ cmp, load/store pairs, the return cache (`/proc/ish/arm64_jit_fuse`).
 Not done yet: the 557 -> 558 slips (item 1 of the order above), which need the
 two app builds alternated on the devices, and the riscv64 guest's own profile.
 
+**Where the databases and a build put it** (2026-10-11, MBP, arm64 guest;
+docs/TODO.md has the baselines): guest code is 61-72% of a 4-job gcc build's
+busy time, 87% of SQLite's, 78-88% of MariaDB's, 79% of PostgreSQL's. The two
+symbols at the top every time are `arm64_chain` (about 12% of SQLite's guest
+time) and `gadget_arm64_load64_fast`. A chained transition today is: load the
+poke flag's address and the flag, test it; load, decrement and store the chain
+budget, test it; compute and store the last block; `dmb ishld`; then the next
+gadget's load and branch. MariaDB also loses 7% at 4 threads, and falls from
+267 to ~240 tps between 4 and 8, waiting for the per-address-space JIT lock
+inside `cpu_step_to_interrupt_arm64`. Those two -- the transition, and that
+lock -- are the next things to do here.
+
 ## 6. `timer_thread_cpu_early` on the A10X and the A9
 
 **Why.** A red test in every device leg on two devices, on 557 and 558 alike:
@@ -303,6 +315,16 @@ a CLOCK_PROCESS_CPUTIME_ID timer running on the whole emulator's CPU (found
 with §6).
 
 ## Done beside the musts
+
+- **Task switching** (2026-10-11, from a look at where builds and databases
+  spend their time). A blocking pipe read made seven host calls where one
+  would do, and went to sleep at once when its answer was microseconds away.
+  A wait now tries again for up to 25 us first (util/wait_spin.h), with a
+  back-off when that finds nothing. Two tasks passing a byte each way: on the
+  M4 iPad a pipe round trip went 9.4 -> 2.4 us, a unix socket 11.3 -> 2.7, a
+  condition variable 9.0 -> 2.9; on the A10X 39.5 -> 24.8, 53.1 -> 19.4 and
+  29.2 -> 9.9. Databases and compiles did not move: they are bound by guest
+  code (79-88% of their busy time), which is item 5's subject.
 
 - **The native applet that ran under the wrong name** (2026-10-11). It
   happened a second time, on the same host and the same line, during this
