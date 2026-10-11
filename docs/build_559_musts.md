@@ -266,6 +266,26 @@ gadget's load and branch. MariaDB also loses 7% at 4 threads, and falls from
 inside `cpu_step_to_interrupt_arm64`. Those two -- the transition, and that
 lock -- are the next things to do here.
 
+**The lock, done 2026-10-11 (c84b26cf3).** A debug-build sample at eight
+clients put 2243 of 2923 lock-wait samples at one line: `lock(&jit->lock)`
+around `jit_lookup` when a thread's own 1024-entry block cache misses. The
+hash's buckets now have locks of their own in 64 stripes, and the i386, arm64
+and riscv64 run loops look there first, taking `jit->lock` only to translate.
+MariaDB on the MBP, before -> after, repeated: 115 -> 116 tps at 1 thread,
+271 -> 268 at 4, 234-240 -> 265-284 at 8, 161 -> 207 at 16. It still falls
+past 8 threads; what waits now is `task_run_current` (task.c:1875 and 1890,
+on every return from a syscall) and `jit_cleanup_jetsam_after_interrupt`. The
+amd64 run loop's miss path has another shape and was not converted.
+
+**The transition, not started.** Three ways to make `arm64_chain` cheaper,
+smallest first: keep the chain budget in a host register instead of loading,
+decrementing and storing it (x19-x27 are all in use as gadget scratch, so one
+has to be freed); store the last block only on the way out to C, by giving
+each block-ending branch its block's address as a stream word, instead of on
+every chained transition; and find out what the `dmb ishld` costs against an
+acquire load. Each touches the lost-poke and chain-patching history
+(c5692489), so each wants its own A/B on the M4 and the A10X.
+
 ## 6. `timer_thread_cpu_early` on the A10X and the A9
 
 **Why.** A red test in every device leg on two devices, on 557 and 558 alike:
