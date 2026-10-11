@@ -517,6 +517,8 @@ void tlb_flush(struct tlb *tlb) {
     tlb->mem_changes = atomic_load_explicit(&tlb->mmu->changes, memory_order_acquire);
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = 1, .page_if_writable = 1};
+    for (unsigned v = 0; v < TLB_VICTIMS; v++)
+        tlb->victim[v] = (struct tlb_entry) {.page = 1, .page_if_writable = 1};
     tlb->exec_ok_page = 0;
 }
 
@@ -646,19 +648,31 @@ bool __tlb_write_cross_page(struct tlb *tlb, guest_addr_t addr, const char *valu
     return true;
 }
 
+// The page an entry is about to lose goes to the front of the victims, and
+// those before `upto` move back one.
+static inline void tlb_evict(struct tlb *tlb, const struct tlb_entry *evicted, unsigned upto) {
+    struct tlb_entry keep = *evicted;
+    for (unsigned v = upto; v > 0; v--)
+        tlb->victim[v] = tlb->victim[v - 1];
+    tlb->victim[0] = keep;
+}
+
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
-    // The second chance (emu/tlb.h, TLB_INDEX_ALT): the page was evicted from
-    // its index by another that hashes there, and is still good. Swap the two,
-    // so this page is found by the first probe again. Not when the table is
-    // stale, and not for a store that has to be revalidated: those take the
-    // whole path below.
+    // The second chance (emu/tlb.h, TLB_VICTIMS): the page was evicted from
+    // its entry by another that hashes there, and is still good. It changes
+    // places with that one. Not when the table is stale, and not for a store
+    // that has to be revalidated: those take the whole path below.
     struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
-    struct tlb_entry *alt = &tlb->entries[TLB_INDEX_ALT(addr)];
-    if ((type == MEM_WRITE ? alt->page_if_writable : alt->page) == TLB_PAGE(addr) &&
-            atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) == tlb->mem_changes &&
-            !(type == MEM_WRITE && tlb->mmu->requires_write_revalidate)) {
-        struct tlb_entry found = *alt;
-        *alt = *tlb_ent;
+    unsigned victim = TLB_VICTIMS;
+    for (unsigned v = 0; v < TLB_VICTIMS; v++)
+        if (tlb->victim[v].page == TLB_PAGE(addr))
+            victim = v;
+    if (victim != TLB_VICTIMS &&
+            (type != MEM_WRITE || (tlb->victim[victim].page_if_writable == TLB_PAGE(addr) &&
+                                   !tlb->mmu->requires_write_revalidate)) &&
+            atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) == tlb->mem_changes) {
+        struct tlb_entry found = tlb->victim[victim];
+        tlb_evict(tlb, tlb_ent, victim);
         *tlb_ent = found;
         if (type == MEM_WRITE)
             tlb->dirty_page = TLB_PAGE(addr);
@@ -700,15 +714,14 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
     }
     tlb->dirty_page = TLB_PAGE(addr);
 
-    // (tlb_flush above may have emptied the table; the two pointers stand.)
-    // The page this one evicts keeps a second chance at the alternate index;
-    // and this page is never left in both places.
-    if (tlb_ent->page != TLB_PAGE(addr)) {
-        if (tlb_ent->page != TLB_PAGE_EMPTY)
-            *alt = *tlb_ent;
-        else if (alt->page == TLB_PAGE(addr))
-            *alt = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
-    }
+    // (tlb_flush above may have emptied everything; the pointer stands.) A
+    // victim's copy of this page that could not serve -- read-only where a
+    // store came, or due revalidation -- goes, so the page is in one place;
+    // and the page this one evicts joins the victims.
+    if (victim != TLB_VICTIMS && tlb->victim[victim].page == TLB_PAGE(addr))
+        tlb->victim[victim] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+    if (tlb_ent->page != TLB_PAGE(addr) && tlb_ent->page != TLB_PAGE_EMPTY)
+        tlb_evict(tlb, tlb_ent, TLB_VICTIMS - 1);
     tlb_ent->page = TLB_PAGE(addr);
     if (type == MEM_WRITE)
         tlb_ent->page_if_writable = tlb_ent->page;

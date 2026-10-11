@@ -381,20 +381,29 @@ starts, so faults and signals see what they always saw.
   fused load's fault path made to name the wrong instruction, it fails.
 - **Seen while counting instructions, and fixed the same day:** about one
   start in five of the same Python loop retired 7.5% more host instructions
-  (one in a dozen, 26% more), with the pass on or off, and never with guest
-  ASLR off. Two pages the loop uses in turn shared an entry of the
-  direct-mapped TLB: nine million trips to `tlb_handle_miss` where the other
-  starts made sixty thousand, 420 host instructions each. A page evicted from
-  its entry now keeps a second chance at an alternate index and is swapped
-  back when used (emu/tlb.h, `TLB_INDEX_ALT`): by the arm64 and riscv64 miss
-  helpers in assembly, and by `tlb_handle_miss` for everyone. The first probe
-  is unchanged. Fourteen starts after: thirteen within 1% of each other, the
-  worst 2.7% more. (Leaving the found page where it lay, without the swap,
-  was tried first and was worse than no fix: up to 17% more.) This is also a
-  good part of the run-to-run spread the device benchmarks have always had.
+  (one in a dozen, 26% more; 3.6% in an optimised build, in a third of
+  starts), with the pass on or off, and never with guest ASLR off. Two pages
+  the loop uses in turn shared an entry of the direct-mapped TLB: nine
+  million trips to `tlb_handle_miss` where the other starts made sixty
+  thousand, 420 host instructions each. The last two pages evicted are now
+  kept (emu/tlb.h, `TLB_VICTIMS`), and one found there changes places with
+  the page in its entry: in the arm64 and riscv64 miss helpers in assembly
+  for the newest, in `tlb_handle_miss` for both and for every guest. The
+  first probe is unchanged. Twenty starts after: nineteen within 1% of each
+  other, the worst 1.9% more.
+  *Two versions were wrong first, and the second was committed for an hour
+  (4b2f214be):* keeping the evicted page at a second table index. Without a
+  swap the page in the wrong place paid on every access (up to 17% more);
+  with one, every real miss paid a probe of a cold line 12 KB away and pushed
+  a useful entry out, and 7-Zip -- 55 million real misses in a 4 MB
+  dictionary, 8% of its time -- was 1.6% slower on the M4, four rounds of
+  four. The list costs a real miss four instructions and a copy: M4, four
+  alternated rounds against no second chance at all, 7-Zip 0.1% faster,
+  Python within 1% either way. So the device benchmarks do not show the gain
+  (one start a run); the instruction counts over many starts do.
   tests/manual/tlb_collide.c picks pages by the hash and narrows, unmaps and
-  replaces them while displaced. The i386 and amd64 gadgets' miss helpers do
-  not look in the alternate entry yet (docs/TODO.md).
+  replaces them while displaced. The i386 and amd64 miss helpers go to C for
+  it (docs/TODO.md).
 
 **The transition itself.** Three ways to make `arm64_chain` cheaper,
 smallest first: keep the chain budget in a host register instead of loading,

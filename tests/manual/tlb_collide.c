@@ -5,12 +5,12 @@
  *
  * AOK's TLB is direct-mapped (emu/tlb.h: 1024 entries, index = page bits 0-9
  * xor bits 10-19). A page evicted by another that hashes to the same index is
- * kept at an alternate index -- the same with its top bit flipped -- and
- * swapped back when it is used again (TLB_INDEX_ALT). So there are entries
- * that are valid but not where the first probe looks, and everything that
- * drops or narrows a mapping has to reach them too. This picks, out of a
+ * kept for a while among the last few evicted (TLB_VICTIMS) and changes
+ * places with the page in its entry when it is used again. So there are
+ * entries that are valid but not where the first probe looks, and everything
+ * that drops or narrows a mapping has to reach them too. This picks, out of a
  * reservation, five pages by that hash: three for one index (A, B, C) and two
- * for its alternate (D, E), and
+ * for another (D, E), and
  *
  *   - reads and writes them in every order, values checked each time;
  *   - makes one read-only while it sits displaced: the next store faults,
@@ -91,7 +91,7 @@ int main(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 
-    // A, B, C share an index; D, E have that index with its top bit flipped.
+    // A, B, C share an index; D, E share another.
     unsigned want = tlb_index((uintptr_t) base);
     uint64_t *pg[5];
     int n = 0;
@@ -152,7 +152,7 @@ int main(void) {
                (unsigned long long) pg[0][1]);
         failures++;
     }
-    // ... and again with the alternate index's own page in between
+    // ... and again after more evictions
     wr(&pg[3][1], 3);
     wr(&pg[1][1], 4);
     if (faults_wr(&pg[0][1], 99) != 1 || rd(&pg[0][1]) != 1) {
@@ -173,8 +173,8 @@ int main(void) {
         failures++;
     }
 
-    // Replaced while displaced: touch E, then D (same index as E's own... the
-    // alternate pair), then map a fresh page over E.
+    // Replaced while displaced: touch E, then D, which shares its index, then
+    // map a fresh page over E.
     wr(&pg[4][1], 0xe);
     wr(&pg[3][1], 0xd);
     wr(&pg[0 + 1][1], 0xb);

@@ -49,6 +49,27 @@ struct tlb_entry {
 #define TLB_BITS 10
 #endif
 #define TLB_SIZE (1 << TLB_BITS)
+// A second chance for an evicted page. The table is direct-mapped, and two
+// pages a program uses in turn can share an index: each access then evicts
+// the other and goes all the way through tlb_handle_miss -- some 400 host
+// instructions, where a hit is six. It is not rare. Which pages collide is
+// decided by the guest's ASLR, and a Python loop measured 2026-10-11 ran 7.5%
+// more host instructions in about one start in five (nine million misses
+// where the other starts had sixty thousand), and 26% more in one of a dozen.
+//
+// So the last two pages evicted are kept, newest first, and a miss looks
+// there before it is taken for real; a page found changes places with the
+// one in its entry. The arm64 and riscv64 guests' miss helpers look at the
+// newest in assembly -- the other page of a pair used in turn is always the
+// newest -- and tlb_handle_miss looks at all of them, for every guest. The
+// first probe, the one every load and store makes, is unchanged, and a miss
+// that is real pays four instructions and a copy for it: 7-Zip, with 55
+// million real misses in a 4 MB dictionary, is what a first version of this
+// (a second table index, probed and filled on every miss) made 1.6% slower.
+//
+// A page is in the table or among the victims, never both; whatever revokes
+// one entry (tlb_revoke_writable) looks in both.
+#define TLB_VICTIMS 2
 struct tlb {
     struct mmu *mmu;
     page_t dirty_page;
@@ -71,6 +92,10 @@ struct tlb {
     guest_addr_t prev_write_addr;
     guest_addr_t prev_write_ip;
     uint64_t prev_write_changes;
+    // The pages most recently evicted from `entries`, newest first: see
+    // TLB_VICTIMS. Directly before `entries`, where the gadgets' miss helpers
+    // reach victim[0] at a small offset from the pointer they hold.
+    struct tlb_entry victim[TLB_VICTIMS];
     struct tlb_entry entries[TLB_SIZE];
     // Instruction fetch (tlb_fetch). fetch_denied: the last fetch failed
     // because its page may not be executed, rather than because it is not
@@ -84,22 +109,6 @@ struct tlb {
 };
 
 #define TLB_INDEX(addr) ((((addr >> PAGE_BITS) ^ (addr >> (PAGE_BITS + TLB_BITS)))) & (TLB_SIZE - 1))
-// A second chance. The table is direct-mapped, and two pages a program uses
-// in turn can share an index: each access then evicts the other and goes all
-// the way to tlb_handle_miss -- some 400 host instructions, where a hit is
-// six. It is not rare. Which pages collide is decided by the guest's ASLR,
-// and a Python loop measured 2026-10-11 ran 7.5% more host instructions in
-// about one start in five (nine million misses where the other starts had
-// sixty thousand), and 26% more in one of a dozen.
-//
-// So a page evicted from its index is kept at the alternate index, the same
-// one with its top bit flipped, and is looked for there before the miss is
-// taken for real, and when found there changes places with the page that
-// evicted it: by tlb_handle_miss, and by the arm64 and riscv64 guests' miss
-// helpers in assembly, which never reach C for it. The first probe, the one
-// every load and store makes, is unchanged. A page is in at most one of its two places; everything that
-// revokes one entry (tlb_revoke_writable) looks in both.
-#define TLB_INDEX_ALT(addr) (TLB_INDEX(addr) ^ (TLB_SIZE >> 1))
 #define TLB_PAGE(addr) ((page_t) PAGE(addr) << PAGE_BITS)
 #define TLB_PAGE_EMPTY 1
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu);
@@ -170,9 +179,9 @@ static inline void tlb_revoke_writable(struct tlb *tlb, guest_addr_t addr) {
     struct tlb_entry *entry = &tlb->entries[TLB_INDEX(addr)];
     if (entry->page_if_writable == TLB_PAGE(addr))
         entry->page_if_writable = TLB_PAGE_EMPTY;
-    entry = &tlb->entries[TLB_INDEX_ALT(addr)];
-    if (entry->page_if_writable == TLB_PAGE(addr))
-        entry->page_if_writable = TLB_PAGE_EMPTY;
+    for (unsigned v = 0; v < TLB_VICTIMS; v++)
+        if (tlb->victim[v].page_if_writable == TLB_PAGE(addr))
+            tlb->victim[v].page_if_writable = TLB_PAGE_EMPTY;
 }
 
 forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, guest_addr_t addr) {

@@ -103,6 +103,7 @@ void cpu() {
     OFFSET(JIT_BLOCK, jit_block, is_jetsam);
 
     OFFSET(TLB, tlb, entries);
+    OFFSET(TLB, tlb, victim);
     OFFSET(TLB, tlb, mmu);
     OFFSET(TLB, tlb, mem_changes);
     OFFSET(TLB, tlb, dirty_page);
