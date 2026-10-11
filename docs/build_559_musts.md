@@ -12,7 +12,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 
 | § | item | state |
 |---|---|---|
-| 1 | Vector registers held across a call that can reach C | in progress |
+| 1 | Vector registers held across a call that can reach C | **DONE** (2026-10-11): no other gadget has it; a checker now reads the built objects in `meson test` and the gate |
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | open |
 | 3 | The 557 crash in `sockrestart_on_resume` | open |
 | 4 | Caching translated code across exec and across runs | open |
@@ -37,15 +37,36 @@ with the same shape is the same bug waiting for a host that exercises it.
 **Established:** `a64_xlate_r/w`'s other caller (`a64_vldst`) holds no vector
 register, and the MOPS copies load and store with no call between.
 
-**Next step:** a check that reads the built gadget objects rather than the
-macro sources: for every `bl`/`blr` in a gadget that can reach C, no v register
-written before it may be read after it without being rewritten. Cover the x86
-VEX/EVEX and x87 gadgets, riscv64's vector.S and the arm64 guest's SIMD/FP
-files; fix what it finds; keep it as a build-time or CI check.
+**Done 2026-10-11:** `tools/gadget-vreg-audit.py` reads the assembled gadget
+objects rather than the macro sources. It disassembles every `jit_*.S.o`,
+builds the control flow (in-gadget jump tables included), and carries "a C
+call may have changed this half" forward over v0-v31, low and high halves
+apart -- a callee keeps v8-v15's low halves, and two 64-bit lane writes make a
+whole register. A call to another assembly routine goes through a summary of
+that routine, so the C call is found wherever it sits.
 
-**Prove:** the check reports nothing on the tree and reports the pre-a4e9b84fc
-MOPS SET gadget when run on that revision (its positive control); the five-root
-suite; bip (A10X) for anything fixed, since that host is the witness.
+- **Result: nothing else has the bug.** 1,968,006 instructions in 31 objects,
+  40,525 gadgets, 126 calls straight into C, 102 assembly routines, 28 jump
+  tables: no read of a changed register, in the Mac build and in 558's own
+  Release-iphoneos archive objects. The x86 VEX/EVEX, x87, riscv64 vector and
+  arm64 SIMD/FP gadgets all rebuild or reload around their slow paths.
+- **Positive control:** with `jit/guest-arm64/control.S` from before a4e9b84fc
+  it reports `_gadget_arm64_mops+0x2a8: calls mops_fill, which reads v0`, from
+  `bl a64_xlate_w` at `+0x29c` -- the 558 blocker, by name.
+- **Self-test** (`--self-test`): sixteen small gadgets, ten with the hazard in
+  a different shape each (straight call, through a helper, handed to a reader,
+  tail call, `blr`, v8's high half, a destructive op, one lane rewritten,
+  behind a jump table, round a loop) and six sound ones it must leave alone.
+- **No gadget hands vector state to the next one:** no gadget reads a vector
+  register before writing it on its straight-line entry. (`--entry-reads` lists
+  the may-reads; they are pairs of branches on one flag, load-if/use-if.)
+- **Kept as a check:** `meson test gadget_vreg_selftest gadget_vreg_audit` on
+  an Apple silicon host (16 s), and a leg of `tools/run-guest-gate.sh`.
+- The host backend for x86_64 (`jit/gadgets-x86_64`, Linux CI only) uses no
+  vector register at all.
+
+Not chased: which callee changes v0 on the older cores only. The rule holds
+whatever the answer, and the checker enforces the rule.
 
 ## 2. RUNNINGBOARD 0xdead10cc under heavy fakefs writes
 

@@ -418,6 +418,19 @@ if [ -n "$DEVICE" ]; then
     legs_run=$((legs_run + 1))
 fi
 
+# The gadget objects, read for a vector register held across a call that can
+# reach C (a4e9b84fc: the A10X-only memset corruption). Seconds, and no guest.
+if [ -z "$ONLY" ] && [ "$(uname -sm)" = "Darwin arm64" ]; then
+    echo
+    echo '########## gadget vector registers ##########'
+    python3 "$REPO/tools/gadget-vreg-audit.py" --self-test > "$LOGDIR/gadget-vreg.log" 2>&1 &&
+        python3 "$REPO/tools/gadget-vreg-audit.py" "$REPO/build/libish_emu.a.p" >> "$LOGDIR/gadget-vreg.log" 2>&1
+    vreg_rc=$?
+    tail -4 "$LOGDIR/gadget-vreg.log"
+    [ "$vreg_rc" -ne 0 ] && fail_total=$((fail_total + 1))
+    legs_run=$((legs_run + 1))
+fi
+
 if [ "$RUN_E2E" -eq 1 ] && [ -z "$ONLY" ]; then
     echo
     echo '########## e2e ##########'

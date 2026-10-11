@@ -2057,6 +2057,18 @@ if not meson.is_cross_build()
         include_directories: [includes, include_directories('tests/riscv64')])
     test('riscv64_decode', riscv64_decode_check)
 
+    # No gadget may read a vector register across a call that can reach C:
+    # save_c keeps general registers only, and on an A10X the TLB slow path
+    # came back with v0 changed (a4e9b84fc). The checker reads the assembled
+    # objects, Mach-O ones, so this is for an Apple silicon host.
+    if host_machine.cpu_family() == 'aarch64' and host_machine.system() == 'darwin'
+        gadget_vreg_audit = files('tools/gadget-vreg-audit.py')
+        test('gadget_vreg_selftest', python, args: [gadget_vreg_audit, '--self-test'])
+        test('gadget_vreg_audit', python,
+            args: [gadget_vreg_audit, meson.current_build_dir() / 'libish_emu.a.p'],
+            depends: [libish_emu], timeout: 300)
+    endif
+
     # The LLM Chat's tool permission rules decide what runs in the guest
     # without the user seeing it. Foundation only, so it needs a Mac.
     if host_machine.system() == 'darwin' and have_curl_shim
