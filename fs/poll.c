@@ -1055,9 +1055,25 @@ int poll_wait(struct poll *poll_, poll_callback_t callback, void *context, struc
         }
 
         // wait for a ready notification
+        //
+        // Listed for the resume once, if the set holds a socket now. It was
+        // a begin per socket here and an end per socket after the wait, over
+        // a list the wait itself unlocks: another thread's epoll_ctl between
+        // the two left the count wrong for good. One socket removed, and the
+        // task stayed on the resume's list after this call, after its exit
+        // and after its memory was freed -- the resume then wrote through
+        // whatever that memory had become (the 557 crash at fs/sockrestart.c,
+        // `task->sockrestart.punt = true` at address -4). One added, and the
+        // count went negative and the task was never listed again.
+        bool listen_wait = false;
         list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
-            sockrestart_begin_listen_wait(poll_fd->fd);
+            if (sockrestart_watches(poll_fd->fd)) {
+                listen_wait = true;
+                break;
+            }
         }
+        if (listen_wait)
+            sockrestart_begin_wait();
         int err;
         // Whether the host wait below ended because the deadline the GUEST
         // asked for has passed, as opposed to the cap this function imposes on
@@ -1211,9 +1227,8 @@ poll_wait_done:
                 }
             }
         }
-        list_for_each_entry(&poll_->poll_fds, poll_fd, fds) {
-            sockrestart_end_listen_wait(poll_fd->fd);
-        }
+        if (listen_wait)
+            sockrestart_end_wait();
 
         if (err < 0) {
             // A spurious host SIGUSR1 (e.g. from task_poke_shared_mem for TLB

@@ -69,9 +69,10 @@ void sockrestart_end_listen(struct fd *sock) {
 
 static struct list listen_tasks = LIST_INITIALIZER(listen_tasks);
 
-void sockrestart_begin_listen_wait(struct fd *sock) {
-    if (sock->ops != &socket_fdops)
-        return;
+// A task is on listen_tasks while it sleeps in a wait the resume should wake
+// (sockrestart_on_resume punts every task on the list). The count is waits,
+// not sockets: one accept, or one poll however many sockets its set holds.
+void sockrestart_begin_wait(void) {
     lock(&sockrestart_lock, 0);
     if (current->sockrestart.count == 0)
         list_add(&listen_tasks, &current->sockrestart.listen);
@@ -79,14 +80,43 @@ void sockrestart_begin_listen_wait(struct fd *sock) {
     unlock(&sockrestart_lock);
 }
 
-void sockrestart_end_listen_wait(struct fd *sock) {
-    if (sock->ops != &socket_fdops)
-        return;
+void sockrestart_end_wait(void) {
     lock(&sockrestart_lock, 0);
     current->sockrestart.count--;
     if (current->sockrestart.count == 0)
         list_remove(&current->sockrestart.listen);
     unlock(&sockrestart_lock);
+}
+
+bool sockrestart_watches(struct fd *fd) {
+    return fd->ops == &socket_fdops;
+}
+
+void sockrestart_begin_listen_wait(struct fd *sock) {
+    if (sockrestart_watches(sock))
+        sockrestart_begin_wait();
+}
+
+void sockrestart_end_listen_wait(struct fd *sock) {
+    if (sockrestart_watches(sock))
+        sockrestart_end_wait();
+}
+
+// A task's memory is about to go. It must not be on listen_tasks: the resume
+// walks that list and writes to every task on it, and the tasks either side
+// write to its node whenever they come and go. Nothing should leave a task
+// listed past its last wait -- poll_wait did, see there -- so this is a
+// backstop, and it says so when it catches something.
+void sockrestart_task_gone(struct task *task) {
+    struct list *node = &task->sockrestart.listen;
+    // Never listed, or listed and taken off: nothing to do, and no lock.
+    if (node->next == NULL || node->next == node)
+        return;
+    lock(&sockrestart_lock, 0);
+    list_remove_safe(node);
+    unlock(&sockrestart_lock);
+    printk("WARNING: sockrestart: pid %d was freed still listed as waiting "
+           "on a socket (count %d)\n", task->pid, task->sockrestart.count);
 }
 
 bool sockrestart_should_restart_listen_wait(int skip) {

@@ -24,6 +24,13 @@ void sockrestart_end_listen(struct fd *sock);
 void sockrestart_note_bound(struct fd *sock);
 void sockrestart_begin_listen_wait(struct fd *sock);
 void sockrestart_end_listen_wait(struct fd *sock);
+// The same pair for a wait on more than one fd: begin once if the set holds
+// a socket (sockrestart_watches), end once if begun.
+bool sockrestart_watches(struct fd *fd);
+void sockrestart_begin_wait(void);
+void sockrestart_end_wait(void);
+struct task;
+void sockrestart_task_gone(struct task *task);
 bool sockrestart_should_restart_listen_wait(int);
 // Both return how many sockets they handled -- listeners, and bound UDP
 // sockets (sockrestart_note_bound) -- so the caller can log

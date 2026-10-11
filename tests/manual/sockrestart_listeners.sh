@@ -37,7 +37,7 @@ trap 'rm -rf "$WORK"' EXIT
 
 cp "$REPO/tests/manual/sockrestart_listeners.c" "$WORK/"
 ISH_REAL_MNT=$WORK "$ISH" -f "$ROOT" /bin/sh -c \
-    'cc -O1 -o /realmnt/probe /realmnt/sockrestart_listeners.c' < /dev/null \
+    'cc -O1 -pthread -o /realmnt/probe /realmnt/sockrestart_listeners.c' < /dev/null \
     || { echo "FAIL: could not build the probe"; exit 1; }
 
 failures=0
@@ -94,6 +94,7 @@ done <<EOF
 - tcp-pending 0
 - tcp-accept 0
 - tcp-epollet 0
+- epoll-change 0
 1 survive 1
 1 abstract 1
 1 poll 1
@@ -102,6 +103,7 @@ done <<EOF
 1 mixed 2
 1 tcp 1
 1 tcp-epollet 1
+1 epoll-change 2
 EOF
 
 if [ "$(uname -s)" = Darwin ]; then

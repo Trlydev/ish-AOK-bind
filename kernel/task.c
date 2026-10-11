@@ -1447,6 +1447,7 @@ static void task_free_final(struct task *task) {
     task->groups = NULL;
     seccomp_filter_release(task->seccomp_filter);
     task->seccomp_filter = NULL;
+    sockrestart_task_gone(task);
     free(task);
 }
 

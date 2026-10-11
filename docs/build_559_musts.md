@@ -14,7 +14,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 |---|---|---|
 | 1 | Vector registers held across a call that can reach C | **DONE** (2026-10-11): no other gadget has it; a checker now reads the built objects in `meson test` and the gate |
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | open |
-| 3 | The 557 crash in `sockrestart_on_resume` | open |
+| 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | open |
 | 5 | The RISC guests at the threaded-code floor | open |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | open |
@@ -91,15 +91,39 @@ quiesce wait for (or refuse) writers before the app is suspended.
 **Why.** A field crash (Organizer, 2026-10-07): fs/sockrestart.c:521 writes
 `task->sockrestart.punt` through a `listen_tasks` node whose `next` is NULL.
 
-**Established:** nothing removes a task from `listen_tasks` at teardown, and
-poll.c pairs begin/end over a `poll_fds` list another thread's `epoll_ctl` can
-change in between. A CLI probe of that shape did not crash.
+**Done 2026-10-11.** The cause was in `poll_wait` (fs/poll.c). It listed the
+waiting task once per socket in the set before the wait and unlisted it once
+per socket after, and the wait itself unlocks the set: another thread's
+`epoll_ctl` in between left the count wrong for good.
 
-**Next step:** remove the task at exit and assert its count is zero; then a
-probe that changes the epoll set during a poll across a suspend.
+- One socket **removed** during the wait: the count stayed at one, so the
+  task stayed on `listen_tasks` after the call, after its exit and after its
+  memory was freed. The resume then walked into whatever that memory had
+  become -- zeroed, it is the crash in the Organizer (`next` NULL, the write
+  at -4); reused by a new task, it is a node linked to itself and a resume
+  that never returns. Its neighbours on the list also wrote to the freed node
+  whenever they came and went. Any multi-threaded server that edits its epoll
+  set from one thread while another sleeps on it does this (Go's netpoller
+  does it constantly).
+- One socket **added**: the count went negative and the task was never listed
+  again, so a resume did not wake it.
 
-**Prove:** the probe fails on 558 and passes after; the socket and epoll tests
-in the five-root suite.
+The fix: one registration per wait if the set holds a socket
+(`sockrestart_begin_wait`/`_end_wait`), which also takes the global
+`sockrestart_lock` twice per wait instead of twice per socket. And
+`sockrestart_task_gone`, called where a task is freed, unlists a task that is
+somehow still listed and says so in the kernel log.
+
+**Proved:** `tests/manual/sockrestart_listeners.sh`'s new `epoll-change` case
+(a sleeper on two listeners, one removed by another thread, the sleeper exits,
+64 threads take its memory, then the suspend/resume cycle).
+- 558's binary: hangs 3 of 3; a host sample shows the resume thread in
+  `sockrestart_on_resume` calling `pthread_kill` without end.
+- The backstop alone (the old pairing put back): no hang, and the kernel log
+  has "pid 3 was freed still listed as waiting on a socket (count 1)", which
+  fails the case.
+- The fix: passes 3 of 3; all 34 cases of the script pass; 50 poll, epoll and
+  socket tests pass on the Devuan arm64 root.
 
 ## 4. Caching translated code across exec and across runs
 
