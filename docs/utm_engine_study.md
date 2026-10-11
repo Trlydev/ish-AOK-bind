@@ -14,11 +14,16 @@ pull request rather than ship a competing app.
 
 ## Summary
 
-- **AOK's engine is much faster than UTM SE's.** For identical programs on
-  the same machine, UTM SE's engine needs **7.9x the CPU cycles on an arm64
-  guest and 6.5x on a riscv64 guest** (geometric mean of six workloads; range
-  3.2x to 14.6x). The ratio is the same on the Mac's fastest cores and on its
-  mid-tier cores.
+- **AOK's engine is much faster than the one UTM SE ships.** For identical
+  programs on the same machine, UTM SE's engine needs **7.8x the CPU cycles
+  on an arm64 guest and 6.5x on a riscv64 guest** (geometric mean of six
+  workloads; range 3.1x to 14.5x). The ratio is the same on the Mac's fastest
+  cores and on its mid-tier cores.
+- **It is still about 3x ahead of the best version of that engine.** An
+  active fork, `tctiSH/qemu` (QEMU 11.1), has made UTM SE's engine about 2.4x
+  faster. Against it AOK leads by **3.3x on arm64 and 2.8x on riscv64**
+  (range 1.6x to 4.5x). That fork, not UTM's QEMU 10, is the base to build
+  on: UTM plans to move to QEMU 11.1 (section 1, "The moving target").
 - **AOK is within about 1.5x of QEMU's real JIT** on the same workloads, and
   ahead of it on floating point. The JIT is what UTM uses where Apple allows
   code generation; an App Store app cannot.
@@ -38,11 +43,10 @@ pull request rather than ship a competing app.
   as it does today; each instruction class added afterwards makes it faster.
 - **x86 guests (FreeDOS, Windows) keep QEMU's engine** until someone ports
   AOK's x86 gadgets the same way. They lose nothing in the meantime.
-- **UTM SE's engine has a fixable defect of its own**: in QEMU 10 it makes a
-  C call for every guest memory access, because its inline fast path only
-  covers table offsets that current QEMU no longer uses (section 2). Fixing
-  it is a small change worth perhaps 1.3x to 1.5x for every guest, x86
-  included, and a good first pull request.
+- **The shipped engine has a defect the fork has already fixed**: in QEMU 10
+  it makes a C call for every guest memory access, because its inline fast
+  path only covers table offsets that current QEMU no longer uses (section 2).
+  Nothing to contribute there.
 - **UTM accepts AI-assisted pull requests**, under rules listed in section 5.
 
 ## 1. Speed race
@@ -126,6 +130,50 @@ have two or three); within a state, repeat samples agree to a few percent.
 Counting host *instructions* instead of cycles gives smaller ratios, 2.2x to
 8.6x, because UTM SE's engine also runs fewer instructions per cycle than AOK
 (for Python on arm64, 2.1 against 3.9).
+
+### The moving target: the tctiSH fork
+
+UTM's tracker (utmapp/UTM#7930, opened 2026-09-30) points at
+`github.com/tctiSH/qemu`, "a fork of QEMU that plays host to the TCTI
+pseudo-JIT": QEMU 11.1.2 with dozens of recent commits to this engine. Among
+them are fused gadgets for loading and storing guest state, a memory fast
+path for every privilege level, in-stream indirect jumps (`goto_ptr`), a
+larger block-lookup cache, and host floating point for x86 guests. Its author
+offered it to UTM; UTM's maintainer answered that QEMU 11.1 is planned for
+UTM 5.1 and he will revisit the engine then. He is also considering a
+WebAssembly backend.
+
+The same race against that fork (`ded0cff`, built the same way), fastest
+cores, billions of host cycles:
+
+**arm64 guest**
+
+| Workload | AOK | tctiSH fork | UTM SE today | fork needs | UTM SE today needs | fork vs UTM SE today |
+|---|--:|--:|--:|--:|--:|--:|
+| CoreMark | 4.0 | 10.7 | 20.2 | 2.7x | 5.1x | 1.9x faster |
+| n-body (floating point) | 2.7 | 10.5 | 24.5 | 3.9x | 9.0x | 2.3x faster |
+| Python | 7.1 | 32.0 | 90.9 | 4.5x | 12.8x | 2.8x faster |
+| xz | 3.6 | 11.0 | 28.9 | 3.1x | 8.1x | 2.6x faster |
+| sha256sum | 2.5 | 4.5 | 8.2 | 1.8x | 3.3x | 1.8x faster |
+| awk | 2.5 | 11.0 | 35.9 | 4.4x | 14.5x | 3.3x faster |
+| Geometric mean | | | | **3.3x** | 7.8x | 2.4x faster |
+
+**riscv64 guest**
+
+| Workload | AOK | tctiSH fork | UTM SE today | fork needs | UTM SE today needs | fork vs UTM SE today |
+|---|--:|--:|--:|--:|--:|--:|
+| CoreMark | 4.6 | 11.8 | 21.4 | 2.6x | 4.6x | 1.8x faster |
+| n-body (floating point) | 3.2 | 10.1 | 22.5 | 3.2x | 7.1x | 2.2x faster |
+| Python | 8.6 | 33.4 | 92.2 | 3.9x | 10.8x | 2.8x faster |
+| xz | 4.4 | 9.5 | 21.7 | 2.2x | 5.0x | 2.3x faster |
+| sha256sum | 3.1 | 5.0 | 9.6 | 1.6x | 3.1x | 1.9x faster |
+| awk | 2.8 | 11.4 | 36.5 | 4.1x | 13.1x | 3.2x faster |
+| Geometric mean | | | | **2.8x** | 6.5x | 2.3x faster |
+
+All of these samples ran on the Super cores at about 4.3 GHz (three per
+cell for the fork, five or six for AOK). The fork is improving week by week,
+so this gap may narrow further; the part it cannot remove without changing
+design is one dispatch per intermediate operation.
 
 ### Reading the numbers
 
@@ -258,13 +306,11 @@ internals that change between QEMU releases. UTM pins its QEMU version
 
 ### C. Improving TCTI in place
 
-Some of AOK's advantage could be had with no new front end at all, by fixing
-the worst costs in TCTI itself (the slow-path memory access above, and the trip back to the main loop on every indirect branch). That helps every guest,
-x86 included, so it is worth offering to UTM regardless, and it is a small,
-self-contained first contribution. Going by the profile it is worth perhaps
-1.3x to 1.5x, against the 6x to 8x measured for AOK: dispatching per
-intermediate operation and writing registers back at every block end are
-inherent to that design.
+Some of AOK's advantage can be had with no new front end at all, by fixing
+the worst costs in TCTI itself (the slow-path memory access above, and the trip back to the main loop on every indirect branch). The tctiSH fork has done exactly this, and
+more, and got about 2.4x (section 1). It helps every guest, x86 included.
+What remains is the roughly 3x that comes from the design itself: dispatching
+per intermediate operation rather than per guest instruction.
 
 ## 4. What AOK's engine would have to provide (option B)
 
@@ -296,9 +342,13 @@ per-guest decoders in `jit/gen.c`.
 
 ## 5. Offering it upstream
 
-- **Target.** TCTI lives in UTM's QEMU fork (`utmapp/qemu`), not mainline
-  QEMU, so that fork is where a second generator would be proposed, with any
-  UTM-side switch in `utmapp/UTM`.
+- **Target.** Build on `tctiSH/qemu` (QEMU 11.1), not on UTM's QEMU 10: it is
+  the QEMU version UTM is moving to, the engine there is the one a fallback
+  block should run on, and its author is actively taking engine work. TCTI is
+  not in mainline QEMU, so mainline is not a target. To survive whichever
+  back end UTM ends up with, AOK's generator should not emit TCTI's stream
+  format: it should enter and leave its own blocks itself and depend only on
+  QEMU's generic engine code (`accel/tcg`), which mainline maintains.
 - **UTM's rules for AI-assisted contributions** (`CONTRIBUTING.md`): one
   well-defined feature or fix per pull request; a human must test the change
   before the PR is opened; no unrelated files touched; an
@@ -335,17 +385,16 @@ per-guest decoders in `jit/gen.c`.
 
 ## 7. Next steps
 
-1. **Ask UTM's maintainers** whether they would take a second block generator
-   in their QEMU fork, before building one. Bring the numbers above.
-2. **Offer the TCTI memory fast-path fix** (option C) as a first, small pull
-   request. It is useful to them whatever they answer to 1.
-3. **Spike option B on riscv64**: the hook, an entry gadget, and integer
-   register-to-register instructions only, declining everything else. Success
-   is a stock kernel booting with some blocks served by AOK gadgets and a
-   measurable gain on CoreMark.
-4. **Measure on an iPad**: UTM SE from the App Store against AOK, same
+1. **Build option B for riscv64 on the tctiSH fork** (decided 2026-10-11):
+   the hook, AOK's own block entry and exit, integer instructions, loads and
+   stores through QEMU's TLB, and branches; everything else ends the block and
+   is left to QEMU. Success is a stock kernel booting with user code served by
+   AOK gadgets and a measured gain on this race.
+2. **Talk to the fork's author and UTM's maintainer** once there is a result
+   to show.
+3. **Measure on an iPad**: UTM SE from the App Store against AOK, same
    userland, to confirm the ratio on the hardware that matters.
-5. Re-run this race when either engine changes: `tests/bench-utm/`.
+4. Re-run this race when either engine changes: `tests/bench-utm/`.
 
 ## Appendix: reproducing the race
 
@@ -359,6 +408,7 @@ and `build/tools/fakefsify`, plus Homebrew's `glib`, `pixman`, `meson` and
 | File | Purpose |
 |---|---|
 | `build-qemu.sh` | downloads UTM's QEMU 10.0.12 and builds it twice (TCTI, JIT) |
+| `build-qemu-tctish.sh` | clones and builds the tctiSH fork (engine name `tctish` in `race.sh`) |
 | `setup-roots.sh`, `update-roots.sh` | build the per-arch Alpine userland as an AOK root and as an initramfs |
 | `bench/` | workload sources and the guest-side scripts |
 | `cycwrap.c` | per-workload host cycles, instructions and Super-core share |

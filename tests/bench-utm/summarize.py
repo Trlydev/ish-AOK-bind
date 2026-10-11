@@ -10,7 +10,8 @@ each core class and the host moves work between them when it throttles:
 
 Logs from the first cycwrap, which did not report the share, are classified by effective clock speed instead
 (>= 4.0 GHz is super, <= 2.2 GHz is mid). For each state, guest arch and workload this prints the median over
-samples of host cycles, host instructions and host CPU seconds per engine, and the ratios between engines.
+samples of host cycles, host instructions and host CPU seconds per engine, and each engine's ratio to AOK
+(above 1 means it needs more than AOK does).
 """
 import sys, collections, statistics
 
@@ -36,7 +37,9 @@ for path in sys.argv[1:]:
             continue
         rows[(state, arch, eng, f[2])].append(x)
 
-engines = ["aok", "tcti", "jit"]
+known = ["aok", "tctish", "tcti", "jit"]   # tctish: the tctiSH fork's TCTI (QEMU 11.1); tcti: UTM's (QEMU 10)
+engines = [e for e in known if any(k[2] == e for k in rows)]
+others = [e for e in engines if e != "aok"]
 order = ["coremark", "nbody", "python", "xz", "sha256", "awk"]
 med = statistics.median
 titles = {"super": "fastest cores (Super), ~4.3 GHz", "mid": "mid-tier cores (Performance), throttled"}
@@ -47,7 +50,7 @@ for state in ("super", "mid"):
                                  ("ins", 1e9, "billions of host instructions"),
                                  ("cpu", 1e3, "host CPU seconds")):
             print(f"-- {title}: median (samples, max/min)")
-            print(f"{'workload':9} " + " ".join(f"{e:>20}" for e in engines) + f" {'tcti/aok':>9} {'aok/jit':>8}")
+            print(f"{'workload':9} " + " ".join(f"{e:>20}" for e in engines) + " " + " ".join(f"{e + '/aok':>10}" for e in others))
             for w in order:
                 m = {}; cells = []
                 for e in engines:
@@ -56,9 +59,8 @@ for state in ("super", "mid"):
                         cells.append(f"{'-':>20}"); continue
                     m[e] = med(s) / unit
                     cells.append(f"{m[e]:8.2f} (n{len(s)}, x{max(s) / min(s):4.2f})")
-                r1 = f"{m['tcti'] / m['aok']:9.1f}" if "tcti" in m and "aok" in m else f"{'-':>9}"
-                r2 = f"{m['aok'] / m['jit']:8.1f}" if "jit" in m and "aok" in m else f"{'-':>8}"
-                print(f"{w:9} " + " ".join(cells) + f" {r1} {r2}")
+                ratios = " ".join(f"{m[e] / m['aok']:10.2f}" if e in m and "aok" in m else f"{'-':>10}" for e in others)
+                print(f"{w:9} " + " ".join(cells) + " " + ratios)
         print("-- instructions per cycle, median")
         for w in order:
             cells = []
