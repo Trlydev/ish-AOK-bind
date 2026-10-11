@@ -22,6 +22,9 @@ void jitprof_note(struct jitprof_block *block, uint32_t insn);
 // x86 guests: the bytes one translation step consumed (one instruction, or a
 // fused group), in order. The report disassembles them.
 void jitprof_note_bytes(struct jitprof_block *block, const uint8_t *bytes, unsigned len);
+// arm64: what one translation step put in the stream -- its first gadget, how
+// many words, and how many guest instructions it consumed.
+void jitprof_note_step(struct jitprof_block *block, uint64_t gadget, unsigned words, unsigned insns);
 // Write the file (main.c's cli_halt); no-op unless ISH_JIT_PROFILE.
 void jitprof_dump(void);
 

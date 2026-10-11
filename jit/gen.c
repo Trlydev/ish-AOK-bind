@@ -407,12 +407,17 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
         // consumes more; note those too, or the profile loses every fused
         // branch and a loop looks like it ends in its compare.
         guest_addr_t start = state->arm64_ip;
+        unsigned emitted_from = state->size;
         int ret = gen_step_arm64(state, tlb);
         for (guest_addr_t a = start + 4; a < state->arm64_ip && a < start + 64; a += 4) {
             uint32_t w;
             if (tlb_read(tlb, a, &w, sizeof(w)))
                 jitprof_note(state->jitprof, w);
         }
+        if (state->size > emitted_from)
+            jitprof_note_step(state->jitprof, state->block->code[emitted_from],
+                    (unsigned) (state->size - emitted_from),
+                    (unsigned) ((state->arm64_ip - start) / 4));
         return ret;
     }
     if (state->riscv64)

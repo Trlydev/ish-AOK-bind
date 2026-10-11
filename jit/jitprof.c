@@ -15,6 +15,7 @@
 // again gets a second record); the counters race between threads. Both are
 // fine for a measurement and would not be for anything else.
 
+#include <dlfcn.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,10 @@ struct jitprof_block {
     // x86: consumed bytes as [len][bytes]... records.
     uint8_t *bytes;
     uint32_t nb, capb;
+    // arm64: what each translation step emitted, as [first gadget][words]
+    // [instructions consumed] triples -- the gadget-level view of the block.
+    uint64_t *steps;
+    uint32_t ns, caps;
 };
 
 static pthread_once_t jitprof_once = PTHREAD_ONCE_INIT;
@@ -66,6 +71,26 @@ void jitprof_dump(void) {
             fputc(' ', f);
             for (unsigned j = 0; j < len && i < b->nb; j++)
                 fprintf(f, "%02x", b->bytes[i++]);
+        }
+        fputc('\n', f);
+        if (b->ns == 0)
+            continue;
+        // "<abi>g <count> <addr> <gadget>/<words>/<instructions> ...": the
+        // same block as the gadgets it became (tools/jitprof-gadget-pairs.py).
+        fprintf(f, "%sg %llu %#llx", names[b->abi],
+                (unsigned long long) count, (unsigned long long) b->addr);
+        for (uint32_t i = 0; i + 2 < b->ns; i += 3) {
+            Dl_info info;
+            const char *sym = "?";
+            if (dladdr((void *) (uintptr_t) b->steps[i], &info) && info.dli_sname != NULL &&
+                    (uintptr_t) info.dli_saddr == (uintptr_t) b->steps[i])
+                sym = info.dli_sname;
+            if (*sym == '_')
+                sym++;
+            if (strncmp(sym, "gadget_arm64_", 13) == 0)
+                sym += 13;
+            fprintf(f, " %s/%llu/%llu", sym, (unsigned long long) b->steps[i + 1],
+                    (unsigned long long) b->steps[i + 2]);
         }
         fputc('\n', f);
     }
@@ -128,4 +153,18 @@ void jitprof_note(struct jitprof_block *block, uint32_t insn) {
         block->cap = cap;
     }
     block->insns[block->n++] = insn;
+}
+
+void jitprof_note_step(struct jitprof_block *block, uint64_t gadget, unsigned words, unsigned insns) {
+    if (block->ns + 3 > block->caps) {
+        uint32_t cap = block->caps ? block->caps * 2 : 48;
+        uint64_t *steps = realloc(block->steps, cap * sizeof(*steps));
+        if (steps == NULL)
+            return;
+        block->steps = steps;
+        block->caps = cap;
+    }
+    block->steps[block->ns++] = gadget;
+    block->steps[block->ns++] = words;
+    block->steps[block->ns++] = insns;
 }
