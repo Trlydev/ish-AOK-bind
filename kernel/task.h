@@ -757,13 +757,6 @@ struct task {
     // clearing TF as it does for the guest's own (x86_signal_handler_flags).
     // Not inherited. At the end for the reason given above native_standin_child.
     bool ptrace_singlestep;
-    // The pipe a blocking socket wait polls beside its socket, so that a
-    // signal can end the wait (deliver_signal writes to poll_notify_fd, which
-    // is this pipe's write end for the length of the wait). The task's own,
-    // made on its first such wait and kept: it was a pipe() and two close()
-    // around every wait. -1 until then. Not inherited. At the end for the
-    // reason given above native_standin_child.
-    int wait_pipe[2];
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {
@@ -1181,9 +1174,6 @@ void guest_cpu_usage_total(uint64_t user_ns, uint64_t system_ns, struct cpu_usag
 // the user/system split isn't available and the total is reported as user
 // time). In nanoseconds, to the host's own precision (microseconds on Darwin).
 void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns);
-// current's wait pipe (see struct task), made if it has none. False if it
-// cannot be had: the wait then goes without, as it did when pipe() failed.
-bool task_wait_pipe(int fds[2]);
 // The calling host thread's own CPU clock, in nanoseconds (kernel/task.c).
 uint64_t host_thread_cpu_ns_self(void);
 // Charges the exiting task's final thread CPU time to its per-virtual-CPU

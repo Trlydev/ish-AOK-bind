@@ -27,7 +27,6 @@
 #include <sched.h>
 #include <stdatomic.h>
 #include <unistd.h>
-#include <fcntl.h>
 
 #define GRACE_PERIOD 2 // How long we want to deallocate tasks that have exited
 
@@ -1330,7 +1329,6 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->futex_restart_wake_seq = 0;
     task->futex_restart_timed = false;
     task->poll_notify_fd = -1;
-    task->wait_pipe[0] = task->wait_pipe[1] = -1;
     lock_init(&task->waiting_cond_lock, "task_creat_wait\0");
     cond_init(&task->pause);
 
@@ -1474,29 +1472,7 @@ static void task_free_final(struct task *task) {
     seccomp_filter_release(task->seccomp_filter);
     task->seccomp_filter = NULL;
     sockrestart_task_gone(task);
-    if (task->wait_pipe[0] >= 0) {
-        close(task->wait_pipe[0]);
-        close(task->wait_pipe[1]);
-    }
     free(task);
-}
-
-bool task_wait_pipe(int fds[2]) {
-    struct task *task = current;
-    if (task->wait_pipe[0] < 0) {
-        int p[2];
-        if (pipe(p) != 0)
-            return false;
-        fcntl(p[0], F_SETFL, O_NONBLOCK);
-        fcntl(p[1], F_SETFL, O_NONBLOCK);
-        fcntl(p[0], F_SETFD, FD_CLOEXEC);
-        fcntl(p[1], F_SETFD, FD_CLOEXEC);
-        task->wait_pipe[0] = p[0];
-        task->wait_pipe[1] = p[1];
-    }
-    fds[0] = task->wait_pipe[0];
-    fds[1] = task->wait_pipe[1];
-    return true;
 }
 
 void task_destroy_unlinked(struct task *task, int caller) {
