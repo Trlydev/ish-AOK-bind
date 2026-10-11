@@ -16,7 +16,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | **prototype in, off by default** (2026-10-11): -21..-26% on short processes with addresses held still; needs a decision on ASLR before it can be on |
-| 5 | The RISC guests at the threaded-code floor | **profiled, not started** (2026-10-11): the arm64 guest's levers are ALU pairs for 7-Zip and block transitions for Python |
+| 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has the first two and wants the third |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
@@ -343,6 +343,46 @@ through memory stops being hidden and starts to cost -- and string code is
 dependent chains (a pointer, a count, a byte). That revises the note above:
 resident registers would do nothing for the M4 *as the dispatch is*, and are
 what a faster dispatch needs. The two belong together.
+
+**Fused pairs, same day -- the largest step.** Two guest instructions that
+run one after the other become one gadget that does both and dispatches once
+(jit/guest-arm64/frag.h has the how; the `pair` bit of
+/proc/ish/arm64_jit_fuse turns it off). It is not a set of hand-written
+fusions: the gadget bodies are macros, a pair gadget is the first body, the
+second, and the dispatch, and the translator replaces two adjacent gadget
+words with the pair's when jit/guest-arm64/pairs.h lists them. Each body
+still reads its own parameters and commits its result before the next
+starts, so faults and signals see what they always saw.
+
+- **Which pairs is measured, not chosen.** ISH_JIT_PROFILE now also records
+  each block as the gadgets it became, and tools/jitprof-gadget-pairs.py
+  --fuse writes the list: every adjacent pair of fusable gadgets that is at
+  least 0.03% of the gadgets run, averaged over Python, sqlite, gcc and 7-Zip.
+  405 pairs from 200 gadgets; they remove 32% of Python's dispatches, 33% of
+  sqlite's, 29% of gcc's and 32% of 7-Zip's.
+- **What a pair is made of:** loads and stores (offset, register-offset,
+  pairs, the prologue's and epilogue's writeback pairs), add/sub/logic with
+  a constant or a register, register moves, constants, bitfields and shifts;
+  and as the second half only, anything that ends a block: b, bl, ret,
+  cbz/cbnz, tbz/tbnz, b.cond, and the compare-and-branch gadgets.
+- **Found on the way, each a gadget that ran far more than it looked:**
+  UBFM/SBFM (lsl, lsr, asr, ubfx, sxtw... 3% of Python's gadgets, 10% of
+  7-Zip's) decoded five fields and took four branches to do two shifts, and
+  now has slot-fed gadgets; ADR/ADRP unpacked a register and an address from
+  one word and is now the constant store it always was; a store's fast path
+  jumped over its own slow path on every execution.
+- **Numbers.** M4, arm64 Alpine, one build, the pass switched off and on in
+  alternation, four rounds: 7-Zip 8.8% faster, Python fib 0.6%, method 3.4%,
+  dict 5.9%, str 28.5% faster. A10X, three rounds: 7-Zip 6.0%, fib 4.7%,
+  method 2.7%, dict 11.9%, str 6.5% faster. Nothing slower on either.
+- **Proved:** tests/manual/arm64/pair_fusion.c -- the values when the second
+  half uses the first's result, a fault in either half (register state and
+  the reported address), branches as the second half. Its control: with a
+  fused load's fault path made to name the wrong instruction, it fails.
+- **Seen while counting instructions, queued:** about one run in five of the
+  same Python loop retires 7.5% more host instructions, with the pass on or
+  off, and never with guest ASLR off. Something address-dependent -- two hot
+  pages on one TLB entry is the first suspect.
 
 **The transition itself.** Three ways to make `arm64_chain` cheaper,
 smallest first: keep the chain budget in a host register instead of loading,

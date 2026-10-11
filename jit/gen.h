@@ -43,6 +43,9 @@ struct gen_state {
     // doesn't either). A directly-following B.cond can then use the
     // bcond_nf_* family and skip the serializing `msr nzcv` reload.
     bool arm64_flags_live;
+    // Where in the stream the previous gen_step_arm64 put its gadget, for
+    // arm64_pair_fuse; UINT_MAX when there is none to pair with.
+    unsigned arm64_pair_prev;
     bool amd64_fallback_to_interp;
     // This instruction's effective address is 32 bits (an effective 0x67,
     // taken off the prefixes): gen_amd64_decode_mem_meta marks the meta word.

@@ -395,13 +395,18 @@ static void amd64_jit_debug(const char *fmt, ...) {
     va_end(args);
 }
 
+static void arm64_pair_fuse(struct gen_state *state, unsigned from);
 static bool gen_amd64_peek(struct gen_state *state, struct tlb *tlb, struct amd64_jit_insn *insn);
 static void amd64_flags_note(struct gen_state *state, const struct amd64_jit_insn *insn,
         unsigned emitted_from);
 int gen_step(struct gen_state *state, struct tlb *tlb) {
     if (state->arm64) {
-        if (state->jitprof == NULL)
-            return gen_step_arm64(state, tlb);
+        if (state->jitprof == NULL) {
+            unsigned from = state->size;
+            int ret = gen_step_arm64(state, tlb);
+            arm64_pair_fuse(state, from);
+            return ret;
+        }
         // ISH_JIT_PROFILE: gen_step_arm64 notes the word it decodes, but a
         // lookahead fusion (compare + b.cond, load-op-store, movz + movk...)
         // consumes more; note those too, or the profile loses every fused
@@ -414,10 +419,13 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
             if (tlb_read(tlb, a, &w, sizeof(w)))
                 jitprof_note(state->jitprof, w);
         }
+        // The profile is of the gadgets as translated, before any pairing:
+        // it is what the pairs are chosen from (jitprof-gadget-pairs.py).
         if (state->size > emitted_from)
             jitprof_note_step(state->jitprof, state->block->code[emitted_from],
                     (unsigned) (state->size - emitted_from),
                     (unsigned) ((state->arm64_ip - start) / 4));
+        arm64_pair_fuse(state, emitted_from);
         return ret;
     }
     if (state->riscv64)
@@ -1349,6 +1357,7 @@ bool gen_start_arm64(guest_addr_t addr, struct gen_state *state) {
     state->arm64 = true;
     state->arm64_ip = addr;
     state->arm64_orig_ip = addr;
+    state->arm64_pair_prev = UINT_MAX;
 #ifdef ISH_JIT_ARM64_GUEST
     state->jitprof = jitprof_block_new(addr, JITPROF_ARM64);
     if (unlikely(state->jitprof != NULL)) {
@@ -2364,6 +2373,16 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
                 (next & 0x1f) == rd && ((next >> 5) & 0x1f) == rd) {
             target += (next >> 10) & 0xfff;
             state->arm64_ip += 4;
+        }
+        // The address is a constant: mov_const stores it, where the adr
+        // gadget unpacks the register and 48 bits of address from one word.
+        // (The same 48 bits, so an ADR whose arithmetic wraps reads alike.)
+        if (rd != 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            extern void gadget_arm64_mov_const(void);
+            gen(state, (unsigned long) gadget_arm64_mov_const);
+            gen(state, offsetof(struct cpu_state, arm64_regs) + rd * 8);
+            gen(state, target & 0xffffffffffffULL);
+            return 1;
         }
         gen(state, (unsigned long) gadget_arm64_adr);
         gen(state, (rd & 0x1f) | ((target & 0xffffffffffffULL) << 8));
@@ -5949,6 +5968,14 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
             gen(state, params);
             gen(state, M);
         } else {
+            extern void gadget_arm64_ospec_ubfm64(void), gadget_arm64_ospec_ubfm32(void);
+            extern void gadget_arm64_ospec_sbfm64(void), gadget_arm64_ospec_sbfm32(void);
+            void (*spec)(void) = opc == 0
+                ? (sf ? gadget_arm64_ospec_sbfm64 : gadget_arm64_ospec_sbfm32)
+                : (sf ? gadget_arm64_ospec_ubfm64 : gadget_arm64_ospec_ubfm32);
+            if (rd != 31 && rn != 31 &&
+                    gen_arm64_ospec(state, spec, 4, arm64_x_off(rd), arm64_x_off(rn), L, S))
+                return 1;
             gen(state, (unsigned long) (opc == 0 ? gadget_arm64_sbfm : gadget_arm64_ubfm));
             gen(state, params);
         }
@@ -20122,6 +20149,80 @@ static unsigned i386_fuse_seed(void) {
     if (getenv("ISH_NO_PUSHPOP_FUSE") != NULL) v &= ~JIT_FUSE_PUSHPOP;
     return v;
 }
+// ---- arm64 guest: fused pairs -----------------------------------------------
+// When a translation step's gadget and the previous step's are a pair in
+// jit/guest-arm64/pairs.h, the two become the one gadget that does both: the
+// first gadget's word is replaced, and the second's is taken out from between
+// the two sets of parameters. See jit/guest-arm64/frag.h.
+#if defined(ISH_JIT_ARM64_GUEST)
+#define FUSE2(a, b) extern void gadget_arm64_##a(void); extern void gadget_arm64_##b(void); \
+    extern void gadget_arm64_f2_##a##__##b(void);
+#include "jit/guest-arm64/pairs.h"
+#undef FUSE2
+static const struct arm64_pair {
+    void (*a)(void), (*b)(void), (*fused)(void);
+    unsigned a_words; // the first gadget and its parameters
+} arm64_pairs[] = {
+#define FUSE2(a, b) {gadget_arm64_##a, gadget_arm64_##b, gadget_arm64_f2_##a##__##b, 1 + NP_##a},
+#include "jit/guest-arm64/pairs.h"
+#undef FUSE2
+};
+#define ARM64_N_PAIRS (sizeof(arm64_pairs) / sizeof(arm64_pairs[0]))
+#define ARM64_PAIR_HASH 4096
+_Static_assert(ARM64_N_PAIRS * 3 < ARM64_PAIR_HASH, "arm64 pair table: raise ARM64_PAIR_HASH");
+static uint16_t arm64_pair_hash[ARM64_PAIR_HASH]; // index + 1; 0 is empty
+static pthread_once_t arm64_pair_once = PTHREAD_ONCE_INIT;
+
+static inline unsigned arm64_pair_slot(unsigned long a, unsigned long b) {
+    uint64_t h = (uint64_t) a * 0x9e3779b97f4a7c15ull ^ (uint64_t) b * 0xc2b2ae3d27d4eb4full;
+    return (unsigned) (h >> 40) & (ARM64_PAIR_HASH - 1);
+}
+static void arm64_pair_init(void) {
+    for (unsigned i = 0; i < ARM64_N_PAIRS; i++) {
+        unsigned slot = arm64_pair_slot((unsigned long) arm64_pairs[i].a, (unsigned long) arm64_pairs[i].b);
+        while (arm64_pair_hash[slot] != 0)
+            slot = (slot + 1) & (ARM64_PAIR_HASH - 1);
+        arm64_pair_hash[slot] = (uint16_t) (i + 1);
+    }
+}
+
+static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
+    unsigned prev = state->arm64_pair_prev;
+    state->arm64_pair_prev = UINT_MAX;
+    if (state->size == from || state->single_step ||
+            !(arm64_jit_fuse_mask() & JIT_FUSE_A64_PAIR))
+        return;
+    unsigned long *code = state->block->code;
+    if (prev != UINT_MAX) {
+        pthread_once(&arm64_pair_once, arm64_pair_init);
+        unsigned slot = arm64_pair_slot(code[prev], code[from]);
+        for (unsigned i; (i = arm64_pair_hash[slot]) != 0; slot = (slot + 1) & (ARM64_PAIR_HASH - 1)) {
+            const struct arm64_pair *p = &arm64_pairs[i - 1];
+            if ((unsigned long) p->a != code[prev] || (unsigned long) p->b != code[from])
+                continue;
+            // The previous step must have been that one gadget and nothing
+            // after it, or what follows its parameters is not this step.
+            if (from - prev != p->a_words)
+                break;
+            code[prev] = (unsigned long) p->fused;
+            memmove(&code[from], &code[from + 1], (state->size - from - 1) * sizeof(code[0]));
+            state->size--;
+            // The step's own records of where its words are (the chain links
+            // of a branch) moved down with them.
+            for (unsigned j = 0; j < 2; j++)
+                if (state->jump_ip[j] > from)
+                    state->jump_ip[j]--;
+            return; // a pair is not the head of another
+        }
+    }
+    state->arm64_pair_prev = from;
+}
+#else
+static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
+    (void) state; (void) from;
+}
+#endif
+
 static unsigned arm64_fuse_seed(void) {
     // ISH_ARM64_NO_FUSE was the single bisection hatch for all three passes and
     // keeps that meaning; the per-pass bits are new granularity, not a change.
@@ -20153,6 +20254,7 @@ static const struct jit_fuse_entry arm64_fuse_names[] = {
     {"ldcmp", JIT_FUSE_A64_LDCMP}, {"retcache", JIT_FUSE_A64_RETCACHE},
     {"vspec", JIT_FUSE_A64_VSPEC}, {"ospec", JIT_FUSE_A64_OSPEC},
     {"lspec", JIT_FUSE_A64_LSPEC}, {"btfn", JIT_FUSE_A64_BTFN},
+    {"pair", JIT_FUSE_A64_PAIR},
 };
 static const struct jit_fuse_entry riscv64_fuse_names[] = {
     {"fold", JIT_FUSE_RV_FOLD}, {"jal", JIT_FUSE_RV_JAL},

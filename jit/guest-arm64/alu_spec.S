@@ -14,20 +14,12 @@
 // upper half.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
 .macro ospec_alu_imm name, op, r, flags=0
-.gadget \name
-    ldp x9, x10, [_ip]
-    ldr x11, [_ip, #16]
-    ldr x12, [_cpu, x10]
-    \op \r\()12, \r\()12, \r\()11
-.if \flags
-    store_flags
-.endif
-    str x12, [_cpu, x9]
-    gret 3
+    f_gadget \name, f_alu_imm, \op, \r, \flags, _, _
 .endm
 ospec_alu_imm ospec_addi64, add, x
 ospec_alu_imm ospec_addi32, add, w
@@ -62,17 +54,7 @@ ospec_cmp_imm ospec_cmni64, adds, x
 ospec_cmp_imm ospec_cmni32, adds, w
 
 .macro ospec_alu_reg name, op, r, flags=0
-.gadget \name
-    ldp x9, x10, [_ip]
-    ldr x11, [_ip, #16]
-    ldr x12, [_cpu, x10]
-    ldr x13, [_cpu, x11]
-    \op \r\()12, \r\()12, \r\()13
-.if \flags
-    store_flags
-.endif
-    str x12, [_cpu, x9]
-    gret 3
+    f_gadget \name, f_alu_reg, \op, \r, \flags, _, _
 .endm
 ospec_alu_reg ospec_addr64, add, x
 ospec_alu_reg ospec_addr32, add, w
@@ -94,15 +76,7 @@ ospec_alu_reg ospec_andsr32, ands, w, 1
 // ADD/SUB with Rm shifted left by a constant (address arithmetic).
 // [d_off][n_off][m_off][shift]
 .macro ospec_alu_reg_lsl name, op, r
-.gadget \name
-    ldp x9, x10, [_ip]
-    ldp x11, x14, [_ip, #16]
-    ldr x12, [_cpu, x10]
-    ldr x13, [_cpu, x11]
-    lslv \r\()13, \r\()13, \r\()14
-    \op \r\()12, \r\()12, \r\()13
-    str x12, [_cpu, x9]
-    gret 4
+    f_gadget \name, f_alu_reg_lsl, \op, \r, _, _, _
 .endm
 ospec_alu_reg_lsl ospec_addr_lsl64, add, x
 ospec_alu_reg_lsl ospec_addr_lsl32, add, w
@@ -123,3 +97,13 @@ ospec_cmp_reg ospec_cmpr64, subs, x
 ospec_cmp_reg ospec_cmpr32, subs, w
 ospec_cmp_reg ospec_cmnr64, adds, x
 ospec_cmp_reg ospec_cmnr32, adds, w
+
+// UBFM/SBFM with real registers: LSL/LSR/ASR by a constant, UBFX/SBFX,
+// UBFIZ, the extends. [d_off][n_off][L][S], the generic gadget's two shift
+// counts (dpextra.S) as their own words. The generic ubfm was 3% of the
+// gadgets Python runs and 10% of 7-Zip's, and decoded five fields and took
+// four branches to do two shifts.
+f_gadget ospec_ubfm64, f_bfm, lsrv, x, _, _, _
+f_gadget ospec_ubfm32, f_bfm, lsrv, w, _, _, _
+f_gadget ospec_sbfm64, f_bfm, asrv, x, _, _, _
+f_gadget ospec_sbfm32, f_bfm, asrv, w, _, _, _

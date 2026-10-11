@@ -19,27 +19,20 @@
 // discipline note).
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
 // UMOV Wd/Xd, Vn.T[i] (and its MOV and FMOV-to-general aliases): zero-
 // extending load of the element, stored as the whole 64-bit GPR.
 .macro vspec_to_gpr name, ld
-.gadget \name
-    ldp x8, x10, [_ip]
-    \ld w11, [_cpu, x10]
-    str x11, [_cpu, x8]
-    gret 2
+    f_gadget \name, f_umov, \ld, w11, _, _, _
 .endm
 vspec_to_gpr vspec_umov8, ldrb
 vspec_to_gpr vspec_umov16, ldrh
 vspec_to_gpr vspec_umov32, ldr
 
-.gadget vspec_umov64
-    ldp x8, x10, [_ip]
-    ldr x11, [_cpu, x10]
-    str x11, [_cpu, x8]
-    gret 2
+f_gadget vspec_umov64, f_umov, ldr, x11, _, _, _
 
 // INS Vd.T[i], Wn/Xn: the element from the GPR slot's low bytes, the other
 // lanes kept. Also INS Vd.T[i], Vn.T[j] (element to element): the source is

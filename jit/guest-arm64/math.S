@@ -11,6 +11,7 @@
 // emits parameters in the same packed form these gadgets expect.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
@@ -109,11 +110,7 @@
 // Profiled on the iSH_benchmark bmm integer loop: the generic movz+movk
 // pair materializing the loop bound was ~11% of total runtime.
 // Code stream: [gadget][rd_slot][value]
-.gadget mov_const
-    ldp x8, x9, [_ip]
-    add _ip, _ip, #16
-    str x9, [_cpu, x8]
-    gret
+f_gadget mov_const, f_mov_const, _, _, _, _, _
 
 // MOVK not preceded by a fusable MOVZ/MOVN (old value is live at runtime):
 // insert the compile-time-shifted 16 bits under a compile-time keep-mask.

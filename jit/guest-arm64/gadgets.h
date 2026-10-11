@@ -286,11 +286,7 @@ _addr   .req x7
         cmp x9, x11
         b.ne slow_write_\id
         ldrb w10, [x10, #MMU_requires_write_revalidate]
-        cbz w10, fast_write_\id
-slow_write_\id :
-        bl_ahead arm64_resolve_write_ptr, \ahead
-        b back_\id
-fast_write_\id :
+        cbnz w10, slow_write_\id   // out of line (_bullshit): the store falls through
     .endif
     // 64-bit page math throughout: arm64 guest addresses are 48-bit, and a
     // 32-bit page compare would treat any two pages 4GiB apart as aliases.
@@ -350,6 +346,11 @@ handle_miss_\id :
     .endif
     bl_ahead arm64_handle_\type\()_miss, \ahead
     b back_\id
+.ifc \type,write
+slow_write_\id :
+    bl_ahead arm64_resolve_write_ptr, \ahead
+    b back_\id
+.endif
 crosspage_load_\id :
     mov x27, #(\size/8)
     bl_ahead arm64_crosspage_load, \ahead

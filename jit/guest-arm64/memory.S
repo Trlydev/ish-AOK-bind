@@ -66,6 +66,7 @@
 // can exceed 32 bits.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
@@ -507,40 +508,11 @@ stp_gadget stp32, 64, 4, w17, w25
 // stores results without runtime register decoding. The rn_slot encodes
 // SP (r=31) as CPU_sp, same as the single-register fast path.
 .macro ldp_fast name, bits, bytes, ldr_reg1, ldr_reg2
-.gadget \name
-    ldp x8, x9, [_ip]          // [rt_slot | rt2_slot<<16], [rn_slot]
-    ldr x19, [_ip, #16]        // offset
-    add _ip, _ip, #32          // 4 param words: slots1 + rn_slot + offset + orig_ip
-    ldr x10, [_cpu, x9]        // base from precomputed rn_slot
-    add x7, x10, x19
-    read_prep \bits, \name
-    ldr \ldr_reg1, [_addr]
-    ldr \ldr_reg2, [_addr, #\bytes]
-    and x9, x8, #0xffff        // rt_slot (low 16 bits)
-    str x17, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
-    ubfx x9, x8, #16, 16      // rt2_slot (high 16 bits)
-    str x25, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
-    gret
-    read_bullshit \bits, \name
+    f_gadget \name, f_ldp, \bits, \bytes, \ldr_reg1, \ldr_reg2, _
 .endm
 
 .macro stp_fast name, bits, bytes, str_reg1, str_reg2
-.gadget \name
-    ldp x8, x9, [_ip]          // [rt_slot | rt2_slot<<16], [rn_slot]
-    ldr x19, [_ip, #16]        // offset
-    add _ip, _ip, #32          // 4 param words
-    and x21, x8, #0xffff       // rt_slot (callee-saved, survives write_prep)
-    ubfx x22, x8, #16, #16    // rt2_slot (callee-saved, survives write_prep)
-    ldr \str_reg1, [_cpu, x21] // load value from rt slot
-    ldr \str_reg2, [_cpu, x22] // load value from rt2 slot
-    ldr x10, [_cpu, x9]        // base from precomputed rn_slot
-    add x7, x10, x19
-    write_prep \bits, \name
-    str \str_reg1, [_addr]
-    str \str_reg2, [_addr, #\bytes]
-    write_done \bits, \name
-    gret
-    write_bullshit \bits, \name
+    f_gadget \name, f_stp, \bits, \bytes, \str_reg1, \str_reg2, _
 .endm
 
 ldp_fast ldp64_fast, 128, 8, x17, x25
@@ -555,52 +527,11 @@ stp_fast stp32_fast, 64, 4, w17, w25
 // rn untouched. gen.c keeps rt or rt2 == rn on the generic gadgets. x23
 // holds the new base and x24 rn's slot across the prep helpers.
 .macro ldp_wb name, bits, bytes, ldr_reg1, ldr_reg2, pre
-.gadget \name
-    ldp x8, x24, [_ip]
-    ldr x19, [_ip, #16]
-    add _ip, _ip, #32
-    ldr x10, [_cpu, x24]
-    add x23, x10, x19
-.if \pre
-    mov x7, x23
-.else
-    mov x7, x10
-.endif
-    read_prep \bits, \name
-    ldr \ldr_reg1, [_addr]
-    ldr \ldr_reg2, [_addr, #\bytes]
-    and x9, x8, #0xffff
-    str x17, [_cpu, x9]
-    ubfx x9, x8, #16, 16
-    str x25, [_cpu, x9]
-    str x23, [_cpu, x24]
-    gret
-    read_bullshit \bits, \name
+    f_gadget \name, f_ldp_wb, \bits, \bytes, \ldr_reg1, \ldr_reg2, \pre
 .endm
 
 .macro stp_wb name, bits, bytes, str_reg1, str_reg2, pre
-.gadget \name
-    ldp x8, x24, [_ip]
-    ldr x19, [_ip, #16]
-    add _ip, _ip, #32
-    and x21, x8, #0xffff
-    ubfx x22, x8, #16, #16
-    ldr \str_reg1, [_cpu, x21]
-    ldr \str_reg2, [_cpu, x22]
-    ldr x10, [_cpu, x24]
-    add x23, x10, x19
-.if \pre
-    mov x7, x23
-.else
-    mov x7, x10
-.endif
-    write_prep \bits, \name
-    str \str_reg1, [_addr]
-    str \str_reg2, [_addr, #\bytes]
-    write_done \bits, \name
-    str x23, [_cpu, x24]
-    gret
-    write_bullshit \bits, \name
+    f_gadget \name, f_stp_wb, \bits, \bytes, \str_reg1, \str_reg2, \pre
 .endm
 
 ldp_wb ldp64_post, 128, 8, x17, x25, 0
@@ -708,32 +639,11 @@ store_single store64,  64, str,  x17
 // guarantee the generic store gadgets already rely on for x17's ride
 // across write_prep.
 .macro load_single_fast name, bits, ldinsn, reg
-.gadget \name
-    ldp x8, x9, [_ip]         // rt_slot, rn_slot
-    ldr x19, [_ip, #16]       // offset
-    add _ip, _ip, #40         // the four parameters and the next gadget: see gret_ahead
-    ldr x10, [_cpu, x9]       // base
-    add x7, x10, x19
-    read_prep \bits, \name, 8
-    \ldinsn \reg, [_addr]
-    str x17, [_cpu, x8]       // full X store: 32-bit loads must clear the upper half
-    gret_ahead
-    read_bullshit \bits, \name, 8
+    f_gadget \name, f_load, \bits, \ldinsn, \reg, _, _
 .endm
 
 .macro store_single_fast name, bits, stinsn, reg
-.gadget \name
-    ldp x8, x9, [_ip]         // rt_slot, rn_slot
-    ldr x19, [_ip, #16]       // offset
-    add _ip, _ip, #40         // the four parameters and the next gadget: see gret_ahead
-    ldr x10, [_cpu, x9]       // base
-    ldr x17, [_cpu, x8]       // value (x17 survives write_prep's helpers)
-    add x7, x10, x19
-    write_prep \bits, \name, 8
-    \stinsn \reg, [_addr]
-    write_done \bits, \name   // clobbers x9 — rt_slot already consumed
-    gret_ahead
-    write_bullshit \bits, \name, 8
+    f_gadget \name, f_store, \bits, \stinsn, \reg, _, _
 .endm
 
 load_single_fast load8_fast,      8, ldrb,  w17
@@ -809,45 +719,14 @@ store_single_fast store64_fast,  64, str,  x17
 
 // ext: 0 = LSL/UXTX/SXTX (Rm as a whole X register), 1 = SXTW, 2 = UXTW.
 // x11 = rm_slot, x12 = shift on entry; x11 = the scaled index on exit.
-.macro rx_index ext
-    ldr x11, [_cpu, x11]
-.if \ext == 1
-    sxtw x11, w11
-.elseif \ext == 2
-    mov w11, w11
-.endif
-    lslv x11, x11, x12
-.endm
+// (rx_index is in frag.h, with the register-offset bodies)
 
 .macro load_single_rx name, bits, ldinsn, reg, ext
-.gadget \name
-    ldp x8, x9, [_ip]         // rt_slot, rn_slot
-    ldp x11, x12, [_ip, #16]  // rm_slot, shift
-    add _ip, _ip, #40
-    ldr x10, [_cpu, x9]
-    rx_index \ext
-    add x7, x10, x11
-    read_prep \bits, \name
-    \ldinsn \reg, [_addr]
-    str x17, [_cpu, x8]
-    gret
-    read_bullshit \bits, \name
+    f_gadget \name, f_load_rx, \bits, \ldinsn, \reg, \ext, _
 .endm
 
 .macro store_single_rx name, bits, stinsn, reg, ext
-.gadget \name
-    ldp x8, x9, [_ip]         // rt_slot, rn_slot
-    ldp x11, x12, [_ip, #16]  // rm_slot, shift
-    add _ip, _ip, #40
-    ldr x10, [_cpu, x9]
-    rx_index \ext
-    add x7, x10, x11
-    ldr x17, [_cpu, x8]
-    write_prep \bits, \name
-    \stinsn \reg, [_addr]
-    write_done \bits, \name
-    gret
-    write_bullshit \bits, \name
+    f_gadget \name, f_store_rx, \bits, \stinsn, \reg, \ext, _
 .endm
 
 // The SIMD/FP twins (ldr q0, [x1, x2, lsl #4]; ldr s0, [x1, w2, sxtw #2]):
