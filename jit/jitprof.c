@@ -43,6 +43,33 @@ static const char *jitprof_path;
 static pthread_mutex_t jitprof_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct jitprof_block *jitprof_blocks;
 
+// A gadget's name, less its prefix. dladdr searches the symbol table each
+// time, and a profile names millions of gadgets from a few hundred, so the
+// answers are kept (only jitprof_dump calls this, under jitprof_lock).
+static const char *gadget_name(uint64_t gadget) {
+    static struct { uint64_t gadget; const char *name; } cache[4096];
+    unsigned slot = (unsigned) ((gadget * 0x9e3779b97f4a7c15ull) >> 52);
+    for (unsigned n = 0; n < 4096; n++, slot = (slot + 1) & 4095) {
+        if (cache[slot].gadget == gadget)
+            return cache[slot].name;
+        if (cache[slot].name != NULL)
+            continue;
+        Dl_info info;
+        const char *sym = "?";
+        if (dladdr((void *) (uintptr_t) gadget, &info) && info.dli_sname != NULL &&
+                (uintptr_t) info.dli_saddr == (uintptr_t) gadget)
+            sym = info.dli_sname;
+        if (*sym == '_')
+            sym++;
+        if (strncmp(sym, "gadget_arm64_", 13) == 0)
+            sym += 13;
+        cache[slot].gadget = gadget;
+        cache[slot].name = sym;
+        return sym;
+    }
+    return "?";
+}
+
 // Called from main.c's cli_halt, as the other instruments' dumps are (it
 // exits with _exit, so atexit would never run). No-op unless ISH_JIT_PROFILE.
 void jitprof_dump(void) {
@@ -79,19 +106,9 @@ void jitprof_dump(void) {
         // same block as the gadgets it became (tools/jitprof-gadget-pairs.py).
         fprintf(f, "%sg %llu %#llx", names[b->abi],
                 (unsigned long long) count, (unsigned long long) b->addr);
-        for (uint32_t i = 0; i + 2 < b->ns; i += 3) {
-            Dl_info info;
-            const char *sym = "?";
-            if (dladdr((void *) (uintptr_t) b->steps[i], &info) && info.dli_sname != NULL &&
-                    (uintptr_t) info.dli_saddr == (uintptr_t) b->steps[i])
-                sym = info.dli_sname;
-            if (*sym == '_')
-                sym++;
-            if (strncmp(sym, "gadget_arm64_", 13) == 0)
-                sym += 13;
-            fprintf(f, " %s/%llu/%llu", sym, (unsigned long long) b->steps[i + 1],
-                    (unsigned long long) b->steps[i + 2]);
-        }
+        for (uint32_t i = 0; i + 2 < b->ns; i += 3)
+            fprintf(f, " %s/%llu/%llu", gadget_name(b->steps[i]),
+                    (unsigned long long) b->steps[i + 1], (unsigned long long) b->steps[i + 2]);
         fputc('\n', f);
     }
     pthread_mutex_unlock(&jitprof_lock);

@@ -2,11 +2,21 @@
 """jitprof-gadget-pairs.py PROFILE... -- from the "arm64g" lines of an
 ISH_JIT_PROFILE file (jit/jitprof.c), the gadget-level view of each block: the
 gadgets that run most, and the adjacent pairs of single-gadget steps."""
-import sys, collections
+import sys, collections, re
+# --fuse PAIRS_H [--min SHARE]: instead of the report, print the FUSE2 lines
+# for jit/guest-arm64/pairs.h -- every adjacent pair of gadgets that header
+# gives a family to, whose mean share of the gadgets run is at least SHARE
+# percent (default 0.01).
+fuse = None; fuse_min = 0.01
+argv = sys.argv[1:]
+if argv and argv[0] == '--fuse':
+    fuse = set(re.findall(r'^#define F_(\w+) ', open(argv[1]).read(), re.M)); argv = argv[2:]
+if argv and argv[0] == '--min':
+    fuse_min = float(argv[1]); argv = argv[2:]
 cols = []
 minw = {}
 data = []
-for path in sys.argv[1:]:
+for path in argv:
     blocks = []
     for line in open(path):
         p = line.split()
@@ -32,6 +42,13 @@ names = collections.Counter(); pn = collections.Counter()
 for tag, total, g, pairs, multi in cols:
     for k, v in g.items(): names[k] += v / total / len(cols)
     for k, v in pairs.items(): pn[k] += v / total / len(cols)
+if fuse is not None:
+    cut = 0.0
+    for (a, b), v in pn.most_common():
+        if a in fuse and b in fuse and 100 * v >= fuse_min:
+            print('FUSE2(%s, %s)' % (a, b)); cut += v
+    sys.stderr.write('%.1f%% of gadget dispatches (mean)\n' % (100 * cut))
+    sys.exit(0)
 print('gadget (words)          mean ' + ''.join('%8s' % c[0][-6:] for c in cols))
 for k, v in names.most_common(60):
     print('%-20s %2d %6.2f ' % (k[:20], minw[k], 100 * v) + ''.join('%8.2f' % (100.0 * c[2][k] / c[1]) for c in cols))
