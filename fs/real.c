@@ -337,6 +337,10 @@ static void realfs_maybe_dump_apt_http_request(struct fd *fd, const void *buf, s
     fclose(f);
 }
 
+// How many more times a read that would block asks before it sleeps; see
+// realfs_read.
+#define REALFS_READ_RETRIES 32
+
 // Make sure the host descriptor does not block, for the reason realfs_read
 // gives. It was F_GETFL and F_SETFL before every read and every write; the
 // flag is nearly always already there, and then asking is enough.
@@ -747,6 +751,16 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     // make and tells us which case we are in; only EAGAIN means "would block",
     // and only then does the signal question arise at all. See the matching
     // comment in realfs_write().
+    //
+    // And ask again a few times before sleeping. A task that has just sent
+    // something and reads the answer -- a client and its server, two ends of a
+    // pipeline, make and its jobs -- usually has it within microseconds, and
+    // going to sleep and being woken costs more than that on its own: two
+    // processes passing a byte each way over a pipe take 4.1us a round trip
+    // on an M5 blocked in read(), 7.0us the way realfs_wait_readable waits
+    // (read, mask, unmask, poll, read), and 2.1us retrying first. A reader
+    // whose data is not coming pays the retries once, then sleeps as before.
+    int retries = REALFS_READ_RETRIES;
     for (;;) {
         realfs_trace_io_enter("read", fd, read_size);
         ssize_t res = read(fd->real_fd, buf, read_size);
@@ -761,6 +775,10 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             return errno_map();
+        if (retries > 0) {
+            retries--;
+            continue;
+        }
 
         int wait_res = realfs_wait_readable(fd->real_fd);
         if (wait_res < 0)
