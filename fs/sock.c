@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include "util/wait_spin.h"
 #include "kernel/calls.h"
 #include "kernel/checkpoint.h"
 #include "kernel/native.h"
@@ -2196,7 +2197,15 @@ struct socket_io_wait {
     bool resolved;
     bool has_deadline;
     struct timespec deadline;
+    // The call's turn at trying again before it sleeps (socket_wait_ready):
+    // 0 not begun, 1 trying, 2 over.
+    int spin_state;
+    struct wait_spin spin;
 };
+
+// A call that began trying again and has not been seen to give up: it got
+// its data, which is how the next call learns the last one's trying paid.
+static __thread bool socket_spin_open;
 
 static void socket_io_wait_resolve(struct socket_io_wait *wait, struct fd *sock, short events) {
     wait->resolved = true;
@@ -2258,6 +2267,32 @@ static int socket_intr_errno(struct fd *sock, short events, struct socket_io_wai
 static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wait *wait) {
     if (wait != NULL && !wait->resolved)
         socket_io_wait_resolve(wait, sock, events);
+
+    // Try again for a little while before sleeping (util/wait_spin.h). A
+    // client and its server on a unix socket is the case. The trying is the
+    // caller's own recv or send: returning "ready" sends it round its loop to
+    // make the call again, and it comes back here if that would still block.
+    // (Asking poll() instead does not work: natively, two processes passing a
+    // byte over a socket pair take 5.2us a round trip blocked in read(), 6.5us
+    // looking with poll(0) before sleeping, and 1.4us retrying the read.)
+    if (wait != NULL && wait->spin_state != 2) {
+        if (wait->spin_state == 0) {
+            if (socket_spin_open)
+                wait_spin_end(true);
+            socket_spin_open = false;
+            wait->spin_state = wait_spin_begin(&wait->spin) ? 1 : 2;
+            socket_spin_open = wait->spin_state == 1;
+        }
+        if (wait->spin_state == 1) {
+            if (wait_spin_more(&wait->spin)) {
+                errno = 0;
+                return 0;
+            }
+            wait_spin_end(false);
+            socket_spin_open = false;
+            wait->spin_state = 2;
+        }
+    }
 
     // Created lazily, and only here: a call that never has to sleep must not
     // pay for a pipe it will never wait on.

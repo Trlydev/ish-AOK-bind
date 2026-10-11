@@ -1,4 +1,5 @@
 #include <stdatomic.h>
+#include "util/wait_spin.h"
 #include "kernel/calls.h"
 #include "kernel/checkpoint.h"
 #include <pthread.h>
@@ -555,7 +556,28 @@ static int futex_wait_masked(guest_addr_t uaddr, dword_t op, dword_t val, struct
         w->thread = pthread_self();
         w->bitset = bitset;
         list_add_tail(&futex->queue, &w->queue);
+        // Queued. Watch for the wake for a little while before sleeping
+        // (util/wait_spin.h): whoever is about to wake us -- the thread
+        // holding the mutex, the one signalling the condition -- is usually
+        // microseconds from it. A waker takes this wait off the queue, and
+        // that is all that is watched: no lock, and nothing of the guest's
+        // memory (looking at the futex word instead takes the address
+        // space's lock each time, and two threads doing that to each other
+        // made a condition variable's round trip 23us where it had been 9).
+        struct wait_spin spin;
+        if (wait_spin_begin(&spin)) {
+            unlock(&futex_lock);
+            while (__atomic_load_n(&w->queue.next, __ATOMIC_ACQUIRE) != NULL &&
+                    wait_spin_more(&spin))
+                continue;
+            lock(&futex_lock, 0);
+            wait_spin_end(list_null(&w->queue));
+        }
         for (;;) {
+            if (list_null(&w->queue)) {
+                err = 0; // woken while it watched, or between sleeps
+                break;
+            }
             struct timespec remaining = wait_slice;
             // Whether this slice ends at the guest's deadline, or is only one
             // of these 50ms caps -- which is what every untimed FUTEX_WAIT,

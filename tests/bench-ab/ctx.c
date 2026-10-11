@@ -72,6 +72,18 @@ static double pingpong_cond(int n) {
 
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 20000;
+    /* ctx N unix | ctx N cond: that round trip alone, for a profiler */
+    if (argc > 2 && strcmp(argv[2], "unix") == 0) {
+        int ua[2], ub[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, ua) || socketpair(AF_UNIX, SOCK_STREAM, 0, ub)) return 1;
+        int ya[2] = {ua[0], ua[1]}, yb[2] = {ub[0], ub[1]};
+        printf("unix socket round trip, two processes:  %8.0f ns\n", pingpong_fds(ya, yb, n));
+        return 0;
+    }
+    if (argc > 2 && strcmp(argv[2], "cond") == 0) {
+        printf("condvar round trip, two threads:        %8.0f ns\n", pingpong_cond(n));
+        return 0;
+    }
     uint64_t t0 = now();
     for (int i = 0; i < 200000; i++) getppid();
     printf("getppid (a syscall that does nothing):  %8.0f ns\n", (double) (now() - t0) / 200000);
