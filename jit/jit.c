@@ -1799,10 +1799,7 @@ static uint64_t jit_code_write_prepare(struct jit *jit, guest_addr_t ip, struct 
                 jit_revoke_writable(jit);
                 break;
             }
-            guest_addr_t addr = (guest_addr_t) slot->page << PAGE_BITS;
-            struct tlb_entry *entry = &tlb->entries[TLB_INDEX(addr)];
-            if (entry->page_if_writable == TLB_PAGE(addr))
-                entry->page_if_writable = TLB_PAGE_EMPTY;
+            tlb_revoke_writable(tlb, (guest_addr_t) slot->page << PAGE_BITS);
         }
     }
     return jit->code_write_seq;

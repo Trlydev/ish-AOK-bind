@@ -379,10 +379,22 @@ starts, so faults and signals see what they always saw.
   half uses the first's result, a fault in either half (register state and
   the reported address), branches as the second half. Its control: with a
   fused load's fault path made to name the wrong instruction, it fails.
-- **Seen while counting instructions, queued:** about one run in five of the
-  same Python loop retires 7.5% more host instructions, with the pass on or
-  off, and never with guest ASLR off. Something address-dependent -- two hot
-  pages on one TLB entry is the first suspect.
+- **Seen while counting instructions, and fixed the same day:** about one
+  start in five of the same Python loop retired 7.5% more host instructions
+  (one in a dozen, 26% more), with the pass on or off, and never with guest
+  ASLR off. Two pages the loop uses in turn shared an entry of the
+  direct-mapped TLB: nine million trips to `tlb_handle_miss` where the other
+  starts made sixty thousand, 420 host instructions each. A page evicted from
+  its entry now keeps a second chance at an alternate index and is swapped
+  back when used (emu/tlb.h, `TLB_INDEX_ALT`): by the arm64 and riscv64 miss
+  helpers in assembly, and by `tlb_handle_miss` for everyone. The first probe
+  is unchanged. Fourteen starts after: thirteen within 1% of each other, the
+  worst 2.7% more. (Leaving the found page where it lay, without the swap,
+  was tried first and was worse than no fix: up to 17% more.) This is also a
+  good part of the run-to-run spread the device benchmarks have always had.
+  tests/manual/tlb_collide.c picks pages by the hash and narrows, unmaps and
+  replaces them while displaced. The i386 and amd64 gadgets' miss helpers do
+  not look in the alternate entry yet (docs/TODO.md).
 
 **The transition itself.** Three ways to make `arm64_chain` cheaper,
 smallest first: keep the chain budget in a host register instead of loading,

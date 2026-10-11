@@ -127,6 +127,34 @@ arm64_segfault_write:
 // free for these routines' own internal use.
 .global arm64_handle_read_miss
 arm64_handle_read_miss:
+    // The second chance (emu/tlb.h, TLB_INDEX_ALT): a page evicted from its
+    // index by another that hashes there is kept at the alternate index.
+    // Found there, it changes places with the page that evicted it -- so the
+    // one in use is the one the first probe finds, and two pages used in turn
+    // cost this swap a turn, not the trip to C below. (Leaving it where it
+    // lay was tried: the page in the wrong place then pays on every access,
+    // and a loop that had cost 7.5% more cost 17% more.) x27 is this
+    // helper's own; x9-x11 are the probe's scratch.
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x27, x10, x10, lsl #1
+    add x27, _tlb, x27, lsl #3          // the page's own entry
+    eor x10, x10, #(1 << (TLB_BITS - 1))
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3          // the alternate
+    ldr x11, [x10, #TLB_ENTRY_page]
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    .irp field, TLB_ENTRY_page, TLB_ENTRY_page_if_writable, TLB_ENTRY_data_minus_addr
+    ldr x9, [x10, #\field]
+    ldr x11, [x27, #\field]
+    str x9, [x27, #\field]
+    str x11, [x10, #\field]
+    .endr
+    add x7, x9, x7                      // x9: the found entry's data_minus_addr
+    ret
+1:
     save_c
     sub x0, _tlb, #TLB_entries
     mov x1, _addr
@@ -140,6 +168,36 @@ arm64_handle_read_miss:
 
 .global arm64_handle_write_miss
 arm64_handle_write_miss:
+    // The second chance (emu/tlb.h, TLB_INDEX_ALT): a page evicted from its
+    // index by another that hashes there is kept at the alternate index.
+    // Found there, it changes places with the page that evicted it -- so the
+    // one in use is the one the first probe finds, and two pages used in turn
+    // cost this swap a turn, not the trip to C below. (Leaving it where it
+    // lay was tried: the page in the wrong place then pays on every access,
+    // and a loop that had cost 7.5% more cost 17% more.) x27 is this
+    // helper's own; x9-x11 are the probe's scratch.
+    // (write_prep has already found the table current and no revalidation due.)
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x27, x10, x10, lsl #1
+    add x27, _tlb, x27, lsl #3          // the page's own entry
+    eor x10, x10, #(1 << (TLB_BITS - 1))
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3          // the alternate
+    ldr x11, [x10, #TLB_ENTRY_page_if_writable]
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .irp field, TLB_ENTRY_page, TLB_ENTRY_page_if_writable, TLB_ENTRY_data_minus_addr
+    ldr x9, [x10, #\field]
+    ldr x11, [x27, #\field]
+    str x9, [x27, #\field]
+    str x11, [x10, #\field]
+    .endr
+    add x7, x9, x7                      // x9: the found entry's data_minus_addr
+    ret
+1:
     save_c
     sub x0, _tlb, #TLB_entries
     mov x1, _addr

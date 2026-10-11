@@ -84,6 +84,22 @@ struct tlb {
 };
 
 #define TLB_INDEX(addr) ((((addr >> PAGE_BITS) ^ (addr >> (PAGE_BITS + TLB_BITS)))) & (TLB_SIZE - 1))
+// A second chance. The table is direct-mapped, and two pages a program uses
+// in turn can share an index: each access then evicts the other and goes all
+// the way to tlb_handle_miss -- some 400 host instructions, where a hit is
+// six. It is not rare. Which pages collide is decided by the guest's ASLR,
+// and a Python loop measured 2026-10-11 ran 7.5% more host instructions in
+// about one start in five (nine million misses where the other starts had
+// sixty thousand), and 26% more in one of a dozen.
+//
+// So a page evicted from its index is kept at the alternate index, the same
+// one with its top bit flipped, and is looked for there before the miss is
+// taken for real, and when found there changes places with the page that
+// evicted it: by tlb_handle_miss, and by the arm64 and riscv64 guests' miss
+// helpers in assembly, which never reach C for it. The first probe, the one
+// every load and store makes, is unchanged. A page is in at most one of its two places; everything that
+// revokes one entry (tlb_revoke_writable) looks in both.
+#define TLB_INDEX_ALT(addr) (TLB_INDEX(addr) ^ (TLB_SIZE >> 1))
 #define TLB_PAGE(addr) ((page_t) PAGE(addr) << PAGE_BITS)
 #define TLB_PAGE_EMPTY 1
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu);
@@ -148,6 +164,16 @@ int x86_atomic_xchg(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 int x86_lock_split_begin(struct cpu_state *cpu, struct tlb *tlb,
                          guest_addr_t addr, unsigned size_bytes, uintptr_t out[3]);
 void x86_lock_split_end(struct tlb *tlb);
+
+// Stop a cached entry for addr's page from serving stores, wherever it is.
+static inline void tlb_revoke_writable(struct tlb *tlb, guest_addr_t addr) {
+    struct tlb_entry *entry = &tlb->entries[TLB_INDEX(addr)];
+    if (entry->page_if_writable == TLB_PAGE(addr))
+        entry->page_if_writable = TLB_PAGE_EMPTY;
+    entry = &tlb->entries[TLB_INDEX_ALT(addr)];
+    if (entry->page_if_writable == TLB_PAGE(addr))
+        entry->page_if_writable = TLB_PAGE_EMPTY;
+}
 
 forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, guest_addr_t addr) {
     if (unlikely(tlb->mem_changes != atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed)))

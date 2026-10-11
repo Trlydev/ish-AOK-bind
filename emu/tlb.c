@@ -647,6 +647,23 @@ bool __tlb_write_cross_page(struct tlb *tlb, guest_addr_t addr, const char *valu
 }
 
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
+    // The second chance (emu/tlb.h, TLB_INDEX_ALT): the page was evicted from
+    // its index by another that hashes there, and is still good. Swap the two,
+    // so this page is found by the first probe again. Not when the table is
+    // stale, and not for a store that has to be revalidated: those take the
+    // whole path below.
+    struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
+    struct tlb_entry *alt = &tlb->entries[TLB_INDEX_ALT(addr)];
+    if ((type == MEM_WRITE ? alt->page_if_writable : alt->page) == TLB_PAGE(addr) &&
+            atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) == tlb->mem_changes &&
+            !(type == MEM_WRITE && tlb->mmu->requires_write_revalidate)) {
+        struct tlb_entry found = *alt;
+        *alt = *tlb_ent;
+        *tlb_ent = found;
+        if (type == MEM_WRITE)
+            tlb->dirty_page = TLB_PAGE(addr);
+        return (void *) (found.data_minus_addr + addr);
+    }
     // SENSOR ONLY. A write miss is the closest thing AOK gets to a notification
     // that the guest is committing memory: the mmap guards approved the mapping
     // once, the pt entries were built then, and the host commits the physical
@@ -683,7 +700,15 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
     }
     tlb->dirty_page = TLB_PAGE(addr);
 
-    struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
+    // (tlb_flush above may have emptied the table; the two pointers stand.)
+    // The page this one evicts keeps a second chance at the alternate index;
+    // and this page is never left in both places.
+    if (tlb_ent->page != TLB_PAGE(addr)) {
+        if (tlb_ent->page != TLB_PAGE_EMPTY)
+            *alt = *tlb_ent;
+        else if (alt->page == TLB_PAGE(addr))
+            *alt = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+    }
     tlb_ent->page = TLB_PAGE(addr);
     if (type == MEM_WRITE)
         tlb_ent->page_if_writable = tlb_ent->page;
