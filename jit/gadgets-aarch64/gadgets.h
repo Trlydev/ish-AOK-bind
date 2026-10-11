@@ -60,18 +60,24 @@ _xaddr .req x3
 // nothing of its own to order, and a chain link is only ever loaded by a
 // branch gadget, which keeps the full gret -- so skipping the barrier here
 // changes no ordering the guest can observe.
+# In both grets the load and the add start from the old _ip, so _ip -- which
+# every gadget reads its operands through, and so is the one dependency chain
+# that runs the length of the stream -- is updated once a gadget. The first
+# form here loaded with write-back and added 8 after: two updates, two cycles
+# no out-of-order core can overlap. On the arm64 guest's gret the same change
+# was worth 6% on 7-Zip and 7-10% on Python on an M4 (jit/guest-arm64/gadgets.h).
 .macro gret_nomem pop=0
-    ldr x8, [_ip, \pop*8]!
-    add _ip, _ip, 8
+    ldr x8, [_ip, \pop*8]
+    add _ip, _ip, \pop*8 + 8
     cbnz x8, 0f
     b jit_ret
 0:  br x8
 .endm
 
 .macro gret pop=0
-    ldr x8, [_ip, \pop*8]!
+    ldr x8, [_ip, \pop*8]
     dmb ishld /* Jason Conway's Re Ordering patch (upstream PR #1944 */
-    add _ip, _ip, 8 /* TODO get rid of this */
+    add _ip, _ip, \pop*8 + 8
     cbnz x8, 0f   /* null gadget safety: if non-null, execute normally */
     b jit_ret     /* null gadget: bail safely (cbz can't reach external; unconditional branch can) */
 0:  br x8

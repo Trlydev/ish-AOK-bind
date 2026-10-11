@@ -73,10 +73,13 @@ _addr   .req x7
     add _ip, _ip, \pop*8
 .endif
     ldar x9, [_ip]
-#else
-    ldr x9, [_ip, \pop*8]!   // no barrier: see arm64_chain (guest-arm64 gadgets.h)
-#endif
     add _ip, _ip, 8
+#else
+    // The load and the add both start from the old _ip: one update of _ip a
+    // gadget, not two. See the arm64 guest's gret (jit/guest-arm64/gadgets.h).
+    ldr x9, [_ip, \pop*8]    // no barrier: see arm64_chain (guest-arm64 gadgets.h)
+    add _ip, _ip, \pop*8 + 8
+#endif
     cbnz x9, 0f
     b jit_ret
 0:  br x9
