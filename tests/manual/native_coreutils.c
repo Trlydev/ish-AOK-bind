@@ -1320,7 +1320,7 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     mkdir(TDIR, 0755);
     mkdir(TDIR "/bin", 0755);
-    static const char *const applets[] = {"head", "tail", "wc", "rm", "sort", "xargs", "find", "grep", "cp", "mv", "date", "sudo", "chmod", "ls", "diff", "cmp", "sed", "uniq", "tr", "nl", "seq", "touch", "stat", "realpath", "readlink", "env", "sum", "rmdir", "cat", "fold", "tac", "dd", "od", "split", "du", "gzip", "gunzip", "zcat", "tar", "awk"};
+    static const char *const applets[] = {"head", "tail", "wc", "rm", "sort", "xargs", "find", "grep", "cp", "mv", "date", "sudo", "chmod", "ls", "diff", "cmp", "sed", "uniq", "tr", "nl", "seq", "touch", "stat", "realpath", "readlink", "env", "sum", "rmdir", "cat", "fold", "tac", "dd", "od", "split", "du", "gzip", "gunzip", "zcat", "tar", "awk", "passwd"};
     for (size_t i = 0; i < sizeof(applets) / sizeof(applets[0]); i++) {
         char link[256];
         snprintf(link, sizeof(link), TDIR "/bin/%s", applets[i]);
@@ -1495,6 +1495,42 @@ int main(int argc, char **argv) {
             } else {
                 printf("FAIL sudo %s (status %d)\n", c->args, status);
                 print_bytes("got ", out, len);
+                failures_total++;
+            }
+        }
+    }
+    // Native passwd is there at all. It was compiled for a Linux host only,
+    // so on the app it said "not supported on this platform" -- and
+    // native-links puts it ahead of the distribution's. Root only, and for an
+    // account that does not exist, so nothing changes: what it says about the
+    // account shows it got as far as the shadow file.
+    if (geteuid() == 0) {
+        int ep[2];
+        if (pipe(ep) == 0) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                int null = open("/dev/null", O_RDWR);
+                dup2(null, 0);
+                dup2(null, 1);
+                dup2(ep[1], 2);
+                close(ep[0]);
+                execl(TDIR "/bin/passwd", "passwd", "no-such-account-zz9", (char *) NULL);
+                _exit(127);
+            }
+            close(ep[1]);
+            char err[256];
+            size_t got = 0;
+            ssize_t n;
+            while (got < sizeof(err) - 1 && (n = read(ep[0], err + got, sizeof(err) - 1 - got)) > 0)
+                got += (size_t) n;
+            err[got] = '\0';
+            close(ep[0]);
+            int status = 0;
+            waitpid(pid, &status, 0);
+            if (strstr(err, "not found in shadow file") != NULL) {
+                test_logf("ok   passwd is built in\n");
+            } else {
+                printf("FAIL passwd no-such-account-zz9 (status %d): %s", status, got ? err : "(nothing)\n");
                 failures_total++;
             }
         }
