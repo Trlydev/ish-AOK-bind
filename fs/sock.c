@@ -2295,9 +2295,10 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
             timeout = cap_ms;
             capped = true;
         }
-        if (notify_pipe[0] < 0 && pipe(notify_pipe) == 0) {
-            fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
-            fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
+        // The task's own pipe, kept from wait to wait (kernel/task.c). A byte
+        // a signal left in it after the last wait only brings this one round
+        // once, to the drain below.
+        if (notify_pipe[0] < 0 && task_wait_pipe(notify_pipe)) {
             // Same lock deliver_signal_unlocked_locked reads the fd under, so
             // it can never observe a closed or reused one (cleared below
             // before close).
@@ -2364,15 +2365,13 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
             break;
         }
     }
-    // Unpublish before closing so a concurrent deliver_signal (which reads the
-    // fd under sighand->lock) can never poke a closed or reused fd. Done
-    // before any errno the caller cares about is restored: lock() clobbers it.
+    // Unpublish: outside a wait a signal has nothing to write to. (The pipe
+    // itself is the task's and stays.) Done before any errno the caller cares
+    // about is restored: lock() clobbers it.
     if (notify_pipe[0] >= 0) {
         lock(&current->sighand->lock, 0);
         current->poll_notify_fd = -1;
         unlock(&current->sighand->lock);
-        close(notify_pipe[0]);
-        close(notify_pipe[1]);
     }
     // Every caller's error path distinguishes an already-mapped negative code
     // from a raw host failure by testing errno == 0, so leave it that way: the
@@ -6641,9 +6640,7 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
                 int cap_ms = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
                 if (poll_timeout < 0 || poll_timeout > cap_ms)
                     poll_timeout = cap_ms;
-                if (notify_pipe[0] < 0 && pipe(notify_pipe) == 0) {
-                    fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
-                    fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
+                if (notify_pipe[0] < 0 && task_wait_pipe(notify_pipe)) {
                     // Same lock deliver_signal_unlocked_locked reads the fd
                     // under, so it can never observe a closed or reused one
                     // (cleared below before close).
@@ -6719,15 +6716,12 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
                 retry = resumed || !socket_guest_signal_pending();
             }
         } while (retry);
-        // Unpublish before closing so a concurrent deliver_signal (which reads
-        // the fd under sighand->lock) can never poke a closed or reused fd.
-        // Done before restoring fail_errno: lock() can clobber errno.
+        // Unpublish (the pipe is the task's and stays). Done before restoring
+        // fail_errno: lock() can clobber errno.
         if (notify_pipe[0] >= 0) {
             lock(&current->sighand->lock, 0);
             current->poll_notify_fd = -1;
             unlock(&current->sighand->lock);
-            close(notify_pipe[0]);
-            close(notify_pipe[1]);
         }
         if (client < 0)
             errno = fail_errno;

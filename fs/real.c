@@ -337,6 +337,15 @@ static void realfs_maybe_dump_apt_http_request(struct fd *fd, const void *buf, s
     fclose(f);
 }
 
+// Make sure the host descriptor does not block, for the reason realfs_read
+// gives. It was F_GETFL and F_SETFL before every read and every write; the
+// flag is nearly always already there, and then asking is enough.
+static void realfs_force_nonblock(int real_fd) {
+    int flags = fcntl(real_fd, F_GETFL, 0);
+    if (flags >= 0 && !(flags & O_NONBLOCK))
+        (void) fcntl(real_fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 static int realfs_wait_readable(int real_fd) {
     const int poll_timeout_ms = 100;
     for (;;) {
@@ -726,7 +735,7 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     // by SIGKILL, since the guest's own signal delivery never gets to run.
     // Observed as the exact cause of a real, SIGKILL-proof stress-ng
     // pipeherd hang (every stuck thread's backtrace stopped right here).
-    (void) fcntl(fd->real_fd, F_SETFL, fcntl(fd->real_fd, F_GETFL, 0) | O_NONBLOCK);
+    realfs_force_nonblock(fd->real_fd);
 
     // ATTEMPT FIRST, wait second. The loop used to call realfs_wait_readable()
     // before ever touching the fd, and that wait reports EINTR the moment a
@@ -779,7 +788,7 @@ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
     // See the matching comment in realfs_read(): force non-blocking
     // idempotently and never restore it, since restoring races against
     // sibling tasks sharing this same open file description (fork()).
-    (void) fcntl(fd->real_fd, F_SETFL, fcntl(fd->real_fd, F_GETFL, 0) | O_NONBLOCK);
+    realfs_force_nonblock(fd->real_fd);
 
     // ATTEMPT FIRST, wait second -- the fix for a native shell intermittently
     // reporting "echo: write error: Interrupted system call" (build 554).
