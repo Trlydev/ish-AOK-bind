@@ -144,10 +144,17 @@ _addr   .req x7
     add _ip, _ip, \pop*8
 .endif
     ldar x9, [_ip]
-#else
-    ldr x9, [_ip, \pop*8]!   // no barrier: see arm64_chain (guest-arm64 gadgets.h)
-#endif
     add _ip, _ip, 8
+#else
+    // Two instructions that both start from the old _ip, not a load that
+    // writes _ip back and an add after it. Every gadget's operands are read
+    // through _ip, so _ip is the one chain that runs through the whole
+    // stream, and each update on it is a cycle no out-of-order core can
+    // overlap: with the write-back form it was two a gadget, and a guest
+    // `add` took 2.4 cycles on an M4 whatever it depended on.
+    ldr x9, [_ip, \pop*8]    // no barrier: see arm64_chain (guest-arm64 gadgets.h)
+    add _ip, _ip, \pop*8 + 8
+#endif
     cbnz x9, 0f
     b jit_ret
 0:  br x9
