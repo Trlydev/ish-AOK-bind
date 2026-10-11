@@ -428,8 +428,18 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
         arm64_pair_fuse(state, emitted_from);
         return ret;
     }
-    if (state->riscv64)
-        return gen_step_riscv64(state, tlb);
+    if (state->riscv64) {
+        if (state->jitprof == NULL)
+            return gen_step_riscv64(state, tlb);
+        // The gadget-level view, as for arm64 above. (A step's instruction
+        // count is not recorded: the guest's instructions are two sizes.)
+        unsigned emitted_from = state->size;
+        int ret = gen_step_riscv64(state, tlb);
+        if (state->size > emitted_from)
+            jitprof_note_step(state->jitprof, state->block->code[emitted_from],
+                    (unsigned) (state->size - emitted_from), 1);
+        return ret;
+    }
     state->orig_ip = state->ip;
     state->orig_ip_extra = 0;
     // amd64 advances amd64_ip, i386 ip.

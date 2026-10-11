@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""jitprof-gadget-pairs.py PROFILE... -- from the "arm64g" lines of an
+"""jitprof-gadget-pairs.py PROFILE... -- from the "arm64g" or "riscv64g" lines of an
 ISH_JIT_PROFILE file (jit/jitprof.c), the gadget-level view of each block: the
 gadgets that run most, and the adjacent pairs of single-gadget steps."""
 import sys, collections, re
@@ -20,7 +20,7 @@ for path in argv:
     blocks = []
     for line in open(path):
         p = line.split()
-        if len(p) < 4 or p[0] != 'arm64g': continue
+        if len(p) < 4 or p[0] not in ('arm64g', 'riscv64g'): continue
         steps = []
         for t in p[3:]:
             name, w, n = t.rsplit('/', 2)

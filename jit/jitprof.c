@@ -63,6 +63,8 @@ static const char *gadget_name(uint64_t gadget) {
             sym++;
         if (strncmp(sym, "gadget_arm64_", 13) == 0)
             sym += 13;
+        else if (strncmp(sym, "gadget_riscv64_", 15) == 0)
+            sym += 15;
         cache[slot].gadget = gadget;
         cache[slot].name = sym;
         return sym;
