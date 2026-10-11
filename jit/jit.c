@@ -131,6 +131,11 @@ void jit_timing_dump(void) {
                 jit_timing_arch_names[i], count, ns, ns / count,
                 atomic_load_explicit(&jit_timing_inherited_by_arch[i], memory_order_relaxed));
     }
+    struct jit_xcache_stats xc;
+    jit_xcache_get(&xc);
+    if (xc.enabled)
+        dprintf(jit_timing_stats_fd, "jit-timing:   exec cache hits=%lu misses=%lu stored=%lu refused=%lu bytes=%llu\n",
+                xc.hits, xc.misses, xc.stored, xc.refused, xc.bytes);
 }
 static atomic_bool amd64_jit_enabled = true;
 static atomic_ulong amd64_jit_compile_attempts;
@@ -2090,6 +2095,7 @@ static struct jit_block *jit_block_compile_common(guest_addr_t ip, struct tlb *t
     else
         assert(state.ip - ip <= PAGE_SIZE);
     state.block->used = state.capacity;
+    state.block->no_share = hle_block || state.jitprof != NULL;
     return state.block;
 }
 
@@ -2279,6 +2285,120 @@ static void jit_donate(struct jit *jit, const struct jit_block *block) {
     pthread_mutex_unlock(&origin->lock);
 }
 
+// ---- The exec cache (prototype, ISH_JIT_XCACHE=1) --------------------------
+// Fork inheritance reaches a child that goes on running its parent's code. An
+// exec starts with nothing, so `sh -c true`, a configure script or a build
+// translates ld.so, libc and each program again for every process: 19-23% of
+// the CPU of a fork+exec loop, 8-10% of a configure script (docs/TODO.md,
+// 2026-10-01). This keeps translated blocks beyond the process that made
+// them, for the next one that maps the same code at the same address.
+//
+// A block is a function of the guest bytes it was translated from and the
+// address they sit at: the stream holds absolute guest addresses (branch
+// targets, adrp results, return addresses) and gadget pointers, and nothing of
+// the process. So the key is the address, and a hit is confirmed by comparing
+// the bytes: the block's own, plus XC_TAIL beyond it, because the translator
+// may have looked that far to decide a fusion it did not take. Blocks that are
+// not such a function are left out (jit_block.no_share).
+//
+// THE PROTOTYPE'S LIMITS, which are why it is off by default: the same
+// address means the guest's ASLR must put the file where it was before, so it
+// only pays with randomize_va_space 0 until blocks can be rebased or images
+// get one base per boot; it is the arm64 guest only; and a run-time change to
+// what the translator emits (/proc/ish/arm64_jit_fuse, hle) does not flush it.
+#define XC_TAIL 8
+#define XC_BUCKETS (1u << 16)
+#define XC_MAX_BYTES (96u << 20)
+
+struct xc_entry {
+    struct xc_entry *next;
+    guest_addr_t addr;
+    unsigned len;               // guest bytes compared, tail included
+    struct jit_block *block;    // unchained, on no list: a template
+    unsigned char bytes[];
+};
+
+static pthread_mutex_t xc_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct xc_entry *xc_table[XC_BUCKETS];
+static unsigned long long xc_bytes;
+static atomic_ulong xc_hits, xc_misses, xc_stored, xc_refused;
+
+static bool jit_xcache_enabled(void) {
+    static atomic_int env = -1;
+    int e = atomic_load_explicit(&env, memory_order_relaxed);
+    if (e == -1) {
+        const char *v = getenv("ISH_JIT_XCACHE");
+        e = v != NULL && strcmp(v, "1") == 0 ? 1 : 0;
+        atomic_store_explicit(&env, e, memory_order_relaxed);
+    }
+    return e == 1;
+}
+
+void jit_xcache_get(struct jit_xcache_stats *stats) {
+    stats->enabled = jit_xcache_enabled();
+    stats->hits = atomic_load_explicit(&xc_hits, memory_order_relaxed);
+    stats->misses = atomic_load_explicit(&xc_misses, memory_order_relaxed);
+    stats->stored = atomic_load_explicit(&xc_stored, memory_order_relaxed);
+    stats->refused = atomic_load_explicit(&xc_refused, memory_order_relaxed);
+    stats->bytes = xc_bytes;
+}
+
+static unsigned xc_bucket(guest_addr_t addr) {
+    unsigned long long h = (unsigned long long) addr * 0x9e3779b97f4a7c15ull;
+    return (unsigned) (h >> 48) & (XC_BUCKETS - 1);
+}
+
+static struct jit_block *jit_xcache_lookup(guest_addr_t ip, struct tlb *tlb) {
+    unsigned char now[PAGE_SIZE + XC_TAIL];
+    unsigned have = 0;          // bytes of `now` read so far
+    struct jit_block *copy = NULL;
+    pthread_mutex_lock(&xc_lock);
+    for (struct xc_entry *e = xc_table[xc_bucket(ip)]; e != NULL; e = e->next) {
+        if (e->addr != ip)
+            continue;
+        if (have < e->len) {
+            if (!tlb_fetch(tlb, ip + have, now + have, e->len - have))
+                continue;
+            have = e->len;
+        }
+        if (memcmp(now, e->bytes, e->len) != 0)
+            continue;
+        copy = jit_block_clone(e->block);
+        break;
+    }
+    pthread_mutex_unlock(&xc_lock);
+    atomic_fetch_add_explicit(copy != NULL ? &xc_hits : &xc_misses, 1, memory_order_relaxed);
+    return copy;
+}
+
+static void jit_xcache_store(const struct jit_block *block, struct tlb *tlb) {
+    if (block->no_share || block->end_addr < block->addr)
+        return;
+    unsigned len = (unsigned) (block->end_addr - block->addr + 1) + XC_TAIL;
+    size_t cost = sizeof(struct xc_entry) + len
+        + sizeof(struct jit_block) + block->used * sizeof(unsigned long);
+    struct xc_entry *e = NULL;
+    if (len <= PAGE_SIZE + XC_TAIL && xc_bytes + cost <= XC_MAX_BYTES)
+        e = malloc(sizeof(*e) + len);
+    // The tail has to be readable now for the comparison to mean anything
+    // later; a block that ends at the edge of its mapping is not kept.
+    if (e == NULL || !tlb_fetch(tlb, block->addr, e->bytes, len) ||
+            (e->block = jit_block_clone(block)) == NULL) {
+        free(e);
+        atomic_fetch_add_explicit(&xc_refused, 1, memory_order_relaxed);
+        return;
+    }
+    e->addr = block->addr;
+    e->len = len;
+    pthread_mutex_lock(&xc_lock);
+    unsigned b = xc_bucket(e->addr);
+    e->next = xc_table[b];
+    xc_table[b] = e;
+    xc_bytes += cost;
+    pthread_mutex_unlock(&xc_lock);
+    atomic_fetch_add_explicit(&xc_stored, 1, memory_order_relaxed);
+}
+
 // The per-arch compile wrappers below: the parent's block if there is one,
 // else a translation.
 static struct jit_block *jit_block_inherit_or_compile(guest_addr_t ip, struct tlb *tlb,
@@ -2291,10 +2411,16 @@ static struct jit_block *jit_block_inherit_or_compile(guest_addr_t ip, struct tl
             *fallback_to_interp = false;
         if (timing)
             atomic_fetch_add_explicit(&jit_timing_inherited_by_arch[arch_idx], 1, memory_order_relaxed);
+    } else if (arm64 && jit_xcache_enabled() && (block = jit_xcache_lookup(ip, tlb)) != NULL) {
+        if (timing)
+            atomic_fetch_add_explicit(&jit_timing_inherited_by_arch[arch_idx], 1, memory_order_relaxed);
+        jit_donate(tlb->mmu->jit, block);
     } else {
         block = jit_block_compile_common(ip, tlb, amd64, arm64, riscv64, fallback_to_interp);
         if (block != NULL && (arm64 || riscv64))
             jit_donate(tlb->mmu->jit, block);
+        if (block != NULL && arm64 && jit_xcache_enabled())
+            jit_xcache_store(block, tlb);
     }
     if (timing)
         jit_timing_note(arch_idx, jit_timing_now_ns() - start,

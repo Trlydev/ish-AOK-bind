@@ -119,6 +119,10 @@ struct jit_block {
     // links for free list
     struct list jetsam;
     bool is_jetsam;
+    // Not a function of the code bytes alone, so not for the exec cache
+    // (jit.c): an hle_call gadget, chosen by which library the mapping is, or
+    // a block carrying ISH_JIT_PROFILE's counters.
+    bool no_share;
     // The code[] slot holding this block's own address (i386 call gadgets),
     // or 0; a copy of the block must point it at itself.
     unsigned patch_ip;
@@ -337,6 +341,14 @@ void jit_fork(struct jit *parent, struct jit *child);
 void jit_lineage_detach(struct jit *jit);
 void jit_inherit_set(bool on);
 bool jit_inherit_enabled(void);
+// The exec cache (jit.c, "The exec cache"): a prototype, off unless
+// ISH_JIT_XCACHE=1. Counters for /proc/ish/jit_timing.
+struct jit_xcache_stats {
+    bool enabled;
+    unsigned long hits, misses, stored, refused;
+    unsigned long long bytes;
+};
+void jit_xcache_get(struct jit_xcache_stats *stats);
 
 // Block translation time, per guest architecture (i386, amd64, arm64, riscv64):
 // ISH_JIT_TIMING at start-up, or /proc/ish/jit_timing at run time.

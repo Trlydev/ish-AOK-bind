@@ -15,7 +15,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 1 | Vector registers held across a call that can reach C | **DONE** (2026-10-11): no other gadget has it; a checker now reads the built objects in `meson test` and the gate |
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
-| 4 | Caching translated code across exec and across runs | open |
+| 4 | Caching translated code across exec and across runs | **prototype in, off by default** (2026-10-11): -21..-26% on short processes with addresses held still; needs a decision on ASLR before it can be on |
 | 5 | The RISC guests at the threaded-code floor | open |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
@@ -167,14 +167,54 @@ fork-without-exec share; only a cache keyed by file reaches the rest.
 against 250 ns (M4) to 1 us (A10X) to translate, so the cache recovers roughly
 60-90% of those shares. [jit_code_cache_plan.md](../jit_code_cache_plan.md) (repo root) is the July Phase 0.
 
-**Next step:** design the key (file identity + offset + page content), the
-relocation records a block needs, and where the cache lives (in memory across
-exec first; on disk second). Build the in-memory one and measure it with the
-2026-10-01 driver before deciding on persistence.
+**Prototype 2026-10-11** (`ISH_JIT_XCACHE=1`, jit/jit.c "The exec cache";
+arm64 guest only, in memory, for the life of the emulator). A translated block
+is a function of the guest bytes it came from and the address they sit at --
+jit/gen.c reads nothing of the task -- so the cache is keyed by address and a
+hit is confirmed by comparing the bytes (the block's own and eight beyond, in
+case the translator looked ahead to a fusion it did not take). HLE blocks and
+profiled blocks are left out. A hit is a clone, as fork inheritance's is.
 
-**Prove:** interleaved A/B on the M4 and the A10X for the 2026-10-01 workloads;
-the five-root suite with the cache on; SMC and `mprotect`/`munmap` tests
-(x86_smc, the exec/TLB tests) since a stale cached block is silent wrong code.
+Measured on the Mac, -O2 CLI, Devuan arm64 root, cache off and on alternated
+five times each, each workload run once to warm and once timed, with
+`ISH_RANDOMIZE_VA_SPACE=0` so that a file lands where it did before:
+
+| workload | off (ms) | on (ms) | change |
+|---|---|---|---|
+| 100 x `/bin/true` | 144 | 111 | -23% |
+| 100 x `dash -c :` | 175 | 129 | -26% |
+| 30 x `perl -e 1` | 174 | 138 | -21% |
+| 3 x gcc compile and link | 1130 | 985 | -13% |
+| 100 x `echo x \| sed q \| tr a b` | 653 | 593 | -9% (noisy) |
+| 5 x `gcc -O1 -c` | 1208 | 1271 | no change (ranges overlap) |
+
+97% of the blocks of the 100 `/bin/true` run were hits (174,834 of 180,390),
+from 2.4 MB of cache. The Devuan arm64 suite passes with the cache on (363,
+less `aslr_layout`, which is the test of the ASLR that was turned off for it).
+
+**The decision it waits on.** The stream holds absolute guest addresses, so a
+block is reusable only where its code is mapped at the same address, and the
+guest's ASLR moves every image on every exec. Three ways on:
+
+1. **One base per file per boot.** The kernel puts a given file at the same
+   address in every process until the app restarts; stack, heap and anonymous
+   mappings stay random per exec. Small (exec.c's PIE and ld.so placement, and
+   mmap's choice for a file mapping with no hint), and the cache then works as
+   it is, for every guest. The cost is ASLR's: a library's address leaked from
+   one process is its address in the others. It is what Windows does for
+   images and what iOS does for its own shared cache.
+2. **Rebase the blocks.** Every emitter that puts a guest address in the
+   stream tags it (the July plan's `gen_addr`), per backend, with a paranoid
+   mode that translates and compares. Keeps ASLR as it is; weeks of work in
+   15,000 lines of emitters, and a missed site is silently wrong code.
+3. **Leave it as an option** for roots run with `randomize_va_space` 0.
+
+Recommended: 1, behind a setting, measured on the devices before it is the
+default. Then the other three guests (riscv64's translation also depends on
+the vector type in force; x86's on mode and segment state -- each needs the
+"function of bytes and address" claim checked before its blocks are shared), a
+bound and eviction, and a flush when what the translator emits is changed at
+run time (`/proc/ish/arm64_jit_fuse`, `hle`).
 
 ## 5. The RISC guests at the threaded-code floor
 
