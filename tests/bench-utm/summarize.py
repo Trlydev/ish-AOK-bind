@@ -37,7 +37,9 @@ for path in sys.argv[1:]:
             continue
         rows[(state, arch, eng, f[2])].append(x)
 
-known = ["aok", "tctish", "tcti", "jit"]   # tctish: the tctiSH fork's TCTI (QEMU 11.1); tcti: UTM's (QEMU 10)
+# aok: AOK's CLI. aokq: AOK's gadgets inside QEMU (the tctiSH fork with --enable-aok-gadgets).
+# tctish: the tctiSH fork's TCTI (QEMU 11.1). tcti: UTM's (QEMU 10). jit: QEMU's JIT.
+known = ["aok", "aokq", "tctish", "tcti", "jit"]
 engines = [e for e in known if any(k[2] == e for k in rows)]
 others = [e for e in engines if e != "aok"]
 order = ["coremark", "nbody", "python", "xz", "sha256", "awk"]

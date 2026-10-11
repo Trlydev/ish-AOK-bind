@@ -1,7 +1,9 @@
 # AOK's CPU engine inside UTM SE: speed race and plug-in study
 
-Status: **study, 2026-10-11. Nothing is built.** It answers two questions that
-came out of a Discord suggestion to run a real Linux kernel:
+Status: **the RISC-V plug-in is built and working (2026-10-11); see section
+8.** Sections 1 to 7 are the study that led to it, as written before any of
+it existed. It answered two questions that came out of a Discord suggestion to
+run a real Linux kernel:
 
 1. Is AOK's gadget engine enough faster than the engine UTM SE ships to be
    worth putting inside UTM SE?
@@ -30,6 +32,12 @@ pull request rather than ship a competing app.
 - **A full VM still pays for an emulated kernel.** Whatever the engine,
   syscall-heavy work will be slower in a VM than in AOK today, where the
   kernel is native code.
+
+- **The plug-in now exists for RISC-V guests, and delivers most of that
+  lead** (section 8). Inside QEMU it needs 1.5x to 2.9x fewer host cycles
+  than the tctiSH fork's engine on the same six workloads, and 2.9x to 7.2x
+  fewer than UTM SE as shipped, with program output and floating-point
+  results identical to QEMU's own.
 
 - **Plug-in point: a second block generator inside QEMU's existing engine,
   not a new accelerator.** UTM SE's engine and AOK's use the same dispatch
@@ -385,16 +393,101 @@ per-guest decoders in `jit/gen.c`.
 
 ## 7. Next steps
 
-1. **Build option B for riscv64 on the tctiSH fork** (decided 2026-10-11):
-   the hook, AOK's own block entry and exit, integer instructions, loads and
-   stores through QEMU's TLB, and branches; everything else ends the block and
-   is left to QEMU. Success is a stock kernel booting with user code served by
-   AOK gadgets and a measured gain on this race.
-2. **Talk to the fork's author and UTM's maintainer** once there is a result
-   to show.
+1. ~~Build option B for riscv64 on the tctiSH fork.~~ Done: section 8.
+2. **Talk to the fork's author and UTM's maintainer.** There is now a result
+   to show. Needs the branch published first.
 3. **Measure on an iPad**: UTM SE from the App Store against AOK, same
    userland, to confirm the ratio on the hardware that matters.
 4. Re-run this race when either engine changes: `tests/bench-utm/`.
+
+## 8. The RISC-V plug-in
+
+Built on `tctiSH/qemu` at `ded0cff` (QEMU 11.1.2), as a local branch
+`aok-gadgets` in `~/git/qemu-aok`: five commits, 8 new files of about 2,900
+lines, and 200 lines added to 13 existing QEMU files (4 lines changed).
+Nothing has been published.
+Its own documentation is `docs/devel/aok-gadgets.rst` in that tree.
+
+It is option B of section 3, with one difference from section 4's sketch:
+AOK's blocks do **not** use TCTI's stream format or entry point. They have
+their own (`aok_tb_exec`), so the plug-in depends only on QEMU's generic
+engine code and works whichever back end UTM ends up with.
+
+### What it does
+
+- Translates RV64 integer code (base, M, A, Zba, Zbb, Zbs, Zicond, C), loads
+  and stores, branches and jumps, CSR accesses, and F and D floating point.
+  Everything else ends the block and is QEMU's: `ecall`, `sret`, vectors.
+- 99.8% of the blocks in a boot and workload run are AOK's.
+- Double-precision arithmetic runs on the host's FP unit where that gives
+  QEMU's software-float answer exactly, flags included, and calls software
+  float where it might not.
+
+### Results
+
+Host CPU cycles on the M5's Super cores, RV64 guest, one CPU, lower is
+better. "Plug-in" is AOK's gadgets inside QEMU; "tctiSH" is the same QEMU
+binary with them switched off (`QEMU_AOK=0`); the three were run interleaved.
+
+| Workload | AOK CLI | Plug-in | tctiSH fork | UTM SE today | Plug-in vs fork | Plug-in vs UTM SE today |
+|---|--:|--:|--:|--:|--:|--:|
+| CoreMark | 4.2 | 6.8 | 11.7 | 21.4 | 1.7x | 3.2x |
+| n-body (floating point) | 3.1 | 3.4 | 10.1 | 22.5 | 2.9x | 6.5x |
+| Python | 7.8 | 13.0 | 34.1 | 92.2 | 2.6x | 7.1x |
+| xz | 4.4 | 5.8 | 9.7 | 21.7 | 1.7x | 3.8x |
+| sha256sum | 2.8 | 3.4 | 5.2 | 9.6 | 1.5x | 2.9x |
+| awk | 2.4 | 5.1 | 12.2 | 36.5 | 2.4x | 7.2x |
+| Geometric mean | | | | | **2.1x** | **4.7x** |
+
+A whole guest boot and shutdown, which is mostly kernel code: 11.6 G cycles
+on the fork's engine, 6.0 G with the plug-in.
+
+The plug-in is still about 1.5x behind AOK's own CLI (1.1x to 2.1x). What
+separates them is mostly what AOK's generator does beyond one gadget per
+instruction (fused pairs, cached register runs), which has not been carried
+over, and for awk the emulated kernel.
+
+### How it was checked
+
+The reference is QEMU's own engine in the same binary. Three guest-side
+tests, each compared between the two:
+
+- **Program transcript** (`bench/check.sh`): CoreMark's checksums, Python
+  big-integer and float arithmetic, xz and gzip, four hashes, sort, awk,
+  shell loops, and a hash of every binary in the image. Identical with one
+  guest CPU and with four.
+- **Floating-point transcript** (`bench/fptest.c`): each double-precision
+  operation over 67 awkward operands in all four rounding modes, hashing
+  every result's bits with the exception flags it raised. Identical on all
+  120 lines. Its first run found a real defect in the first version of the
+  FP gadgets (6 lines differed): a product equal to the smallest normal can
+  have been rounded up from a tiny value, and then RISC-V raises underflow
+  and AArch64's flag cannot be used to tell.
+- **Stress**: four transcripts at once on a four-CPU guest, all four equal
+  to the reference.
+
+### Bugs worth remembering
+
+- **QEMU 11.1 stores its per-mode TLB tables in reverse order**
+  (`tlb.f[mmuidx_to_fast_index()]`). Probing `tlb.f[mmu_idx]` found some
+  other mode's table: every access missed and took the slow path. Correct
+  output, four times slower than the engine being replaced.
+- **`GETPC()` is a variable under TCTI.** A helper called from a gadget saw
+  the position of the last helper call some *other* block had made, and when
+  it raised an exception QEMU unwound the CPU to that unrelated block.
+  OpenSBI probes for CSRs by trapping, so the firmware hung with the wrong
+  hart id.
+- Both of these produced a system that booted and gave right answers, or
+  hung, rather than one that quietly computed wrong results.
+
+### Not done
+
+- Measured on a Mac only. An iPad run needs the plug-in built into a UTM
+  build, which is the next real step.
+- arm64 and x86 guests. Each needs its gadgets retargeted the same way.
+- Single-precision FP natively, `ecall`/`sret` without leaving the stream,
+  and AOK's fused gadgets.
+- QEMU's own TCG test suites for RISC-V have not been run against it.
 
 ## Appendix: reproducing the race
 
@@ -415,3 +508,6 @@ and `build/tools/fakefsify`, plus Homebrew's `glib`, `pixman`, `meson` and
 | `profile-tcti.sh` | samples UTM SE's engine during one workload |
 | `race.sh` | the race: rounds x arch x engine, one process at a time |
 | `summarize.py` | the tables above |
+| `boot-aok.sh`, `run-aok.sh` | boot the RISC-V guest on the plug-in build (`~/aok-vm-bench/build-aok`), gadgets on or off |
+| `bench/check.sh`, `bench/fptest.c` | the program and floating-point transcripts of section 8 |
+| `prof-aok.sh` | where the plug-in build's time goes, by category |
