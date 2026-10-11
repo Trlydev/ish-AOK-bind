@@ -2817,7 +2817,7 @@ int nlibc_getmntinfo(struct statfs **mntbufp, int flags) {
 
     // Freed on the next call: getmntinfo's contract is that the caller never
     // owns the buffer.
-    static struct statfs *previous;
+    static __thread struct statfs *previous;
     free(previous);
     previous = out;
     *mntbufp = out;
@@ -3225,8 +3225,10 @@ int nlibc_unlockpt(int fd_no) {
 
 char *nlibc_ptsname(int fd_no) {
     // ptsname's contract is a pointer into storage the caller does not own,
-    // valid until the next call.
-    static char name[32];
+    // valid until the next call -- this thread's next call: native programs
+    // are threads of one process, and one buffer for all of them hands a
+    // program another's answer.
+    static __thread char name[32];
     dword_t number = 0;
     if (nlibc_tty_ioctl(fd_no, TIOCGPTN_, &number, sizeof(number), true) < 0)
         return NULL;
@@ -3276,11 +3278,79 @@ int nlibc_openpty(int *amaster, int *aslave, char *name,
     return 0;
 }
 
+// ---- one process, many programs: libc state that must be per thread --------
+// See native_libc.h. The host's versions of these keep their state, or the
+// buffer their answer is in, in one place for the process; a native program
+// is a thread, so here it is the thread's.
+char *nlibc_strtok(char *str, const char *sep) {
+    static __thread char *save;
+    return strtok_r(str, sep, &save);
+}
+
+struct tm *nlibc_gmtime(const time_t *t) {
+    static __thread struct tm result;
+    return gmtime_r(t, &result);
+}
+
+char *nlibc_asctime(const struct tm *tm) {
+    static __thread char buf[64];
+    return asctime_r(tm, buf);
+}
+
+#ifdef __APPLE__
+// POSIX basename and dirname as Darwin's are: the argument is not written to,
+// and the answer is in the callee's storage until the next call.
+char *nlibc_basename(char *path) {
+    static __thread char out[MAX_PATH];
+    if (path == NULL || *path == '\0')
+        return strcpy(out, ".");
+    const char *end = path + strlen(path);
+    while (end > path + 1 && end[-1] == '/')
+        end--;                              // trailing slashes
+    if (end == path + 1 && *path == '/')
+        return strcpy(out, "/");
+    const char *start = end;
+    while (start > path && start[-1] != '/')
+        start--;
+    size_t len = (size_t) (end - start);
+    if (len >= sizeof(out)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+char *nlibc_dirname(char *path) {
+    static __thread char out[MAX_PATH];
+    if (path == NULL || *path == '\0')
+        return strcpy(out, ".");
+    const char *end = path + strlen(path);
+    while (end > path + 1 && end[-1] == '/')
+        end--;                              // trailing slashes
+    while (end > path && end[-1] != '/')
+        end--;                              // the last component
+    if (end == path)
+        return strcpy(out, ".");            // no slash in it
+    while (end > path + 1 && end[-1] == '/')
+        end--;                              // the slashes before it
+    size_t len = (size_t) (end - path);
+    if (len >= sizeof(out)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return out;
+}
+#endif
+
 // The guest's own answer, through /proc/self/fd -- AOK's procfs makes each
 // descriptor a symlink to what it points at (fs/proc/pid.c), which is how
 // ttyname is implemented on Linux too.
 char *nlibc_ttyname(int fd_no) {
-    static char name[MAX_PATH];
+    static __thread char name[MAX_PATH];
     if (!nlibc_isatty(fd_no)) {
         errno = ENOTTY;
         return NULL;
@@ -9419,11 +9489,11 @@ char *nlibc_setlocale(int category, const char *name) {
 // /etc/services is whitespace-separated rather than colon-separated
 // ("ssh 22/tcp SSH"), so it cannot reuse nlibc_scan_db, which splits on colons
 // for passwd and group.
-static char nlibc_se_line[512];
-static struct servent nlibc_se;
-static char *nlibc_se_aliases[1];
-static char nlibc_se_proto[16];
-static size_t nlibc_se_pos;
+static __thread char nlibc_se_line[512];
+static __thread struct servent nlibc_se;
+static __thread char *nlibc_se_aliases[1];
+static __thread char nlibc_se_proto[16];
+static __thread size_t nlibc_se_pos;
 
 void nlibc_setservent(int stayopen) { (void) stayopen; nlibc_se_pos = 0; }
 void nlibc_endservent(void) { nlibc_se_pos = 0; }
@@ -9544,10 +9614,10 @@ struct servent *nlibc_getservbyport(int port, const char *proto) {
 //
 // Same walker shape as getservent above, over "tcp 6 TCP" instead of
 // "ssh 22/tcp SSH".
-static char nlibc_pe_line[512];
-static struct protoent nlibc_pe;
-static char *nlibc_pe_aliases[1];
-static size_t nlibc_pe_pos;
+static __thread char nlibc_pe_line[512];
+static __thread struct protoent nlibc_pe;
+static __thread char *nlibc_pe_aliases[1];
+static __thread size_t nlibc_pe_pos;
 
 void nlibc_setprotoent(int stayopen) { (void) stayopen; nlibc_pe_pos = 0; }
 void nlibc_endprotoent(void) { nlibc_pe_pos = 0; }

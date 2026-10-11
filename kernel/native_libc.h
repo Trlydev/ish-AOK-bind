@@ -409,6 +409,21 @@ time_t nlibc_mktime(struct tm *tm);
 void nlibc_tzset(void);
 char *nlibc_ctime_r(const time_t *t, char *buf);
 char *nlibc_ctime(const time_t *t);
+/* State the host C library keeps in ONE place for the whole process. Native
+ * programs are threads of that process, so two of them calling one of these
+ * at the same moment shared it: Darwin's basename() returns a pointer into a
+ * single buffer, and SmallCLUE picks its applet with basename(argv[0]) -- an
+ * applet starting beside another could run as the other (`sha256sum | cut
+ * -c1-32` printing "sha256sum: unsupported option '-c1-32'";
+ * tests/manual/native_applet_race.c). Each gets its state per thread here. */
+char *nlibc_strtok(char *str, const char *sep);
+struct tm *nlibc_gmtime(const time_t *t);
+char *nlibc_asctime(const struct tm *tm);
+#ifdef __APPLE__
+/* glibc's two, the GNU one and libgen's, work in the caller's own string. */
+char *nlibc_basename(char *path);
+char *nlibc_dirname(char *path);
+#endif
 int nlibc_futimens(int fd, const struct timespec times[2]);
 int nlibc_statfs(const char *path, void *buf);
 #ifndef NATIVE_LIBC_OWN_GLOB
@@ -944,6 +959,13 @@ const char *nlibc_dlerror(void);
 #define utimensat   nlibc_utimensat
 #define localtime_r nlibc_localtime_r
 #define localtime   nlibc_localtime
+#define gmtime      nlibc_gmtime
+#define asctime     nlibc_asctime
+#define strtok      nlibc_strtok
+#ifdef __APPLE__
+#define basename    nlibc_basename
+#define dirname     nlibc_dirname
+#endif
 #define mktime      nlibc_mktime
 #define timelocal   nlibc_mktime
 #define tzset       nlibc_tzset

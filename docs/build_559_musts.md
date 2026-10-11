@@ -219,7 +219,8 @@ clock's share for the calling thread).
 
 **Proved on bip (A10X):** `timer_thread_cpu_early` passes 10 runs of 10 (it
 failed 27-30 rounds of 30 on 557 and 558); the probe now shows the thread's
-own two views 0.004-0.024 ms apart after a 9 ms burst. The Mac passes it with
+own two views 0.004-0.024 ms apart after a 9 ms burst. The M4 iPad still
+passes it, 3 runs of 3. The Mac passes it with
 timeout_and_cpu_timer, rusage_monotonic, proc_pid_stat_cputime, itimer_prof_rate
 and getrusage_group. **Not run:** the A9 (ip5), which was not connected -- the
 same kernel generation and the same symptom, so expected to follow.
@@ -235,5 +236,25 @@ skipped, and it fails on the Mac on 558 too once another guest process is busy.
 
 Not musts. Each is in docs/TODO.md's queue: nullDescriptor in the MoltenVK fork
 (GL on the GPU for Mesa 25.2+, and Wayfire on Alpine 3.24); guest fault reports
-flooding the kernel log; the native applet that ran under the wrong name; GH
-#631, ssh sessions dropping when the device idles.
+flooding the kernel log; GH #631, ssh sessions dropping when the device idles;
+a CLOCK_PROCESS_CPUTIME_ID timer running on the whole emulator's CPU (found
+with §6).
+
+## Done beside the musts
+
+- **The native applet that ran under the wrong name** (2026-10-11). It
+  happened a second time, on the same host and the same line, during this
+  cycle's own suite run. Darwin's `basename()` answers from one buffer for the
+  whole process, native programs are threads of that process, and SmallCLUE
+  picks its applet with `basename(argv[0])`: an applet starting beside another
+  could read the other's name. `tests/manual/native_applet_race.c` starts
+  `true` and `false` together 4000 times: one wrong in every run of three
+  before, none in 12,000 after. basename, dirname, strtok, gmtime and asctime
+  are per thread for native programs now (kernel/native_libc.c), and so are
+  the shim's own static buffers.
+- **Native `passwd`** said "not supported on this platform" (reported
+  2026-10-11): the one shadow-auth applet still compiled for a Linux host
+  only. Fixed in SmallCLUE; native_coreutils checks it is there.
+- **iPhone 18 Pro and Pro Max** in kernel/hostinfo.m, and
+  `tools/check-device-table.py`, which compares the table with Xcode's device
+  database (nothing else was missing).
