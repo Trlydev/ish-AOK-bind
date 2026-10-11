@@ -4,6 +4,7 @@
 // bits by gen_step_riscv64.
 
 #include "gadgets.h"
+#include "frag.h"
 
 // Exit-to-kernel with an interrupt code and a 64-bit guest pc.
 // Code stream: [gadget][code][pc][addr]
@@ -90,35 +91,24 @@
 
 // rd = constant (LUI, AUIPC, li-style folds; also jal/jalr link writes).
 // Code stream: [gadget][rd_off][value]
-.gadget mov_const
-    ldr x9, [_ip]
-    ldr x10, [_ip, #8]
-    str x10, [_cpu, x9]
-    gret 2
+f_gadget mov_const
 
 // rd = rs1 + imm (ADDI; covers mv and li-with-base).
 // Code stream: [gadget][rd_off][rs1_off][imm]
-.gadget addi
-    ldr x9, [_ip]           // rd_off
-    ldr x10, [_ip, #8]      // rs1_off
-    ldr x11, [_ip, #16]     // imm
-    ldr x10, [_cpu, x10]
-    add x10, x10, x11
-    str x10, [_cpu, x9]
-    gret 3
+f_gadget addi
 
 // Unconditional compile-time branch (JAL after its link write; also
 // gen_exit's block-size-cap continuation). Code stream: [gadget][target],
 // target tagged with bit 63 when unchained — same tagged-word chaining
 // scheme as guest-arm64 control.S; riscv64_branch_dispatch below is that
 // design with this guest's pc field.
-.gadget b
-    ldr _ip, [_ip]
-    b riscv64_branch_dispatch
+f_gadget b
 
 .global riscv64_branch_dispatch
 riscv64_branch_dispatch:
     tbz _ip, #63, riscv64_chain
+.global riscv64_branch_unchained
+riscv64_branch_unchained:
     and x8, _ip, #0x7fffffffffffffff
     str x8, [_cpu, #CPU_riscv64_pc]
     b jit_ret
@@ -148,6 +138,7 @@ riscv64_chain:
     dmb ishld
 #endif
     gret
+.global riscv64_chain_poked
 riscv64_chain_poked:
     ldur x8, [_ip, #(JIT_BLOCK_addr - JIT_BLOCK_code)]
     str x8, [_cpu, #CPU_riscv64_pc]

@@ -17,6 +17,7 @@
 // rd_off in x19 across read_prep for the same reason.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
@@ -232,19 +233,8 @@ riscv64_crosspage_store:
 
 
 // ---- Loads ---------------------------------------------------------------
-.macro load_gadget name, size, id, ld_insn, reg
-.gadget \name
-    ldr x19, [_ip]            // rd_off (callee-saved across prep)
-    ldr x9, [_ip, #8]         // rs1_off
-    ldr x10, [_ip, #16]       // imm
-    add _ip, _ip, #32         // 3 params + trailing orig_ip (fault restart)
-    ldr x7, [_cpu, x9]
-    add x7, x7, x10           // effective address
-    read_prep \size, \id
-    \ld_insn \reg, [x7]
-    str x11, [_cpu, x19]
-    gret
-    read_bullshit \size, \id
+.macro load_gadget name, size, lid, ld_insn, reg
+    f_gadget \name
 .endm
 
 // add t, ra, rb ; l{b,h,w,d}[u] rd, imm(t) -- an indexed load, the second
@@ -286,20 +276,8 @@ load_gadget lwu, 32, rvlwu, ldr,   w11
 load_gadget ld,  64, rvld,  ldr,   x11
 
 // ---- Stores --------------------------------------------------------------
-.macro store_gadget name, size, id, st_insn, reg
-.gadget \name
-    ldr x9, [_ip]             // rs2_off (value)
-    ldr x10, [_ip, #8]        // rs1_off (base)
-    ldr x11, [_ip, #16]       // imm
-    add _ip, _ip, #32
-    ldr x19, [_cpu, x9]       // value survives prep in callee-saved reg
-    ldr x7, [_cpu, x10]
-    add x7, x7, x11
-    write_prep \size, \id
-    \st_insn \reg, [x7]
-    write_done \size, \id
-    gret
-    write_bullshit \size, \id
+.macro store_gadget name, size, lid, st_insn, reg
+    f_gadget \name
 .endm
 
 store_gadget sb, 8,  rvsb, strb, w19

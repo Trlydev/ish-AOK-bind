@@ -396,6 +396,7 @@ static void amd64_jit_debug(const char *fmt, ...) {
 }
 
 static void arm64_pair_fuse(struct gen_state *state, unsigned from);
+static void riscv64_pair_fuse(struct gen_state *state, unsigned from);
 static bool gen_amd64_peek(struct gen_state *state, struct tlb *tlb, struct amd64_jit_insn *insn);
 static void amd64_flags_note(struct gen_state *state, const struct amd64_jit_insn *insn,
         unsigned emitted_from);
@@ -429,15 +430,14 @@ int gen_step(struct gen_state *state, struct tlb *tlb) {
         return ret;
     }
     if (state->riscv64) {
-        if (state->jitprof == NULL)
-            return gen_step_riscv64(state, tlb);
         // The gadget-level view, as for arm64 above. (A step's instruction
         // count is not recorded: the guest's instructions are two sizes.)
         unsigned emitted_from = state->size;
         int ret = gen_step_riscv64(state, tlb);
-        if (state->size > emitted_from)
+        if (unlikely(state->jitprof != NULL) && state->size > emitted_from)
             jitprof_note_step(state->jitprof, state->block->code[emitted_from],
                     (unsigned) (state->size - emitted_from), 1);
+        riscv64_pair_fuse(state, emitted_from);
         return ret;
     }
     state->orig_ip = state->ip;
@@ -1367,7 +1367,7 @@ bool gen_start_arm64(guest_addr_t addr, struct gen_state *state) {
     state->arm64 = true;
     state->arm64_ip = addr;
     state->arm64_orig_ip = addr;
-    state->arm64_pair_prev = UINT_MAX;
+    state->pair_prev = UINT_MAX;
 #ifdef ISH_JIT_ARM64_GUEST
     state->jitprof = jitprof_block_new(addr, JITPROF_ARM64);
     if (unlikely(state->jitprof != NULL)) {
@@ -6426,6 +6426,7 @@ bool gen_start_riscv64(guest_addr_t addr, struct gen_state *state) {
     state->riscv64_orig_ip = addr;
     state->riscv64_vtype = UINT64_MAX;
     state->riscv64_v_off = false;
+    state->pair_prev = UINT_MAX;
     state->jitprof = jitprof_block_new(addr, JITPROF_RISCV64);
     if (unlikely(state->jitprof != NULL)) {
         extern void gadget_riscv64_block_count(void);
@@ -20159,55 +20160,47 @@ static unsigned i386_fuse_seed(void) {
     if (getenv("ISH_NO_PUSHPOP_FUSE") != NULL) v &= ~JIT_FUSE_PUSHPOP;
     return v;
 }
-// ---- arm64 guest: fused pairs -----------------------------------------------
-// When a translation step's gadget and the previous step's are a pair in
-// jit/guest-arm64/pairs.h, the two become the one gadget that does both: the
-// first gadget's word is replaced, and the second's is taken out from between
-// the two sets of parameters. See jit/guest-arm64/frag.h.
-#if defined(ISH_JIT_ARM64_GUEST)
-#define FUSE2(a, b) extern void gadget_arm64_##a(void); extern void gadget_arm64_##b(void); \
-    extern void gadget_arm64_f2_##a##__##b(void);
-#include "jit/guest-arm64/pairs.h"
-#undef FUSE2
-static const struct arm64_pair {
+// ---- arm64 and riscv64 guests: fused pairs ------------------------------------
+// When a translation step's gadget and the previous step's are a pair in the
+// guest's pairs.h, the two become the one gadget that does both: the first
+// gadget's word is replaced, and the second's is taken out from between the
+// two sets of parameters. See jit/guest-arm64/frag.h.
+struct jit_pair {
     void (*a)(void), (*b)(void), (*fused)(void);
     unsigned a_words; // the first gadget and its parameters
-} arm64_pairs[] = {
-#define FUSE2(a, b) {gadget_arm64_##a, gadget_arm64_##b, gadget_arm64_f2_##a##__##b, 1 + NP_##a},
-#include "jit/guest-arm64/pairs.h"
-#undef FUSE2
 };
-#define ARM64_N_PAIRS (sizeof(arm64_pairs) / sizeof(arm64_pairs[0]))
-#define ARM64_PAIR_HASH 4096
-_Static_assert(ARM64_N_PAIRS * 3 < ARM64_PAIR_HASH, "arm64 pair table: raise ARM64_PAIR_HASH");
-static uint16_t arm64_pair_hash[ARM64_PAIR_HASH]; // index + 1; 0 is empty
-static pthread_once_t arm64_pair_once = PTHREAD_ONCE_INIT;
+#define JIT_PAIR_HASH 4096
+struct jit_pair_set {
+    const struct jit_pair *pairs;
+    unsigned n;
+    uint16_t hash[JIT_PAIR_HASH]; // index + 1; 0 is empty
+};
 
-static inline unsigned arm64_pair_slot(unsigned long a, unsigned long b) {
+static inline unsigned jit_pair_slot(unsigned long a, unsigned long b) {
     uint64_t h = (uint64_t) a * 0x9e3779b97f4a7c15ull ^ (uint64_t) b * 0xc2b2ae3d27d4eb4full;
-    return (unsigned) (h >> 40) & (ARM64_PAIR_HASH - 1);
+    return (unsigned) (h >> 40) & (JIT_PAIR_HASH - 1);
 }
-static void arm64_pair_init(void) {
-    for (unsigned i = 0; i < ARM64_N_PAIRS; i++) {
-        unsigned slot = arm64_pair_slot((unsigned long) arm64_pairs[i].a, (unsigned long) arm64_pairs[i].b);
-        while (arm64_pair_hash[slot] != 0)
-            slot = (slot + 1) & (ARM64_PAIR_HASH - 1);
-        arm64_pair_hash[slot] = (uint16_t) (i + 1);
+static void jit_pair_set_init(struct jit_pair_set *set) {
+    for (unsigned i = 0; i < set->n; i++) {
+        unsigned slot = jit_pair_slot((unsigned long) set->pairs[i].a, (unsigned long) set->pairs[i].b);
+        while (set->hash[slot] != 0)
+            slot = (slot + 1) & (JIT_PAIR_HASH - 1);
+        set->hash[slot] = (uint16_t) (i + 1);
     }
 }
 
-static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
-    unsigned prev = state->arm64_pair_prev;
-    state->arm64_pair_prev = UINT_MAX;
-    if (state->size == from || state->single_step ||
-            !(arm64_jit_fuse_mask() & JIT_FUSE_A64_PAIR))
+// `from`: where the step that just ran put its first word. The set's hash is
+// already built (the callers' pthread_once).
+static void jit_pair_fuse(struct gen_state *state, unsigned from, const struct jit_pair_set *set) {
+    unsigned prev = state->pair_prev;
+    state->pair_prev = UINT_MAX;
+    if (state->size == from)
         return;
     unsigned long *code = state->block->code;
     if (prev != UINT_MAX) {
-        pthread_once(&arm64_pair_once, arm64_pair_init);
-        unsigned slot = arm64_pair_slot(code[prev], code[from]);
-        for (unsigned i; (i = arm64_pair_hash[slot]) != 0; slot = (slot + 1) & (ARM64_PAIR_HASH - 1)) {
-            const struct arm64_pair *p = &arm64_pairs[i - 1];
+        unsigned slot = jit_pair_slot(code[prev], code[from]);
+        for (unsigned i; (i = set->hash[slot]) != 0; slot = (slot + 1) & (JIT_PAIR_HASH - 1)) {
+            const struct jit_pair *p = &set->pairs[i - 1];
             if ((unsigned long) p->a != code[prev] || (unsigned long) p->b != code[from])
                 continue;
             // The previous step must have been that one gadget and nothing
@@ -20225,10 +20218,65 @@ static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
             return; // a pair is not the head of another
         }
     }
-    state->arm64_pair_prev = from;
+    state->pair_prev = from;
+}
+
+#if defined(ISH_JIT_ARM64_GUEST)
+#define FUSE2(a, b) extern void gadget_arm64_##a(void); extern void gadget_arm64_##b(void); \
+    extern void gadget_arm64_f2_##a##__##b(void);
+#include "jit/guest-arm64/pairs.h"
+#undef FUSE2
+static const struct jit_pair arm64_pairs[] = {
+#define FUSE2(a, b) {gadget_arm64_##a, gadget_arm64_##b, gadget_arm64_f2_##a##__##b, 1 + NP_##a},
+#include "jit/guest-arm64/pairs.h"
+#undef FUSE2
+};
+_Static_assert(sizeof(arm64_pairs) / sizeof(arm64_pairs[0]) * 3 < JIT_PAIR_HASH, "arm64 pair table: raise JIT_PAIR_HASH");
+static struct jit_pair_set arm64_pair_set = {arm64_pairs, sizeof(arm64_pairs) / sizeof(arm64_pairs[0]), {0}};
+static pthread_once_t arm64_pair_once = PTHREAD_ONCE_INIT;
+static void arm64_pair_init(void) {
+    jit_pair_set_init(&arm64_pair_set);
+}
+static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
+    if (state->single_step || !(arm64_jit_fuse_mask() & JIT_FUSE_A64_PAIR)) {
+        state->pair_prev = UINT_MAX;
+        return;
+    }
+    pthread_once(&arm64_pair_once, arm64_pair_init);
+    jit_pair_fuse(state, from, &arm64_pair_set);
 }
 #else
 static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
+    (void) state; (void) from;
+}
+#endif
+
+#if defined(ISH_JIT_RISCV64_GUEST)
+#define FUSE2(a, b) extern void gadget_riscv64_##a(void); extern void gadget_riscv64_##b(void); \
+    extern void gadget_riscv64_f2_##a##__##b(void);
+#include "jit/guest-riscv64/pairs.h"
+#undef FUSE2
+static const struct jit_pair riscv64_pairs[] = {
+#define FUSE2(a, b) {gadget_riscv64_##a, gadget_riscv64_##b, gadget_riscv64_f2_##a##__##b, 1 + NP_##a},
+#include "jit/guest-riscv64/pairs.h"
+#undef FUSE2
+};
+_Static_assert(sizeof(riscv64_pairs) / sizeof(riscv64_pairs[0]) * 3 < JIT_PAIR_HASH, "riscv64 pair table: raise JIT_PAIR_HASH");
+static struct jit_pair_set riscv64_pair_set = {riscv64_pairs, sizeof(riscv64_pairs) / sizeof(riscv64_pairs[0]), {0}};
+static pthread_once_t riscv64_pair_once = PTHREAD_ONCE_INIT;
+static void riscv64_pair_init(void) {
+    jit_pair_set_init(&riscv64_pair_set);
+}
+static void riscv64_pair_fuse(struct gen_state *state, unsigned from) {
+    if (state->single_step || !(riscv64_jit_fuse_mask() & JIT_FUSE_RV_FUSE2)) {
+        state->pair_prev = UINT_MAX;
+        return;
+    }
+    pthread_once(&riscv64_pair_once, riscv64_pair_init);
+    jit_pair_fuse(state, from, &riscv64_pair_set);
+}
+#else
+static void riscv64_pair_fuse(struct gen_state *state, unsigned from) {
     (void) state; (void) from;
 }
 #endif
@@ -20270,7 +20318,7 @@ static const struct jit_fuse_entry riscv64_fuse_names[] = {
     {"fold", JIT_FUSE_RV_FOLD}, {"jal", JIT_FUSE_RV_JAL},
     {"retcache", JIT_FUSE_RV_RETCACHE}, {"pair", JIT_FUSE_RV_PAIR},
     {"alu", JIT_FUSE_RV_ALU}, {"br", JIT_FUSE_RV_BRANCH}, {"btfn", JIT_FUSE_RV_BTFN},
-    {"rcache", JIT_FUSE_RV_RCACHE},
+    {"rcache", JIT_FUSE_RV_RCACHE}, {"fuse2", JIT_FUSE_RV_FUSE2},
 };
 static const struct jit_fuse_entry amd64_fuse_names[] = {
     {"incdec_reg", JIT_FUSE_AMD64_INCDEC_REG}, {"deadflags", JIT_FUSE_AMD64_DEADFLAGS},

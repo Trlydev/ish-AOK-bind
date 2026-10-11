@@ -16,7 +16,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | **prototype in, off by default** (2026-10-11): -21..-26% on short processes with addresses held still; needs a decision on ASLR before it can be on |
-| 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has the first two and wants the third |
+| 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has all three as of the same evening (M4: 7-Zip ~16%, Python 5-45% faster than 558), untimed on the A10X |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
@@ -404,6 +404,32 @@ starts, so faults and signals see what they always saw.
   tests/manual/tlb_collide.c picks pages by the hash and narrows, unmaps and
   replaces them while displaced. The i386 and amd64 miss helpers go to C for
   it (docs/TODO.md).
+
+**The riscv64 guest, the same evening: the three arm64 steps in one.** Its
+gadgets had the dispatch change and the memory probe, and not the rest. Now:
+
+- **Fused pairs** (jit/guest-riscv64/frag.h, pairs.h; the `fuse2` bit of
+  /proc/ish/riscv64_jit_fuse -- `pair` was taken by the hand-written ld+ld).
+  The same scheme, with the bodies named for their gadgets and defined where
+  the gadgets are. 332 pairs from 95 gadgets, by the gadget-level profiles
+  of Python, gcc and gzip/bzip2: they remove 38%, 34% and 38% of those
+  workloads' dispatches. In a pair: every load and store, the OP and OP-IMM
+  families and their W forms, the Zba adds, constants, addi; second only:
+  the branches in all their layouts, j, jal, jalr.
+- **Loads and stores move the stream pointer once** (gret_ahead), and a
+  store's fast path no longer jumps over its slow one.
+- **Each branch gadget dispatches for itself** (branch_dispatch), instead of
+  every block transition in the guest leaving by riscv64_chain's one `br`.
+- **Numbers.** M4, riscv64 Alpine. The pair pass off and on inside one
+  build, four rounds: 7-Zip 9.3% faster, Python fib flat, method 4.4%, dict
+  3.3%, str 37.6% faster. All three against the build before, three
+  alternated rounds: 7-Zip 9.9%, fib 1.1%, method 5.4%, dict 9.4%, str 36.1%
+  faster. Mac, host instructions for a Python loop: 5.3% fewer. **Not timed
+  on the A10X:** it was locked.
+- **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
+  this guest, with the same control (a fused load's fault path naming the
+  wrong instruction fails it); the standalone ALU gadgets are byte for byte
+  what they were.
 
 **The transition itself.** Three ways to make `arm64_chain` cheaper,
 smallest first: keep the chain budget in a host register instead of loading,

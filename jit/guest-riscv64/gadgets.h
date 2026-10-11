@@ -85,6 +85,35 @@ _addr   .req x7
 0:  br x9
 .endm
 
+// The dispatch for a gadget that has already moved _ip past its parameters
+// AND past the next gadget's word, in the one `add` it makes on entry (see
+// jit/guest-arm64/gadgets.h's gret_ahead): a gadget that can fault has to
+// move _ip before its access, and with gret that made two updates of _ip a
+// gadget. Such a gadget passes the distance as the `ahead` argument of
+// read_prep/write_prep and their _bullshit halves, so that every call out of
+// them is made with _ip where the slow paths expect it.
+.macro gret_ahead
+#if defined(ISH_ARM64_GRET_LDAR)
+    sub x9, _ip, #8
+    ldar x9, [x9]
+#else
+    ldr x9, [_ip, #-8]
+#endif
+    cbnz x9, 0f
+    b jit_ret
+0:  br x9
+.endm
+
+.macro bl_ahead target, ahead
+    .if \ahead
+    sub _ip, _ip, #\ahead
+    .endif
+    bl \target
+    .if \ahead
+    add _ip, _ip, #\ahead
+    .endif
+.endm
+
 // ---- TLB access machinery: verbatim copies of jit/guest-arm64/
 // gadgets.h's read_prep/write_prep/write_done and save_c/restore_c
 // (same _cpu/_tlb/_ip/_addr register convention), with the miss/
@@ -106,7 +135,7 @@ _addr   .req x7
 // convention, set up once in entry.S, not per-gadget).
 .irp type, read,write
 
-.macro \type\()_prep size, id
+.macro \type\()_prep size, id, ahead=0
     // An access that crosses into the next page takes crosspage_load_\id --
     // BOTH types, i386's own design (jit/gadgets-aarch64/gadgets.h): for a
     // WRITE that straddles a page boundary, riscv64_crosspage_load fills
@@ -140,11 +169,7 @@ _addr   .req x7
         cmp x9, x11
         b.ne slow_write_\id
         ldrb w10, [x10, #MMU_requires_write_revalidate]
-        cbz w10, fast_write_\id
-slow_write_\id :
-        bl riscv64_resolve_write_ptr
-        b back_\id
-fast_write_\id :
+        cbnz w10, slow_write_\id   // out of line (_bullshit): the store falls through
     .endif
     // 64-bit page math throughout: arm64 guest addresses are 48-bit, and a
     // 32-bit page compare would treat any two pages 4GiB apart as aliases.
@@ -181,7 +206,7 @@ fast_write_\id :
 back_\id:
 .endm
 
-.macro \type\()_bullshit size, id
+.macro \type\()_bullshit size, id, ahead=0
 handle_miss_\id :
     .if \size > 8 && \size <= 64
     // Not a hit as probed (see \type\()_prep): crossing, unaligned, or missing.
@@ -202,16 +227,21 @@ handle_miss_\id :
     b back_\id
 1:
     .endif
-    bl riscv64_handle_\type\()_miss
+    bl_ahead riscv64_handle_\type\()_miss, \ahead
     b back_\id
+.ifc \type,write
+slow_write_\id :
+    bl_ahead riscv64_resolve_write_ptr, \ahead
+    b back_\id
+.endif
 crosspage_load_\id :
     mov x27, #(\size/8)
-    bl riscv64_crosspage_load
+    bl_ahead riscv64_crosspage_load, \ahead
     b back_\id
 .ifc \type,write
 crosspage_store_\id :
     mov x27, #(\size/8)
-    bl riscv64_crosspage_store
+    bl_ahead riscv64_crosspage_store, \ahead
     b back_write_done_\id
 .endif
 .endm

@@ -297,9 +297,14 @@ void jit_note_shared_write(struct jit *jit, const struct pt_entry *entry);
 // gen_riscv64_try_rcache_run: straight register-only runs keep up to four guest
 // registers in host x23-x26 (jit/guest-riscv64/rcache.S).
 #define JIT_FUSE_RV_RCACHE (1u << 7)
+// Two gadgets that follow each other in a block become one that does both and
+// dispatches once: the arm64 guest's JIT_FUSE_A64_PAIR for this one
+// (jit/guest-riscv64/frag.h, pairs.h). "fuse2", since "pair" was taken by the
+// hand-written ld+ld and sd+sd.
+#define JIT_FUSE_RV_FUSE2 (1u << 8)
 #define JIT_FUSE_RV_ALL (JIT_FUSE_RV_FOLD | JIT_FUSE_RV_JAL | JIT_FUSE_RV_RETCACHE | \
                          JIT_FUSE_RV_PAIR | JIT_FUSE_RV_ALU | JIT_FUSE_RV_BRANCH | \
-                         JIT_FUSE_RV_BTFN | JIT_FUSE_RV_RCACHE)
+                         JIT_FUSE_RV_BTFN | JIT_FUSE_RV_RCACHE | JIT_FUSE_RV_FUSE2)
 
 // The amd64 guest's bits are not fusions in the i386 sense (two gadgets folded
 // into one) but NATIVE-vs-BRIDGE switches, which is the same A/B in the shape
