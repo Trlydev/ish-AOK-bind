@@ -311,6 +311,39 @@ two profiles the eight busiest guest registers take 70-77% of operand
 references and 52-66% of instructions use no other, but they are not the same
 eight (Python: x0-x4, sp, x29, x30; 7-Zip: x0, x2-x4, x8, x15, x17, sp).
 
+**The dispatch, same day.** The two things that paid were both in `gret`,
+the three or four instructions every gadget ends with.
+
+- **One update of the stream pointer a gadget, not two** (41d8d5260 arm64,
+  54f2b2279 the other three guests). Every gadget reads its operands through
+  `_ip`, so `_ip` is one dependency chain through the whole stream; `gret`
+  loaded with write-back and then added 8. M4, each guest's Alpine root, three
+  alternated rounds -- 7-Zip / Python fib, method, dict, str, all faster:
+  arm64 5.7% / 9.8, 8.1, 7.1, 11.9%; x86_64 4.3% / 10.1, 8.7, 3.9, 4.3%; i386
+  4.2% / 12.4, 6.1, 6.6, 3.5%; riscv64 5.5% / 5.4, 3.8, 8.8, 4.3%. A10X, arm64:
+  1.2% / 3.5, 7.8% faster, dict 2.3% slower, str flat.
+- **The same for the fast loads and stores** (`gret_ahead`): they have to move
+  `_ip` before the access, for the fault paths, and so still made two updates.
+  They now make one, past the next gadget's word, and the slow paths are
+  called with `_ip` put back. M4: 7-Zip 0.9%, fib 1.2%, method 2.2%, dict 0.9%
+  faster. A10X, three rounds: 7-Zip 0.6% slower (inside the spread), fib
+  6.7%, method 3.8% and dict 1.3% faster, str flat.
+
+**Tried and NOT kept: one taken branch a dispatch.** `gret` hops over a
+`b jit_ret` to reach its `br` -- two taken branches a gadget. Three ways of
+making it one (falling through a `cbz`; no null test at all; the test, the
+add, then the branch) all did the same on the M4 over 3-7 rounds: 7-Zip
+3.0-4.6% faster, method 2-6.7% and dict 1.5-3.8% faster, and **Python str
+12-21% slower**, every round. Not kept: a fifth off one workload is not a
+price for a twentieth on the others. The likely reason is worth more than the
+change: on an M-series Mac, as the dispatch got faster a *dependent* guest
+`add` got slower (0.53 -> 0.73 -> 0.90 ns) while an independent one got faster
+(0.53 -> 0.36), so with a faster dispatch the round trip of a guest register
+through memory stops being hidden and starts to cost -- and string code is
+dependent chains (a pointer, a count, a byte). That revises the note above:
+resident registers would do nothing for the M4 *as the dispatch is*, and are
+what a faster dispatch needs. The two belong together.
+
 **The transition itself.** Three ways to make `arm64_chain` cheaper,
 smallest first: keep the chain budget in a host register instead of loading,
 decrementing and storing it (x19-x27 are all in use as gadget scratch, so one

@@ -711,29 +711,29 @@ store_single store64,  64, str,  x17
 .gadget \name
     ldp x8, x9, [_ip]         // rt_slot, rn_slot
     ldr x19, [_ip, #16]       // offset
-    add _ip, _ip, #32
+    add _ip, _ip, #40         // the four parameters and the next gadget: see gret_ahead
     ldr x10, [_cpu, x9]       // base
     add x7, x10, x19
-    read_prep \bits, \name
+    read_prep \bits, \name, 8
     \ldinsn \reg, [_addr]
     str x17, [_cpu, x8]       // full X store: 32-bit loads must clear the upper half
-    gret
-    read_bullshit \bits, \name
+    gret_ahead
+    read_bullshit \bits, \name, 8
 .endm
 
 .macro store_single_fast name, bits, stinsn, reg
 .gadget \name
     ldp x8, x9, [_ip]         // rt_slot, rn_slot
     ldr x19, [_ip, #16]       // offset
-    add _ip, _ip, #32
+    add _ip, _ip, #40         // the four parameters and the next gadget: see gret_ahead
     ldr x10, [_cpu, x9]       // base
     ldr x17, [_cpu, x8]       // value (x17 survives write_prep's helpers)
     add x7, x10, x19
-    write_prep \bits, \name
+    write_prep \bits, \name, 8
     \stinsn \reg, [_addr]
     write_done \bits, \name   // clobbers x9 — rt_slot already consumed
-    gret
-    write_bullshit \bits, \name
+    gret_ahead
+    write_bullshit \bits, \name, 8
 .endm
 
 load_single_fast load8_fast,      8, ldrb,  w17

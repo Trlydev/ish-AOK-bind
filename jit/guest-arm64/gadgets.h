@@ -160,6 +160,38 @@ _addr   .req x7
 0:  br x9
 .endm
 
+// The dispatch for a gadget that has already moved _ip past its parameters
+// AND past the next gadget's word, in the one `add` it makes on entry: the
+// next gadget is at [_ip, #-8] and there is nothing left to update. A gadget
+// that can fault has to move _ip before its access (the slow paths find the
+// instruction's address in the stream behind it), and with gret that made two
+// updates of _ip a gadget; this way it is one. Such a gadget passes `8` as
+// the `ahead` argument of read_prep/write_prep and their _bullshit halves, so
+// that every call out of them is made with _ip where the slow paths expect it.
+.macro gret_ahead
+#if defined(ISH_ARM64_GRET_LDAR)
+    sub x9, _ip, #8
+    ldar x9, [x9]
+#else
+    ldr x9, [_ip, #-8]
+#endif
+    cbnz x9, 0f
+    b jit_ret
+0:  br x9
+.endm
+
+// A call from a gadget's slow path, made with _ip put back where a gadget
+// that used gret would have it (see gret_ahead).
+.macro bl_ahead target, ahead
+    .if \ahead
+    sub _ip, _ip, #\ahead
+    .endif
+    bl \target
+    .if \ahead
+    add _ip, _ip, #\ahead
+    .endif
+.endm
+
 // ---- Guest register access (memory-based; see file header) -------------
 
 .macro load_guest_reg host_reg, guest_idx
@@ -220,7 +252,7 @@ _addr   .req x7
 // convention, set up once in entry.S, not per-gadget).
 .irp type, read,write
 
-.macro \type\()_prep size, id
+.macro \type\()_prep size, id, ahead=0
     // An access that crosses into the next page takes crosspage_load_\id --
     // BOTH types, i386's own design (jit/gadgets-aarch64/gadgets.h): for a
     // WRITE that straddles a page boundary, arm64_crosspage_load fills
@@ -256,7 +288,7 @@ _addr   .req x7
         ldrb w10, [x10, #MMU_requires_write_revalidate]
         cbz w10, fast_write_\id
 slow_write_\id :
-        bl arm64_resolve_write_ptr
+        bl_ahead arm64_resolve_write_ptr, \ahead
         b back_\id
 fast_write_\id :
     .endif
@@ -295,7 +327,7 @@ fast_write_\id :
 back_\id:
 .endm
 
-.macro \type\()_bullshit size, id
+.macro \type\()_bullshit size, id, ahead=0
 handle_miss_\id :
     .if \size > 8 && \size <= 64
     // Not a hit as probed (see \type\()_prep): crossing, unaligned, or missing.
@@ -316,16 +348,16 @@ handle_miss_\id :
     b back_\id
 1:
     .endif
-    bl arm64_handle_\type\()_miss
+    bl_ahead arm64_handle_\type\()_miss, \ahead
     b back_\id
 crosspage_load_\id :
     mov x27, #(\size/8)
-    bl arm64_crosspage_load
+    bl_ahead arm64_crosspage_load, \ahead
     b back_\id
 .ifc \type,write
 crosspage_store_\id :
     mov x27, #(\size/8)
-    bl arm64_crosspage_store
+    bl_ahead arm64_crosspage_store, \ahead
     b back_write_done_\id
 .endif
 .endm
