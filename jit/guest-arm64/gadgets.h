@@ -214,24 +214,32 @@ _addr   .req x7
 .irp type, read,write
 
 .macro \type\()_prep size, id
-    and w9, w7, #0xfff
-    cmp x9, #(0x1000-(\size/8))
-    // BOTH types branch to crosspage_load_\id -- this is i386's own design
-    // (jit/gadgets-aarch64/gadgets.h line 48), deliberately: for a WRITE
-    // that straddles a page boundary, arm64_crosspage_load fills
+    // An access that crosses into the next page takes crosspage_load_\id --
+    // BOTH types, i386's own design (jit/gadgets-aarch64/gadgets.h): for a
+    // WRITE that straddles a page boundary, arm64_crosspage_load fills
     // LOCAL_value with the current guest bytes, stashes the guest address
     // in LOCAL_value_addr, and redirects _addr to the LOCAL_value buffer;
     // the gadget's store instruction then writes into the buffer, and
     // write_done (below) detects _addr==LOCAL_value and calls
     // arm64_crosspage_store to flush the buffer back to guest memory
-    // using the stashed address. A previous revision of this port
-    // misdiagnosed this shared branch target as a label-collision bug and
-    // "fixed" it by branching writes directly to crosspage_store_\id --
-    // which flushes the still-uninitialized buffer and skips the actual
-    // store entirely. Corrected by re-reading i386's flow end-to-end
-    // (memory.S's crosspage_load/crosspage_store pair) rather than
-    // reasoning about the prep macro in isolation.
+    // using the stashed address. (Branching writes straight to
+    // crosspage_store_\id flushes the still-uninitialized buffer and skips
+    // the store: it was tried.)
+    //
+    // For 2, 4 and 8 bytes the crossing test is folded into the TLB compare:
+    // the tag is compared with the address's page AND its low alignment bits,
+    // so an aligned access -- which cannot cross -- hits in one compare, and
+    // anything unaligned leaves by handle_miss_\id, which sorts out whether it
+    // crosses, is merely unaligned inside its page (and probes again), or is a
+    // real miss. That is three instructions and a branch off nearly every
+    // load and store; one byte cannot cross and needs no test at all. A pair
+    // (16 bytes, aligned to 8) can cross while aligned, so it keeps the
+    // explicit test.
+    .if \size > 64
+    and w9, w7, #0xfff
+    cmp x9, #(0x1000-(\size/8))
     b.hi crosspage_load_\id
+    .endif
     .ifc \type,write
         ldr x10, [_tlb, #(-TLB_entries+TLB_mmu)]
         ldr x9, [_tlb, #(-TLB_entries+TLB_mem_changes)]
@@ -245,22 +253,25 @@ slow_write_\id :
         b back_\id
 fast_write_\id :
     .endif
-    // 64-bit page math throughout: this macro was copied from the i386
-    // gadget set, whose w-register page compare and unmasked `eor ..,
-    // lsr #22` index are only correct for 32-bit guest addresses. arm64
-    // guest addresses are 48-bit: the unmasked eor indexed OUTSIDE the
-    // 1024-entry TLB array (ld crashed the whole app dereferencing a
-    // garbage data_minus_addr), and the 32-bit page compare would treat
-    // any two pages 4GiB apart as aliases — silent wrong-memory access.
+    // 64-bit page math throughout: arm64 guest addresses are 48-bit, and a
+    // 32-bit page compare would treat any two pages 4GiB apart as aliases.
+    .if \size > 64 || \size == 8
     and x9, x7, #0xfffffffffffff000
-    .ifc \type,write
-        str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .else
+    and x9, x7, #(0xfffffffffffff000 | (\size/8 - 1))
     .endif
-    ubfx x10, x7, #12, #10
-    eor x10, x10, x7, lsr #22
-    and x10, x10, #(1 << TLB_BITS) - 1
-    mov w11, #TLB_ENTRY_SIZE
-    madd x10, x10, x11, _tlb
+    // TLB_INDEX (emu/tlb.h), page bits 0-9 xor bits 10-19, and the entry's
+    // address, without the mask, the constant and the multiply the first
+    // version of this took: xor the address with itself shifted and the
+    // index is one field of the result; 24 bytes an entry is times three,
+    // times eight.
+    .if TLB_ENTRY_SIZE != 24 || TLB_BITS != 10
+    .error "the TLB probe below is written for 1024 entries of 24 bytes"
+    .endif
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3
     .ifc \type,read
         ldr x11, [x10, #TLB_ENTRY_page]
     .else
@@ -268,6 +279,10 @@ fast_write_\id :
     .endif
     cmp x9, x11
     b.ne handle_miss_\id
+    .ifc \type,write
+        // (x9 is the page itself here: the compare passed)
+        str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .endif
     ldr x11, [x10, #TLB_ENTRY_data_minus_addr]
     add x7, x11, x7, uxtx
 back_\id:
@@ -275,6 +290,25 @@ back_\id:
 
 .macro \type\()_bullshit size, id
 handle_miss_\id :
+    .if \size > 8 && \size <= 64
+    // Not a hit as probed (see \type\()_prep): crossing, unaligned, or missing.
+    and w9, w7, #0xfff
+    cmp x9, #(0x1000-(\size/8))
+    b.hi crosspage_load_\id
+    tst x7, #(\size/8 - 1)
+    b.eq 1f
+    // Unaligned inside its page: the same entry, compared with the page alone.
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    .ifc \type,write
+        str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .endif
+    ldr x11, [x10, #TLB_ENTRY_data_minus_addr]
+    add x7, x11, x7, uxtx
+    b back_\id
+1:
+    .endif
     bl arm64_handle_\type\()_miss
     b back_\id
 crosspage_load_\id :

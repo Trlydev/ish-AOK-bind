@@ -87,24 +87,52 @@
 .global arm64_branch_dispatch
 arm64_branch_dispatch:
     tbz _ip, #63, arm64_chain
+arm64_branch_unchained:
     and x8, _ip, #0x7fffffffffffffff
     str x8, [_cpu, #CPU_pc]
     b jit_ret
+
+// The same, a copy for each branch gadget: arm64_chain's work written out, so
+// that the indirect branch into the next block is the gadget's own. Through
+// the shared tail every transition between blocks in the whole guest left by
+// ONE `br`, and a predictor has one entry's worth of history to tell their
+// targets apart; the i386 and amd64 engines each gained 2-2.5% from the same
+// change (chain_ip, jit/gadgets-aarch64/gadgets.h). The rare ways out -- an
+// unchained target, the budget spent, the one transition in 64 that looks at
+// the poke flag -- stay shared.
+.macro branch_dispatch
+    tbnz _ip, #63, 9f       // (a test-and-branch reaches 32K: hence the stub)
+    ldr x8, [_cpu, #CPU_poked_ptr]
+    ldrb w8, [x8]
+    cbnz w8, arm64_chain_poked
+    ldr x8, [_cpu, #LOCAL_chain_budget]
+    subs x8, x8, #1
+    str x8, [_cpu, #LOCAL_chain_budget]
+    b.le arm64_chain_poked
+    sub x8, _ip, #JIT_BLOCK_code
+    str x8, [_cpu, #LOCAL_last_block]
+#if !defined(ISH_ARM64_GRET_LDAR)
+    dmb ishld
+#endif
+    gret
+9:  b arm64_branch_unchained
+.endm
 // Global, not file-local: the ret_cache_dispatch macro below enters here with a
 // block->code pointer it has already validated, skipping the tagged-word test
 // above (a cache entry is a host pointer, never a tagged guest address).
 .global arm64_chain
 arm64_chain:
-    ldr x8, [_cpu, #CPU_poked_ptr]
-    ldrb w8, [x8]
-    cbnz w8, arm64_chain_poked
     // Chain budget: bounded time-in-JIT is what makes chaining BACKWARD
     // edges (loops) safe — see jit_frame.chain_budget. Expiry exits to C
     // exactly like a poke, at the destination block's start.
+    ldr x8, [_cpu, #CPU_poked_ptr]
+    ldrb w8, [x8]
+    cbnz w8, arm64_chain_poked
     ldr x8, [_cpu, #LOCAL_chain_budget]
     subs x8, x8, #1
     str x8, [_cpu, #LOCAL_chain_budget]
     b.le arm64_chain_poked
+arm64_chain_go:
     sub x8, _ip, #JIT_BLOCK_code       // recover the block pointer for the
     str x8, [_cpu, #LOCAL_last_block]  // C loop's chaining bookkeeping
 #if !defined(ISH_ARM64_GRET_LDAR)
@@ -114,6 +142,10 @@ arm64_chain:
     dmb ishld
 #endif
     gret
+arm64_chain_look:
+    ldr x8, [_cpu, #CPU_poked_ptr]
+    ldrb w8, [x8]
+    cbz w8, arm64_chain_go
 arm64_chain_poked:
     // Poked or out of budget mid-chain: resume at the DESTINATION block.
     ldur x8, [_ip, #(JIT_BLOCK_addr - JIT_BLOCK_code)]
@@ -122,14 +154,14 @@ arm64_chain_poked:
 
 .gadget b
     ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 .gadget bl
     ldr x9, [_ip, #8]
     add x10, _cpu, #CPU_x0
     str x9, [x10, #(30*8)]  // X30 = return address
     ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 // BR, BLR, RET — branch to a register value. Code stream: [gadget][rn].
 // For blr, code stream also has [return_addr] after rn, same as bl.
@@ -685,10 +717,10 @@ hle_call_return:
     b not_taken_cbz
 taken_cbz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_cbz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 .gadget cbnz
     ldr x8, [_ip]
@@ -707,10 +739,10 @@ not_taken_cbz:
     b not_taken_cbnz
 taken_cbnz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_cbnz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 // TBZ, TBNZ — code stream: [gadget][rt | bit_pos<<8][taken_pc][fallthrough_pc]
 .gadget tbz
@@ -728,10 +760,10 @@ not_taken_cbnz:
     b not_taken_tbz
 taken_tbz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_tbz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 .gadget tbnz
     ldr x8, [_ip]
@@ -748,10 +780,10 @@ not_taken_tbz:
     b not_taken_tbnz
 taken_tbnz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_tbnz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 // Offset-fed CBZ/CBNZ/TBZ/TBNZ (the "ospec" pass; rt != 31). Streams:
 //   cb_*: [gadget][rt_off][taken][fallthrough]
@@ -768,17 +800,17 @@ not_taken_tbnz:
     ldr x9, [_cpu, x9]
     \jmp \reg, 1f
     ldr _ip, [_ip, #16]      // fallthrough
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip, #8]       // taken
-    b arm64_branch_dispatch
+    branch_dispatch
 .gadget \name\()_bk
     ldr x9, [_ip]
     ldr x9, [_cpu, x9]
     \jmp_bk \reg, 1f
     ldr _ip, [_ip, #8]       // taken
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip, #16]      // fallthrough
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 a64_cb cbz_x,  x9, cbz,  cbnz
 a64_cb cbz_w,  w9, cbz,  cbnz
@@ -792,18 +824,18 @@ a64_cb cbnz_w, w9, cbnz, cbz
     and x9, x9, x10
     \jmp x9, 1f
     ldr _ip, [_ip, #24]      // fallthrough
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip, #16]      // taken
-    b arm64_branch_dispatch
+    branch_dispatch
 .gadget \name\()_bk
     ldp x9, x10, [_ip]
     ldr x9, [_cpu, x9]
     and x9, x9, x10
     \jmp_bk x9, 1f
     ldr _ip, [_ip, #16]      // taken
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip, #24]      // fallthrough
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 a64_tb tb_z,  cbz,  cbnz
 a64_tb tb_nz, cbnz, cbz
@@ -816,9 +848,9 @@ a64_tb tb_nz, cbnz, cbz
     load_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 // bcond_nf_* — B.cond WITHOUT the load_flags reload, for use directly
@@ -835,9 +867,9 @@ a64_tb tb_nz, cbnz, cbz
 .gadget \name
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 bcond_nf_gadget bcond_nf_eq, eq
@@ -900,9 +932,9 @@ bcond_gadget bcond_le, le
     store_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 .macro fused_cmpr name, cmpop, zr, r15, r13, cc
@@ -918,9 +950,9 @@ bcond_gadget bcond_le, le
     store_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 .macro fused_subsi name, subop, r16, r15, r11, cc
@@ -937,9 +969,9 @@ bcond_gadget bcond_le, le
     str x16, [x14, x9, lsl #3]
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 #define CC_LIST eq,ne,cs,cc,mi,pl,vs,vc,hi,ls,ge,lt,gt,le
@@ -1002,9 +1034,9 @@ fused_table arm64_fused_subsi32_table, fused_subsi32
 1:  msr nzcv, x8                 // restore ANDS flags for branch
     b.\cc 2f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 2:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 .macro fused_andsr name, andop, r16, r15, r13, cc
@@ -1026,9 +1058,9 @@ fused_table arm64_fused_subsi32_table, fused_subsi32
 1:  msr nzcv, x8                 // restore ANDS flags for branch
     b.\cc 2f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 2:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 .irp cc, CC_LIST
@@ -1071,9 +1103,9 @@ fused_andsr fused_andsr32_\cc, ands, w16, w15, w13, \cc
     store_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
     read_bullshit \bits, \name
 .endm
 
