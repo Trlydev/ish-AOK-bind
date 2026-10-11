@@ -1188,6 +1188,8 @@ struct jit *jit_new(struct mmu *mmu) {
         printk("ERROR: Failed to allocate memory for JIT\n");
         return NULL;
     }
+    for (int i = 0; i < JIT_LOOKUP_STRIPES; i++)
+        pthread_mutex_init(&jit->lookup_lock[i], NULL);
     lock(&jit->lock, 0);
     jit->mmu = mmu;
     jit_resize_hash(jit, JIT_INITIAL_HASH_SIZE);
@@ -1302,6 +1304,8 @@ void jit_free(struct jit *jit) {
     free(jit->code_writes);
     jit_shared_free(jit);
     unlock(&jit->lock);
+    for (int i = 0; i < JIT_LOOKUP_STRIPES; i++)
+        pthread_mutex_destroy(&jit->lookup_lock[i]);
     free(jit);
 }
 
@@ -1923,9 +1927,16 @@ void jit_invalidate_all(struct jit *jit) {
     jit_invalidate_range(jit, 0, mem->page_limit);
 }
 
+static inline pthread_mutex_t *jit_lookup_stripe(struct jit *jit, guest_addr_t addr) {
+    return &jit->lookup_lock[jit_hash_bucket(addr, JIT_LOOKUP_STRIPES)];
+}
+
 static void jit_resize_hash(struct jit *jit, size_t new_size) {
     TRACE_(verbose, "%d resizing hash to %lu, using %lu bytes for gadgets\n", current_pid(current), new_size, jit->mem_used);
+    _Static_assert(JIT_INITIAL_HASH_SIZE % JIT_LOOKUP_STRIPES == 0, "a bucket's stripe must survive a resize");
     struct list *new_hash = calloc(new_size, sizeof(struct list));
+    for (int i = 0; i < JIT_LOOKUP_STRIPES; i++)
+        pthread_mutex_lock(&jit->lookup_lock[i]);
     for (size_t i = 0; i < jit->hash_size; i++) {
         if (list_null(&jit->hash[i]))
             continue;
@@ -1938,6 +1949,8 @@ static void jit_resize_hash(struct jit *jit, size_t new_size) {
     free(jit->hash);
     jit->hash = new_hash;
     jit->hash_size = new_size;
+    for (int i = JIT_LOOKUP_STRIPES - 1; i >= 0; i--)
+        pthread_mutex_unlock(&jit->lookup_lock[i]);
 }
 
 // Every write to guest memory from the kernel (mem_ptr with MEM_WRITE) and
@@ -1987,7 +2000,9 @@ static void jit_insert(struct jit *jit, struct jit_block *block) {
     if (jit->num_blocks >= jit->page_hash_size * 2)
         jit_resize_page_hash(jit, jit->page_hash_size * 2);
 
+    pthread_mutex_lock(jit_lookup_stripe(jit, block->addr));
     list_init_add(&jit->hash[jit_hash_bucket(block->addr, jit->hash_size)], &block->chain);
+    pthread_mutex_unlock(jit_lookup_stripe(jit, block->addr));
     list_init_add(blocks_list(jit, PAGE(block->addr), 0), &block->page[0]);
     if (PAGE(block->addr) != PAGE(block->end_addr))
         list_init_add(blocks_list(jit, PAGE(block->end_addr), 1), &block->page[1]);
@@ -2003,6 +2018,16 @@ static struct jit_block *jit_lookup(struct jit *jit, guest_addr_t addr) {
             return block;
     }
     return NULL;
+}
+
+// The same for a thread that holds only the jetsam read lock, which is what
+// keeps the block it finds from being freed: see jit.lookup_lock.
+static struct jit_block *jit_lookup_shared(struct jit *jit, guest_addr_t addr) {
+    pthread_mutex_t *stripe = jit_lookup_stripe(jit, addr);
+    pthread_mutex_lock(stripe);
+    struct jit_block *block = jit_lookup(jit, addr);
+    pthread_mutex_unlock(stripe);
+    return block;
 }
 
 static struct jit_block *jit_block_compile_common(guest_addr_t ip, struct tlb *tlb,
@@ -2494,8 +2519,13 @@ static void jit_block_disconnect(struct jit *jit, struct jit_block *block) {
     if (jit != NULL) {
         jit->mem_used -= block->used;
         jit->num_blocks--;
+        // In a hash only if it has a jit; see jit.lookup_lock.
+        pthread_mutex_lock(jit_lookup_stripe(jit, block->addr));
+        list_remove(&block->chain);
+        pthread_mutex_unlock(jit_lookup_stripe(jit, block->addr));
+    } else {
+        list_remove(&block->chain);
     }
-    list_remove(&block->chain);
     for (int i = 0; i <= 1; i++) {
         list_remove(&block->page[i]);
         list_remove_safe(&block->jumps_from_links[i]);
@@ -2873,6 +2903,13 @@ rearm_i386:
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
+            // Another thread may have it: look in the shared table under the
+            // bucket's own lock first (jit.lookup_lock), and take the jit's
+            // lock only to translate.
+            block = jit_lookup_shared(jit, ip);
+            if (block != NULL) {
+                cache[cache_index] = block;
+            } else {
             lock(&jit->lock, 0);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
@@ -2985,6 +3022,7 @@ rearm_i386:
             }
             cache[cache_index] = block;
             unlock(&jit->lock);
+            }
         }
         struct jit_block *last_block = frame->last_block;
         // If cleanup_seq changed since last_block was set, jetsam blocks were
@@ -3295,6 +3333,13 @@ rearm_arm64:
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
+            // Another thread may have it: look in the shared table under the
+            // bucket's own lock first (jit.lookup_lock), and take the jit's
+            // lock only to translate.
+            block = jit_lookup_shared(jit, ip);
+            if (block != NULL) {
+                cache[cache_index] = block;
+            } else {
             lock(&jit->lock, 0);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
@@ -3366,6 +3411,7 @@ rearm_arm64:
             }
             cache[cache_index] = block;
             unlock(&jit->lock);
+            }
         }
         struct jit_block *last_block = frame->last_block;
         if (atomic_load_explicit(&jit->cleanup_seq, memory_order_relaxed) != last_block_cleanup_seq) {
@@ -3809,6 +3855,13 @@ rearm_riscv64:
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
+            // Another thread may have it: look in the shared table under the
+            // bucket's own lock first (jit.lookup_lock), and take the jit's
+            // lock only to translate.
+            block = jit_lookup_shared(jit, ip);
+            if (block != NULL) {
+                cache[cache_index] = block;
+            } else {
             lock(&jit->lock, 0);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
@@ -3879,6 +3932,7 @@ rearm_riscv64:
             }
             cache[cache_index] = block;
             unlock(&jit->lock);
+            }
         }
         struct jit_block *last_block = frame->last_block;
         if (atomic_load_explicit(&jit->cleanup_seq, memory_order_relaxed) != last_block_cleanup_seq) {

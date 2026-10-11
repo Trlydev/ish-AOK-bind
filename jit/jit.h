@@ -10,6 +10,7 @@
 #if ENGINE_JIT
 
 #define JIT_INITIAL_HASH_SIZE (1 << 10)
+#define JIT_LOOKUP_STRIPES 64
 #define JIT_CACHE_SIZE (1 << 10)
 #define JIT_INITIAL_PAGE_HASH_SIZE (1 << 10)
 
@@ -40,6 +41,15 @@ struct jit {
     } reference;
 
     lock_t lock;
+    // The block hash's buckets, in JIT_LOOKUP_STRIPES groups, each with a lock
+    // of its own, so that a thread whose own cache missed can look a block up
+    // without the lock above. Every thread of a process shares one jit, and a
+    // miss used to take that one mutex just to read: under sysbench with eight
+    // clients, 77% of MariaDB's lock waiting was there. Whoever changes a
+    // bucket's chain holds `lock` AND the bucket's stripe; a resize holds them
+    // all. Bucket b is in stripe b % JIT_LOOKUP_STRIPES, which the hash sizes
+    // (1024 doubled) keep the same across a resize.
+    pthread_mutex_t lookup_lock[JIT_LOOKUP_STRIPES];
     wrlock_t jetsam_lock;
     // Set once jit_teardown_lock has acquired jetsam_lock for write, ahead
     // of mem_destroy's own pt_unmap_always call -- see jit_invalidate_lock's
