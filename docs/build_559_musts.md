@@ -16,7 +16,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | **prototype in, off by default** (2026-10-11): -21..-26% on short processes with addresses held still; needs a decision on ASLR before it can be on |
-| 5 | The RISC guests at the threaded-code floor | open |
+| 5 | The RISC guests at the threaded-code floor | **profiled, not started** (2026-10-11): the arm64 guest's levers are ALU pairs for 7-Zip and block transitions for Python |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
@@ -231,6 +231,28 @@ blocks.
 
 **Prove:** tests/bench-ab on the M4 and the A10X, builds alternated; the
 arm64 and riscv64 suites.
+
+**Profiled 2026-10-11** (ISH_JIT_PROFILE, arm64 guest, Alpine 3.24, the Mac's
+-O2 CLI; tools/jitprof-report.py). What is fused today: cmp + b.cond, load +
+cmp, load/store pairs, the return cache (`/proc/ish/arm64_jit_fuse`).
+
+- **7-Zip** (`7z b 1 -mmt1 -md22`, 27.3G instructions, 27.9 a block): 48%
+  register data processing, 21% immediate, 17% loads and stores, 14% branches.
+  The commonest pairs are ALU on ALU, none of them fused: add -> eor 7.5% and
+  eor -> add 7.5%, add -> add 2.7%, mul -> cmp 2.3%, sub -> sub 1.4%, lsr ->
+  lsl 1.4%, lsl -> mul 1.4%, add -> sub 1.3%. cmp + b.cond, already fused, is
+  9.4%. So the first superinstruction to try is a pair of register ALU ops in
+  one gadget, operands fed as the ospec gadgets take them.
+- **Python** (tests/bench-ab/pybench.py, 4.0G instructions): 37% loads and
+  stores, 27% immediate, 20% branches, and **8.1 instructions a block** -- a
+  block transition every eighth instruction. Pairs: ldr -> ldr 4.6%, adrp ->
+  ldr 2.2%, mov -> mov 2.2%, ldr -> cmp 2.0% (fused), str -> str 2.0%. Here
+  the lever is the transition itself (the queue's item 3: chain_ip's poke
+  check and the chain-budget load and store on every chained branch), then
+  ldr pairs.
+
+Not done yet: the 557 -> 558 slips (item 1 of the order above), which need the
+two app builds alternated on the devices, and the riscv64 guest's own profile.
 
 ## 6. `timer_thread_cpu_early` on the A10X and the A9
 
