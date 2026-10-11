@@ -17,7 +17,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | open |
 | 5 | The RISC guests at the threaded-code floor | open |
-| 6 | `timer_thread_cpu_early` on the A10X and the A9 | open |
+| 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
 which share their measuring kit, then 6.
@@ -169,14 +169,36 @@ arm64 and riscv64 suites.
 a CLOCK_THREAD_CPUTIME_ID timer armed for 5.0 ms of CPU fires with 0.5-4.8 ms
 used by the thread's own clock.
 
-**Established:** the timer samples `thread_info(THREAD_BASIC_INFO)` from the
-timer thread while the guest reads the host's own-thread clock, and on those
-older kernels the two disagree by milliseconds. The M4 and the iPhone 12 pass.
+**Done 2026-10-11.** The suspicion in the queue (two clocks that disagree) was
+half right, and a probe on bip said which half. Three views of one thread's
+CPU time, side by side over a burst-and-nap loop: its own
+CLOCK_THREAD_CPUTIME_ID, its own `thread_info` (getrusage RUSAGE_THREAD), and
+`thread_info` asked from another thread while it naps.
 
-**Next step:** THREAD_EXTENDED_INFO's nanosecond fields, or anchor the arming
-to thread_info's figure rather than the clock's.
+- The view from another thread agrees with the thread's clock: 0.01-0.26 ms
+  apart, the same total over 3 s. So the timer thread's samples were fine.
+- The thread's `thread_info` of ITSELF leaves out the run on the CPU it is in
+  the middle of: 4.06 ms behind its clock after a 4 ms burst, 6.9 ms after a
+  9 ms one. The M4 (iPadOS 26) and macOS read the same from both.
+- A timer takes "now" on the arming thread. The test spins 1-9 ms and arms, so
+  the anchor was that much in the past and the 5 ms timer fired that early.
 
-**Prove:** the test on bip and ip5, 30 rounds each; still passing on the M4.
+The fix (kernel/task.c `host_thread_cpu_ns_self`): a thread's reading of its
+own CPU time is topped up to its own clock, in `task_thread_cpu_time_ns` (the
+timer's anchor) and in `cpu_usage_self` (getrusage, times(), the process
+clock's share for the calling thread).
+
+**Proved on bip (A10X):** `timer_thread_cpu_early` passes 10 runs of 10 (it
+failed 27-30 rounds of 30 on 557 and 558); the probe now shows the thread's
+own two views 0.004-0.024 ms apart after a 9 ms burst. The Mac passes it with
+timeout_and_cpu_timer, rusage_monotonic, proc_pid_stat_cputime, itimer_prof_rate
+and getrusage_group. **Not run:** the A9 (ip5), which was not connected -- the
+same kernel generation and the same symptom, so expected to follow.
+
+**Found beside it, queued in docs/TODO.md:** a POSIX timer on
+CLOCK_PROCESS_CPUTIME_ID runs on the whole emulator's CPU clock. It is why
+`timer_missed_periods` fails on bip whenever its process-clock case is not
+skipped, and it fails on the Mac on 558 too once another guest process is busy.
 
 ---
 

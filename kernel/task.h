@@ -1174,6 +1174,8 @@ void guest_cpu_usage_total(uint64_t user_ns, uint64_t system_ns, struct cpu_usag
 // the user/system split isn't available and the total is reported as user
 // time). In nanoseconds, to the host's own precision (microseconds on Darwin).
 void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns);
+// The calling host thread's own CPU clock, in nanoseconds (kernel/task.c).
+uint64_t host_thread_cpu_ns_self(void);
 // Charges the exiting task's final thread CPU time to its per-virtual-CPU
 // accounting slot; called once from do_exit while the host thread still
 // exists to be queried. Sets task->cpu_time_banked.

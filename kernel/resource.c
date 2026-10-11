@@ -459,6 +459,17 @@ static struct rusage_ cpu_usage_self(void) {
     rusage.utime.usec = info.user_time.microseconds;
     rusage.stime.sec = info.system_time.seconds;
     rusage.stime.usec = info.system_time.microseconds;
+    // An older kernel's thread_info leaves out the calling thread's current
+    // run on the CPU (host_thread_cpu_ns_self, kernel/task.c): count it, as
+    // user time, so getrusage and times() agree with the thread's own clock.
+    uint64_t own_usec = host_thread_cpu_ns_self() / 1000;
+    uint64_t sys_usec = (uint64_t) rusage.stime.sec * 1000000 + (uint64_t) rusage.stime.usec;
+    uint64_t user_usec = (uint64_t) rusage.utime.sec * 1000000 + (uint64_t) rusage.utime.usec;
+    if (own_usec > user_usec + sys_usec) {
+        user_usec = own_usec - sys_usec;
+        rusage.utime.sec = user_usec / 1000000;
+        rusage.utime.usec = user_usec % 1000000;
+    }
 #endif
     return rusage;
 }

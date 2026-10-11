@@ -980,6 +980,25 @@ static int task_cpu_slot(struct task *task, int ncpu) {
     return (int) (task->pid % (dword_t) ncpu);
 }
 
+// The calling host thread's CPU time by its own clock, the one a guest's
+// CLOCK_THREAD_CPUTIME_ID reads.
+//
+// thread_info is the only way to another thread's time, and to the split
+// between user and system. But asked by a thread about ITSELF, older Darwin
+// kernels leave out the run on the CPU it is in the middle of: on an A10X
+// (iPadOS 17) a thread that had spun 9ms since it last slept read 6.9ms less
+// from thread_info than from its clock; an M4 on iPadOS 26 and macOS read the
+// same from both. A thread CPU timer takes "now" on its own thread when it is
+// armed, so there a 5ms timer was anchored that far back and fired with 1.2 to
+// 3.7ms used (tests/manual/timer_thread_cpu_early, 27-30 rounds of 30, and the
+// same on an A9). So a thread's reading of itself is topped up to this.
+uint64_t host_thread_cpu_ns_self(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return (uint64_t) ts.tv_sec * NSEC_PER_SEC_U64 + (uint64_t) ts.tv_nsec;
+}
+
 void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns) {
     *user_ns = 0;
     *system_ns = 0;
@@ -995,6 +1014,11 @@ void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *sys
             *system_ns = (uint64_t) info.system_time.seconds * NSEC_PER_SEC_U64
                          + (uint64_t) info.system_time.microseconds * 1000;
         }
+    }
+    if (pthread_equal(task->thread, pthread_self())) {
+        uint64_t own = host_thread_cpu_ns_self();
+        if (own > *user_ns + *system_ns)
+            *user_ns = own - *system_ns;
     }
 #else
     clockid_t clkid;
