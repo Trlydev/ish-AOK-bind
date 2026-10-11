@@ -277,7 +277,41 @@ past 8 threads; what waits now is `task_run_current` (task.c:1875 and 1890,
 on every return from a syscall) and `jit_cleanup_jetsam_after_interrupt`. The
 amd64 run loop's miss path has another shape and was not converted.
 
-**The transition, not started.** Three ways to make `arm64_chain` cheaper,
+**The hot gadgets, 2026-10-11: what was tried, and what the devices said.**
+The MBP was busy that day (wall time and cycles moved by up to 60% between
+identical runs), so the counts below are host instructions retired, which do
+not move, and the times are app builds alternated three times on the M4 iPad
+and the A10X (tests/bench-ab).
+
+| change (arm64 guest) | host instructions | M4: 7-Zip, Python dict | verdict |
+|---|---|---|---|
+| look at the poke flag on 1 transition in 64 | -1% | **-4.1%, +11.9% slower** | dropped |
+| TLB index in 4 instructions, no multiply | -2% | +0.7%, +1.7% (noise) | kept |
+| each branch gadget dispatches for itself | 0 | -0.5%, +0.9% (noise) | kept |
+| page-crossing test folded into the TLB compare | -4% | with the index: -0.8%, -1.0% | kept |
+| the three kept, together | -7 to -8% | **+1.5%, -3.8%**; method -4.3% | b755b8ee1 |
+
+On the A10X the three together gave 7-Zip +1.9%, fib -6.7%, method -6.3%,
+dict -8.5%, str -4.7% (three rounds). The riscv64 guest got the index and the folded test: M4
+7-Zip +0.8%, fib -3.1%, method -4.8%, dict -4.3%.
+
+Two things to take from it. **Instructions are not time on an M-series
+core:** 8% fewer bought 1.5-4%, and 1% fewer cost 4-12% -- a branch taken
+every 64th time is one the predictor cannot learn. So nothing here is judged
+by count again; only by the devices. And **this vein is nearly worked out:**
+what a guest instruction costs on the M4 is not the length of its gadget but
+the round trip of every guest register through memory (a dependent `add` is
+~9 cycles of which the add is one). The riscv64 register cache showed that
+within straight runs (2.28 -> 0.99 ns for a dependent add) and lost it at the
+runs' edges. Guest registers held in host registers for as long as the JIT
+runs -- no edges -- is the remaining large step, and it is the size of the
+amd64 work of the last cycle: gadgets specialised by host register, a spill
+on every way out to C, signal and ptrace state read from the spill. In these
+two profiles the eight busiest guest registers take 70-77% of operand
+references and 52-66% of instructions use no other, but they are not the same
+eight (Python: x0-x4, sp, x29, x30; 7-Zip: x0, x2-x4, x8, x15, x17, sp).
+
+**The transition itself.** Three ways to make `arm64_chain` cheaper,
 smallest first: keep the chain budget in a host register instead of loading,
 decrementing and storing it (x19-x27 are all in use as gadget scratch, so one
 has to be freed); store the last block only on the way out to C, by giving
