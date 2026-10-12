@@ -9,6 +9,7 @@
 # "mode" (beside this script) saying "list", it installs the base system and writes the list of packages
 # still to fetch to /dev/vdc; the host fetches them in parallel and serves them at 10.0.2.2:8642. With
 # "install" it takes them from there and finishes. Either pass can be repeated: what is done is kept.
+# A third mode, "tools", only brings an existing disk's /AOK/tools and boot-time hooks up to date.
 set -ex
 MODE=$(cat "$(dirname "$0")/mode")
 MIRROR=http://pkgmaster.devuan.org/merged
@@ -32,6 +33,45 @@ cp /etc/resolv.conf /mnt/etc/resolv.conf
 echo "deb $MIRROR excalibur main" > /mnt/etc/apt/sources.list
 printf 'Acquire::http::Timeout "30";\nAcquire::Retries "5";\n' > /mnt/etc/apt/apt.conf.d/80aok-build
 finish() { umount /mnt/dev /mnt/sys /mnt/proc; umount /mnt; sync; }
+
+# What the machine carries of iSH-AOK's tools (the job brings them in tools/): the provisioning and
+# Wayland scripts that the same distribution uses under the app, which know a machine of its own when they
+# are on one. And rc.local's two hooks, read from the kernel command line:
+#   gltest=FRAMES  run gltest once the machine is up, on the console
+#   aokjob=DEV     DEV holds a tar with run.sh: run it as root on the console, then power off. This is how
+#                  build-devuan-disk.sh runs those scripts in the machine itself, as its owner would.
+install_tools() {
+    here=$(dirname "$0")
+    if [ -d "$here/tools" ]; then
+        mkdir -p /mnt/AOK/tools
+        cp -r "$here"/tools/* /mnt/AOK/tools/
+        chmod -R u+rwX,go+rX /mnt/AOK/tools
+        # `desktop`: the Wayland desktop on this machine's display, once setup-wayland.sh has run.
+        printf '#!/bin/sh\nexec sh /AOK/tools/start-wayland.sh "$@"\n' > /mnt/usr/local/bin/desktop
+        chmod 755 /mnt/usr/local/bin/desktop
+    fi
+    cat > /mnt/etc/rc.local <<'R'
+#!/bin/sh
+for x in $(cat /proc/cmdline); do
+    case $x in
+    gltest=*) (sleep 4; /usr/local/bin/gltest "${x#gltest=}" > /dev/console 2>&1) & ;;
+    aokjob=*) (mkdir -p /run/aokjob && tar -xf "/dev/${x#aokjob=}" -C /run/aokjob &&
+               sh /run/aokjob/run.sh > /dev/console 2>&1; echo "AOKJOB-DONE rc=$?" > /dev/console
+               sync; poweroff) & ;;
+    esac
+done
+exit 0
+R
+    chmod +x /mnt/etc/rc.local
+}
+
+if [ "$MODE" = tools ]; then
+    install_tools
+    ls -la /mnt/AOK/tools
+    finish
+    echo DEVUAN-TOOLS-OK
+    exit 0
+fi
 
 if [ "$MODE" = list ]; then
     chroot /mnt /bin/sh -ex -c "export LC_ALL=C; apt-get -q update;
@@ -81,15 +121,7 @@ grep -iE "renderer|vendor|version" /tmp/gltest.log | grep -viE "extensions|shadi
 grep "Rendered" /tmp/gltest.log | tail -1 | sed 's/^/GLTEST /'
 G
 chmod +x /mnt/usr/local/bin/gltest
-# gltest=FRAMES on the kernel command line runs it once the machine is up, on the console.
-cat > /mnt/etc/rc.local <<'R'
-#!/bin/sh
-for x in $(cat /proc/cmdline); do
-    case $x in gltest=*) (sleep 4; /usr/local/bin/gltest "${x#gltest=}" > /dev/console 2>&1) & ;; esac
-done
-exit 0
-R
-chmod +x /mnt/etc/rc.local
+install_tools
 echo 'Devuan 6 (Excalibur) riscv64, built for the AOK QEMU. gltest: is the display accelerated?' > /mnt/etc/motd
 ls -la /mnt/boot
 (cd /mnt/boot && tar -cf /dev/vdc vmlinu* initrd.img* config-*)

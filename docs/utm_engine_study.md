@@ -658,6 +658,52 @@ server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
 fencing changes), which overlaps QEMU 11's own rework of the same code. A
 guest that wants Vulkan or Direct3D gets OpenGL until then.
 
+### The "ultimate" machine: AOK's own scripts in a VM
+
+The Devuan machine is provisioned by the scripts an AOK root is provisioned
+with, not by copies of them. `provision-ultimate-devuan.sh` and
+`-alpine.sh`, `setup-wayland.sh` and `start-wayland.sh` now know a machine
+with a kernel of its own (no `/proc/ish`) and leave out or change what only
+the app can do there:
+
+- chrony keeps the distribution's configuration and disciplines the clock,
+  which under AOK is the device's and is only watched;
+- nothing follows the device's timezone, and there are no native programs to
+  link;
+- `setup-wayland.sh` also installs seatd and puts the logins in its group;
+- `start-wayland.sh` puts the desktop on the machine's own display when
+  there is a DRM card: the compositor takes the card and the input devices
+  through its seat, nothing is headless and no VNC bridge runs. The seeded
+  configuration, menu, theme and panel are the ones AOK's Display applet
+  shows.
+
+Under AOK every one of them takes the path it took before.
+
+`build-devuan-disk.sh ultimate` puts them in the machine's `/AOK/tools` and
+runs them *in the machine*, booted with its own kernel, through a hook in its
+`rc.local` (`aokjob=` on the kernel command line), as its owner would. What
+comes out (1.3 GB compressed, 1.8 GB used of 6):
+
+- the tool set of the provision script, sshd, cron, rsyslog, chrony;
+- a login `aok`, without a password and with sudo, on the display's console;
+  root on the serial terminal;
+- labwc, foot, waybar, Xwayland and a few desktop programs; `desktop` starts
+  them.
+
+`build-devuan-disk.sh desktop-test` boots it with a display nobody watches,
+starts the desktop as `aok` and takes a picture through QEMU's monitor: a
+foot terminal in AOK's window theme under the panel. On the AOK-gadgets
+binary, whose Mac build has no monitor screenshot, the picture was taken in
+the guest instead (grim), once with the gadgets and once with QEMU's own
+engine: 1280x800, and the two differ in nine rows of the panel, where the
+clock and the load figures are. 1.3 million pairs were fused getting there.
+
+Not run yet: the desktop on the GL display device (both pictures are of a
+display without 3D, rendered in software), and anything of it on an iPad.
+
+The Alpine guests carry the Alpine script and the Wayland ones as well, to
+try: they live in memory, and their Mesa has no virgl driver.
+
 ## 10. One source for both
 
 Until 2026-10-12 the plug-in's integer gadgets were AOK's, copied and
@@ -736,18 +782,100 @@ timed: it was locked.
 The program and FP transcripts are identical to QEMU's own engine with the
 pairs, with forwarding off, and with four guest CPUs.
 
+### Loads, stores and branches
+
+The other 214 pairs contain a load, a store or a branch, and those bodies
+named AOK's registers, its TLB macros and its block chaining. Since
+`7db3de6cd` they reach guest memory and leave a block through names the host
+supplies, and the plug-in (`bea9939`) supplies them:
+
+- **Memory.** A load or store body computes the address and makes the access
+  itself. Between the two the host turns a guest address into a host one
+  (`read_prep`, `write_prep`): AOK's TLB probe and miss handlers, or QEMU's
+  memory fast path. On a miss in the plug-in QEMU does the whole access in C,
+  and the body's own access is made of a scratch word, where a load finds
+  what C read.
+- **Ways out.** A branch body names its two ways out by parameter words it
+  does not read, and `branch_leave` takes one: AOK's tagged chain word, or
+  QEMU's linked-jump slot. The plug-in's is a copy per way out, as AOK's is,
+  so each ends in an indirect branch of its own; that alone was 1.7% of the
+  cycles (xz 4.8%).
+- **`jalr`** stays each host's own, since it ends in that host's block
+  lookup, but the plug-in writes its own as a body under AOK's name
+  (`jalr_cached`) and takes the pairs that end in it.
+- AOK's `alu.o`, `memory.o` and `core.o` are byte for byte what they were.
+  The check script now stands in for a host with a memory model and a way
+  out of its own: 137 gadgets and 326 pairs assemble under it, and four
+  planted violations were caught.
+
+All 332 pairs are built in the plug-in. In a boot and the six workloads
+220,000 pairs are fused out of 697,000 translated instructions (it was
+49,000), 66,000 of them forwarding a register.
+
+Host cycles on the M5, all on Super cores, five interleaved runs each of the
+same build without pairs, with them, and QEMU's own engine in that build:
+
+| Workload | Without | With pairs | Ratio | Fork's engine | AOK gadgets faster by |
+|---|---|---|---|---|---|
+| CoreMark | 6.72 G | 6.23 G | 1.080 | 11.62 G | 1.87x |
+| n-body | 3.37 G | 3.25 G | 1.035 | 9.99 G | 3.07x |
+| Python | 12.92 G | 11.80 G | 1.095 | 32.96 G | 2.79x |
+| xz -3 | 5.58 G | 4.88 G | 1.144 | 8.33 G | 1.71x |
+| sha256sum | 3.36 G | 3.09 G | 1.087 | 5.01 G | 1.62x |
+| awk | 5.02 G | 4.65 G | 1.080 | 11.35 G | 2.44x |
+
+Geometric mean 1.086 from the pairs, and 2.18x the fork's engine.
+
+On the M4 iPad (the benchmark app of section 8, seven interleaved rounds,
+the guest's own milliseconds, median, thermal state nominal throughout):
+
+| Workload | Without | With pairs | Ratio |
+|---|---|---|---|
+| CoreMark | 1664 | 1523 | 1.093 |
+| n-body | 927 | 899 | 1.031 |
+| Python | 3760 | 3238 | 1.161 |
+| xz -3 | 1439 | 1267 | 1.136 |
+| sha256sum | 849 | 769 | 1.104 |
+| awk | 1349 | 1203 | 1.121 |
+
+Geometric mean 1.107, and its program, FP and memory transcripts are the
+Mac's, line for line. The A10X has the build and no figures or transcript
+yet: its run was cut short when another app was brought to the front. With
+the integer pairs alone it had gained more than the M4 did (1.072 against
+1.040, three rounds).
+
+A new transcript guards this: `memtest` (tests/bench-utm/bench), every access
+size, signed and unsigned, at every alignment and across a page boundary,
+and pointer walks over pages that fault on first touch and are restarted by a
+signal handler that hashes each fault's address and pc. A pair that repeated
+its first instruction after a fault in its second, or reported the wrong
+instruction, changes it. It is identical to QEMU's own engine with pairs,
+without, with forwarding off and with four CPUs, as the program and FP
+transcripts are. (Flipping one bit of what the plug-in's slow path returns
+does not get as far as the test: the kernel does not boot.)
+
 ### What is not shared yet
 
-- **Loads, stores and branches.** In the plug-in they go through QEMU's
-  memory TLB and block linking, so they are its own, and the 214 pairs that
-  contain one are not built. Written as bodies under the same contract (the
-  host supplying the address translation and the way out), they would bring
-  those pairs with them, and those are the pairs programs execute most.
-- **The fusing pass**, as above: two copies of one algorithm.
-- **AOK's hand-fused idioms** (`sll_srl`, `sll_sra`, `sll_add`) are assembled
-  in the plug-in, which has no selection for them yet.
+- **The fusing pass**: `aok_gen_pair` in the plug-in is a second copy of
+  `jit_pair_fuse` (`jit/gen.c`). Queued in `docs/TODO.md`.
+- **The idioms AOK's translator folds into one gadget** before the pair pass
+  sees them: a shift pair (`sll_srl`, `sll_sra`), a shift and an add
+  (`sll_add`), a constant or a bit test and the branch on it (`beq_ri`,
+  `andi_beqz` and their kin), an add and the load through its result. The
+  gadgets are assembled in the plug-in; its translator does not select them,
+  so the pairs that name them never occur there, and the pair list was
+  measured on streams that have them.
+- **Constants that are code addresses.** QEMU's blocks are position
+  independent, so `auipc` is the plug-in's own gadget rather than AOK's
+  `mov_const`, and pairs that begin with it are not taken.
 - **Cached register runs** need host registers the plug-in uses for QEMU's
   bookkeeping.
+- One thing got slower: with pairs off, CoreMark costs 2.5% more on the
+  shared load, store and branch bodies than it did on the plug-in's
+  hand-written ones (the other five workloads: within 1%). Not understood
+  yet. With pairs on, the finished build is about 2% ahead of the previous
+  one (integer pairs only) on CoreMark and 5% to 8% on the other five
+  (medians of separate runs).
 
 ## Appendix: reproducing the race
 

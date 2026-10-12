@@ -15,14 +15,20 @@ names. Copied into the app's Documents, UTM lists it like one made in its own wi
                             a virtio-ramfb display, USB input, sound, network. It ends at the firmware's own
                             shell, having found nothing to boot. It is there to attach an installer to.
 
-  "Devuan RISC-V.utm"       With DEVUAN_DIR (what build-devuan-disk.sh leaves: devuan-riscv64.qcow2,
-                            vmlinuz, initrd.img): Devuan 6 on a disk of its own, booted with its own kernel,
-                            on the GL display device, four CPUs, 2 GB. root is logged in on the display and
-                            on the serial terminal; "gltest" there says which GL renderer a program gets.
+  "Devuan Ultimate RISC-V.utm"
+                            With DEVUAN_DIR (what build-devuan-disk.sh and its "ultimate" step leave:
+                            devuan-riscv64.qcow2, vmlinuz, initrd.img): Devuan 6 on a disk of its own, booted
+                            with its own kernel, on the GL display device, four CPUs, 2 GB, and provisioned
+                            with iSH-AOK's own scripts, which are in /AOK/tools there: the "ultimate
+                            terminal" tool set, and a Wayland desktop that `desktop` starts. The login aok
+                            (no password, sudo without one) is on the display's console, root on the serial
+                            terminal; "gltest" says which GL renderer a program gets.
 
 INITRAMFS is the VM image of update-roots.sh (initramfs-riscv64-vm.cpio): the race's userland plus the
 kernel's modules, without which the guest has no driver for a network card, a display or a USB keyboard.
-All three have UTM's debug log on (Data/debug.log: the QEMU command line and QEMU's messages).
+The Alpine guests carry the same scripts in /AOK/tools when the image was built with them (update-roots.sh),
+to try: they live in memory, so what the scripts install is gone at shutdown.
+All of them have UTM's debug log on (Data/debug.log: the QEMU command line and QEMU's messages).
 """
 import os
 import plistlib
@@ -97,10 +103,13 @@ def write(outdir, config, files):
 
 
 def devuan(outdir, d):
-    vm = base("Devuan RISC-V",
-              "Devuan 6 (Excalibur) riscv64 with its own kernel, on the GL display device. root is logged in "
-              "on the console; run gltest to see which GL renderer programs get.",
-              "A0C0A0C0-0000-4000-8000-000000000005", cpus=4, memory=2048)
+    # (a name and a UUID of its own: an earlier, unprovisioned "Devuan RISC-V" may be installed and running)
+    vm = base("Devuan Ultimate RISC-V",
+              "Devuan 6 (Excalibur) riscv64 with its own kernel, provisioned by iSH-AOK's scripts "
+              "(/AOK/tools). The login aok is on the display: `desktop` starts the Wayland desktop, "
+              "`gltest` says which GL renderer programs get. root is on the serial terminal. Neither has a "
+              "password.",
+              "A0C0A0C0-0000-4000-8000-000000000006", cpus=4, memory=2048)
     # net.ifnames=0: the image's network configuration names eth0.
     vm["QEMU"]["AdditionalArguments"] = [
         '-append "root=/dev/vda rw console=ttyS0 console=tty0 net.ifnames=0 quiet"',
@@ -108,10 +117,10 @@ def devuan(outdir, d):
     vm["QEMU"]["RNGDevice"] = True
     vm["Input"]["UsbBusSupport"] = "3.0"
     vm["Display"] = [dict(display(), Hardware="virtio-ramfb-gl")]
-    vm["Network"] = [network("52:54:00:A0:C0:05")]
+    vm["Network"] = [network("52:54:00:A0:C0:06")]
     vm["Serial"] = [terminal()]
     def ident(n):
-        return str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000D0 + n)).upper()
+        return str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000E0 + n)).upper()
     vm["Drive"] = [
         {"ImageName": "vmlinuz", "ImageType": "LinuxKernel", "Interface": "None", "InterfaceVersion": 1,
          "Identifier": ident(1), "ReadOnly": True},

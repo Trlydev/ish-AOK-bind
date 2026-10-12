@@ -45,6 +45,22 @@ if [ ! -f "$W/modules-riscv64.cpio" ]; then
     bsdtar -xf "$W/dl-kernel/linux-lts-riscv64.apk" -C "$M" lib/modules
     (cd "$M" && bsdtar -c --format=newc --uid 0 --gid 0 -f "$W/modules-riscv64.cpio" lib)
 fi
-cat "$W/initramfs-riscv64.cpio" "$W/modules-riscv64.cpio" > "$W/initramfs-riscv64-vm.cpio"
+# And a third, when ~/aok-vm-bench/aok-tools holds them: iSH-AOK's own provisioning and Wayland scripts
+# (opt/AOK/tools/provision-ultimate-alpine.sh, setup-wayland.sh, setup-wayland-extras.sh, start-wayland.sh)
+# at /AOK/tools, where the same distribution has them under the app. They know a machine of its own when
+# they are on one. A separate archive because /AOK inside an AOK root is the app's own file system: the
+# root cannot hold files there. This guest lives in memory, so what they install is gone at shutdown.
+T=$W/dl-kernel/aoktools
+rm -rf "$T" "$W/aoktools-riscv64.cpio"
+if ls "$W"/aok-tools/*.sh > /dev/null 2>&1; then   # (and aok-tools/wayland, the release guard's source)
+    mkdir -p "$T/AOK/tools"
+    for f in "$W"/aok-tools/*; do
+        case $f in */provision-ultimate-devuan.sh) ;; *) cp -r "$f" "$T/AOK/tools/" ;; esac
+    done
+    chmod -R u+rwX,go+rX "$T/AOK/tools"
+    (cd "$T" && bsdtar -c --format=newc --uid 0 --gid 0 -f "$W/aoktools-riscv64.cpio" AOK)
+fi
+cat "$W/initramfs-riscv64.cpio" "$W/modules-riscv64.cpio" $(ls "$W/aoktools-riscv64.cpio" 2>/dev/null) \
+    > "$W/initramfs-riscv64-vm.cpio"
 ls -la "$W/modules-riscv64.cpio" "$W/initramfs-riscv64-vm.cpio"
 echo UPDATE-DONE
