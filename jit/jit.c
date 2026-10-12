@@ -2370,8 +2370,9 @@ static bool jit_xcache_enabled(void) {
 // at, so the cache only pays when every process puts a file where the last
 // one did -- and turning it on turns the guest's ASLR off
 // (/proc/sys/kernel/randomize_va_space 0), for processes started from then
-// on. Turning it off puts randomize_va_space back if nothing else has moved
-// it since, and lets the cached blocks go.
+// on, and holds it off: the guest cannot write another value there until the
+// cache is off again. Turning it off puts randomize_va_space back and lets
+// the cached blocks go.
 void jit_xcache_set_enabled(bool on) {
     pthread_mutex_lock(&xc_lock);
     bool was = atomic_load_explicit(&xc_enabled, memory_order_relaxed) == 1;
@@ -2379,8 +2380,10 @@ void jit_xcache_set_enabled(bool on) {
     if (on && !was) {
         xc_aslr_before = aslr_randomize_va_space();
         aslr_set_randomize_va_space(0);
+        aslr_lock_randomize_va_space(true);
     } else if (!on && was) {
-        if (xc_aslr_before >= 0 && aslr_randomize_va_space() == 0)
+        aslr_lock_randomize_va_space(false);
+        if (xc_aslr_before >= 0)
             aslr_set_randomize_va_space(xc_aslr_before);
         xc_aslr_before = -1;
         for (unsigned b = 0; b < XC_BUCKETS; b++) {

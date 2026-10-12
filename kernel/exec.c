@@ -308,6 +308,16 @@ void aslr_set_randomize_va_space(int value) {
     atomic_store(&randomize_va_space, value);
 }
 
+static _Atomic bool randomize_va_space_locked;
+
+void aslr_lock_randomize_va_space(bool locked) {
+    atomic_store(&randomize_va_space_locked, locked);
+}
+
+bool aslr_randomize_va_space_locked(void) {
+    return atomic_load(&randomize_va_space_locked);
+}
+
 // A uniformly random page count below 2^bits.
 static pages_t aslr_pages(unsigned bits) {
     uint64_t r = 0;

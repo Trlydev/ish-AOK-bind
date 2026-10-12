@@ -223,9 +223,11 @@ on the Linux system's ASLR is off, what ASLR is for, and that iOS's own
 protection of the app is not involved. The switch is
 `UserPreferences.shouldEnableJITCache` (`/proc/ish/defaults/enable_jit_cache`),
 which calls `jit_xcache_set_enabled` (jit/jit.c): on sets
-`/proc/sys/kernel/randomize_va_space` to 0 and starts caching, off puts
-randomize_va_space back -- unless something else has set it meanwhile -- and
-frees the cache. `/proc/ish/jit_cache` is the same switch from inside the
+`/proc/sys/kernel/randomize_va_space` to 0, holds it there -- the file
+refuses any other value with EPERM while the cache is on, so a
+distribution's own `sysctl kernel.randomize_va_space=2` at boot cannot undo
+the setting unnoticed -- and starts caching; off puts randomize_va_space
+back, makes it writable again, and frees the cache. `/proc/ish/jit_cache` is the same switch from inside the
 guest, with the cache's counters. Programs already running keep the layout
 they were given.
 
@@ -234,12 +236,11 @@ they were given.
   2 and empty.
 - **Proved:** tests/manual/jit_cache_switch.c -- the layout moves with it
   off and does not with it on, the same program again is served from the
-  cache (arm64), off restores what was there and leaves alone a
-  randomize_va_space set meanwhile. All five roots. Both arm64 roots also ran
+  cache (arm64), randomize_va_space takes no other value while it is on and
+  does again after, and off restores what was there. All five roots. Both arm64 roots also ran
   the whole suite with the cache on and ASLR off (see the commit).
 - **Still open, as before:** it is the arm64 guest only; it has a bound (96 MB)
-  and no eviction; a distribution's own `sysctl kernel.randomize_va_space=2`
-  at boot quietly makes it useless; a run-time change of what the translator
+  and no eviction; a run-time change of what the translator
   emits does not flush it. One base per file per boot (the first way) would
   give most of the gain with most of ASLR, and is what to do if the setting
   proves popular.

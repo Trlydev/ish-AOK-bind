@@ -375,8 +375,8 @@ struct jit_xcache_stats {
     unsigned long long bytes;
 };
 void jit_xcache_get(struct jit_xcache_stats *stats);
-// Turn the cache on or off. On also sets randomize_va_space to 0; off puts it
-// back and frees the cache. See jit.c.
+// Turn the cache on or off. On also sets randomize_va_space to 0 and holds it
+// there; off puts it back and frees the cache. See jit.c.
 void jit_xcache_set_enabled(bool on);
 
 // Block translation time, per guest architecture (i386, amd64, arm64, riscv64):

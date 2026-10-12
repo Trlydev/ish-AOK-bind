@@ -1520,9 +1520,9 @@ static int proc_ish_update_hle(struct proc_entry *UNUSED(e), struct proc_data *d
 // /proc/ish/jit_cache: the cache of translated code that outlives the process
 // that made it (jit.c's exec cache; the app's "Cache Translated Code"
 // setting). Read: "1" or "0", then what it has done. Write 1 or 0 to turn it
-// on or off -- on also sets /proc/sys/kernel/randomize_va_space to 0, because
-// a cached block is found by its address; off puts that back and empties the
-// cache. arm64 guests only.
+// on or off -- on also sets /proc/sys/kernel/randomize_va_space to 0 and
+// makes it refuse any other value, because a cached block is found by its
+// address; off puts that back and empties the cache. arm64 guests only.
 static int proc_ish_show_jit_cache(struct proc_entry *UNUSED(e), struct proc_data *buf) {
     struct jit_xcache_stats xc;
     jit_xcache_get(&xc);

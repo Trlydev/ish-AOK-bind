@@ -729,7 +729,10 @@ static int sys_show_kernel_randomize_va_space(struct proc_entry *UNUSED(entry), 
     return 0;
 }
 
-// Root only, 0 to 2, as on Linux; it applies from the next exec.
+// Root only, 0 to 2, as on Linux; it applies from the next exec. Read-only
+// in effect while the cache of translated code is on (kernel/personality.h):
+// a write of the value already in force succeeds, any other is EPERM, which
+// sysctl(8) reports and systemd-sysctl passes over.
 static int sys_update_kernel_randomize_va_space(struct proc_entry *UNUSED(entry), struct proc_data *data) {
     if (!superuser())
         return _EPERM;
@@ -737,6 +740,8 @@ static int sys_update_kernel_randomize_va_space(struct proc_entry *UNUSED(entry)
     int err = proc_sys_scalar_parse(data, 0, 2, &value);
     if (err < 0)
         return err;
+    if (aslr_randomize_va_space_locked())
+        return (int) value == aslr_randomize_va_space() ? 0 : _EPERM;
     aslr_set_randomize_va_space((int) value);
     return 0;
 }

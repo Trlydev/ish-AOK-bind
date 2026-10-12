@@ -10,10 +10,13 @@
 //     running the same program again is served from the cache;
 //   - off: randomize_va_space is what it was, the layout moves again, and
 //     the cache is empty;
-//   - off does not undo a randomize_va_space somebody else set meanwhile.
+//   - while it is on randomize_va_space cannot be set to anything else -- a
+//     distribution's own `sysctl kernel.randomize_va_space=2` at boot would
+//     otherwise undo the setting without a word -- and can be again after.
 //
 // Needs root (it writes under /proc); skips on a kernel without the file.
 #define _GNU_SOURCE
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,9 +47,16 @@ static int write_file(const char *path, const char *value) {
     int fd = open(path, O_WRONLY);
     if (fd < 0)
         return -1;
+    // (A refusal may come from the write or, where the file is handed over
+    // whole on close, from the close; errno is the refusal's either way.)
     ssize_t n = write(fd, value, strlen(value));
-    close(fd);
-    return n == (ssize_t) strlen(value) ? 0 : -1;
+    int write_errno = errno;
+    int closed = close(fd);
+    if (n != (ssize_t) strlen(value)) {
+        errno = write_errno;
+        return -1;
+    }
+    return closed;
 }
 static int aslr(void) {
     char buf[16];
@@ -154,14 +164,21 @@ int main(int argc, char **argv) {
     if (aslr_off == 2)
         CHECK(same_layouts(self, 6) < 5, "after off the layout does not move");
 
-    // Somebody else's setting made while the cache was on is theirs.
+    // While it is on, randomize_va_space is read-only in effect: the value in
+    // force may be written again, no other; and it is writable once it is off.
     write_file(CACHE, "1");
-    CHECK(write_file(ASLR, "1") == 0, "writing randomize_va_space failed");
+    errno = 0;
+    CHECK(write_file(ASLR, "2") != 0 && errno == EPERM, "writing randomize_va_space 2 with the cache on: errno %d", errno);
+    CHECK(write_file(ASLR, "1") != 0, "writing randomize_va_space 1 with the cache on was accepted");
+    CHECK(aslr() == 0, "with the cache on randomize_va_space was moved to %d", aslr());
+    CHECK(write_file(ASLR, "0") == 0, "writing the value in force was refused");
+    CHECK(same_layouts(self, 4) == 3, "after the refused writes the layout moves");
     write_file(CACHE, "0");
-    CHECK(aslr() == 1, "off undid a randomize_va_space set meanwhile: reads %d", aslr());
+    CHECK(aslr() == aslr_off, "after off randomize_va_space reads %d, was %d", aslr(), aslr_off);
+    CHECK(write_file(ASLR, "1") == 0 && aslr() == 1, "with the cache off randomize_va_space cannot be set");
     char back[4];
     snprintf(back, sizeof(back), "%d", aslr_off);
-    write_file(ASLR, back);
+    CHECK(write_file(ASLR, back) == 0, "putting randomize_va_space back failed");
 
     // Not 0 or 1 is refused.
     CHECK(write_file(CACHE, "2") != 0, "writing 2 was accepted");
