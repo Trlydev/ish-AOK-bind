@@ -618,9 +618,17 @@ The display half is now carried to the plug-in's QEMU 11, on a third branch
   OpenGL.
 
 Checked in the iOS simulator inside UTM SE, with the arguments UTM passes by
-default: virglrenderer comes up on ANGLE's Metal renderer and a Linux
-guest's virtio-gpu console is drawn through it. That build is the one on
-both iPads now, with a fourth machine (`AOK RISC-V Display GL`).
+default: virglrenderer comes up on ANGLE's Metal renderer, the guest's
+kernel reports `+virgl` with two capability sets, and its virtio-gpu console
+is drawn through the GL path. That build is the one on both iPads now, with
+a fourth machine (`AOK RISC-V Display GL`).
+
+**Not shown: a guest program rendering on the host's GPU.** The test guest
+cannot do it whatever QEMU does. Alpine's RISC-V Mesa (26.1.6) is built
+without the virgl driver: its loader says `virtio_gpu: driver missing` and
+falls back to llvmpipe, so `bench/gltest.sh` there draws its cube in
+software (and reports exactly that). The check needs a guest whose Mesa has
+virgl, which means another distribution's RISC-V image.
 
 Not done: the fork's work in `virtio-gpu-virgl.c` (its in-process render
 server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
