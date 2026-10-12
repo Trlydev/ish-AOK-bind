@@ -24,6 +24,7 @@ cat > /etc/motd <<'M'
    Devuan GNU/Linux 6 (excalibur), riscv64, for the AOK QEMU engine
    ------------------------------------------------------------
    desktop  :  desktop                  (Wayland: labwc, foot, waybar)
+               desktop soft             (the same, drawn without the GPU)
    display  :  gltest                   which GL renderer programs get
    re-setup :  sudo sh /AOK/tools/provision-ultimate-devuan.sh
                (timezone, login, hostname: it asks)

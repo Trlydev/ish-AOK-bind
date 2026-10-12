@@ -154,8 +154,8 @@ COMPOSITOR_CMD="${WAYLAND_COMPOSITOR_CMD:-$COMPOSITOR_BIN}"
 # takes the card and the input devices through its seat (seatd, which
 # setup-wayland.sh installs on such a machine), nothing is headless, and no
 # VNC bridge runs. Everything else is as under iSH-AOK: the same seeded
-# configuration, menu, theme and panel, and software compositing unless
-# WLR_RENDERER says otherwise (AOK_WL_OWN_RENDERER below has why). AOK_WAYLAND_BACKEND=headless or
+# configuration, menu, theme and panel. Who composites depends on the card
+# (aok_wl_virtio_gpu below). AOK_WAYLAND_BACKEND=headless or
 # =display overrides the choice.
 AOK_WL_DISPLAY=0
 case "${AOK_WAYLAND_BACKEND:-}" in
@@ -535,18 +535,39 @@ WL_GPU_COMPOSITOR=0
 if [ "$AOK_WL_DISPLAY" = 0 ] && [ -z "${WLR_RENDERER:-}" ] && [ "${ISH_DISPLAY_GPU:-1}" != 0 ] && wl_gpu_usable_for "$COMPOSITOR_BIN"; then
     WL_GPU_COMPOSITOR=1
 fi
-# A machine's own display is composited in software too, unless the caller
-# names another renderer (WLR_RENDERER=gles2), which then is the caller's
-# whole choice: its programs get the card as well. The one such machine there
-# is, the UTM virtual machine on its GL display device, shows nothing but the
-# cursor of a desktop composited with GLES2: the compositor draws every frame
-# (its own screenshot has them) and none reaches the screen, with atomic
-# modesetting or without, on a still desktop or a busy one. Nothing drawn
-# with GL does there: kmscube stays black too, on a GBM surface or an FBO
-# (simulator and an M4 iPad, 2026-10-12; docs/TODO.md has the entry). pixman
-# draws into dumb buffers, the path the text console uses, and is seen.
+# A machine's own display: who composites?
+#   - a virtio-gpu that has negotiated virgl (a virtual machine on a GL
+#     display device): the host's GPU, with GLES2. Under an emulated CPU that
+#     is the difference between a desktop and a slide show, and its programs
+#     get GL as well.
+#   - a virtio-gpu without it: pixman. wlroots would pick GLES2 on llvmpipe
+#     there, which is software twice over.
+#   - any other card: wlroots' own choice, as on any machine.
+# WLR_RENDERER from the caller wins over all three (`desktop soft` sets
+# pixman). Whatever is not pixman is "own renderer" below, and the settings
+# that go with a compositor unable to take GL buffers are left out for it.
+#
+# 2026-10-12: on the UTM build's GL device nothing drawn with GL reached the
+# screen -- a black desktop with a cursor that moved, the compositor's own
+# screenshot notwithstanding -- because its QEMU passed the scanout's Metal
+# texture on as the wrong type (qemu-aok 524b5e9 fixed it). A screen like that
+# on an older build of the app is this; `desktop soft` works there.
+aok_wl_virtio_gpu() {    # 3d: with virgl; 2d: without; fails when there is none
+    for _vg in /sys/bus/virtio/devices/virtio*; do
+        [ "$(cat "$_vg/device" 2>/dev/null)" = 0x0010 ] || continue
+        case "$(cat "$_vg/features" 2>/dev/null)" in 1*) echo 3d ;; *) echo 2d ;; esac
+        return 0
+    done
+    return 1
+}
+if [ "$AOK_WL_DISPLAY" = 1 ] && [ -z "${WLR_RENDERER:-}" ]; then
+    case "$(aok_wl_virtio_gpu)" in
+        3d) export WLR_RENDERER=gles2 ;;
+        2d) export WLR_RENDERER=pixman ;;
+    esac
+fi
 AOK_WL_OWN_RENDERER=0
-if [ "$AOK_WL_DISPLAY" = 1 ] && [ -n "${WLR_RENDERER:-}" ] && [ "$WLR_RENDERER" != pixman ]; then
+if [ "$AOK_WL_DISPLAY" = 1 ] && [ "${WLR_RENDERER:-}" != pixman ]; then
     AOK_WL_OWN_RENDERER=1
 fi
 # Two things Wayfire cannot do, where the session is the plain labwc desktop
@@ -1925,7 +1946,7 @@ start_compositor() {
         WL_GPU_COMPOSITOR=0
     fi
     if [ "$AOK_WL_DISPLAY" = 1 ]; then
-        log "starting $COMPOSITOR_CMD (on this machine's display, renderer: $WLR_RENDERER)"
+        log "starting $COMPOSITOR_CMD (on this machine's display, renderer: ${WLR_RENDERER:-chosen by the compositor})"
     else
         log "starting $COMPOSITOR_CMD (headless)"
     fi

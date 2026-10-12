@@ -47,7 +47,12 @@ install_tools() {
         cp -r "$here"/tools/* /mnt/AOK/tools/
         chmod -R u+rwX,go+rX /mnt/AOK/tools
         # `desktop`: the Wayland desktop on this machine's display, once setup-wayland.sh has run.
-        printf '#!/bin/sh\nexec sh /AOK/tools/start-wayland.sh "$@"\n' > /mnt/usr/local/bin/desktop
+        # `desktop soft`: composited without the GPU, for a display whose GL path does not show.
+        cat > /mnt/usr/local/bin/desktop <<'D'
+#!/bin/sh
+[ "$1" = soft ] && { shift; export WLR_RENDERER=pixman; }
+exec sh /AOK/tools/start-wayland.sh "$@"
+D
         chmod 755 /mnt/usr/local/bin/desktop
     fi
     cat > /mnt/etc/rc.local <<'R'
