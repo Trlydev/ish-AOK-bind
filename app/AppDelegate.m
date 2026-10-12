@@ -2975,6 +2975,20 @@ static void PopCurrentTask(struct task *previousCurrent) {
     }
 }
 
+// "Keep Screen Turned On". It was applied once, at launch, and that is not
+// enough: the system's idea of the idle timer and the app's can part company
+// while the app is inactive (reported 2026-10-12: the setting on, the screen
+// locking after two minutes), and an assignment of the value the property
+// already holds is then a no-op. So it is put again every time a scene
+// becomes active, and through NO first so the YES is a change.
+void ISHApplyIdleTimerPreference(void) {
+    UIApplication *app = UIApplication.sharedApplication;
+    BOOL keepOn = UserPreferences.shared.shouldDisableDimming;
+    if (keepOn)
+        app.idleTimerDisabled = NO;
+    app.idleTimerDisabled = keepOn;
+}
+
 @implementation AppDelegate
 
 + (BOOL)pushUsableInitTaskAsCurrent:(struct task **)previousCurrent {
@@ -5438,7 +5452,7 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
     [UserPreferences.shared observe:@[@"shouldDisableDimming"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIApplication.sharedApplication.idleTimerDisabled = UserPreferences.shared.shouldDisableDimming;
+            ISHApplyIdleTimerPreference();
         });
     }];
     

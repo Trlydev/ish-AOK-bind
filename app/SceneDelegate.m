@@ -609,6 +609,8 @@ BOOL ISHApplyShortcutActivityToConnectedScene(NSUserActivity *activity) {
 }
 
 - (void)sceneDidBecomeActive:(UIScene *)scene {
+    extern void ISHApplyIdleTimerPreference(void);
+    ISHApplyIdleTimerPreference();
     [ISHDiagnosticsStore recordLaunchStage:@"scene.didBecomeActive"
                                    details:@{@"session": scene.session.persistentIdentifier ?: @""}];
     [ISHDiagnosticsStore recordBreadcrumb:@"scene.didBecomeActive"
