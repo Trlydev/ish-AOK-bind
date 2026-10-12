@@ -25,6 +25,13 @@ void jitprof_note_bytes(struct jitprof_block *block, const uint8_t *bytes, unsig
 // arm64: what one translation step put in the stream -- its first gadget, how
 // many words, and how many guest instructions it consumed.
 void jitprof_note_step(struct jitprof_block *block, uint64_t gadget, unsigned words, unsigned insns);
+// The step just noted was fused onto the one before it by the pair pass
+// (jit/gen.c's jit_pair_fuse): how = 1, or 2 or 3 when the pair hands the
+// first's result to the second's first or second operand in a register. It
+// goes into the step's instruction count as hundreds, so a "...g" line still
+// names the gadgets as translated and also says what became of them
+// (tools/jitprof-gadget-pairs.py --fused).
+void jitprof_note_fused(struct jitprof_block *block, unsigned how);
 // Write the file (main.c's cli_halt); no-op unless ISH_JIT_PROFILE.
 void jitprof_dump(void);
 

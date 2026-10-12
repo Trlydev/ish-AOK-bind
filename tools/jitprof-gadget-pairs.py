@@ -7,8 +7,35 @@ import sys, collections, re
 # for jit/guest-arm64/pairs.h -- every adjacent pair of gadgets that header
 # gives a family to, whose mean share of the gadgets run is at least SHARE
 # percent (default 0.01).
+#
+# --fused: what the pair pass did with them, from the marks it leaves in a
+# step's count (jit/jitprof.h's jitprof_note_fused): per profile, the share of
+# the gadgets run that were fused onto the one before, how many of those
+# pairs hand the result over in a register, and the commonest pairs with n
+# or m where the first or second operand was forwarded. A list that fuses
+# more need not forward more, and on a fast host the second is worth as much
+# (docs/build_559_musts.md, the riscv64 list of seven workloads).
 fuse = None; fuse_min = 0.01
 argv = sys.argv[1:]
+if argv and argv[0] == '--fused':
+    for path in argv[1:]:
+        tot = 0; fp = collections.Counter(); kinds = collections.Counter()
+        for line in open(path):
+            p = line.split()
+            if len(p) < 4 or p[0] not in ('arm64g', 'riscv64g'): continue
+            n = int(p[1]); prev = None
+            for t in p[3:]:
+                name, w, c = t.rsplit('/', 2); k = int(c) // 100
+                tot += n
+                if k:
+                    fp[(prev, name, k)] += n; kinds[k] += n
+                prev = name
+        f = max(sum(kinds.values()), 1)
+        print('%s: %.1f%% of the gadgets run were fused onto the one before; %.0f%% of those pairs forward (first operand %.0f%%, second %.0f%%)' % (
+            path.split('/')[-1], 100.0 * f / max(tot, 1), 100.0 * (kinds[2] + kinds[3]) / f, 100.0 * kinds[2] / f, 100.0 * kinds[3] / f))
+        for (a, b, k), v in fp.most_common(40):
+            print('  %-20s %-20s %s %5.2f' % (a, b, '--nm'[k], 100.0 * v / tot))
+    sys.exit(0)
 if argv and argv[0] == '--fuse':
     fuse = set(re.findall(r'^#define F_(\w+) ', open(argv[1]).read(), re.M)); argv = argv[2:]
 if argv and argv[0] == '--min':
@@ -24,7 +51,7 @@ for path in argv:
         steps = []
         for t in p[3:]:
             name, w, n = t.rsplit('/', 2)
-            steps.append((name, int(w), int(n)))
+            steps.append((name, int(w), int(n) % 100))
             if name not in minw or int(w) < minw[name]: minw[name] = int(w)
         blocks.append((int(p[1]), steps))
     data.append((path.split('/')[-1].split('.')[0], blocks))

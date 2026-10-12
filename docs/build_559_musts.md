@@ -539,6 +539,15 @@ how a carry is collected) behind it.
   a fused pair and not. It passes with ospec, pair and fwd each off.
   Control: mapping the EON shift forms to the EOR ones fails it 5,066 times.
 
+**What is left of this on arm64, by simulation (2026-10-12).** The pair pass
+removes 34.2% of dispatches, mean of the ten workloads. Giving bodies to the
+gadget families that still have none -- compares with CSEL/CSET, writeback
+loads and stores, the SP-relative stores, MOVK, the generic add/sub
+immediate -- would make it 36.5%; with every gadget fusable, 39.6%. At what
+a point of dispatches has been worth on the M4 (0.27% of time), that is
+under 1% for all three families together. The pairs are done; what remains
+is longer sequences (TODO: triples and quads).
+
 **Tried the same day and NOT kept.**
 
 - *Checks only on backward links.* A chained transition looks at the poke
@@ -586,6 +595,29 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   7-Zip 3.4%, fib 3.6%, method 0.7%, dict 3.2%, str 1.1% faster. A10X,
   four rounds: 7-Zip 0.4%, fib 2.7%, method 7.2%, dict 4.3%, str 3.0%
   faster.
+- **The list from seven workloads, 2026-10-12: built, measured, NOT
+  committed -- it waits for the A10X.** The same look the arm64 guest had,
+  with digests and Python big numbers: this guest has no generic gadgets to
+  find (its hot ones in a digest are xor, addw, add, srlw, sllw: one
+  instruction each already), only pairs its three-workload list lacked. A
+  list from Python, gcc, gzip/bzip2, 7-Zip, digests, a shell script and
+  awk/sort at 0.015% is 535 pairs and removes, by simulation, 7-Zip 31.3 ->
+  39.1% of dispatches, digests 32.4 -> 47.0, shell 31.6 -> 39.7, awk 29.5 ->
+  36.2, the first three within a point. M4, builds alternated: 7-Zip 0.7%
+  faster, Python within 1.3% either way (five rounds); busybox digests over
+  48 MB, six rounds in two runs: md5sum 4-11% less time, sha512sum 5% MORE,
+  sha1sum 3% more, sha256sum and cksum unchanged. The same list assembled in
+  reverse order gave the same sha512sum and sha1sum, so it is the pairs and
+  not where they landed. On the Mac the same binaries are equal or faster on
+  every digest. What the profile says (`jitprof-gadget-pairs.py --fused`,
+  new the same day): in sha1sum the new list fuses 40.2% of gadgets where
+  the old fused 25.8%, and forwards exactly as many results (16.5% of
+  gadgets either way) -- but not the same ones. Fourteen points of
+  dispatches bought nothing on the M4, and which results are forwarded
+  moved the time by 3-5%: on that host a result handed over in a register
+  is worth at least what a dispatch is, and on a dependent chain more. The
+  A10X has always got more from a dispatch than from a forward (pairs 6-9%,
+  forwarding 0.4-1%), so it may well want this list; it was charging.
 - **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
   this guest, with the same control (a fused load's fault path naming the
   wrong instruction fails it); the standalone ALU gadgets are byte for byte

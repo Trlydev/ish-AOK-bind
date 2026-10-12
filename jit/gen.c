@@ -20361,6 +20361,7 @@ static void jit_pair_fuse(struct gen_state *state, unsigned from, const struct j
             // the pair that hands it over in a host register does the same
             // thing without the trip through memory.
             void (*fused)(void) = p->fused;
+            unsigned how = 1;
             for (unsigned k = 0; forward && k < 2 && p->fused_fw[k] != NULL; k++) {
                 unsigned long word = code[from + 1 + p->op[k].index], slot = ~0ul;
                 switch (p->op[k].kind) {
@@ -20374,9 +20375,12 @@ static void jit_pair_fuse(struct gen_state *state, unsigned from, const struct j
                 }
                 if (slot == code[prev + 1]) {
                     fused = p->fused_fw[k];
+                    how = 2 + k;
                     break;
                 }
             }
+            if (unlikely(state->jitprof != NULL))
+                jitprof_note_fused(state->jitprof, how);
             code[prev] = (unsigned long) fused;
             memmove(&code[from], &code[from + 1], (state->size - from - 1) * sizeof(code[0]));
             state->size--;

@@ -187,3 +187,8 @@ void jitprof_note_step(struct jitprof_block *block, uint64_t gadget, unsigned wo
     block->steps[block->ns++] = words;
     block->steps[block->ns++] = insns;
 }
+
+void jitprof_note_fused(struct jitprof_block *block, unsigned how) {
+    if (block != NULL && block->ns >= 3)
+        block->steps[block->ns - 1] += 100 * how;
+}
