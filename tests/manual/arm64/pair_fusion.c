@@ -72,6 +72,21 @@ VCASE(v_alu_tbz,     "add x26, x17, #4\n tbz x26, #2, 1f\n mov x3, #111\n b 2f\n
 VCASE(v_alu_cmp_b,   "add x26, x17, #1\n cmp x26, x17\n b.hi 1f\n mov x3, #111\n b 2f\n 1: mov x3, #222\n 2:")
 VCASE(v_ld_cmpi_b,   "ldr w26, [x5]\n cmp w26, #0x10\n b.eq 1f\n mov x3, #111\n b 2f\n 1: mov x3, #222\n 2:")
 VCASE(v_alu_b,       "add x26, x17, #3\n b 1f\n mov x26, #0\n 1: add x3, x26, #1")
+// the second half's SECOND operand is the first half's result, and the other
+// places a result can go: a store's base, a load's index, a compare's right
+// side, a 32-bit move, an indirect branch
+VCASE(v_alu_alu_m,   "add x26, x17, #5\n sub x3, x17, x26")
+VCASE(v_ld_alu_m,    "ldr x26, [x5]\n sub x3, x17, x26")
+VCASE(v_alu_st_base, "add x26, x5, #8\n str x17, [x26, #8]")
+VCASE(v_ld_st_base,  "ldr x26, [x5, #24]\n str x17, [x26]")
+VCASE(v_ld_ldx_idx,  "ldr x26, [x5, #16]\n ldr x3, [x5, x26, lsl #3]")
+VCASE(v_alu_cmp_m,   "add x26, x17, #1\n cmp x17, x26\n b.lo 1f\n mov x3, #111\n b 2f\n 1: mov x3, #222\n 2:")
+VCASE(v_alu_movw,    "add x26, x17, #1\n mov w3, w26")
+VCASE(v_ld_movx,     "ldr x26, [x5, #8]\n mov x3, x26")
+VCASE(v_alu_lsl,     "add x26, x17, #1\n lsl x3, x26, #4")
+VCASE(v_alu_addlsl,  "add x26, x17, #1\n add x3, x17, x26, lsl #2")
+VCASE(v_ld_stp_base, "ldr x26, [x5, #24]\n stp x17, x17, [x26]")
+VCASE(v_ld_br,       "adr x9, 1f\n str x9, [x5, #16]\n nop\n ldr x26, [x5, #16]\n br x26\n mov x3, #111\n 1: add x3, x3, #7")
 VCASE(v_subs_bcond,  "subs x26, x17, x17\n nop\n add x3, x26, #5\n b.eq 1f\n mov x3, #111\n 1:")
 
 // A call and its return: `mov; bl` going in, `ldp post; ret` coming back.
@@ -115,6 +130,13 @@ static const struct { const char *name; void (*fn)(struct st *); struct st in, o
     {"ld;cmpi+b", v_ld_cmpi_b, {0, 0, 0, M}, {0, 0x10, 222, M}},
     {"alu;b",     v_alu_b,     {1, 0, 0, M}, {1, 4, 5, M}},
     {"subs;b.eq", v_subs_bcond, {3, 1, 0, M}, {3, 0, 5, M}},
+    {"alu;alu m", v_alu_alu_m, {100, 0, 0, M}, {100, 105, (uint64_t) -5, M}},
+    {"ld;alu m",  v_ld_alu_m,  {100, 0, 0, M}, {100, 0x10, 0x54, M}},
+    {"alu;cmp m", v_alu_cmp_m, {9, 0, 0, M}, {9, 10, 222, M}},
+    {"alu;mov w", v_alu_movw,  {0xfffffffff, 0, 0, M}, {0xfffffffff, 0x1000000000, 0, M}},
+    {"ld;mov x",  v_ld_movx,   {0, 0, 0, M}, {0, 0x20, 0x20, M}},
+    {"alu;lsl",   v_alu_lsl,   {0xf, 0, 0, M}, {0xf, 0x10, 0x100, M}},
+    {"alu;add lsl", v_alu_addlsl, {3, 0, 0, M}, {3, 4, 19, M}},
 #undef M
 };
 
@@ -139,6 +161,41 @@ static int values(void) {
                 failures++;
                 break;
             }
+        }
+    }
+    {   // results that are addresses: a store through the first half's result
+        struct st s = {0x77, 0, 0, {0x10, 0x20, 0, 0}};
+        v_alu_st_base(&s);
+        if (s.b != (uint64_t) &s.mem[1] || s.mem[2] != 0x77 || s.mem[1] != 0x20) {
+            printf("pair_fusion: alu;st base: b=%#llx mem=%#llx,%#llx\n", (unsigned long long) s.b,
+                   (unsigned long long) s.mem[1], (unsigned long long) s.mem[2]);
+            failures++;
+        }
+        struct st t = {0x55, 0, 0, {0x10, 0x20, 0, 0}};
+        t.mem[3] = (uint64_t) &t.mem[1];
+        v_ld_st_base(&t);
+        if (t.b != (uint64_t) &t.mem[1] || t.mem[1] != 0x55) {
+            printf("pair_fusion: ld;st base: b=%#llx mem1=%#llx\n", (unsigned long long) t.b, (unsigned long long) t.mem[1]);
+            failures++;
+        }
+        struct st u = {0x66, 0, 0, {0x10, 0x20, 0, 0}};
+        u.mem[3] = (uint64_t) &u.mem[0];
+        v_ld_stp_base(&u);
+        if (u.mem[0] != 0x66 || u.mem[1] != 0x66) {
+            printf("pair_fusion: ld;stp base: mem=%#llx,%#llx\n", (unsigned long long) u.mem[0], (unsigned long long) u.mem[1]);
+            failures++;
+        }
+        struct st v = {0, 0, 0, {0x10, 0x20, 1, 0}};      // index 1 -> mem[1]
+        v_ld_ldx_idx(&v);
+        if (v.b != 1 || v.c != 0x20) {
+            printf("pair_fusion: ld;ldr index: b=%#llx c=%#llx\n", (unsigned long long) v.b, (unsigned long long) v.c);
+            failures++;
+        }
+        struct st w = {0, 0, 100, {0x10, 0x20, 0, 0}};    // an indirect branch through a loaded pointer
+        v_ld_br(&w);
+        if (w.c != 107 || w.b != w.mem[2]) {
+            printf("pair_fusion: ld;br: c=%llu\n", (unsigned long long) w.c);
+            failures++;
         }
     }
     {   // the dependent load: mem[3] holds a pointer to mem[1]

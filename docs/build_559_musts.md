@@ -405,6 +405,32 @@ starts, so faults and signals see what they always saw.
   replaces them while displaced. The i386 and amd64 miss helpers go to C for
   it (docs/TODO.md).
 
+**Forwarding inside a pair, 2026-10-12 (arm64 guest).** A guest instruction
+that uses what the one before it produced is the common case, and through
+the register file each such step waits out a store and a load of the same
+slot -- the reason a dependent guest `add` cost 2.5 times an independent one
+on the M4 once the dispatch was fast. In a pair the first half's result is
+still in a host register when the second half starts (x12 for the ALU,
+bitfield, move and constant bodies, x17 for the loads). So where the second
+half has operands it could take from one, the pair exists again with its
+first operand (f2n_) or its second (f2m_) taken from that register, and the
+translator picks that gadget when the operand's slot IS the first half's
+destination (the `fwd` bit of /proc/ish/arm64_jit_fuse). Operands covered:
+both sources of the ALU forms, a load's base and index, a store's value and
+base, a pair's base, what cbz/tbz test, both sides of a compare-and-branch,
+the target of br/blr/ret. The first half still stores: the register file is
+always current, and faults see what they did. 826 gadgets from the 405
+pairs, 207 KB.
+
+- **Numbers.** M4, arm64 Alpine, one build, forwarding off and on, five
+  rounds: 7-Zip 3.8% faster, Python fib 5.0%, method 4.3%, dict 3.3%, str
+  5.2% faster.
+- **Proved:** tests/manual/arm64/pair_fusion.c grew cases for the second
+  operand, a store's base, a load's index, a compare's right side, the
+  32-bit move and an indirect branch through a loaded pointer; it passes with
+  `fwd=0` and `fwd=1`. Handing the second-operand gadgets a wrong register
+  does not fail the test: the guest does not reach a shell.
+
 **The riscv64 guest, the same evening: the three arm64 steps in one.** Its
 gadgets had the dispatch change and the memory probe, and not the rest. Now:
 

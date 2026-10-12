@@ -153,22 +153,22 @@ arm64_chain_poked:
     str x8, [_cpu, #CPU_pc]
     b jit_ret
 
-.macro f_b_body id, last, a1, a2, a3, a4, a5
+.macro f_b_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
     ldr _ip, [_ip]
     branch_dispatch
 .endm
-.macro f_b_stub id, last, a1, a2, a3, a4, a5
+.macro f_b_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
 .endm
 f_gadget b, f_b, _, _, _, _, _
 
-.macro f_bl_body id, last, a1, a2, a3, a4, a5
+.macro f_bl_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
     ldr x9, [_ip, #8]
     add x10, _cpu, #CPU_x0
     str x9, [x10, #(30*8)]  // X30 = return address
     ldr _ip, [_ip]
     branch_dispatch
 .endm
-.macro f_bl_stub id, last, a1, a2, a3, a4, a5
+.macro f_bl_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
 .endm
 f_gadget bl, f_bl, _, _, _, _, _
 
@@ -673,7 +673,8 @@ hle_call_return:
     ldr x10, [_cpu, #CPU_pc]
     ret_cache_dispatch x10
 
-.macro f_br_cached_body id, last, a1, a2, a3, a4, a5
+.macro f_br_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
     ldr x8, [_ip]
     and x8, x8, #0x1f
     add x9, _cpu, #CPU_x0
@@ -682,13 +683,18 @@ hle_call_return:
     ldr x10, [x9, x8, lsl #3]
     b 2f
 1:  mov x10, #0
-2:  ret_cache_dispatch x10
+2:
+.else
+    mov x10, x\fn            // the target, from the pair's first half
+.endif
+    ret_cache_dispatch x10
 .endm
-.macro f_br_cached_stub id, last, a1, a2, a3, a4, a5
+.macro f_br_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
 .endm
 f_gadget br_cached, f_br_cached, _, _, _, _, _
 
-.macro f_blr_cached_body id, last, a1, a2, a3, a4, a5
+.macro f_blr_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
     ldr x8, [_ip]
     and x8, x8, #0x1f
     add x9, _cpu, #CPU_x0
@@ -697,11 +703,16 @@ f_gadget br_cached, f_br_cached, _, _, _, _, _
     ldr x10, [x9, x8, lsl #3]
     b 2f
 1:  mov x10, #0
-2:  ldr x11, [_ip, #8]      // return address
+2:
+.else
+    mov x10, x\fn
+    add x9, _cpu, #CPU_x0
+.endif
+    ldr x11, [_ip, #8]      // return address
     str x11, [x9, #(30*8)]  // X30 = return address, AFTER the target is read
     ret_cache_dispatch x10
 .endm
-.macro f_blr_cached_stub id, last, a1, a2, a3, a4, a5
+.macro f_blr_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
 .endm
 f_gadget blr_cached, f_blr_cached, _, _, _, _, _
 
@@ -803,27 +814,35 @@ not_taken_tbnz:
 // loops). Whichever path jumps inside the gadget costs ~1.3 ns more on the
 // A10X (measured on the riscv64 twins, jit/guest-riscv64/alu.S branch_tail).
 // No host flags are touched: bcond_nf relies on NZCV surviving other gadgets.
-.macro f_cb_body id, last, reg, jmp, a3, a4, a5
+.macro f_cb_body id, last, reg, jmp, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
     ldr x9, [_ip]
     ldr x9, [_cpu, x9]
+.else
+    mov x9, x\fn
+.endif
     \jmp \reg, 1f
     ldr _ip, [_ip, #16]      // fallthrough
     branch_dispatch
 1:  ldr _ip, [_ip, #8]       // taken
     branch_dispatch
 .endm
-.macro f_cb_stub id, last, reg, jmp, a3, a4, a5
+.macro f_cb_stub id, last, reg, jmp, a3, a4, a5, fn=_, fm=_
 .endm
-.macro f_cb_bk_body id, last, reg, jmp_bk, a3, a4, a5
+.macro f_cb_bk_body id, last, reg, jmp_bk, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
     ldr x9, [_ip]
     ldr x9, [_cpu, x9]
+.else
+    mov x9, x\fn
+.endif
     \jmp_bk \reg, 1f
     ldr _ip, [_ip, #8]       // taken
     branch_dispatch
 1:  ldr _ip, [_ip, #16]      // fallthrough
     branch_dispatch
 .endm
-.macro f_cb_bk_stub id, last, reg, jmp_bk, a3, a4, a5
+.macro f_cb_bk_stub id, last, reg, jmp_bk, a3, a4, a5, fn=_, fm=_
 .endm
 .macro a64_cb name, reg, jmp, jmp_bk
     f_gadget \name, f_cb, \reg, \jmp, _, _, _
@@ -834,9 +853,9 @@ a64_cb cbz_w,  w9, cbz,  cbnz
 a64_cb cbnz_x, x9, cbnz, cbz
 a64_cb cbnz_w, w9, cbnz, cbz
 
-.macro f_tb_body id, last, jmp, a2, a3, a4, a5
+.macro f_tb_body id, last, jmp, a2, a3, a4, a5, fn=_, fm=_
     ldp x9, x10, [_ip]       // rt_off, mask
-    ldr x9, [_cpu, x9]
+    f_src 9, x9, \fn
     and x9, x9, x10
     \jmp x9, 1f
     ldr _ip, [_ip, #24]      // fallthrough
@@ -844,11 +863,11 @@ a64_cb cbnz_w, w9, cbnz, cbz
 1:  ldr _ip, [_ip, #16]      // taken
     branch_dispatch
 .endm
-.macro f_tb_stub id, last, jmp, a2, a3, a4, a5
+.macro f_tb_stub id, last, jmp, a2, a3, a4, a5, fn=_, fm=_
 .endm
-.macro f_tb_bk_body id, last, jmp_bk, a2, a3, a4, a5
+.macro f_tb_bk_body id, last, jmp_bk, a2, a3, a4, a5, fn=_, fm=_
     ldp x9, x10, [_ip]
-    ldr x9, [_cpu, x9]
+    f_src 9, x9, \fn
     and x9, x9, x10
     \jmp_bk x9, 1f
     ldr _ip, [_ip, #16]      // taken
@@ -856,7 +875,7 @@ a64_cb cbnz_w, w9, cbnz, cbz
 1:  ldr _ip, [_ip, #24]      // fallthrough
     branch_dispatch
 .endm
-.macro f_tb_bk_stub id, last, jmp_bk, a2, a3, a4, a5
+.macro f_tb_bk_stub id, last, jmp_bk, a2, a3, a4, a5, fn=_, fm=_
 .endm
 .macro a64_tb name, jmp, jmp_bk
     f_gadget \name, f_tb, \jmp, _, _, _, _
@@ -868,7 +887,7 @@ a64_tb tb_nz, cbnz, cbz
 // B.cond family — code stream: [gadget][taken_pc][fallthrough_pc]. One
 // gadget per condition code; gen_step_arm64 picks the right one at
 // compile time based on the decoded cond field.
-.macro f_bcond_body id, last, cc, a2, a3, a4, a5
+.macro f_bcond_body id, last, cc, a2, a3, a4, a5, fn=_, fm=_
     load_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
@@ -876,7 +895,7 @@ a64_tb tb_nz, cbnz, cbz
 1:  ldr _ip, [_ip]
     branch_dispatch
 .endm
-.macro f_bcond_stub id, last, cc, a2, a3, a4, a5
+.macro f_bcond_stub id, last, cc, a2, a3, a4, a5, fn=_, fm=_
 .endm
 .macro bcond_gadget name, cc
     f_gadget \name, f_bcond, \cc, _, _, _, _
@@ -892,14 +911,14 @@ a64_tb tb_nz, cbnz, cbz
 // only emits these when the immediately preceding instruction in the
 // SAME block set the flags via a fast gadget (state->arm64_flags_live);
 // everything else keeps the reloading bcond_* family above.
-.macro f_bcond_nf_body id, last, cc, a2, a3, a4, a5
+.macro f_bcond_nf_body id, last, cc, a2, a3, a4, a5, fn=_, fm=_
     b.\cc 1f
     ldr _ip, [_ip, #8]
     branch_dispatch
 1:  ldr _ip, [_ip]
     branch_dispatch
 .endm
-.macro f_bcond_nf_stub id, last, cc, a2, a3, a4, a5
+.macro f_bcond_nf_stub id, last, cc, a2, a3, a4, a5, fn=_, fm=_
 .endm
 .macro bcond_nf_gadget name, cc
     f_gadget \name, f_bcond_nf, \cc, _, _, _, _
@@ -954,12 +973,16 @@ bcond_gadget bcond_le, le
 //   fused_andsi: [gadget][rd | rn<<8][imm][taken][fallthrough]
 //   fused_andsr: [gadget][rd | rn<<8 | rm<<16][taken][fallthrough]
 
-.macro f_fused_cmpi_body id, last, cmpop, zr, r15, r11, cc
+.macro f_fused_cmpi_body id, last, cmpop, zr, r15, r11, cc, fn=_, fm=_
     ldr x10, [_ip]
     ldr x11, [_ip, #8]
     add _ip, _ip, #16
+.ifc \fn,_
     add x14, _cpu, #CPU_x0
     ldr x15, [x14, x10, lsl #3]
+.else
+    mov x15, x\fn
+.endif
     \cmpop \zr, \r15, \r11
     store_flags
     b.\cc 1f
@@ -968,20 +991,28 @@ bcond_gadget bcond_le, le
 1:  ldr _ip, [_ip]
     branch_dispatch
 .endm
-.macro f_fused_cmpi_stub id, last, cmpop, zr, r15, r11, cc
+.macro f_fused_cmpi_stub id, last, cmpop, zr, r15, r11, cc, fn=_, fm=_
 .endm
 .macro fused_cmpi name, cmpop, zr, r15, r11, cc
     f_gadget \name, f_fused_cmpi, \cmpop, \zr, \r15, \r11, \cc
 .endm
 
-.macro f_fused_cmpr_body id, last, cmpop, zr, r15, r13, cc
+.macro f_fused_cmpr_body id, last, cmpop, zr, r15, r13, cc, fn=_, fm=_
     ldr x8, [_ip]
     add _ip, _ip, #8
     and x10, x8, #0x1f
-    ubfx x12, x8, #8, #5
+    ubfx x16, x8, #8, #5      // (not x12: a pair's first half may have left its result there)
     add x14, _cpu, #CPU_x0
+.ifc \fm,_
+    ldr x13, [x14, x16, lsl #3]
+.else
+    mov x13, x\fm
+.endif
+.ifc \fn,_
     ldr x15, [x14, x10, lsl #3]
-    ldr x13, [x14, x12, lsl #3]
+.else
+    mov x15, x\fn
+.endif
     \cmpop \zr, \r15, \r13
     store_flags
     b.\cc 1f
@@ -990,7 +1021,7 @@ bcond_gadget bcond_le, le
 1:  ldr _ip, [_ip]
     branch_dispatch
 .endm
-.macro f_fused_cmpr_stub id, last, cmpop, zr, r15, r13, cc
+.macro f_fused_cmpr_stub id, last, cmpop, zr, r15, r13, cc, fn=_, fm=_
 .endm
 .macro fused_cmpr name, cmpop, zr, r15, r13, cc
     f_gadget \name, f_fused_cmpr, \cmpop, \zr, \r15, \r13, \cc
@@ -1173,6 +1204,6 @@ fused_table arm64_fused_andsr32_table, fused_andsr32
 // Here, at the end of the file that defines the branch bodies, because a
 // branch can be the second of a pair.
 .text
-#define FUSE2(a, b) fuse2 a##__##b, F_##a, F_##b
+#define FUSE2(a, b) fuse2 a##__##b, R_##a, K_##b, F_##a, F_##b
 #include "pairs.h"
 #undef FUSE2

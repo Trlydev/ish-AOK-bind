@@ -263,11 +263,14 @@ void jit_note_shared_write(struct jit *jit, const struct pt_entry *entry);
 // Two gadgets that follow each other in a block become one that does both and
 // dispatches once (jit/guest-arm64/frag.h, pairs.h; gen.c's arm64_pair_fuse).
 #define JIT_FUSE_A64_PAIR (1u << 8)
+// In such a pair, an operand of the second gadget that is the first one's
+// result comes over in a host register, not through its cpu_state slot.
+#define JIT_FUSE_A64_FWD (1u << 9)
 #define JIT_FUSE_A64_ALL (JIT_FUSE_A64_BCOND | JIT_FUSE_A64_LDST | \
                           JIT_FUSE_A64_LDCMP | JIT_FUSE_A64_RETCACHE | \
                           JIT_FUSE_A64_VSPEC | JIT_FUSE_A64_OSPEC | \
                           JIT_FUSE_A64_LSPEC | JIT_FUSE_A64_BTFN | \
-                          JIT_FUSE_A64_PAIR)
+                          JIT_FUSE_A64_PAIR | JIT_FUSE_A64_FWD)
 
 // riscv64 had NO switch at all for either of its fusions, so neither could be
 // A/B'd without rebuilding. ISH_RISCV64_NO_FUSE now clears both.

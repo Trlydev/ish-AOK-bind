@@ -26,13 +26,13 @@
 // UMOV Wd/Xd, Vn.T[i] (and its MOV and FMOV-to-general aliases): zero-
 // extending load of the element, stored as the whole 64-bit GPR.
 .macro vspec_to_gpr name, ld
-    f_gadget \name, f_umov, \ld, w11, _, _, _
+    f_gadget \name, f_umov, \ld, w12, _, _, _
 .endm
 vspec_to_gpr vspec_umov8, ldrb
 vspec_to_gpr vspec_umov16, ldrh
 vspec_to_gpr vspec_umov32, ldr
 
-f_gadget vspec_umov64, f_umov, ldr, x11, _, _, _
+f_gadget vspec_umov64, f_umov, ldr, x12, _, _, _
 
 // INS Vd.T[i], Wn/Xn: the element from the GPR slot's low bytes, the other
 // lanes kept. Also INS Vd.T[i], Vn.T[j] (element to element): the source is
