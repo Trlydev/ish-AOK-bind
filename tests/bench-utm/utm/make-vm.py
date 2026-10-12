@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""make-vm.py OUTDIR KERNEL INITRAMFS EFI_VARS -- three ready-made RISC-V virtual machines for UTM.
+"""make-vm.py OUTDIR KERNEL INITRAMFS EFI_VARS [DEVUAN_DIR] -- ready-made RISC-V virtual machines for UTM.
 
 A .utm bundle is a directory: config.plist (UTM's configuration format, version 4) and Data/ with the files it
 names. Copied into the app's Documents, UTM lists it like one made in its own wizard.
@@ -14,6 +14,11 @@ names. Copied into the app's Documents, UTM lists it like one made in its own wi
   "AOK RISC-V UEFI.utm"     What UTM's wizard makes for a RISC-V "virt" machine, with no disk: UEFI firmware,
                             a virtio-ramfb display, USB input, sound, network. It ends at the firmware's own
                             shell, having found nothing to boot. It is there to attach an installer to.
+
+  "Devuan RISC-V.utm"       With DEVUAN_DIR (what build-devuan-disk.sh leaves: devuan-riscv64.qcow2,
+                            vmlinuz, initrd.img): Devuan 6 on a disk of its own, booted with its own kernel,
+                            on the GL display device, four CPUs, 2 GB. root is logged in on the display and
+                            on the serial terminal; "gltest" there says which GL renderer a program gets.
 
 INITRAMFS is the VM image of update-roots.sh (initramfs-riscv64-vm.cpio): the race's userland plus the
 kernel's modules, without which the guest has no driver for a network card, a display or a USB keyboard.
@@ -91,8 +96,37 @@ def write(outdir, config, files):
     print(bundle)
 
 
+def devuan(outdir, d):
+    vm = base("Devuan RISC-V",
+              "Devuan 6 (Excalibur) riscv64 with its own kernel, on the GL display device. root is logged in "
+              "on the console; run gltest to see which GL renderer programs get.",
+              "A0C0A0C0-0000-4000-8000-000000000005", cpus=4, memory=2048)
+    # net.ifnames=0: the image's network configuration names eth0.
+    vm["QEMU"]["AdditionalArguments"] = [
+        '-append "root=/dev/vda rw console=ttyS0 console=tty0 net.ifnames=0 quiet"',
+    ]
+    vm["QEMU"]["RNGDevice"] = True
+    vm["Input"]["UsbBusSupport"] = "3.0"
+    vm["Display"] = [dict(display(), Hardware="virtio-ramfb-gl")]
+    vm["Network"] = [network("52:54:00:A0:C0:05")]
+    vm["Serial"] = [terminal()]
+    def ident(n):
+        return str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000D0 + n)).upper()
+    vm["Drive"] = [
+        {"ImageName": "vmlinuz", "ImageType": "LinuxKernel", "Interface": "None", "InterfaceVersion": 1,
+         "Identifier": ident(1), "ReadOnly": True},
+        {"ImageName": "initrd.img", "ImageType": "LinuxInitrd", "Interface": "None", "InterfaceVersion": 1,
+         "Identifier": ident(2), "ReadOnly": True},
+        {"ImageName": "devuan-riscv64.qcow2", "ImageType": "Disk", "Interface": "VirtIO",
+         "InterfaceVersion": 1, "Identifier": ident(3), "ReadOnly": False},
+    ]
+    write(outdir, vm, {n: os.path.join(d, n) for n in ("vmlinuz", "initrd.img", "devuan-riscv64.qcow2")})
+
+
 def main():
     outdir, kernel, initramfs, efi_vars = sys.argv[1:5]
+    if len(sys.argv) > 5:
+        devuan(outdir, sys.argv[5])
     os.makedirs(outdir, exist_ok=True)
 
     # Fixed UUIDs: copying a rebuilt bundle over an installed one keeps it the same machine to UTM.

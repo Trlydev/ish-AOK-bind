@@ -6,9 +6,12 @@ mount -t devtmpfs dev /dev
 exec </dev/console >/dev/console 2>&1
 mount -t proc proc /proc
 mount -t sysfs sys /sys
-B=none; THEN=poweroff; GLTEST=
+B=none; THEN=poweroff; GLTEST=; SCRIPT=
 for x in $(cat /proc/cmdline); do
-    case $x in bench=*) B=${x#bench=} ;; then=*) THEN=${x#then=} ;; gltest=*) GLTEST=${x#gltest=} ;; esac
+    case $x in
+    bench=*) B=${x#bench=} ;; then=*) THEN=${x#then=} ;; gltest=*) GLTEST=${x#gltest=} ;;
+    script=*) SCRIPT=${x#script=} ;;
+    esac
 done
 if [ -d "/lib/modules/$(uname -r)" ]; then
     # The image for a VM front end carries the kernel's modules (the race's does not). Load the drivers for
@@ -41,6 +44,11 @@ echo "BENCH-START $(uname -m) $(uname -r) $B"
 /bench/run1.sh $(echo "$B" | tr , ' ')
 echo BENCH-END
 [ -n "$GLTEST" ] && /bench/gltest.sh "$GLTEST"
+# script=vdb: a job for this machine, as a tar on that disk with run.sh in it (how the Devuan disk is built).
+if [ -n "$SCRIPT" ]; then
+    mkdir -p /tmp/script && tar -xf "/dev/$SCRIPT" -C /tmp/script && sh /tmp/script/run.sh
+    echo "SCRIPT-EXIT $?"
+fi
 if [ "$THEN" = shell ]; then
     echo "A shell. Workloads: /bench/run1.sh coremark|nbody|python|xz|sha256|awk. To stop the VM: poweroff -f"
     echo "Network: apk add works. Is the display accelerated: /bench/gltest.sh"

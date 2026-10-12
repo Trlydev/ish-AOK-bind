@@ -623,12 +623,33 @@ kernel reports `+virgl` with two capability sets, and its virtio-gpu console
 is drawn through the GL path. That build is the one on both iPads now, with
 a fourth machine (`AOK RISC-V Display GL`).
 
-**Not shown: a guest program rendering on the host's GPU.** The test guest
-cannot do it whatever QEMU does. Alpine's RISC-V Mesa (26.1.6) is built
-without the virgl driver: its loader says `virtio_gpu: driver missing` and
-falls back to llvmpipe, so `bench/gltest.sh` there draws its cube in
-software (and reports exactly that). The check needs a guest whose Mesa has
-virgl, which means another distribution's RISC-V image.
+**A guest program on the host's GPU needs a guest that can ask for it.**
+Alpine's RISC-V Mesa (26.1.6) is built without the virgl driver: its loader
+says `virtio_gpu: driver missing` and falls back to llvmpipe, so
+`bench/gltest.sh` there draws its cube in software (and reports exactly
+that), whatever QEMU does.
+
+### Devuan
+
+So the machine to judge by is Devuan 6 "Excalibur", whose RISC-V port is
+official and whose Mesa (25.0.7) has virgl. `utm/build-devuan-disk.sh` makes
+it: a 6 GB disk with Devuan's own kernel (6.12), sysvinit, network by DHCP
+and Mesa, built by running debootstrap natively inside the Alpine RISC-V
+guest on the build Mac's stock QEMU, with the packages fetched on the host
+over many connections (the mirrors gave one connection 85 kB/s).
+`utm/make-vm.py` wraps it as `Devuan RISC-V.utm`: direct kernel boot, the
+disk on virtio-blk, the GL display device, four CPUs.
+
+- Under the plug-in's QEMU on the Mac (gadgets on): Devuan's kernel boots,
+  mounts the disk, sysvinit brings the system up, root is logged in on the
+  serial port, and it shuts down cleanly.
+- In the iOS simulator inside UTM SE: the boot is on the display, the
+  network has its address, and `gltest` says **renderer: "virgl"**, OpenGL
+  ES 3.0, Mesa 25.0.7. A guest program is rendering on the host's GPU
+  through this QEMU. (Devuan's kmscube ran its frames and exited without an
+  error; no frame of it was captured.)
+
+On both iPads; not yet started there.
 
 Not done: the fork's work in `virtio-gpu-virgl.c` (its in-process render
 server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
@@ -662,3 +683,4 @@ and `build/tools/fakefsify`, plus Homebrew's `glib`, `pixman`, `meson` and
 | `utm/` | UTM SE with the plug-in (section 9): `build-qemu-utm.sh` and `install-qemu-utm.sh` build this QEMU against UTM's sysroot and put it there (`AOK_GL=1` for the build with the accelerated display), `build-utm.sh` builds and signs UTM, `make-vm.py` writes ready-made virtual machines, `install-utm.sh` puts both on a device |
 | `bench/init`, `bench/udhcpc.sh` | the guest's init; in the VM image (the race's plus the kernel's modules) it also loads drivers and takes an address |
 | `bench/gltest.sh` | in a guest: installs Mesa and runs kmscube, which names the renderer it was given |
+| `utm/build-devuan-disk.sh`, `utm/devuan-provision.sh`, `utm/fetch-debs.py` | the Devuan RISC-V disk: built natively in the Alpine guest (its `/init` runs a job from a tar disk with `script=vdb`), packages fetched in parallel on the host |
