@@ -2722,6 +2722,28 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
                 return 0;
             }
         }
+        // The inverted and the shifted forms without flags, slot-fed: BIC,
+        // ORN, EON; any of the six with LSL/LSR/ASR/ROR by a constant; MVN.
+        if (opc != 3 && rd != 31 && rm != 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            extern void gadget_arm64_ospec_bicr64(void), gadget_arm64_ospec_bicr32(void), gadget_arm64_ospec_ornr64(void), gadget_arm64_ospec_ornr32(void), gadget_arm64_ospec_eonr64(void), gadget_arm64_ospec_eonr32(void), gadget_arm64_ospec_and_lsl64(void), gadget_arm64_ospec_and_lsl32(void), gadget_arm64_ospec_and_lsr64(void), gadget_arm64_ospec_and_lsr32(void), gadget_arm64_ospec_and_asr64(void), gadget_arm64_ospec_and_asr32(void), gadget_arm64_ospec_and_ror64(void), gadget_arm64_ospec_and_ror32(void), gadget_arm64_ospec_orr_lsl64(void), gadget_arm64_ospec_orr_lsl32(void), gadget_arm64_ospec_orr_lsr64(void), gadget_arm64_ospec_orr_lsr32(void), gadget_arm64_ospec_orr_asr64(void), gadget_arm64_ospec_orr_asr32(void), gadget_arm64_ospec_orr_ror64(void), gadget_arm64_ospec_orr_ror32(void), gadget_arm64_ospec_eor_lsl64(void), gadget_arm64_ospec_eor_lsl32(void), gadget_arm64_ospec_eor_lsr64(void), gadget_arm64_ospec_eor_lsr32(void), gadget_arm64_ospec_eor_asr64(void), gadget_arm64_ospec_eor_asr32(void), gadget_arm64_ospec_eor_ror64(void), gadget_arm64_ospec_eor_ror32(void), gadget_arm64_ospec_bic_lsl64(void), gadget_arm64_ospec_bic_lsl32(void), gadget_arm64_ospec_bic_lsr64(void), gadget_arm64_ospec_bic_lsr32(void), gadget_arm64_ospec_bic_asr64(void), gadget_arm64_ospec_bic_asr32(void), gadget_arm64_ospec_bic_ror64(void), gadget_arm64_ospec_bic_ror32(void), gadget_arm64_ospec_orn_lsl64(void), gadget_arm64_ospec_orn_lsl32(void), gadget_arm64_ospec_orn_lsr64(void), gadget_arm64_ospec_orn_lsr32(void), gadget_arm64_ospec_orn_asr64(void), gadget_arm64_ospec_orn_asr32(void), gadget_arm64_ospec_orn_ror64(void), gadget_arm64_ospec_orn_ror32(void), gadget_arm64_ospec_eon_lsl64(void), gadget_arm64_ospec_eon_lsl32(void), gadget_arm64_ospec_eon_lsr64(void), gadget_arm64_ospec_eon_lsr32(void), gadget_arm64_ospec_eon_asr64(void), gadget_arm64_ospec_eon_asr32(void), gadget_arm64_ospec_eon_ror64(void), gadget_arm64_ospec_eon_ror32(void), gadget_arm64_ospec_mvn64(void), gadget_arm64_ospec_mvn32(void);
+            static void (*const sh[6][4][2])(void) = {{{gadget_arm64_ospec_and_lsl32, gadget_arm64_ospec_and_lsl64}, {gadget_arm64_ospec_and_lsr32, gadget_arm64_ospec_and_lsr64}, {gadget_arm64_ospec_and_asr32, gadget_arm64_ospec_and_asr64}, {gadget_arm64_ospec_and_ror32, gadget_arm64_ospec_and_ror64}}, {{gadget_arm64_ospec_orr_lsl32, gadget_arm64_ospec_orr_lsl64}, {gadget_arm64_ospec_orr_lsr32, gadget_arm64_ospec_orr_lsr64}, {gadget_arm64_ospec_orr_asr32, gadget_arm64_ospec_orr_asr64}, {gadget_arm64_ospec_orr_ror32, gadget_arm64_ospec_orr_ror64}}, {{gadget_arm64_ospec_eor_lsl32, gadget_arm64_ospec_eor_lsl64}, {gadget_arm64_ospec_eor_lsr32, gadget_arm64_ospec_eor_lsr64}, {gadget_arm64_ospec_eor_asr32, gadget_arm64_ospec_eor_asr64}, {gadget_arm64_ospec_eor_ror32, gadget_arm64_ospec_eor_ror64}}, {{gadget_arm64_ospec_bic_lsl32, gadget_arm64_ospec_bic_lsl64}, {gadget_arm64_ospec_bic_lsr32, gadget_arm64_ospec_bic_lsr64}, {gadget_arm64_ospec_bic_asr32, gadget_arm64_ospec_bic_asr64}, {gadget_arm64_ospec_bic_ror32, gadget_arm64_ospec_bic_ror64}}, {{gadget_arm64_ospec_orn_lsl32, gadget_arm64_ospec_orn_lsl64}, {gadget_arm64_ospec_orn_lsr32, gadget_arm64_ospec_orn_lsr64}, {gadget_arm64_ospec_orn_asr32, gadget_arm64_ospec_orn_asr64}, {gadget_arm64_ospec_orn_ror32, gadget_arm64_ospec_orn_ror64}}, {{gadget_arm64_ospec_eon_lsl32, gadget_arm64_ospec_eon_lsl64}, {gadget_arm64_ospec_eon_lsr32, gadget_arm64_ospec_eon_lsr64}, {gadget_arm64_ospec_eon_asr32, gadget_arm64_ospec_eon_asr64}, {gadget_arm64_ospec_eon_ror32, gadget_arm64_ospec_eon_ror64}}}; // [op + 3N][shift][sf]
+            static void (*const inv[3][2])(void) = {{gadget_arm64_ospec_bicr32, gadget_arm64_ospec_bicr64}, {gadget_arm64_ospec_ornr32, gadget_arm64_ospec_ornr64}, {gadget_arm64_ospec_eonr32, gadget_arm64_ospec_eonr64}}; // [op][sf], N = 1 and no shift
+            if (rn != 31) {
+                if (imm6 != 0) {
+                    gen_arm64_ospec(state, sh[opc + 3 * N][shift_type][sf], 4, arm64_x_off(rd),
+                            arm64_x_off(rn), arm64_x_off(rm), imm6);
+                    return 1;
+                }
+                if (N) {
+                    gen_arm64_ospec(state, inv[opc][sf], 3, arm64_x_off(rd), arm64_x_off(rn), arm64_x_off(rm), 0);
+                    return 1;
+                }
+            } else if (opc == 1 && N && imm6 == 0) { // MVN: ORN from XZR
+                gen_arm64_ospec(state, sf ? gadget_arm64_ospec_mvn64 : gadget_arm64_ospec_mvn32, 2,
+                        arm64_x_off(rd), arm64_x_off(rm), 0, 0);
+                return 1;
+            }
+        }
         uint64_t params = rd | ((uint64_t) rn << 5) | ((uint64_t) rm << 10)
             | ((uint64_t) shift_type << 15) | ((uint64_t) imm6 << 17)
             | ((uint64_t) sf << 23) | ((uint64_t) opc << 24) | ((uint64_t) N << 26);
@@ -2835,6 +2857,17 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
                     arm64_x_off(rn), arm64_x_off(rm), imm6))
                 return 1;
         }
+        if (imm6 != 0 && (shift_type == 1 || shift_type == 2) && !S && rd != 31 && rn != 31 && rm != 31) {
+            extern void gadget_arm64_ospec_addr_lsr32(void), gadget_arm64_ospec_addr_lsr64(void), gadget_arm64_ospec_addr_asr32(void), gadget_arm64_ospec_addr_asr64(void), gadget_arm64_ospec_subr_lsr32(void), gadget_arm64_ospec_subr_lsr64(void), gadget_arm64_ospec_subr_asr32(void), gadget_arm64_ospec_subr_asr64(void);
+            static void (*const ot[2][2][2])(void) = { // [op_sub][asr][sf]
+                {{gadget_arm64_ospec_addr_lsr32, gadget_arm64_ospec_addr_lsr64},
+                 {gadget_arm64_ospec_addr_asr32, gadget_arm64_ospec_addr_asr64}},
+                {{gadget_arm64_ospec_subr_lsr32, gadget_arm64_ospec_subr_lsr64},
+                 {gadget_arm64_ospec_subr_asr32, gadget_arm64_ospec_subr_asr64}}};
+            if (gen_arm64_ospec(state, ot[op_sub][shift_type == 2][sf], 4, arm64_x_off(rd),
+                    arm64_x_off(rn), arm64_x_off(rm), imm6))
+                return 1;
+        }
         uint64_t params = rd | ((uint64_t) rn << 5) | ((uint64_t) rm << 10)
             | ((uint64_t) shift_type << 15) | ((uint64_t) imm6 << 17)
             | ((uint64_t) sf << 23) | ((uint64_t) op_sub << 24) | ((uint64_t) S << 26);
@@ -2874,6 +2907,23 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
             state->arm64_flags_live = true;
             return 1;
         }
+        if (rd != 31 && rn != 31 && rm == 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            // ... + carry: the second operand XZR.
+#define A64_ADCZ(op) extern void gadget_arm64_ospec_##op##z64(void), gadget_arm64_ospec_##op##z32(void), \
+                gadget_arm64_ospec_##op##z64_nf(void), gadget_arm64_ospec_##op##z32_nf(void);
+            A64_ADCZ(adc) A64_ADCZ(adcs) A64_ADCZ(sbc) A64_ADCZ(sbcs)
+#undef A64_ADCZ
+            static void (*const t[2][2][2][2])(void) = { // [sbc][S][sf][flags live]
+                {{{gadget_arm64_ospec_adcz32, gadget_arm64_ospec_adcz32_nf}, {gadget_arm64_ospec_adcz64, gadget_arm64_ospec_adcz64_nf}},
+                 {{gadget_arm64_ospec_adcsz32, gadget_arm64_ospec_adcsz32_nf}, {gadget_arm64_ospec_adcsz64, gadget_arm64_ospec_adcsz64_nf}}},
+                {{{gadget_arm64_ospec_sbcz32, gadget_arm64_ospec_sbcz32_nf}, {gadget_arm64_ospec_sbcz64, gadget_arm64_ospec_sbcz64_nf}},
+                 {{gadget_arm64_ospec_sbcsz32, gadget_arm64_ospec_sbcsz32_nf}, {gadget_arm64_ospec_sbcsz64, gadget_arm64_ospec_sbcsz64_nf}}}};
+            gen(state, (unsigned long) t[op_sbc][S][sf][arm64_flags_were_live]);
+            gen(state, arm64_x_off(rd));
+            gen(state, arm64_x_off(rn));
+            state->arm64_flags_live = true;
+            return 1;
+        }
         gen(state, (unsigned long) gadget_arm64_adcsbc);
         gen(state, rd | ((uint64_t) rn << 5) | ((uint64_t) rm << 10)
             | ((uint64_t) sf << 15) | ((uint64_t) op_sbc << 16) | ((uint64_t) S << 17));
@@ -2898,6 +2948,29 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
         bool sf = (insn >> 31) & 1;
         if (opt != 0 || imm3 > 4) {
             return gen_arm64_undefined(state);
+        }
+        // Slot-fed: no flags, a real Rm, the extends that narrow (option 0-2
+        // and 4-6; UXTX/SXTX of a 64-bit add is a shifted add). rd and rn are
+        // SP when 31 here, which their slots say.
+        if (!S && rm != 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            extern void gadget_arm64_ospec_add_uxtw64(void), gadget_arm64_ospec_add_sxtw64(void), gadget_arm64_ospec_add_uxtb64(void), gadget_arm64_ospec_add_uxth64(void), gadget_arm64_ospec_add_sxtb64(void), gadget_arm64_ospec_add_sxth64(void), gadget_arm64_ospec_sub_uxtw64(void), gadget_arm64_ospec_sub_sxtw64(void), gadget_arm64_ospec_sub_uxtb64(void), gadget_arm64_ospec_sub_uxth64(void), gadget_arm64_ospec_sub_sxtb64(void), gadget_arm64_ospec_sub_sxth64(void), gadget_arm64_ospec_add_uxtb32(void), gadget_arm64_ospec_add_uxth32(void), gadget_arm64_ospec_add_sxtb32(void), gadget_arm64_ospec_add_sxth32(void), gadget_arm64_ospec_sub_uxtb32(void), gadget_arm64_ospec_sub_uxth32(void), gadget_arm64_ospec_sub_sxtb32(void), gadget_arm64_ospec_sub_sxth32(void);
+            extern void gadget_arm64_ospec_addr_lsl64(void), gadget_arm64_ospec_subr_lsl64(void);
+            // [op_sub][option]: uxtb uxth uxtw uxtx sxtb sxth sxtw sxtx
+            static void (*const e64[2][8])(void) = {
+                {gadget_arm64_ospec_add_uxtb64, gadget_arm64_ospec_add_uxth64, gadget_arm64_ospec_add_uxtw64, gadget_arm64_ospec_addr_lsl64,
+                 gadget_arm64_ospec_add_sxtb64, gadget_arm64_ospec_add_sxth64, gadget_arm64_ospec_add_sxtw64, gadget_arm64_ospec_addr_lsl64},
+                {gadget_arm64_ospec_sub_uxtb64, gadget_arm64_ospec_sub_uxth64, gadget_arm64_ospec_sub_uxtw64, gadget_arm64_ospec_subr_lsl64,
+                 gadget_arm64_ospec_sub_sxtb64, gadget_arm64_ospec_sub_sxth64, gadget_arm64_ospec_sub_sxtw64, gadget_arm64_ospec_subr_lsl64}};
+            static void (*const e32[2][8])(void) = {
+                {gadget_arm64_ospec_add_uxtb32, gadget_arm64_ospec_add_uxth32, NULL, NULL,
+                 gadget_arm64_ospec_add_sxtb32, gadget_arm64_ospec_add_sxth32, NULL, NULL},
+                {gadget_arm64_ospec_sub_uxtb32, gadget_arm64_ospec_sub_uxth32, NULL, NULL,
+                 gadget_arm64_ospec_sub_sxtb32, gadget_arm64_ospec_sub_sxth32, NULL, NULL}};
+            void (*spec)(void) = sf ? e64[op_sub][option] : e32[op_sub][option];
+            if (spec != NULL) {
+                gen_arm64_ospec(state, spec, 4, arm64_xsp_off(rd), arm64_xsp_off(rn), arm64_x_off(rm), imm3);
+                return 1;
+            }
         }
         gen(state, (unsigned long) gadget_arm64_addsub_ext);
         gen(state, rd | ((uint64_t) rn << 5) | ((uint64_t) rm << 10)
@@ -6028,6 +6101,13 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
         unsigned rd = insn & 0x1f;
         if (op21 != 0 || N != sf || o0 != 0 || (!sf && (imms & 0x20))) {
             return gen_arm64_undefined(state);
+        }
+        if (rn == rm && rd != 31 && rn != 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            // ROR by a constant: the rotate of every hash.
+            extern void gadget_arm64_ospec_ror64(void), gadget_arm64_ospec_ror32(void);
+            gen_arm64_ospec(state, sf ? gadget_arm64_ospec_ror64 : gadget_arm64_ospec_ror32, 3,
+                    arm64_x_off(rd), arm64_x_off(rn), imms, 0);
+            return 1;
         }
         gen(state, (unsigned long) gadget_arm64_extr);
         gen(state, rd | ((uint64_t) rn << 8) | ((uint64_t) rm << 16)

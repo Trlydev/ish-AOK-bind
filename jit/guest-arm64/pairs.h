@@ -17,11 +17,13 @@
 //
 // The second table is chosen by measurement, not by hand: it is the commonest
 // adjacent pairs of such gadgets in the gadget-level JIT profiles of Python,
-// sqlite, gcc, 7-Zip, perl, a shell-and-coreutils script and openssl
-// (ISH_JIT_PROFILE, tools/jitprof-gadget-pairs.py --fuse --min 0.02), most
-// frequent first. Regenerate it with
+// sqlite, gcc, 7-Zip, perl, a shell-and-coreutils script, openssl (its
+// speed tests, and separately its digests and ciphers), the coreutils
+// digests, and awk, sort and gzip (ISH_JIT_PROFILE,
+// tools/jitprof-gadget-pairs.py --fuse --min 0.015), most frequent first.
+// Regenerate it with
 //
-//     python3 tools/jitprof-gadget-pairs.py --fuse jit/guest-arm64/pairs.h PROFILE...
+//     python3 tools/jitprof-gadget-pairs.py --fuse jit/guest-arm64/pairs.h --min 0.015 PROFILE...
 //
 // after adding a family, or to weigh in another workload.
 
@@ -1249,504 +1251,1209 @@
 #define K_ospec_smull 2
 #define OPS_ospec_smull {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_ospec_smull 3
+#define F_ospec_ror64 f_alu_imm, rorv, x, 0, _, _
+#define R_ospec_ror64 12
+#define HR_ospec_ror64 1
+#define K_ospec_ror64 1
+#define OPS_ospec_ror64 {1, PAIR_OP_SLOT}
+#define NP_ospec_ror64 3
+#define F_ospec_ror32 f_alu_imm, rorv, w, 0, _, _
+#define R_ospec_ror32 12
+#define HR_ospec_ror32 1
+#define K_ospec_ror32 1
+#define OPS_ospec_ror32 {1, PAIR_OP_SLOT}
+#define NP_ospec_ror32 3
+#define F_ospec_mvn64 f_mvn, x, _, _, _, _
+#define R_ospec_mvn64 12
+#define HR_ospec_mvn64 1
+#define K_ospec_mvn64 1
+#define OPS_ospec_mvn64 {1, PAIR_OP_SLOT}
+#define NP_ospec_mvn64 2
+#define F_ospec_mvn32 f_mvn, w, _, _, _, _
+#define R_ospec_mvn32 12
+#define HR_ospec_mvn32 1
+#define K_ospec_mvn32 1
+#define OPS_ospec_mvn32 {1, PAIR_OP_SLOT}
+#define NP_ospec_mvn32 2
+#define F_ospec_bicr64 f_alu_reg, bic, x, 0, _, _
+#define R_ospec_bicr64 12
+#define HR_ospec_bicr64 1
+#define K_ospec_bicr64 2
+#define OPS_ospec_bicr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bicr64 3
+#define F_ospec_bicr32 f_alu_reg, bic, w, 0, _, _
+#define R_ospec_bicr32 12
+#define HR_ospec_bicr32 1
+#define K_ospec_bicr32 2
+#define OPS_ospec_bicr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bicr32 3
+#define F_ospec_ornr64 f_alu_reg, orn, x, 0, _, _
+#define R_ospec_ornr64 12
+#define HR_ospec_ornr64 1
+#define K_ospec_ornr64 2
+#define OPS_ospec_ornr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_ornr64 3
+#define F_ospec_ornr32 f_alu_reg, orn, w, 0, _, _
+#define R_ospec_ornr32 12
+#define HR_ospec_ornr32 1
+#define K_ospec_ornr32 2
+#define OPS_ospec_ornr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_ornr32 3
+#define F_ospec_eonr64 f_alu_reg, eon, x, 0, _, _
+#define R_ospec_eonr64 12
+#define HR_ospec_eonr64 1
+#define K_ospec_eonr64 2
+#define OPS_ospec_eonr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eonr64 3
+#define F_ospec_eonr32 f_alu_reg, eon, w, 0, _, _
+#define R_ospec_eonr32 12
+#define HR_ospec_eonr32 1
+#define K_ospec_eonr32 2
+#define OPS_ospec_eonr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eonr32 3
+#define F_ospec_and_lsl64 f_alu_reg_sh, and, x, lslv, _, _
+#define R_ospec_and_lsl64 12
+#define HR_ospec_and_lsl64 1
+#define K_ospec_and_lsl64 2
+#define OPS_ospec_and_lsl64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_lsl64 4
+#define F_ospec_and_lsl32 f_alu_reg_sh, and, w, lslv, _, _
+#define R_ospec_and_lsl32 12
+#define HR_ospec_and_lsl32 1
+#define K_ospec_and_lsl32 2
+#define OPS_ospec_and_lsl32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_lsl32 4
+#define F_ospec_and_lsr64 f_alu_reg_sh, and, x, lsrv, _, _
+#define R_ospec_and_lsr64 12
+#define HR_ospec_and_lsr64 1
+#define K_ospec_and_lsr64 2
+#define OPS_ospec_and_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_lsr64 4
+#define F_ospec_and_lsr32 f_alu_reg_sh, and, w, lsrv, _, _
+#define R_ospec_and_lsr32 12
+#define HR_ospec_and_lsr32 1
+#define K_ospec_and_lsr32 2
+#define OPS_ospec_and_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_lsr32 4
+#define F_ospec_and_asr64 f_alu_reg_sh, and, x, asrv, _, _
+#define R_ospec_and_asr64 12
+#define HR_ospec_and_asr64 1
+#define K_ospec_and_asr64 2
+#define OPS_ospec_and_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_asr64 4
+#define F_ospec_and_asr32 f_alu_reg_sh, and, w, asrv, _, _
+#define R_ospec_and_asr32 12
+#define HR_ospec_and_asr32 1
+#define K_ospec_and_asr32 2
+#define OPS_ospec_and_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_asr32 4
+#define F_ospec_and_ror64 f_alu_reg_sh, and, x, rorv, _, _
+#define R_ospec_and_ror64 12
+#define HR_ospec_and_ror64 1
+#define K_ospec_and_ror64 2
+#define OPS_ospec_and_ror64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_ror64 4
+#define F_ospec_and_ror32 f_alu_reg_sh, and, w, rorv, _, _
+#define R_ospec_and_ror32 12
+#define HR_ospec_and_ror32 1
+#define K_ospec_and_ror32 2
+#define OPS_ospec_and_ror32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_and_ror32 4
+#define F_ospec_orr_lsl64 f_alu_reg_sh, orr, x, lslv, _, _
+#define R_ospec_orr_lsl64 12
+#define HR_ospec_orr_lsl64 1
+#define K_ospec_orr_lsl64 2
+#define OPS_ospec_orr_lsl64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_lsl64 4
+#define F_ospec_orr_lsl32 f_alu_reg_sh, orr, w, lslv, _, _
+#define R_ospec_orr_lsl32 12
+#define HR_ospec_orr_lsl32 1
+#define K_ospec_orr_lsl32 2
+#define OPS_ospec_orr_lsl32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_lsl32 4
+#define F_ospec_orr_lsr64 f_alu_reg_sh, orr, x, lsrv, _, _
+#define R_ospec_orr_lsr64 12
+#define HR_ospec_orr_lsr64 1
+#define K_ospec_orr_lsr64 2
+#define OPS_ospec_orr_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_lsr64 4
+#define F_ospec_orr_lsr32 f_alu_reg_sh, orr, w, lsrv, _, _
+#define R_ospec_orr_lsr32 12
+#define HR_ospec_orr_lsr32 1
+#define K_ospec_orr_lsr32 2
+#define OPS_ospec_orr_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_lsr32 4
+#define F_ospec_orr_asr64 f_alu_reg_sh, orr, x, asrv, _, _
+#define R_ospec_orr_asr64 12
+#define HR_ospec_orr_asr64 1
+#define K_ospec_orr_asr64 2
+#define OPS_ospec_orr_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_asr64 4
+#define F_ospec_orr_asr32 f_alu_reg_sh, orr, w, asrv, _, _
+#define R_ospec_orr_asr32 12
+#define HR_ospec_orr_asr32 1
+#define K_ospec_orr_asr32 2
+#define OPS_ospec_orr_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_asr32 4
+#define F_ospec_orr_ror64 f_alu_reg_sh, orr, x, rorv, _, _
+#define R_ospec_orr_ror64 12
+#define HR_ospec_orr_ror64 1
+#define K_ospec_orr_ror64 2
+#define OPS_ospec_orr_ror64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_ror64 4
+#define F_ospec_orr_ror32 f_alu_reg_sh, orr, w, rorv, _, _
+#define R_ospec_orr_ror32 12
+#define HR_ospec_orr_ror32 1
+#define K_ospec_orr_ror32 2
+#define OPS_ospec_orr_ror32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orr_ror32 4
+#define F_ospec_eor_lsl64 f_alu_reg_sh, eor, x, lslv, _, _
+#define R_ospec_eor_lsl64 12
+#define HR_ospec_eor_lsl64 1
+#define K_ospec_eor_lsl64 2
+#define OPS_ospec_eor_lsl64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_lsl64 4
+#define F_ospec_eor_lsl32 f_alu_reg_sh, eor, w, lslv, _, _
+#define R_ospec_eor_lsl32 12
+#define HR_ospec_eor_lsl32 1
+#define K_ospec_eor_lsl32 2
+#define OPS_ospec_eor_lsl32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_lsl32 4
+#define F_ospec_eor_lsr64 f_alu_reg_sh, eor, x, lsrv, _, _
+#define R_ospec_eor_lsr64 12
+#define HR_ospec_eor_lsr64 1
+#define K_ospec_eor_lsr64 2
+#define OPS_ospec_eor_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_lsr64 4
+#define F_ospec_eor_lsr32 f_alu_reg_sh, eor, w, lsrv, _, _
+#define R_ospec_eor_lsr32 12
+#define HR_ospec_eor_lsr32 1
+#define K_ospec_eor_lsr32 2
+#define OPS_ospec_eor_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_lsr32 4
+#define F_ospec_eor_asr64 f_alu_reg_sh, eor, x, asrv, _, _
+#define R_ospec_eor_asr64 12
+#define HR_ospec_eor_asr64 1
+#define K_ospec_eor_asr64 2
+#define OPS_ospec_eor_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_asr64 4
+#define F_ospec_eor_asr32 f_alu_reg_sh, eor, w, asrv, _, _
+#define R_ospec_eor_asr32 12
+#define HR_ospec_eor_asr32 1
+#define K_ospec_eor_asr32 2
+#define OPS_ospec_eor_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_asr32 4
+#define F_ospec_eor_ror64 f_alu_reg_sh, eor, x, rorv, _, _
+#define R_ospec_eor_ror64 12
+#define HR_ospec_eor_ror64 1
+#define K_ospec_eor_ror64 2
+#define OPS_ospec_eor_ror64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_ror64 4
+#define F_ospec_eor_ror32 f_alu_reg_sh, eor, w, rorv, _, _
+#define R_ospec_eor_ror32 12
+#define HR_ospec_eor_ror32 1
+#define K_ospec_eor_ror32 2
+#define OPS_ospec_eor_ror32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eor_ror32 4
+#define F_ospec_bic_lsl64 f_alu_reg_sh, bic, x, lslv, _, _
+#define R_ospec_bic_lsl64 12
+#define HR_ospec_bic_lsl64 1
+#define K_ospec_bic_lsl64 2
+#define OPS_ospec_bic_lsl64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_lsl64 4
+#define F_ospec_bic_lsl32 f_alu_reg_sh, bic, w, lslv, _, _
+#define R_ospec_bic_lsl32 12
+#define HR_ospec_bic_lsl32 1
+#define K_ospec_bic_lsl32 2
+#define OPS_ospec_bic_lsl32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_lsl32 4
+#define F_ospec_bic_lsr64 f_alu_reg_sh, bic, x, lsrv, _, _
+#define R_ospec_bic_lsr64 12
+#define HR_ospec_bic_lsr64 1
+#define K_ospec_bic_lsr64 2
+#define OPS_ospec_bic_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_lsr64 4
+#define F_ospec_bic_lsr32 f_alu_reg_sh, bic, w, lsrv, _, _
+#define R_ospec_bic_lsr32 12
+#define HR_ospec_bic_lsr32 1
+#define K_ospec_bic_lsr32 2
+#define OPS_ospec_bic_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_lsr32 4
+#define F_ospec_bic_asr64 f_alu_reg_sh, bic, x, asrv, _, _
+#define R_ospec_bic_asr64 12
+#define HR_ospec_bic_asr64 1
+#define K_ospec_bic_asr64 2
+#define OPS_ospec_bic_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_asr64 4
+#define F_ospec_bic_asr32 f_alu_reg_sh, bic, w, asrv, _, _
+#define R_ospec_bic_asr32 12
+#define HR_ospec_bic_asr32 1
+#define K_ospec_bic_asr32 2
+#define OPS_ospec_bic_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_asr32 4
+#define F_ospec_bic_ror64 f_alu_reg_sh, bic, x, rorv, _, _
+#define R_ospec_bic_ror64 12
+#define HR_ospec_bic_ror64 1
+#define K_ospec_bic_ror64 2
+#define OPS_ospec_bic_ror64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_ror64 4
+#define F_ospec_bic_ror32 f_alu_reg_sh, bic, w, rorv, _, _
+#define R_ospec_bic_ror32 12
+#define HR_ospec_bic_ror32 1
+#define K_ospec_bic_ror32 2
+#define OPS_ospec_bic_ror32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_bic_ror32 4
+#define F_ospec_orn_lsl64 f_alu_reg_sh, orn, x, lslv, _, _
+#define R_ospec_orn_lsl64 12
+#define HR_ospec_orn_lsl64 1
+#define K_ospec_orn_lsl64 2
+#define OPS_ospec_orn_lsl64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_lsl64 4
+#define F_ospec_orn_lsl32 f_alu_reg_sh, orn, w, lslv, _, _
+#define R_ospec_orn_lsl32 12
+#define HR_ospec_orn_lsl32 1
+#define K_ospec_orn_lsl32 2
+#define OPS_ospec_orn_lsl32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_lsl32 4
+#define F_ospec_orn_lsr64 f_alu_reg_sh, orn, x, lsrv, _, _
+#define R_ospec_orn_lsr64 12
+#define HR_ospec_orn_lsr64 1
+#define K_ospec_orn_lsr64 2
+#define OPS_ospec_orn_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_lsr64 4
+#define F_ospec_orn_lsr32 f_alu_reg_sh, orn, w, lsrv, _, _
+#define R_ospec_orn_lsr32 12
+#define HR_ospec_orn_lsr32 1
+#define K_ospec_orn_lsr32 2
+#define OPS_ospec_orn_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_lsr32 4
+#define F_ospec_orn_asr64 f_alu_reg_sh, orn, x, asrv, _, _
+#define R_ospec_orn_asr64 12
+#define HR_ospec_orn_asr64 1
+#define K_ospec_orn_asr64 2
+#define OPS_ospec_orn_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_asr64 4
+#define F_ospec_orn_asr32 f_alu_reg_sh, orn, w, asrv, _, _
+#define R_ospec_orn_asr32 12
+#define HR_ospec_orn_asr32 1
+#define K_ospec_orn_asr32 2
+#define OPS_ospec_orn_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_asr32 4
+#define F_ospec_orn_ror64 f_alu_reg_sh, orn, x, rorv, _, _
+#define R_ospec_orn_ror64 12
+#define HR_ospec_orn_ror64 1
+#define K_ospec_orn_ror64 2
+#define OPS_ospec_orn_ror64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_ror64 4
+#define F_ospec_orn_ror32 f_alu_reg_sh, orn, w, rorv, _, _
+#define R_ospec_orn_ror32 12
+#define HR_ospec_orn_ror32 1
+#define K_ospec_orn_ror32 2
+#define OPS_ospec_orn_ror32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_orn_ror32 4
+#define F_ospec_eon_lsl64 f_alu_reg_sh, eon, x, lslv, _, _
+#define R_ospec_eon_lsl64 12
+#define HR_ospec_eon_lsl64 1
+#define K_ospec_eon_lsl64 2
+#define OPS_ospec_eon_lsl64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_lsl64 4
+#define F_ospec_eon_lsl32 f_alu_reg_sh, eon, w, lslv, _, _
+#define R_ospec_eon_lsl32 12
+#define HR_ospec_eon_lsl32 1
+#define K_ospec_eon_lsl32 2
+#define OPS_ospec_eon_lsl32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_lsl32 4
+#define F_ospec_eon_lsr64 f_alu_reg_sh, eon, x, lsrv, _, _
+#define R_ospec_eon_lsr64 12
+#define HR_ospec_eon_lsr64 1
+#define K_ospec_eon_lsr64 2
+#define OPS_ospec_eon_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_lsr64 4
+#define F_ospec_eon_lsr32 f_alu_reg_sh, eon, w, lsrv, _, _
+#define R_ospec_eon_lsr32 12
+#define HR_ospec_eon_lsr32 1
+#define K_ospec_eon_lsr32 2
+#define OPS_ospec_eon_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_lsr32 4
+#define F_ospec_eon_asr64 f_alu_reg_sh, eon, x, asrv, _, _
+#define R_ospec_eon_asr64 12
+#define HR_ospec_eon_asr64 1
+#define K_ospec_eon_asr64 2
+#define OPS_ospec_eon_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_asr64 4
+#define F_ospec_eon_asr32 f_alu_reg_sh, eon, w, asrv, _, _
+#define R_ospec_eon_asr32 12
+#define HR_ospec_eon_asr32 1
+#define K_ospec_eon_asr32 2
+#define OPS_ospec_eon_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_asr32 4
+#define F_ospec_eon_ror64 f_alu_reg_sh, eon, x, rorv, _, _
+#define R_ospec_eon_ror64 12
+#define HR_ospec_eon_ror64 1
+#define K_ospec_eon_ror64 2
+#define OPS_ospec_eon_ror64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_ror64 4
+#define F_ospec_eon_ror32 f_alu_reg_sh, eon, w, rorv, _, _
+#define R_ospec_eon_ror32 12
+#define HR_ospec_eon_ror32 1
+#define K_ospec_eon_ror32 2
+#define OPS_ospec_eon_ror32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_eon_ror32 4
+#define F_ospec_addr_lsr64 f_alu_reg_sh, add, x, lsrv, _, _
+#define R_ospec_addr_lsr64 12
+#define HR_ospec_addr_lsr64 1
+#define K_ospec_addr_lsr64 2
+#define OPS_ospec_addr_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_addr_lsr64 4
+#define F_ospec_addr_lsr32 f_alu_reg_sh, add, w, lsrv, _, _
+#define R_ospec_addr_lsr32 12
+#define HR_ospec_addr_lsr32 1
+#define K_ospec_addr_lsr32 2
+#define OPS_ospec_addr_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_addr_lsr32 4
+#define F_ospec_addr_asr64 f_alu_reg_sh, add, x, asrv, _, _
+#define R_ospec_addr_asr64 12
+#define HR_ospec_addr_asr64 1
+#define K_ospec_addr_asr64 2
+#define OPS_ospec_addr_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_addr_asr64 4
+#define F_ospec_addr_asr32 f_alu_reg_sh, add, w, asrv, _, _
+#define R_ospec_addr_asr32 12
+#define HR_ospec_addr_asr32 1
+#define K_ospec_addr_asr32 2
+#define OPS_ospec_addr_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_addr_asr32 4
+#define F_ospec_add_uxtw64 f_alu_ext, add, x, uxtw, _, _
+#define R_ospec_add_uxtw64 12
+#define HR_ospec_add_uxtw64 1
+#define K_ospec_add_uxtw64 2
+#define OPS_ospec_add_uxtw64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_uxtw64 4
+#define F_ospec_add_sxtw64 f_alu_ext, add, x, sxtw, _, _
+#define R_ospec_add_sxtw64 12
+#define HR_ospec_add_sxtw64 1
+#define K_ospec_add_sxtw64 2
+#define OPS_ospec_add_sxtw64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_sxtw64 4
+#define F_ospec_add_uxtb64 f_alu_ext, add, x, uxtb, _, _
+#define R_ospec_add_uxtb64 12
+#define HR_ospec_add_uxtb64 1
+#define K_ospec_add_uxtb64 2
+#define OPS_ospec_add_uxtb64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_uxtb64 4
+#define F_ospec_add_uxth64 f_alu_ext, add, x, uxth, _, _
+#define R_ospec_add_uxth64 12
+#define HR_ospec_add_uxth64 1
+#define K_ospec_add_uxth64 2
+#define OPS_ospec_add_uxth64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_uxth64 4
+#define F_ospec_add_sxtb64 f_alu_ext, add, x, sxtb, _, _
+#define R_ospec_add_sxtb64 12
+#define HR_ospec_add_sxtb64 1
+#define K_ospec_add_sxtb64 2
+#define OPS_ospec_add_sxtb64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_sxtb64 4
+#define F_ospec_add_sxth64 f_alu_ext, add, x, sxth, _, _
+#define R_ospec_add_sxth64 12
+#define HR_ospec_add_sxth64 1
+#define K_ospec_add_sxth64 2
+#define OPS_ospec_add_sxth64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_sxth64 4
+#define F_ospec_add_uxtb32 f_alu_ext, add, w, uxtb, _, _
+#define R_ospec_add_uxtb32 12
+#define HR_ospec_add_uxtb32 1
+#define K_ospec_add_uxtb32 2
+#define OPS_ospec_add_uxtb32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_uxtb32 4
+#define F_ospec_add_uxth32 f_alu_ext, add, w, uxth, _, _
+#define R_ospec_add_uxth32 12
+#define HR_ospec_add_uxth32 1
+#define K_ospec_add_uxth32 2
+#define OPS_ospec_add_uxth32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_uxth32 4
+#define F_ospec_add_sxtb32 f_alu_ext, add, w, sxtb, _, _
+#define R_ospec_add_sxtb32 12
+#define HR_ospec_add_sxtb32 1
+#define K_ospec_add_sxtb32 2
+#define OPS_ospec_add_sxtb32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_sxtb32 4
+#define F_ospec_add_sxth32 f_alu_ext, add, w, sxth, _, _
+#define R_ospec_add_sxth32 12
+#define HR_ospec_add_sxth32 1
+#define K_ospec_add_sxth32 2
+#define OPS_ospec_add_sxth32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_add_sxth32 4
+#define F_ospec_subr_lsr64 f_alu_reg_sh, sub, x, lsrv, _, _
+#define R_ospec_subr_lsr64 12
+#define HR_ospec_subr_lsr64 1
+#define K_ospec_subr_lsr64 2
+#define OPS_ospec_subr_lsr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_subr_lsr64 4
+#define F_ospec_subr_lsr32 f_alu_reg_sh, sub, w, lsrv, _, _
+#define R_ospec_subr_lsr32 12
+#define HR_ospec_subr_lsr32 1
+#define K_ospec_subr_lsr32 2
+#define OPS_ospec_subr_lsr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_subr_lsr32 4
+#define F_ospec_subr_asr64 f_alu_reg_sh, sub, x, asrv, _, _
+#define R_ospec_subr_asr64 12
+#define HR_ospec_subr_asr64 1
+#define K_ospec_subr_asr64 2
+#define OPS_ospec_subr_asr64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_subr_asr64 4
+#define F_ospec_subr_asr32 f_alu_reg_sh, sub, w, asrv, _, _
+#define R_ospec_subr_asr32 12
+#define HR_ospec_subr_asr32 1
+#define K_ospec_subr_asr32 2
+#define OPS_ospec_subr_asr32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_subr_asr32 4
+#define F_ospec_sub_uxtw64 f_alu_ext, sub, x, uxtw, _, _
+#define R_ospec_sub_uxtw64 12
+#define HR_ospec_sub_uxtw64 1
+#define K_ospec_sub_uxtw64 2
+#define OPS_ospec_sub_uxtw64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_uxtw64 4
+#define F_ospec_sub_sxtw64 f_alu_ext, sub, x, sxtw, _, _
+#define R_ospec_sub_sxtw64 12
+#define HR_ospec_sub_sxtw64 1
+#define K_ospec_sub_sxtw64 2
+#define OPS_ospec_sub_sxtw64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_sxtw64 4
+#define F_ospec_sub_uxtb64 f_alu_ext, sub, x, uxtb, _, _
+#define R_ospec_sub_uxtb64 12
+#define HR_ospec_sub_uxtb64 1
+#define K_ospec_sub_uxtb64 2
+#define OPS_ospec_sub_uxtb64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_uxtb64 4
+#define F_ospec_sub_uxth64 f_alu_ext, sub, x, uxth, _, _
+#define R_ospec_sub_uxth64 12
+#define HR_ospec_sub_uxth64 1
+#define K_ospec_sub_uxth64 2
+#define OPS_ospec_sub_uxth64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_uxth64 4
+#define F_ospec_sub_sxtb64 f_alu_ext, sub, x, sxtb, _, _
+#define R_ospec_sub_sxtb64 12
+#define HR_ospec_sub_sxtb64 1
+#define K_ospec_sub_sxtb64 2
+#define OPS_ospec_sub_sxtb64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_sxtb64 4
+#define F_ospec_sub_sxth64 f_alu_ext, sub, x, sxth, _, _
+#define R_ospec_sub_sxth64 12
+#define HR_ospec_sub_sxth64 1
+#define K_ospec_sub_sxth64 2
+#define OPS_ospec_sub_sxth64 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_sxth64 4
+#define F_ospec_sub_uxtb32 f_alu_ext, sub, w, uxtb, _, _
+#define R_ospec_sub_uxtb32 12
+#define HR_ospec_sub_uxtb32 1
+#define K_ospec_sub_uxtb32 2
+#define OPS_ospec_sub_uxtb32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_uxtb32 4
+#define F_ospec_sub_uxth32 f_alu_ext, sub, w, uxth, _, _
+#define R_ospec_sub_uxth32 12
+#define HR_ospec_sub_uxth32 1
+#define K_ospec_sub_uxth32 2
+#define OPS_ospec_sub_uxth32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_uxth32 4
+#define F_ospec_sub_sxtb32 f_alu_ext, sub, w, sxtb, _, _
+#define R_ospec_sub_sxtb32 12
+#define HR_ospec_sub_sxtb32 1
+#define K_ospec_sub_sxtb32 2
+#define OPS_ospec_sub_sxtb32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_sxtb32 4
+#define F_ospec_sub_sxth32 f_alu_ext, sub, w, sxth, _, _
+#define R_ospec_sub_sxth32 12
+#define HR_ospec_sub_sxth32 1
+#define K_ospec_sub_sxth32 2
+#define OPS_ospec_sub_sxth32 {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
+#define NP_ospec_sub_sxth32 4
+#define F_ospec_adcz64 f_adc_z, adc, x, 0, 0, _
+#define R_ospec_adcz64 12
+#define HR_ospec_adcz64 1
+#define K_ospec_adcz64 1
+#define OPS_ospec_adcz64 {1, PAIR_OP_SLOT}
+#define NP_ospec_adcz64 2
+#define F_ospec_adcz64_nf f_adc_z, adc, x, 0, 1, _
+#define R_ospec_adcz64_nf 12
+#define HR_ospec_adcz64_nf 1
+#define K_ospec_adcz64_nf 1
+#define OPS_ospec_adcz64_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_adcz64_nf 2
+#define F_ospec_adcz32 f_adc_z, adc, w, 0, 0, _
+#define R_ospec_adcz32 12
+#define HR_ospec_adcz32 1
+#define K_ospec_adcz32 1
+#define OPS_ospec_adcz32 {1, PAIR_OP_SLOT}
+#define NP_ospec_adcz32 2
+#define F_ospec_adcz32_nf f_adc_z, adc, w, 0, 1, _
+#define R_ospec_adcz32_nf 12
+#define HR_ospec_adcz32_nf 1
+#define K_ospec_adcz32_nf 1
+#define OPS_ospec_adcz32_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_adcz32_nf 2
+#define F_ospec_adcsz64 f_adc_z, adcs, x, 1, 0, _
+#define R_ospec_adcsz64 12
+#define HR_ospec_adcsz64 1
+#define K_ospec_adcsz64 1
+#define OPS_ospec_adcsz64 {1, PAIR_OP_SLOT}
+#define NP_ospec_adcsz64 2
+#define F_ospec_adcsz64_nf f_adc_z, adcs, x, 1, 1, _
+#define R_ospec_adcsz64_nf 12
+#define HR_ospec_adcsz64_nf 1
+#define K_ospec_adcsz64_nf 1
+#define OPS_ospec_adcsz64_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_adcsz64_nf 2
+#define F_ospec_adcsz32 f_adc_z, adcs, w, 1, 0, _
+#define R_ospec_adcsz32 12
+#define HR_ospec_adcsz32 1
+#define K_ospec_adcsz32 1
+#define OPS_ospec_adcsz32 {1, PAIR_OP_SLOT}
+#define NP_ospec_adcsz32 2
+#define F_ospec_adcsz32_nf f_adc_z, adcs, w, 1, 1, _
+#define R_ospec_adcsz32_nf 12
+#define HR_ospec_adcsz32_nf 1
+#define K_ospec_adcsz32_nf 1
+#define OPS_ospec_adcsz32_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_adcsz32_nf 2
+#define F_ospec_sbcz64 f_adc_z, sbc, x, 0, 0, _
+#define R_ospec_sbcz64 12
+#define HR_ospec_sbcz64 1
+#define K_ospec_sbcz64 1
+#define OPS_ospec_sbcz64 {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcz64 2
+#define F_ospec_sbcz64_nf f_adc_z, sbc, x, 0, 1, _
+#define R_ospec_sbcz64_nf 12
+#define HR_ospec_sbcz64_nf 1
+#define K_ospec_sbcz64_nf 1
+#define OPS_ospec_sbcz64_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcz64_nf 2
+#define F_ospec_sbcz32 f_adc_z, sbc, w, 0, 0, _
+#define R_ospec_sbcz32 12
+#define HR_ospec_sbcz32 1
+#define K_ospec_sbcz32 1
+#define OPS_ospec_sbcz32 {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcz32 2
+#define F_ospec_sbcz32_nf f_adc_z, sbc, w, 0, 1, _
+#define R_ospec_sbcz32_nf 12
+#define HR_ospec_sbcz32_nf 1
+#define K_ospec_sbcz32_nf 1
+#define OPS_ospec_sbcz32_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcz32_nf 2
+#define F_ospec_sbcsz64 f_adc_z, sbcs, x, 1, 0, _
+#define R_ospec_sbcsz64 12
+#define HR_ospec_sbcsz64 1
+#define K_ospec_sbcsz64 1
+#define OPS_ospec_sbcsz64 {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcsz64 2
+#define F_ospec_sbcsz64_nf f_adc_z, sbcs, x, 1, 1, _
+#define R_ospec_sbcsz64_nf 12
+#define HR_ospec_sbcsz64_nf 1
+#define K_ospec_sbcsz64_nf 1
+#define OPS_ospec_sbcsz64_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcsz64_nf 2
+#define F_ospec_sbcsz32 f_adc_z, sbcs, w, 1, 0, _
+#define R_ospec_sbcsz32 12
+#define HR_ospec_sbcsz32 1
+#define K_ospec_sbcsz32 1
+#define OPS_ospec_sbcsz32 {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcsz32 2
+#define F_ospec_sbcsz32_nf f_adc_z, sbcs, w, 1, 1, _
+#define R_ospec_sbcsz32_nf 12
+#define HR_ospec_sbcsz32_nf 1
+#define K_ospec_sbcsz32_nf 1
+#define OPS_ospec_sbcsz32_nf {1, PAIR_OP_SLOT}
+#define NP_ospec_sbcsz32_nf 2
 
 // ---- generated: the pairs ----
+FUSE2(ospec_adcs64, ospec_umulh)
 FUSE2(mov_const, load64_fast)
+FUSE2(ospec_umulh, ospec_adcs64)
+FUSE2(ospec_ror64, ospec_addr64)
 FUSE2(load64_fast, load64_fast)
+FUSE2(ldp64_fast, ldp64_fast)
+FUSE2(ospec_addr64, ospec_ror64)
+FUSE2(ospec_mul64, ospec_adcs64)
+FUSE2(load64_fast, ospec_addi64)
+FUSE2(ospec_addr64, ospec_eorr64)
 FUSE2(ospec_eorr32, ospec_addr32)
 FUSE2(ospec_addr32, ospec_eorr32)
-FUSE2(ldp64_fast, ldp64_fast)
-FUSE2(load64_fast, ospec_addi64)
-FUSE2(ospec_adcs64, ospec_umulh)
 FUSE2(mov_const, mov_const)
+FUSE2(ospec_addr64, ospec_addr64)
 FUSE2(ldp64_post, ret_cached)
-FUSE2(vspec_umov64, vspec_umov64)
+FUSE2(ospec_adcs64, ospec_mul64)
+FUSE2(ospec_eorr64, ospec_ror64)
 FUSE2(ospec_addi64, stp64_fast)
-FUSE2(ospec_umulh, ospec_adcs64)
+FUSE2(vspec_umov64, vspec_umov64)
 FUSE2(stp64_fast, vspec_umov64)
+FUSE2(ospec_eorr64, ospec_eorr64)
 FUSE2(load64_fast, store64_fast)
+FUSE2(ospec_eorr64, ospec_addr64)
 FUSE2(ospec_addi64, br_cached)
 FUSE2(stp64_pre, ospec_addi64)
-FUSE2(ldp64_fast, ldp64_post)
-FUSE2(vspec_umov64, bl)
-FUSE2(ospec_mul64, ospec_adcs64)
-FUSE2(load64_fast, cbz_x)
-FUSE2(load64_fast, vspec_umov64)
-FUSE2(ospec_addi64, store64_fast)
-FUSE2(vspec_umov64, load64_fast)
-FUSE2(ospec_adcs64, ospec_mul64)
-FUSE2(store64_fast, store64_fast)
 FUSE2(ospec_andr64, ospec_andr64)
+FUSE2(ldp64_fast, ldp64_post)
+FUSE2(ospec_ror64, ospec_eorr64)
+FUSE2(vspec_umov64, bl)
+FUSE2(ospec_adcs64_nf, ospec_adcs64_nf)
+FUSE2(ospec_addi64, store64_fast)
+FUSE2(load64_fast, vspec_umov64)
+FUSE2(vspec_umov64, stp64_fast)
+FUSE2(load64_fast, cbz_x)
+FUSE2(vspec_umov64, load64_fast)
+FUSE2(vspec_umov64, mov_const)
+FUSE2(store64_fast, store64_fast)
+FUSE2(mov_const, ospec_addi64)
+FUSE2(load64_fast, ospec_addr64)
+FUSE2(ospec_addsr64, ospec_umulh)
+FUSE2(store64_fast, mov_const)
+FUSE2(load64_fast, mov_const)
+FUSE2(ospec_addi64, load64_fast)
+FUSE2(stp64_fast, stp64_fast)
+FUSE2(stp64_fast, ospec_addi64)
+FUSE2(ospec_adcs64, ospec_adcs64_nf)
 FUSE2(ospec_ubfm32, ospec_mul32)
 FUSE2(ospec_mul32, fused_cmpr32_ls)
-FUSE2(vspec_umov64, stp64_fast)
-FUSE2(vspec_umov64, mov_const)
-FUSE2(load64_fast, mov_const)
-FUSE2(mov_const, ospec_addi64)
-FUSE2(store64_fast, mov_const)
-FUSE2(ospec_addi64, load64_fast)
-FUSE2(ospec_ubfm32, ospec_ubfm32)
-FUSE2(stp64_fast, ospec_addi64)
-FUSE2(store64_fast, vspec_umov64)
-FUSE2(load64_fast, load8_fast)
-FUSE2(vspec_umov64, ospec_addi64)
-FUSE2(store64_fast, load64_fast)
-FUSE2(load64_fast, load32_fast)
-FUSE2(load8_fast, cbnz_w_bk)
-FUSE2(stp64_fast, mov_const)
-FUSE2(stp64_fast, stp64_fast)
-FUSE2(ospec_addi64, fused_cmpi32_hi)
-FUSE2(load32_fast, load64_fast)
-FUSE2(load64_fast, stp64_fast)
-FUSE2(load32_fast, mov_const)
-FUSE2(ospec_ubfm32, ospec_andi32)
-FUSE2(mov_const, bl)
-FUSE2(load64_fast, cbnz_x)
-FUSE2(ospec_adcs64_nf, ospec_adcs64_nf)
-FUSE2(vspec_umov32, vspec_umov64)
-FUSE2(ospec_addi64, mov_const)
-FUSE2(load64_fast, ospec_addr64)
-FUSE2(ospec_ubfm64, ospec_addr32)
-FUSE2(mov_const, b)
-FUSE2(load64_fast, ldp64_fast)
-FUSE2(load8_fast, ospec_addi64)
-FUSE2(vspec_umov64, load8_fast)
-FUSE2(mov_const, bcond_ne)
-FUSE2(load64_fast, ospec_subsr64)
-FUSE2(ospec_addsr64, ospec_umulh)
-FUSE2(mov_const, store64_fast)
-FUSE2(ospec_subsr64, mov_const)
-FUSE2(vspec_umov64, ldp64_fast)
-FUSE2(stp64_fast, vspec_umov32)
-FUSE2(load8_fast, load64_fast)
-FUSE2(load16_rxl, fused_cmpr32_hi)
-FUSE2(ospec_addi64, ospec_addi64)
-FUSE2(ospec_addi64, bl)
-FUSE2(store64_fast, b)
-FUSE2(vspec_umov64, vspec_umov32)
-FUSE2(load32_fast, load32_fast)
-FUSE2(vspec_umov64, cbz_x)
-FUSE2(load64_fast, ldp64_post)
-FUSE2(stp64_pre, mov_const)
-FUSE2(load8_fast, cbz_w)
-FUSE2(load64_fast, ret_cached)
-FUSE2(ospec_adcs64, ospec_adcs64_nf)
-FUSE2(load16_rxu, fused_cmpr32_hi)
-FUSE2(mov_const, load32_fast)
-FUSE2(stp64_pre, vspec_umov64)
-FUSE2(load8_fast, cbnz_w)
-FUSE2(store64_fast, bl)
 FUSE2(ospec_mul64, ospec_addsr64)
-FUSE2(load32_fast, vspec_umov64)
-FUSE2(ospec_addi32, ospec_subr32)
-FUSE2(ospec_addi64, b)
-FUSE2(store64_fast, ospec_addi64)
-FUSE2(store32_fast, load64_fast)
-FUSE2(load64_fast, fused_cmpi32_ne)
-FUSE2(ospec_subi64, store64_fast)
-FUSE2(load64_fast, ospec_subr64)
-FUSE2(load16_rxu, mov_const)
-FUSE2(vspec_umov64, store64_fast)
-FUSE2(ospec_addi32, store32_fast)
-FUSE2(load64_rxs, br_cached)
-FUSE2(ospec_andi32, load64_rxs)
-FUSE2(ospec_subr32, ospec_ubfm64)
-FUSE2(ospec_addi32, ospec_addi64)
-FUSE2(load8_fast, fused_cmpi32_eq)
-FUSE2(mov_const, stp64_fast)
-FUSE2(ospec_subr32, b)
-FUSE2(ospec_addi64, vspec_umov64)
-FUSE2(mov_const, load8_fast)
-FUSE2(load64_fast, ospec_andi64)
-FUSE2(ospec_addr32, store16_fast)
-FUSE2(stp64_fast, load64_fast)
-FUSE2(ospec_addi64, fused_cmpi32_ne)
+FUSE2(store64_fast, load64_fast)
+FUSE2(stp64_fast, mov_const)
+FUSE2(store64_fast, vspec_umov64)
+FUSE2(vspec_umov64, ospec_addi64)
+FUSE2(load64_fast, load32_fast)
+FUSE2(load64_fast, stp64_fast)
+FUSE2(load64_fast, load8_fast)
+FUSE2(load64_fast, cbnz_x)
 FUSE2(ospec_addsr64, ospec_mul64)
-FUSE2(vspec_umov32, stp64_fast)
-FUSE2(load64_fast, b)
-FUSE2(load8_fast, load8_fast)
-FUSE2(load8_fast, vspec_umov64)
-FUSE2(store64_fast, load8_fast)
-FUSE2(ospec_subi64, load64_fast)
-FUSE2(load64_fast, tb_z)
-FUSE2(mov_const, ldp64_fast)
-FUSE2(vspec_umov64, load32_fast)
-FUSE2(ospec_addi64, blr_cached)
-FUSE2(mov_const, ret_cached)
-FUSE2(load64_fast, blr_cached)
-FUSE2(load64_fast, ospec_ubfm64)
-FUSE2(load32_fast, tb_nz)
-FUSE2(mov_const, vspec_umov64)
-FUSE2(load8_fast, tb_nz)
-FUSE2(store64_fast, ldp64_fast)
-FUSE2(ospec_subi32, load64_rxl)
+FUSE2(ospec_ubfm32, ospec_ubfm32)
+FUSE2(mov_const, bl)
 FUSE2(ospec_addi64, ospec_mul64)
-FUSE2(ospec_andr64, ospec_orrr64)
-FUSE2(ospec_addr64, load64_fast)
-FUSE2(load32_fast, cbnz_w)
+FUSE2(load8_fast, cbnz_w_bk)
+FUSE2(load32_fast, mov_const)
+FUSE2(vspec_umov32, vspec_umov64)
+FUSE2(load32_fast, load64_fast)
+FUSE2(ospec_addi64, mov_const)
+FUSE2(ospec_addi64, ospec_addi64)
+FUSE2(ospec_addi64, fused_cmpi32_hi)
+FUSE2(load64_fast, ldp64_fast)
+FUSE2(ospec_mul64, ospec_addi64)
+FUSE2(ospec_adcs64_nf, cbnz_x_bk)
+FUSE2(stp64_fast, vspec_umov32)
+FUSE2(ospec_ubfm32, ospec_andi32)
+FUSE2(ospec_addi32, ospec_addi64)
+FUSE2(vspec_umov64, ldp64_fast)
+FUSE2(mov_const, store64_fast)
+FUSE2(mov_const, b)
+FUSE2(mov_const, bcond_ne)
+FUSE2(load64_fast, ospec_ubfm64)
+FUSE2(ospec_addi64, b)
+FUSE2(load64_fast, ospec_subsr64)
+FUSE2(load8_fast, cbz_w)
+FUSE2(ospec_ubfm64, ospec_addr32)
+FUSE2(vspec_umov64, vspec_umov32)
+FUSE2(ospec_subsr64, mov_const)
 FUSE2(load64_rxl, ospec_andr64)
-FUSE2(load64_fast, tb_nz)
+FUSE2(ospec_andr64, ospec_orrr64)
+FUSE2(ospec_subi32, load64_rxl)
 FUSE2(load64_rxl, ospec_subi32)
-FUSE2(ldp64_fast, vspec_umov64)
+FUSE2(store64_fast, b)
 FUSE2(ospec_addi64, ospec_orrr64)
+FUSE2(ospec_orrr64, ospec_andr64)
 FUSE2(ospec_orrr64, fused_cmpr32_ne)
 FUSE2(ospec_orrr64, ospec_orrr64)
 FUSE2(load64_fast, ospec_eorr32)
-FUSE2(ospec_orrr64, ospec_andr64)
 FUSE2(ospec_andr64, ospec_addi32)
 FUSE2(ospec_sbfm64, ospec_orrr64)
-FUSE2(ospec_eorr32, load64_rxl)
 FUSE2(ospec_orrr64, ospec_sbfm64)
-FUSE2(load64_fast, bl)
-FUSE2(store64_fast, cbz_x)
-FUSE2(vspec_umov64, fused_cmpi32_eq)
-FUSE2(load64_rxl, load64_fast)
-FUSE2(load64_fast, ospec_subi64)
+FUSE2(ospec_eorr32, load64_rxl)
+FUSE2(load64_rxl, ospec_eonr32)
+FUSE2(ospec_eonr32, load64_rxl)
+FUSE2(load32_fast, load32_fast)
+FUSE2(load64_fast, ldp64_post)
+FUSE2(load8_fast, ospec_addi64)
+FUSE2(vspec_umov64, load8_fast)
+FUSE2(ospec_mul64, ospec_mul64)
+FUSE2(vspec_umov64, cbz_x)
+FUSE2(load8_fast, load64_fast)
+FUSE2(ospec_addi64, bl)
+FUSE2(ospec_addr64, load64_fast)
+FUSE2(stp64_pre, mov_const)
+FUSE2(mov_const, load32_fast)
+FUSE2(ospec_umulh, load64_rxl)
+FUSE2(store32_fast, load64_fast)
+FUSE2(mov_const, stp64_fast)
+FUSE2(store64_fast, bl)
+FUSE2(load16_rxu, mov_const)
+FUSE2(load16_rxl, fused_cmpr32_hi)
+FUSE2(load64_fast, ospec_subr64)
+FUSE2(ospec_umulh, ospec_adcz64)
+FUSE2(vspec_umov64, store64_fast)
+FUSE2(load64_fast, ospec_andi64)
+FUSE2(mov_const, load8_fast)
+FUSE2(ospec_addi64, vspec_umov64)
+FUSE2(load64_rxl, ospec_adcs64)
+FUSE2(ldp64_fast, ospec_addi64)
+FUSE2(load64_fast, ret_cached)
+FUSE2(load32_fast, cbnz_w)
+FUSE2(stp64_pre, vspec_umov64)
+FUSE2(mov_const, ospec_add_sxth64)
+FUSE2(ospec_add_sxth64, br_cached)
+FUSE2(load32_fast, vspec_umov64)
 FUSE2(ospec_addr64, store64_fast)
+FUSE2(store64_fast, ospec_addi64)
+FUSE2(load8_fast, cbnz_w)
+FUSE2(load16_rxu, fused_cmpr32_hi)
+FUSE2(mov_const, vspec_umov64)
+FUSE2(load8_fast, fused_cmpi32_eq)
+FUSE2(ospec_subr32, ospec_subr_lsr32)
+FUSE2(load64_fast, tb_z)
+FUSE2(mov_const, ldp64_fast)
+FUSE2(load64_fast, store32_fast)
+FUSE2(vspec_umov32, stp64_fast)
+FUSE2(ospec_addi32, ospec_subr32)
+FUSE2(stp64_fast, load64_fast)
+FUSE2(ospec_addi64, fused_cmpr64_ne)
+FUSE2(load32_fast, cbz_w)
+FUSE2(ospec_ubfm64, ospec_addr64)
+FUSE2(load8_fast, vspec_umov64)
+FUSE2(mov_const, ret_cached)
+FUSE2(ospec_addi32, store32_fast)
+FUSE2(ospec_subi64, store64_fast)
+FUSE2(load64_fast, fused_cmpi32_ne)
+FUSE2(vspec_umov64, load32_fast)
+FUSE2(store64_fast, load8_fast)
+FUSE2(load64_rxs, br_cached)
+FUSE2(ospec_andi32, load64_rxs)
+FUSE2(ospec_subr32, ospec_ubfm64)
+FUSE2(ospec_mul64, ospec_adc64)
+FUSE2(vspec_umov64, fused_cmpi32_eq)
+FUSE2(store64_fast, ldp64_fast)
+FUSE2(ospec_umulh, ospec_mul64)
+FUSE2(load64_fast, vspec_umov32)
+FUSE2(load64_fast, b)
+FUSE2(vspec_umov32, mov_const)
+FUSE2(load32_fast, tb_nz)
+FUSE2(store64_fast, cbz_x)
+FUSE2(ospec_subr32, b)
+FUSE2(ldp64_fast, vspec_umov64)
+FUSE2(vspec_umov32, ldp64_fast)
+FUSE2(vspec_umov64, b)
+FUSE2(ospec_adc64, ospec_mul64)
+FUSE2(load8_fast, tb_nz)
+FUSE2(ospec_addi64, fused_cmpi32_ne)
+FUSE2(ospec_addr32, store16_fast)
+FUSE2(mov_const, store32_fast)
+FUSE2(ospec_subr_lsr32, ospec_addi32)
+FUSE2(load8_fast, load8_fast)
+FUSE2(stp64_fast, store64_fast)
+FUSE2(load8_fast, ospec_andi32)
+FUSE2(ospec_subi64, load64_fast)
+FUSE2(ldp64_fast, load64_fast)
+FUSE2(load64_fast, bl)
+FUSE2(ldp64_fast, ospec_adcs64)
+FUSE2(load64_fast, blr_cached)
+FUSE2(load64_fast, cbz_x_bk)
+FUSE2(ospec_addi64, blr_cached)
+FUSE2(ospec_addi64, fused_cmpi32_eq)
+FUSE2(store64_fast, store32_fast)
+FUSE2(load8_fast, ospec_addr32)
+FUSE2(load64_fast, tb_nz)
+FUSE2(vspec_umov32, load64_fast)
+FUSE2(store32_fast, bl)
+FUSE2(vspec_umov32, load8_fast)
+FUSE2(load64_fast, ospec_subi64)
+FUSE2(ldp64_fast, mov_const)
+FUSE2(ospec_andi32, mov_const)
+FUSE2(ospec_andi32, ospec_ubfm32)
+FUSE2(ospec_addr32, cbz_w)
+FUSE2(ospec_addsr64, ospec_subr64)
+FUSE2(load8_fast, mov_const)
+FUSE2(load64_rxl, load64_fast)
+FUSE2(load64_fast, load16_fast)
+FUSE2(store32_fast, store64_fast)
+FUSE2(ospec_adcs64, ldp64_fast)
+FUSE2(ospec_addi64, load32_fast)
 FUSE2(load64_fast, load16_rxu)
 FUSE2(load8_fast, fused_cmpr32_ne)
-FUSE2(vspec_umov64, b)
-FUSE2(ospec_mul64, ospec_addi64)
-FUSE2(ospec_adcs64_nf, cbnz_x_bk)
-FUSE2(vspec_umov32, mov_const)
-FUSE2(store16_rxl, ospec_ubfm64)
-FUSE2(load64_fast, store32_fast)
-FUSE2(ospec_addr32, store16_rxl)
-FUSE2(ospec_addr64, fused_cmpr64_cs)
-FUSE2(ospec_addi64, fused_cmpr64_ne)
-FUSE2(store32_fast, bl)
-FUSE2(ospec_addr_lsl64, load64_fast)
-FUSE2(mov_const, store32_fast)
-FUSE2(load64_fast, vspec_umov32)
-FUSE2(store64_fast, fused_cmpi32_hi)
-FUSE2(ospec_addi64, ospec_subi64)
-FUSE2(store32_fast, store64_fast)
-FUSE2(ospec_andi32, ospec_ubfm32)
+FUSE2(ospec_addr32, ospec_addr32)
 FUSE2(load32_fast, store32_fast)
+FUSE2(ospec_addr32, cbnz_w_bk)
+FUSE2(ospec_adcz64, ospec_mul64)
+FUSE2(load32_fast, ospec_andr32)
+FUSE2(load64_fast, ospec_andi32)
+FUSE2(store16_rxl, ospec_ubfm64)
+FUSE2(vspec_umov64, ospec_addr64)
+FUSE2(ospec_madd32, ospec_addr32)
+FUSE2(ospec_mul64, ospec_subi64)
+FUSE2(ospec_addr_lsl64, load64_fast)
+FUSE2(ospec_addi64, ospec_subi64)
+FUSE2(ospec_addr64, fused_cmpr64_cs)
+FUSE2(ospec_subi32, fused_cmpi32_ls)
+FUSE2(ospec_adcs64_nf, ldp64_fast)
+FUSE2(ospec_addr32, store16_rxl)
+FUSE2(ospec_addi64, fused_cmpr64_eq)
 FUSE2(ospec_ubfm64, ospec_addr_lsl64)
-FUSE2(load8_rxs, vspec_umov64)
-FUSE2(ospec_sbfm32, cbz_w)
+FUSE2(load64_fast, cbnz_x_bk)
+FUSE2(ospec_andi32, fused_cmpi32_eq)
+FUSE2(load8_fast, tb_z)
+FUSE2(ospec_mul64, ospec_adcz64)
+FUSE2(store64_fast, fused_cmpi32_hi)
 FUSE2(load32_fast, ospec_andi32)
-FUSE2(load64_fast, load16_fast)
-FUSE2(ospec_addi64, fused_cmpi32_eq)
-FUSE2(ospec_andi32, mov_const)
+FUSE2(load64_rxl, ospec_addsr64)
+FUSE2(store64_fast, load32_fast)
+FUSE2(ospec_subi64, ospec_mul64)
+FUSE2(ospec_adcs64_nf, ospec_adc64_nf)
+FUSE2(ospec_adc64_nf, cbnz_x_bk)
+FUSE2(ospec_mul64, ospec_andi64)
+FUSE2(ospec_andi64, ospec_mul64)
+FUSE2(store32_fast, b)
+FUSE2(ospec_sbfm64, mov_const)
+FUSE2(load32_fast, ospec_addi64)
+FUSE2(load8_rxs, vspec_umov64)
+FUSE2(store16_fast, ospec_add_uxtw64)
+FUSE2(ospec_sbfm32, cbz_w)
+FUSE2(vspec_umov32, b)
 FUSE2(load64_fast, ospec_ubfm32)
-FUSE2(vspec_umov32, ldp64_fast)
+FUSE2(ospec_ubfm64, ospec_addi64)
 FUSE2(ospec_addi32, ospec_andr32)
 FUSE2(ospec_ubfm64, load16_rxu)
-FUSE2(vspec_umov32, load8_fast)
-FUSE2(load32_fast, cbz_w)
-FUSE2(load64_fast, cbnz_x_bk)
-FUSE2(ospec_sbfm64, mov_const)
-FUSE2(ldp64_fast, load64_fast)
-FUSE2(ldp64_fast, ospec_addi64)
-FUSE2(ospec_mul64, ospec_mul64)
+FUSE2(load32_fast, store64_fast)
+FUSE2(ospec_subi64, ospec_subi64)
+FUSE2(load64_fast, load64_rxl)
+FUSE2(ospec_subi32, ospec_andi32)
+FUSE2(load64_rxl, cbz_x)
 FUSE2(ospec_addr32, bcond_ne)
-FUSE2(ospec_addr_lsl32, ospec_addr32)
 FUSE2(load8_rxu, load8_rxu)
-FUSE2(load64_fast, ospec_andi32)
+FUSE2(ospec_addr_lsl32, ospec_addr32)
+FUSE2(ospec_addi64, ldp64_fast)
+FUSE2(ospec_add_uxtw64, load16_rxu)
+FUSE2(ospec_ror64, load64_fast)
+FUSE2(vspec_umov32, bl)
+FUSE2(ospec_addi64, fused_cmpi64_ne)
+FUSE2(store64_fast, ret_cached)
+FUSE2(load64_fast, ospec_eorr64)
+FUSE2(ospec_andi32, tb_z)
+FUSE2(ospec_subr64, ospec_adcs64)
 FUSE2(ospec_sbfm32, ospec_addi32)
 FUSE2(ospec_subr32, ospec_sbfm32)
 FUSE2(ospec_ubfm32, ospec_subsi32)
 FUSE2(ospec_subsi32, ospec_subr32)
 FUSE2(ospec_andr32, ospec_addr_lsl32)
-FUSE2(load32_fast, ospec_addi64)
-FUSE2(store64_fast, ret_cached)
-FUSE2(ospec_andi32, tb_z)
-FUSE2(ospec_subi64, ospec_subi64)
-FUSE2(ospec_addr32, ospec_addr32)
+FUSE2(ospec_addi64, ospec_addr64)
+FUSE2(vspec_umov32, vspec_umov32)
+FUSE2(ospec_subi64, load32_fast)
 FUSE2(ospec_andi64, load64_fast)
-FUSE2(ospec_subi32, ospec_andi32)
-FUSE2(store64_fast, store32_fast)
+FUSE2(load16_fast, load64_fast)
+FUSE2(vspec_umov32, ospec_addi64)
+FUSE2(ospec_andi32, store32_fast)
+FUSE2(ospec_addr64, ospec_addi64)
+FUSE2(ldp64_fast, vspec_umov32)
 FUSE2(ospec_addi32, fused_cmpr32_eq)
 FUSE2(load32_rxl, ospec_addr32)
-FUSE2(stp64_fast, store64_fast)
-FUSE2(vspec_umov32, vspec_umov32)
-FUSE2(vspec_umov32, ospec_addi64)
-FUSE2(load64_rxl, cbz_x)
-FUSE2(ospec_umulh, load64_rxl)
-FUSE2(vspec_umov32, b)
-FUSE2(store64_fast, load32_fast)
-FUSE2(ospec_addi64, ospec_addr64)
-FUSE2(ospec_subi64, load32_fast)
-FUSE2(ospec_andi32, store32_fast)
-FUSE2(load8_fast, ospec_andi32)
-FUSE2(ldp64_fast, vspec_umov32)
-FUSE2(mov_const, ospec_orrr32)
-FUSE2(ospec_addi64, ospec_ubfm32)
-FUSE2(ospec_addi64, load32_fast)
-FUSE2(store32_fast, b)
-FUSE2(ospec_addr_lsl64, load16_rxl)
-FUSE2(load32_fast, tb_z)
-FUSE2(load64_fast, load64_rxl)
-FUSE2(vspec_umov64, blr_cached)
-FUSE2(ospec_addr64, load64_rxl)
-FUSE2(ospec_addr64, ospec_addi64)
-FUSE2(load32_fast, store64_fast)
-FUSE2(ospec_subi32, fused_cmpi32_ls)
-FUSE2(load64_rxl, ospec_adcs64)
-FUSE2(ospec_ubfm32, load16_fast)
-FUSE2(load16_fast, load16_rxs)
-FUSE2(ldp64_fast, mov_const)
-FUSE2(load8_rxu, fused_cmpr32_eq)
+FUSE2(store32_fast, vspec_umov64)
 FUSE2(ospec_addr64, load8_rxl)
-FUSE2(load64_fast, cbz_x_bk)
-FUSE2(load16_fast, ospec_addi64)
+FUSE2(vspec_umov64, store32_fast)
+FUSE2(load32_fast, stp64_fast)
+FUSE2(ospec_addr64, bl)
+FUSE2(ospec_mul64, ospec_umulh)
+FUSE2(ospec_subr64, fused_cmpi64_hi)
+FUSE2(ospec_subr64, store64_fast)
+FUSE2(ospec_addr64, load64_rxl)
+FUSE2(ospec_addi64, ospec_ubfm32)
+FUSE2(load32_fast, tb_z)
+FUSE2(mov_const, ospec_orrr32)
 FUSE2(store32_fast, mov_const)
-FUSE2(vspec_umov32, bl)
-FUSE2(ospec_subr32, ospec_subr32)
+FUSE2(load32_fast, ospec_eorr32)
 FUSE2(load64_fast, ospec_addi32)
-FUSE2(ospec_andi32, ospec_andi32)
-FUSE2(ospec_andi32, fused_cmpi32_eq)
-FUSE2(ospec_umulh, ospec_mul64)
+FUSE2(vspec_umov64, blr_cached)
+FUSE2(ospec_addr_lsl64, load16_rxl)
 FUSE2(load8_fast, fused_cmpi32_ne)
+FUSE2(ospec_ror64, ospec_ror64)
+FUSE2(ospec_eorr64, load64_fast)
+FUSE2(ospec_subr32, ospec_subr32)
+FUSE2(ospec_andi32, ospec_orr_lsl32)
+FUSE2(load16_fast, ospec_addi64)
+FUSE2(ospec_ubfm32, load16_fast)
+FUSE2(ospec_andr64, ospec_add_uxth64)
+FUSE2(load16_fast, load16_rxs)
+FUSE2(load8_rxu, fused_cmpr32_eq)
+FUSE2(store32_fast, store32_fast)
+FUSE2(ospec_andi32, ospec_andi32)
+FUSE2(store32_fast, load32_fast)
+FUSE2(ospec_addi64, load8_fast)
+FUSE2(ospec_addr64, store64_rxl)
 FUSE2(load8_fast, cbz_w_bk)
-FUSE2(store32_fast, load8_fast)
+FUSE2(load32_fast, fused_cmpi32_hi)
 FUSE2(load8_fast, ospec_addr_lsl64)
-FUSE2(ospec_ubfm64, ospec_addr64)
+FUSE2(store32_fast, load8_fast)
+FUSE2(mov_const, ospec_andi32)
+FUSE2(ospec_ubfm32, ospec_orr_lsl32)
 FUSE2(mov_const, ospec_andr32)
-FUSE2(vspec_umov32, load64_fast)
+FUSE2(ospec_orr_lsl32, ospec_ubfm32)
+FUSE2(ospec_and_lsl32, ospec_addr32)
+FUSE2(stp64_fast, ldp64_fast)
 FUSE2(ospec_addi64, load16_fast)
-FUSE2(load16_fast, load64_fast)
+FUSE2(store8_rxl, ospec_addi64)
+FUSE2(load16_fast, mov_const)
+FUSE2(ospec_addi64, ospec_subr64)
+FUSE2(load64_fast, fused_cmpi32_eq)
 FUSE2(ldp64_fast, ospec_ubfm32)
-FUSE2(ospec_mul64, ospec_adc64)
+FUSE2(ospec_ubfm64, load16_rxl)
 FUSE2(load16_rxs, load8_fast)
+FUSE2(ospec_add_uxth64, cbnz_w)
 FUSE2(loads8_64_fast, tb_z)
 FUSE2(loads8_32_fast, ospec_andi32)
 FUSE2(ospec_orrr32, b)
-FUSE2(store32_fast, vspec_umov64)
-FUSE2(ospec_subr64, fused_cmpi64_hi)
-FUSE2(ospec_addi64, load8_fast)
-FUSE2(store32_fast, store32_fast)
-FUSE2(store8_rxl, ospec_addi64)
-FUSE2(load16_fast, mov_const)
-FUSE2(mov_const, ospec_subr32)
-FUSE2(ospec_andi32, fused_cmpi32_hi)
-FUSE2(load32_fast, fused_cmpi32_hi)
-FUSE2(mov_const, ospec_addr64)
-FUSE2(load8_fast, tb_z)
-FUSE2(ospec_subr64, store64_fast)
-FUSE2(ospec_ubfm64, load16_rxl)
-FUSE2(load32_fast, ospec_andr32)
-FUSE2(load8_fast, mov_const)
-FUSE2(ospec_subr32, mov_const)
-FUSE2(mov_const, vspec_umov32)
-FUSE2(ospec_adc64, ospec_mul64)
 FUSE2(mov_const, ospec_ubfm64)
+FUSE2(ospec_addr64, load16_rxl)
+FUSE2(mov_const, cbz_x)
+FUSE2(ospec_adcs64, load64_rxl)
+FUSE2(mov_const, ospec_addr64)
+FUSE2(ospec_subr32, mov_const)
 FUSE2(stp64_fast, load32_fast)
-FUSE2(vspec_umov64, ldp64_post)
-FUSE2(store16_fast, ospec_addr_lsl64)
-FUSE2(ospec_eorr32, ospec_ubfm64)
+FUSE2(ospec_addr64, cbz_x)
+FUSE2(mov_const, vspec_umov32)
+FUSE2(ospec_andi32, fused_cmpi32_hi)
+FUSE2(mov_const, ospec_subr32)
+FUSE2(vspec_umov32, store64_fast)
+FUSE2(ospec_addsr64, ospec_adcs64_nf)
+FUSE2(ospec_orr_lsl32, tb_z)
+FUSE2(ospec_subi32, store32_fast)
 FUSE2(ospec_andi32, load64_fast)
+FUSE2(ospec_addr64, stp64_fast)
+FUSE2(ospec_addr64, vspec_umov64)
+FUSE2(ospec_andi32, ospec_orrr32)
+FUSE2(vspec_umov64, ldp64_post)
+FUSE2(ospec_ubfm64, load64_rxl)
+FUSE2(ospec_eorr32, ospec_ubfm64)
+FUSE2(store16_fast, ospec_addr_lsl64)
 FUSE2(vspec_umov64, cbnz_x_bk)
+FUSE2(load8_fast, ospec_subi32)
+FUSE2(ospec_addi64, load32_rxl)
+FUSE2(ospec_ubfm64, load64_fast)
 FUSE2(load16_fast, ospec_ubfm32)
 FUSE2(load32_fast, ospec_addr32)
-FUSE2(ospec_addi64, load32_rxl)
-FUSE2(ospec_subi32, store32_fast)
+FUSE2(ospec_addr64, mov_const)
+FUSE2(ldp64_post, b)
+FUSE2(stp64_fast, bl)
 FUSE2(ospec_addr_lsl64, load32_fast)
-FUSE2(vspec_umov32, store64_fast)
 FUSE2(load8_rxl, load8_rxl)
-FUSE2(ospec_ubfm64, load64_rxl)
+FUSE2(store8_fast, store8_fast)
 FUSE2(store32_fast, ospec_addi64)
-FUSE2(vspec_umov64, store32_fast)
-FUSE2(ospec_addi64, fused_cmpi64_ne)
+FUSE2(ospec_sbcs64, ldp64_fast)
+FUSE2(ldp64_fast, b)
+FUSE2(ldp64_post, mov_const)
+FUSE2(load32_fast, fused_cmpi32_eq)
+FUSE2(load16_fast, store64_fast)
+FUSE2(load64_fast, ospec_sbfm64)
+FUSE2(ospec_ubfm64, mov_const)
+FUSE2(load64_fast, load16_rxl)
+FUSE2(ldp64_fast, store64_fast)
+FUSE2(load32_fast, tb_z_bk)
+FUSE2(ospec_orrr32, store32_fast)
 FUSE2(ospec_sbfm32, b)
 FUSE2(ospec_addr32, ospec_sbfm32)
-FUSE2(ospec_orrr32, store32_fast)
-FUSE2(ospec_addsr64, ospec_subr64)
-FUSE2(ldp64_fast, ospec_adcs64)
-FUSE2(load8_fast, load32_rxs)
+FUSE2(ldp64_fast, ospec_mul64)
+FUSE2(ospec_addi64, ospec_ubfm64)
 FUSE2(vspec_umov64, ospec_subi64)
-FUSE2(store8_fast, store8_fast)
-FUSE2(ldp64_post, b)
+FUSE2(load8_fast, load32_rxs)
 FUSE2(ospec_ubfm32, ospec_ubfm64)
+FUSE2(ospec_andi64, fused_cmpr64_cs)
 FUSE2(ospec_ubfm64, load32_rxl)
+FUSE2(ospec_andr32, ospec_ubfm64)
 FUSE2(ospec_subi64, ospec_ubfm64)
-FUSE2(ospec_mul64, ospec_subi64)
+FUSE2(load8_fast, load32_rxl)
 FUSE2(load16_fast, fused_cmpr32_hi)
-FUSE2(ospec_ubfm64, mov_const)
+FUSE2(store64_fast, vspec_umov32)
 FUSE2(ospec_ubfm64, ospec_subr32)
 FUSE2(load16_fast, vspec_umov64)
-FUSE2(ospec_adcs64, ldp64_fast)
-FUSE2(load8_fast, load32_rxl)
 FUSE2(store32_fast, vspec_umov32)
-FUSE2(store32_fast, load32_fast)
-FUSE2(ospec_addi64, ldp64_fast)
-FUSE2(load64_fast, ospec_sbfm64)
-FUSE2(ospec_addi64, ospec_ubfm64)
+FUSE2(load16_fast, fused_cmpi32_eq)
+FUSE2(ospec_addi64, store32_fast)
+FUSE2(store64_fast, ospec_addr64)
+FUSE2(ospec_addr64, load8_fast)
+FUSE2(ospec_addi64, load64_rxl)
+FUSE2(stp64_fast, load8_fast)
 FUSE2(load16_fast, ospec_subi32)
+FUSE2(ospec_addi64, fused_cmpr64_ls)
+FUSE2(ospec_add_uxtw64, store64_fast)
+FUSE2(load8_fast, load16_fast)
 FUSE2(ospec_addi32, fused_cmpr32_lt)
 FUSE2(load64_fast, loads32_64_fast)
-FUSE2(load32_fast, fused_cmpi32_eq)
-FUSE2(ospec_addi64, ospec_subr64)
-FUSE2(ospec_addr64, ospec_addr64)
-FUSE2(load8_fast, ospec_subi32)
-FUSE2(load64_fast, load16_rxl)
-FUSE2(ospec_subi64, ospec_mul64)
-FUSE2(ospec_adcs64_nf, ospec_adc64_nf)
-FUSE2(ospec_adc64_nf, cbnz_x_bk)
-FUSE2(load64_fast, fused_cmpi32_eq)
-FUSE2(ospec_ubfm32, load64_rxl)
-FUSE2(ospec_addr_lsl64, ospec_addi64)
-FUSE2(mov_const, ospec_andi32)
-FUSE2(vspec_umov64, load16_fast)
-FUSE2(load16_fast, fused_cmpi32_eq)
-FUSE2(ldp64_fast, b)
-FUSE2(ospec_addi64, fused_cmpr64_eq)
-FUSE2(load64_rxl, ospec_addsr64)
-FUSE2(ospec_addr64, bl)
-FUSE2(ospec_addi64, store32_fast)
-FUSE2(ospec_andi32, tb_nz)
-FUSE2(load64_rxl, store64_fast)
-FUSE2(ospec_ubfm64, store16_fast)
-FUSE2(ospec_addi32, load32_fast)
-FUSE2(ospec_adcs64_nf, ldp64_fast)
-FUSE2(ospec_addr64, load16_rxl)
-FUSE2(ospec_addr_lsl64, ospec_addi32)
-FUSE2(ospec_andi32, ospec_ubfm64)
-FUSE2(ospec_mul64, ospec_andi64)
-FUSE2(ospec_andi64, ospec_mul64)
-FUSE2(ospec_addr32, ospec_addi32)
-FUSE2(ospec_ubfm64, load64_fast)
-FUSE2(ospec_ubfm32, ospec_addr_lsl32)
-FUSE2(stp64_fast, load8_fast)
-FUSE2(stp64_fast, ospec_ubfm32)
-FUSE2(ospec_andi32, fused_cmpi32_ls)
-FUSE2(ospec_addi32, load64_fast)
-FUSE2(ospec_addi64, load64_rxl)
-FUSE2(store16_fast, load16_rxl)
-FUSE2(store64_fast, ospec_orri64)
-FUSE2(store8_fast, load64_fast)
-FUSE2(vspec_umov64, ospec_ubfm64)
+FUSE2(ldp64_fast, ospec_addr64)
+FUSE2(ospec_andi32, ospec_subi32)
+FUSE2(ldp64_fast, ospec_subr64)
+FUSE2(ldp64_fast, stp64_fast)
+FUSE2(ospec_addsr64, store64_fast)
 FUSE2(ospec_ubfm64, stp64_fast)
-FUSE2(store64_fast, ospec_ubfm32)
-FUSE2(ospec_addr_lsl32, ospec_subi64)
-FUSE2(load8_fast, store32_fast)
-FUSE2(mov_const, store8_fast)
+FUSE2(ospec_addr_lsl64, ospec_addi64)
+FUSE2(ldp64_fast, ospec_sbcs64)
+FUSE2(vspec_umov32, ospec_andi32)
+FUSE2(ospec_andr64, tb_nz)
+FUSE2(vspec_umov64, load16_fast)
+FUSE2(ospec_addi32, load64_fast)
+FUSE2(store8_fast, load64_fast)
+FUSE2(ospec_sbfm64, ospec_addr64)
+FUSE2(ospec_ubfm32, load64_rxl)
+FUSE2(store64_fast, stp64_fast)
+FUSE2(ospec_addr_lsl64, ospec_addi32)
+FUSE2(load64_rxl, store64_fast)
 FUSE2(store32_fast, ldp64_fast)
-FUSE2(mov_const, cbz_x)
-FUSE2(ospec_andi64, ospec_orrr64)
-FUSE2(ospec_ubfm32, tb_z)
-FUSE2(vspec_umov64, ospec_andi32)
-FUSE2(load16_fast, cbz_w)
-FUSE2(ospec_subr64, ospec_sbfm64)
+FUSE2(ospec_andi32, fused_cmpi32_ls)
 FUSE2(ospec_addr32, mov_const)
 FUSE2(ospec_addi64, ospec_andi64)
-FUSE2(ospec_addi64, ospec_addi32)
+FUSE2(ospec_ubfm64, store16_fast)
+FUSE2(ospec_andi32, tb_nz)
+FUSE2(ospec_bicr64, ospec_bicr64)
+FUSE2(load32_fast, fused_cmpi32_ne)
+FUSE2(ospec_addr64, ospec_eor_ror64)
+FUSE2(ospec_addi32, load32_fast)
+FUSE2(store64_rxl, fused_cmpr64_hi)
+FUSE2(ospec_andi32, ospec_ubfm64)
+FUSE2(ospec_addr32, ospec_addi32)
+FUSE2(ospec_addi64, ospec_addr_lsl64)
+FUSE2(ospec_ubfm32, ospec_addr_lsl32)
+FUSE2(stp64_fast, ospec_ubfm32)
+FUSE2(vspec_umov64, ospec_ubfm64)
+FUSE2(ospec_addi32, ospec_sbfm64)
+FUSE2(store16_fast, load16_rxl)
+FUSE2(ospec_mul64, ldp64_post)
+FUSE2(store64_fast, ospec_orri64)
+FUSE2(load32_fast, ospec_bicr32)
+FUSE2(mov_const, store8_fast)
+FUSE2(store64_fast, ospec_ubfm32)
+FUSE2(ospec_add_sxtw64, ospec_addi64)
+FUSE2(ospec_addr_lsl32, ospec_subi64)
+FUSE2(ospec_bicr32, ospec_ubfm32)
+FUSE2(load8_fast, store32_fast)
+FUSE2(vspec_umov64, ospec_andi32)
+FUSE2(ldp64_post, ospec_umulh)
+FUSE2(stp64_fast, ospec_adcs64)
 FUSE2(vspec_umov32, ospec_addi32)
-FUSE2(ospec_andi32, ospec_orrr32)
-FUSE2(ospec_ubfm64, ospec_andi32)
+FUSE2(load64_fast, load8_rxs)
+FUSE2(load64_fast, cbz_w)
+FUSE2(vspec_umov64, fused_cmpr64_eq)
+FUSE2(ospec_andi64, ospec_orrr64)
+FUSE2(ospec_addi32, vspec_umov32)
+FUSE2(ospec_addi64, ospec_addi32)
+FUSE2(ospec_addr64, load32_fast)
 FUSE2(ospec_addi32, ospec_ubfm64)
+FUSE2(ospec_sbcs64, stp64_fast)
+FUSE2(ospec_ubfm32, tb_z)
 FUSE2(load64_fast, ospec_addr_lsl64)
+FUSE2(load16_fast, cbz_w)
+FUSE2(ospec_subr_lsr32, ospec_subr32)
+FUSE2(ospec_subr64, ospec_sbfm64)
+FUSE2(ospec_umulh, stp64_fast)
+FUSE2(stp64_fast, ospec_subi64)
+FUSE2(ospec_andi64, load32_fast)
+FUSE2(vspec_umov64, ospec_subi32)
+FUSE2(ospec_andi32, store8_fast)
+FUSE2(loads8_32_fast, load32_fast)
+FUSE2(store64_fast, loads8_32_fast)
+FUSE2(vspec_umov32, load32_fast)
 FUSE2(store64_fast, fused_cmpr64_ls)
+FUSE2(ospec_ubfm64, ospec_andi32)
+FUSE2(ospec_andi32, vspec_umov64)
+FUSE2(stp64_fast, ospec_sbcs64)
+FUSE2(ospec_umulh, ospec_addsr64)
+FUSE2(ospec_subr64, ldp64_fast)
 FUSE2(ospec_subr32, fused_cmpr32_hi)
-FUSE2(ldp64_post, mov_const)
+FUSE2(store64_fast, store16_rxl)
+FUSE2(ospec_ubfm32, load64_fast)
+FUSE2(load32_fast, ospec_addi32)
 FUSE2(store16_fast, mov_const)
 FUSE2(ospec_addr32, load32_fast)
-FUSE2(ospec_subr64, ospec_adcs64)
-FUSE2(ospec_addr_lsl32, ospec_addr_lsl64)
-FUSE2(load32_fast, fused_cmpi32_ne)
-FUSE2(ospec_andi64, fused_cmpr64_cs)
-FUSE2(load32_fast, ospec_addi32)
-FUSE2(load64_rxs, cbz_x)
-FUSE2(load32_fast, b)
-FUSE2(store32_fast, fused_cmpi32_hi)
-FUSE2(ospec_ubfm32, load64_fast)
-FUSE2(ospec_addr64, stp64_fast)
-FUSE2(load64_fast, cbz_w)
-FUSE2(load16_fast, store64_fast)
-FUSE2(vspec_umov32, load32_fast)
-FUSE2(ospec_addr64, mov_const)
-FUSE2(store64_fast, ospec_subi32)
-FUSE2(vspec_umov64, ospec_addr64)
-FUSE2(stp64_fast, bl)
-FUSE2(stp64_fast, ldp64_fast)
-FUSE2(load32_fast, ospec_eorr32)
-FUSE2(load8_rxl, fused_cmpr32_eq)
-FUSE2(ospec_addi32, vspec_umov32)
-FUSE2(store64_fast, ospec_subi64)
-FUSE2(ospec_addr64, load32_fast)
-FUSE2(mov_const, store16_fast)
-FUSE2(store64_fast, cbnz_x)
-FUSE2(ospec_subi64, fused_cmpi64_hi)
-FUSE2(store64_fast, tb_nz)
-FUSE2(load64_fast, bcond_ne)
-FUSE2(load16_fast, load16_fast)
-FUSE2(store64_fast, ospec_andi64)
-FUSE2(store64_fast, store16_rxl)
-FUSE2(ospec_subi32, load64_fast)
-FUSE2(load16_fast, fused_cmpi32_ne)
-FUSE2(vspec_umov32, cbz_w)
-FUSE2(ospec_addr64, load8_fast)
-FUSE2(ospec_subr32, store32_fast)
-FUSE2(ospec_subi64, mov_const)
-FUSE2(load8_fast, store64_fast)
-FUSE2(ospec_andr32, fused_cmpi32_eq)
-FUSE2(ospec_andr32, ospec_andr32)
-FUSE2(ospec_addi64, ospec_addr_lsl64)
-FUSE2(ospec_ubfm64, load64_rxs)
-FUSE2(stp64_fast, ospec_subi64)
-FUSE2(mov_const, load16_fast)
-FUSE2(ospec_addi64, load8_rxl)
+FUSE2(load16_fast, ospec_andi32)
+FUSE2(ospec_andr32, fused_cmpr32_ne)
+FUSE2(ospec_ubfm64, vspec_umov32)
 FUSE2(ospec_subi64, load8_fast)
+FUSE2(vspec_umov32, cbnz_w)
+FUSE2(ospec_addi64, tb_nz)
+FUSE2(ospec_addr_lsl32, ospec_addr_lsl64)
+FUSE2(load64_fast, ospec_ror64)
+FUSE2(load32_fast, b)
+FUSE2(load64_rxs, cbz_x)
+FUSE2(store32_fast, fused_cmpi32_hi)
+FUSE2(ospec_subi64, mov_const)
+FUSE2(vspec_umov32, ospec_addr64)
+FUSE2(ospec_bicr64, ospec_eorr64)
+FUSE2(store64_fast, ospec_subi32)
+FUSE2(load8_fast, store64_fast)
+FUSE2(store64_fast, ospec_subi64)
+FUSE2(vspec_umov64, cbnz_w)
+FUSE2(ospec_subi64, cbz_w)
+FUSE2(load8_rxl, fused_cmpr32_eq)
+FUSE2(ospec_addi32, fused_cmpr32_ne)
+FUSE2(ospec_addr64, ldp64_fast)
+FUSE2(store64_fast, cbnz_x)
+FUSE2(store64_fast, tb_nz)
+FUSE2(mov_const, store16_fast)
+FUSE2(ospec_subi64, fused_cmpi64_hi)
+FUSE2(ospec_subi32, load64_fast)
+FUSE2(load32_fast, ospec_subi32)
+FUSE2(load64_fast, bcond_ne)
+FUSE2(ospec_andr32, ospec_andr32)
+FUSE2(load16_fast, load16_fast)
+FUSE2(vspec_umov64, cbnz_x)
+FUSE2(ospec_addr64, tb_nz)
+FUSE2(store64_fast, ospec_andi64)
+FUSE2(load16_fast, fused_cmpi32_ne)
+FUSE2(load8_rxs, fused_cmpi32_ls)
+FUSE2(vspec_umov32, cbz_w)
+FUSE2(mov_const, load16_fast)
+FUSE2(ospec_andr32, fused_cmpi32_eq)
+FUSE2(load32_fast, cbnz_w_bk)
+FUSE2(ospec_subr64, ospec_subr64)
+FUSE2(stp64_fast, ospec_addr64)
+FUSE2(ospec_subr32, store32_fast)
+FUSE2(ospec_addi64, fused_cmpr64_hi)
+FUSE2(ospec_subi64, ospec_andi64)
 FUSE2(store32_fast, cbz_w)
+FUSE2(stp64_fast, ospec_andi32)
+FUSE2(ospec_ubfm64, load64_rxs)
+FUSE2(load32_fast, cbz_w_bk)
+FUSE2(ospec_addi64, load8_rxl)
+FUSE2(ospec_addr32, store32_fast)
+FUSE2(vspec_umov32, ospec_ubfm64)
+FUSE2(load32_fast, fused_cmpi32_le)
+FUSE2(ospec_sbfm64, load64_fast)
+FUSE2(ospec_add_uxtw64, ospec_addr64)
+FUSE2(mov_const, ldp64_post)
 FUSE2(ospec_subi32, ospec_subi64)
 FUSE2(load64_rxs, ospec_subi64)
+FUSE2(ospec_addi64, cbz_w)
 FUSE2(ospec_addr32, ospec_addi64)
-FUSE2(vspec_umov32, ospec_ubfm64)
 FUSE2(load32_rxl, load32_rxl)
-FUSE2(ospec_andi32, store8_fast)
-FUSE2(ospec_addi32, fused_cmpr32_ne)
-FUSE2(vspec_umov32, cbnz_w)
+FUSE2(ospec_ubfm64, load32_fast)
+FUSE2(ospec_orri32, store8_fast)
 FUSE2(ospec_subr64, load8_fast)
-FUSE2(ospec_addr64, tb_nz)
 FUSE2(load32_rxl, ospec_subr64)
+FUSE2(store32_fast, tb_z)
+FUSE2(ospec_umull, ospec_addr64)
 FUSE2(ldp64_fast, load8_fast)
-FUSE2(stp64_fast, ospec_andi32)
+FUSE2(store64_fast, tb_z)
+FUSE2(vspec_umov64, br_cached)
 FUSE2(load32_fast, ospec_andi64)
 FUSE2(load32_fast, ospec_addr_lsl64)
-FUSE2(store64_fast, tb_z)
-FUSE2(ospec_addr64, store64_rxl)
+FUSE2(store32_fast, cbnz_w)
 FUSE2(store16_fast, b)
-FUSE2(stp64_fast, ospec_addr64)
-FUSE2(ospec_ubfm64, load32_fast)
-FUSE2(ospec_addr32, store32_fast)
-FUSE2(ospec_orri32, store8_fast)
+FUSE2(ospec_subr64, load32_fast)
+FUSE2(ospec_sub_uxtw64, load8_fast)
+FUSE2(store16_fast, load64_fast)
+FUSE2(ospec_andi64, store64_fast)
 FUSE2(ospec_ubfm64, ospec_addr_lsl32)
 FUSE2(ospec_addr_lsl32, ospec_subr_lsl32)
 FUSE2(ospec_andr32, store32_fast)
-FUSE2(store16_fast, load64_fast)
-FUSE2(ospec_andi64, store64_fast)
-FUSE2(ospec_umull, ospec_ubfm64)
-FUSE2(ospec_subr32, ospec_eorr32)
-FUSE2(ospec_subr64, mov_const)
-FUSE2(store32_fast, cbnz_w)
-FUSE2(ospec_subi32, fused_cmpr32_le)
-FUSE2(ospec_sbfm64, ospec_addr64)
-FUSE2(vspec_umov64, br_cached)
-FUSE2(ospec_addi32, fused_cmpi32_hi)
-FUSE2(ospec_addi64, cbz_w)
-FUSE2(ospec_sbfm64, ospec_addi64)
-FUSE2(ospec_orrr64, store64_fast)
-FUSE2(load8_rxl, load8_fast)
-FUSE2(load8_fast, load16_fast)
-FUSE2(ospec_addr_lsl64, ospec_addr32)
-FUSE2(load64_fast, br_cached)
-FUSE2(load16_rxl, ospec_eorr32)
-FUSE2(ospec_subi64, ospec_andi64)
-FUSE2(ospec_subr32, ospec_addi32)
-FUSE2(ospec_subi32, ospec_ubfm32)
-FUSE2(ospec_mul64, ospec_umulh)
-FUSE2(load32_fast, fused_cmpi32_le)
+FUSE2(load64_fast, ospec_addsr64)
 FUSE2(ospec_addi32, mov_const)
-FUSE2(mov_const, ospec_subr64)
-FUSE2(ospec_ubfm64, ospec_addi64)
-FUSE2(ospec_addr_lsl32, ospec_andr32)
-FUSE2(store64_fast, ospec_addi32)
-FUSE2(mov_const, fused_cmpr32_hi)
-FUSE2(store32_fast, store16_fast)
+FUSE2(ospec_addr64, fused_cmpr64_ne)
+FUSE2(ospec_subi64, ospec_addr64)
+FUSE2(ospec_subr64, mov_const)
+FUSE2(load64_rxl, bl)
+FUSE2(ospec_umull, ospec_ubfm64)
 FUSE2(load64_fast, ospec_subi32)
-FUSE2(ospec_addr32, ospec_subi32)
-FUSE2(ospec_subi32, mov_const)
-FUSE2(load32_fast, cbnz_w_bk)
-FUSE2(ospec_sbfm64, load64_fast)
+FUSE2(mov_const, ospec_addi32)
+FUSE2(ospec_andi32, ospec_addr64)
+FUSE2(ospec_subr32, ospec_eorr32)
+FUSE2(ospec_addr32, ospec_and_lsl32)
+FUSE2(ospec_andi32, fused_cmpi32_ne)
+FUSE2(ospec_eor_ror64, ospec_addr64)

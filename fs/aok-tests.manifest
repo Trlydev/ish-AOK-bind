@@ -539,6 +539,7 @@ arm64/ands_bcond_fusion.c
 arm64/cbz_tbz.c
 arm64/pair_fusion.c
 arm64/adc_mul_ospec.c
+arm64/alu_shift_ospec.c
 arm64/hle_loop.c
 arm64/dc_zva.c
 riscv64/ptrace_regset.c

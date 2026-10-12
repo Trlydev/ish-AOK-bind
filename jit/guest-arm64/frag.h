@@ -143,6 +143,86 @@
 .macro f_alu_reg_lsl_stub id, last, op, r, a3, a4, a5, fn=_, fm=_
 .endm
 
+// One operation on a register and a register shifted by a constant: the
+// logical operations and their inverted forms with any of the four shifts,
+// ADD and SUB with LSR and ASR (LSL has f_alu_reg_lsl). The rotates and
+// shift-xors of hashing. [d_off][n_off][m_off][amount]: op, r, shv
+.macro f_alu_reg_sh_body id, last, op, r, shv, a4, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    ldp x11, x14, [_ip, #16]
+    f_src 13, x11, \fm
+    f_src 12, x10, \fn
+    \shv \r\()13, \r\()13, \r\()14
+    \op \r\()12, \r\()12, \r\()13
+    str x12, [_cpu, x9]
+    f_end \last, 4
+.endm
+.macro f_alu_reg_sh_stub id, last, op, r, shv, a4, a5, fn=_, fm=_
+.endm
+
+// ADD and SUB with the second register extended from 8, 16 or 32 bits and
+// shifted left 0-4: array indexing by a narrower index. Either of rd and rn
+// may be SP (their slots say). [d_off][n_off][m_off][shift]: op, r, ext
+.macro f_alu_ext_body id, last, op, r, ext, a4, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    ldp x11, x14, [_ip, #16]
+    f_src 13, x11, \fm
+    f_src 12, x10, \fn
+.ifc \ext,uxtw
+    mov w13, w13
+.endif
+.ifc \ext,sxtw
+    sxtw x13, w13
+.endif
+.ifc \ext,uxtb
+    and x13, x13, #0xff
+.endif
+.ifc \ext,uxth
+    and x13, x13, #0xffff
+.endif
+.ifc \ext,sxtb
+    sxtb x13, w13
+.endif
+.ifc \ext,sxth
+    sxth x13, w13
+.endif
+    lslv x13, x13, x14
+    \op \r\()12, \r\()12, \r\()13
+    str x12, [_cpu, x9]
+    f_end \last, 4
+.endm
+.macro f_alu_ext_stub id, last, op, r, ext, a4, a5, fn=_, fm=_
+.endm
+
+// MVN. [d_off][m_off]: r
+.macro f_mvn_body id, last, r, a2, a3, a4, a5, fn=_, fm=_
+    ldp x8, x10, [_ip]
+    f_src 12, x10, \fn
+    mvn \r\()12, \r\()12
+    str x12, [_cpu, x8]
+    f_end \last, 2
+.endm
+.macro f_mvn_stub id, last, r, a2, a3, a4, a5, fn=_, fm=_
+.endm
+
+// ADC/ADCS/SBC/SBCS with XZR as the second operand: adding the carry in.
+// [d_off][n_off]: op, r, flags, nf (see f_adc)
+.macro f_adc_z_body id, last, op, r, flags, nf, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    f_src 12, x10, \fn
+.if \nf == 0
+    load_flags
+.endif
+    \op \r\()12, \r\()12, \r\()zr
+.if \flags
+    store_flags
+.endif
+    str x12, [_cpu, x9]
+    f_end \last, 2
+.endm
+.macro f_adc_z_stub id, last, op, r, flags, nf, a5, fn=_, fm=_
+.endm
+
 // Add/subtract with carry (ADC, ADCS, SBC, SBCS): the guest's carry comes in
 // through the host's flags. `nf`: the gadget before this one left the host's
 // NZCV equal to the guest's (a flag-setting ALU gadget, or another of these --

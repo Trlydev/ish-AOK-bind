@@ -501,6 +501,44 @@ branch tree to do one instruction.
   builds alternated, five rounds: 7-Zip 0.8% faster, Python method 8.6% and
   dict 1.9% faster, fib and str within 1.6% either way.
 
+**Rotates and shifted operands, later the same day (arm64 guest).** The
+method that found the carry gadgets, pointed at hashing: the coreutils
+digests, more of openssl (digests and ciphers), and awk, sort and gzip were
+profiled. The digests were the outlier: the pair list removed 8.6% of their
+dispatches against 29-36% everywhere else, because 17.8% of the gadgets
+they run were `extr` -- the generic gadget behind `ror`, which is all a
+BLAKE2 or an MD5 round is made of -- with shifted-operand logic
+(`logical_reg`) and add-with-carry of zero (`adcsbc` again: `adc x, x, xzr`,
+how a carry is collected) behind it.
+
+- **102 more slot-fed gadgets** (alu_spec.S, the `ospec` bit): ROR by a
+  constant (EXTR with both sources the same); AND, ORR, EOR and their
+  inverted forms BIC, ORN, EON with the second operand shifted any of the
+  four ways, and unshifted for the inverted three; MVN; ADD and SUB with an
+  LSR or ASR operand; ADD and SUB with a zero- or sign-extended operand
+  (UXTB to SXTW); and the four carry instructions with XZR as an operand,
+  in both the flag-reloading and the host-flags kind.
+- **The pair list from ten workloads**, at 0.015% of gadgets run: 592 pairs,
+  1,242 gadgets with the forwarding ones. Dispatches removed, before and
+  after: Python 32.8 -> 33.1%, sqlite 33.2 -> 34.5, gcc 30.0 -> 30.6, 7-Zip
+  34.1 -> 35.6, perl 33.5 -> 34.0, shell 33.5 -> 33.8, openssl speed 31.1 ->
+  33.0, openssl digests and ciphers 36.4 -> 40.0, awk/sort/gzip 29.3 ->
+  33.2, and the coreutils digests 8.6 -> 34.1.
+- **Numbers.** M4, builds alternated. The coreutils digests over 48 MB in
+  the booted Devuan arm64 root (tests/bench-ab/digestab.sh, three rounds):
+  b2sum 475 -> 371 ms (22% less time), md5sum 428 -> 387 (10% less);
+  sha1sum, sha256sum, sha512sum and cksum unchanged -- Devuan's are
+  openssl's, which uses the SHA instructions the guest is given. `openssl
+  speed`, three rounds: ECDSA P-256 signing 6% and verifying 4% faster,
+  RSA-2048 signing 1-3% faster. The usual benchmarks, five rounds: 7-Zip
+  2.5% faster, Python fib and dict 1.3% faster, method 0.6% faster, str
+  unchanged. Nothing slower. **Not timed on the A10X:** its battery was at
+  36% and not gaining on the Mac's USB port.
+- **Proved:** tests/manual/arm64/alu_shift_ospec.c, every new form against
+  the same operation computed in C, at edge shifts and values, each feeding
+  a fused pair and not. It passes with ospec, pair and fwd each off.
+  Control: mapping the EON shift forms to the EOR ones fails it 5,066 times.
+
 **Tried the same day and NOT kept.**
 
 - *Checks only on backward links.* A chained transition looks at the poke
