@@ -740,6 +740,48 @@ fi
 exit 0
 DETACH_EOF
 chmod 755 "$AOK_SESSION_BIN/pkexec" "$AOK_SESSION_BIN/aok-detach"
+# A launcher reads Terminal= the way the Desktop Entry spec writes it: "true".
+# Debian's bsdgames ships its 38 entries with "True", which GLib's launcher
+# (wf-panel's menu, anything on GIO) and fuzzel read as no: Air Traffic
+# Controller or BSD Tetris then started with no terminal to draw in, and
+# nothing ever appeared (GH #620). An entry at the same path under
+# XDG_DATA_HOME wins over the system's, so each entry with a capitalised
+# boolean gets a corrected copy there. The copies carry a marker: only those
+# are ever replaced or removed here, never a file of the user's own.
+aok_desktop_fix_marker='# Corrected copy written by /AOK/tools/start-wayland.sh (boolean keys in lower case).'
+aok_user_apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications
+# (find and awk only, and nothing GNU-only in either: on a device they may be
+# busybox's or the native applets.)
+if [ -d "$aok_user_apps" ]; then
+    find "$aok_user_apps" -type f -name '*.desktop' -exec awk -v m="$aok_desktop_fix_marker" '
+        index($0, m) == 1 && !(FILENAME in seen) { seen[FILENAME] = 1; print FILENAME }' {} + 2>/dev/null |
+    while IFS= read -r aok_f; do
+        rm -f -- "$aok_f"
+    done
+fi
+for aok_base in /usr/local/share/applications /usr/share/applications; do
+    [ -d "$aok_base" ] || continue
+    find "$aok_base" -type f -name '*.desktop' -exec awk '
+        /^(Terminal|NoDisplay|Hidden)=[TF]/ && !(FILENAME in seen) { seen[FILENAME] = 1; print FILENAME }' {} + 2>/dev/null |
+    while IFS= read -r aok_f; do
+        aok_dest=$aok_user_apps/${aok_f#"$aok_base"/}
+        [ -e "$aok_dest" ] && continue      # the user's own, or the copy of a nearer directory
+        mkdir -p "${aok_dest%/*}" 2>/dev/null || continue
+        {
+            awk '{
+                line = $0
+                if (line ~ /^(Terminal|NoDisplay|Hidden)=/) {
+                    i = index(line, "="); value = tolower(substr(line, i + 1))
+                    sub(/[ \t\r]+$/, "", value)
+                    if (value == "true" || value == "false") line = substr(line, 1, i) value
+                }
+                print line
+            }' "$aok_f"
+            printf '%s\n' "$aok_desktop_fix_marker"
+        } > "$aok_dest" 2>/dev/null
+    done
+done
+
 # The terminal a desktop's launcher opens a terminal program in (Terminal=true:
 # btop, htop, mc). GLib's launcher -- wf-panel's menu, and anything else on
 # GIO -- asks for xdg-terminal-exec first and, without it, falls to
@@ -1251,11 +1293,12 @@ if [ $# -gt 0 ]; then
         /^\[/ { group = $0; next }
         group != "[Desktop Entry]" { next }
         /^Type=/ { type = substr($0, 6) }
-        /^NoDisplay=true/ { hidden = 1 }
-        /^Hidden=true/ { hidden = 1 }
+        # (Any capitalisation: Debian's bsdgames writes Terminal=True, #620.)
+        tolower($0) ~ /^nodisplay=true/ { hidden = 1 }
+        tolower($0) ~ /^hidden=true/ { hidden = 1 }
         /^Name=/ && name == "" { name = substr($0, 6) }
         /^Exec=/ && execline == "" { execline = substr($0, 6) }
-        /^Terminal=true/ { terminal = "true" }
+        tolower($0) ~ /^terminal=true/ { terminal = "true" }
         /^Categories=/ { categories = substr($0, 12) }
         /^OnlyShowIn=/ { only_show_in = substr($0, 12) }
         /^NotShowIn=/ { not_show_in = substr($0, 11) }
