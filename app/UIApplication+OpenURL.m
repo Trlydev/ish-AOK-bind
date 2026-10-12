@@ -10,7 +10,11 @@
 @implementation UIApplication (OpenURL)
 
 + (void)openURL:(NSString *)url {
-    [[self sharedApplication] openURL:[NSURL URLWithString:url] options:@{} completionHandler:nil];
+    // (URLWithString: throws on nil, and a string that is no URL gives nil.)
+    NSURL *parsed = url != nil ? [NSURL URLWithString:url] : nil;
+    if (parsed == nil)
+        return;
+    [[self sharedApplication] openURL:parsed options:@{} completionHandler:nil];
 }
 
 @end

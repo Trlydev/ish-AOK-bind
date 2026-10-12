@@ -6,6 +6,7 @@
 //
 
 #import "AppDelegate.h"
+#import "AppGroup.h"
 #import "Roots.h"
 #import "RootsTableViewController.h"
 #import "ProgressReportViewController.h"
@@ -1097,12 +1098,26 @@ static UIColor *RootRowInUseAccentColor(void) {
 }
 
 - (void)browseFiles {
-    // The root now lives one level down, inside the single "iSH-AOK" domain.
-    NSURL *url = [[NSFileProviderManager.defaultManager.documentStorageURL
-                   URLByAppendingPathComponent:@"iSH-AOK"]
+    // Files shows a filesystem through the File Provider extension, which
+    // reads it out of the shared App Group container. A copy of the app
+    // re-signed without that group -- a sideloaded one, usually -- has no
+    // such container and registers no domain (Roots.m), and iOS then has no
+    // storage URL to give. NSURLComponents throws on a nil URL, and that was
+    // this row aborting the app (#625). Say why instead.
+    NSURL *storage = ContainerIsSharedAppGroup() ? NSFileProviderManager.defaultManager.documentStorageURL : nil;
+    // The root lives one level down, inside the single "iSH-AOK" domain.
+    NSURL *url = [[storage URLByAppendingPathComponent:@"iSH-AOK"]
                   URLByAppendingPathComponent:self.rootName];
-    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSURLComponents *components = url != nil ? [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO] : nil;
     components.scheme = @"shareddocuments";
+    if (components.string == nil) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Files Can’t Show This Filesystem", @"Alert title: Browse Files is unavailable")
+                                                                       message:NSLocalizedString(@"This copy of iSH-AOK was installed without its shared App Group, as a re-signed (sideloaded) copy usually is, so the Files app has no way to reach its filesystems. Export still works.", @"Alert message: Browse Files is unavailable")
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"Alert button") style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     [UIApplication openURL:components.string];
 }
 

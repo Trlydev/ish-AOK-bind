@@ -31854,6 +31854,65 @@
         }
       }
     },
+    "Files Can’t Show This Filesystem" : {
+      "comment" : "Alert title: Browse Files is unavailable",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "„Dateien“ kann dieses Dateisystem nicht anzeigen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Archivos no puede mostrar este sistema de archivos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fichiers ne peut pas afficher ce système de fichiers"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "「ファイル」でこのファイルシステムを表示できません"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 앱에서 이 파일 시스템을 표시할 수 없음"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O app Arquivos Não Pode Mostrar Este Sistema de Arquivos"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "«Файлы» не могут показать эту файловую систему"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "“文件”无法显示此文件系统"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "「檔案」無法顯示此檔案系統"
+          }
+        }
+      }
+    },
     "Filesystem Name" : {
       "comment" : "Accessibility label for the filesystem name field",
       "localizations" : {
@@ -72191,6 +72250,65 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "這會關閉該工作區視窗。該工作區中執行的終端機可能會隨場景分離或關閉。"
+          }
+        }
+      }
+    },
+    "This copy of iSH-AOK was installed without its shared App Group, as a re-signed (sideloaded) copy usually is, so the Files app has no way to reach its filesystems. Export still works." : {
+      "comment" : "Alert message: Browse Files is unavailable",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Diese Kopie von iSH-AOK wurde ohne ihre gemeinsame App Group installiert, wie es bei einer neu signierten (per Sideloading installierten) Kopie meist der Fall ist. Die App „Dateien“ hat daher keinen Zugriff auf ihre Dateisysteme. „Exportieren“ funktioniert weiterhin."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esta copia de iSH-AOK se instaló sin su App Group compartido, como suele ocurrir con una copia firmada de nuevo (instalada por sideloading), por lo que la app Archivos no puede acceder a sus sistemas de archivos. Exportar sigue funcionando."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cette copie d’iSH-AOK a été installée sans son App Group partagé, comme c’est généralement le cas d’une copie re-signée (installée par sideloading) ; l’app Fichiers n’a donc aucun moyen d’accéder à ses systèmes de fichiers. Exporter fonctionne toujours."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この iSH-AOK は共有 App Group なしでインストールされています。再署名（サイドロード）されたコピーでは通常そうなります。そのため「ファイル」App からファイルシステムにアクセスできません。「書き出す」は引き続き使用できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 iSH-AOK 사본은 공유 App Group 없이 설치되었습니다. 다시 서명된(사이드로드된) 사본은 대개 그렇습니다. 따라서 파일 앱에서 이 앱의 파일 시스템에 접근할 수 없습니다. 내보내기는 계속 사용할 수 있습니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esta cópia do iSH-AOK foi instalada sem o App Group compartilhado, como costuma acontecer com uma cópia reassinada (instalada por sideload); por isso o app Arquivos não tem como acessar seus sistemas de arquivos. Exportar continua funcionando."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эта копия iSH-AOK установлена без общей группы приложений (App Group), как обычно бывает с переподписанной копией (установленной в обход App Store), поэтому приложение «Файлы» не может получить доступ к её файловым системам. Экспорт по-прежнему работает."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 iSH-AOK 副本安装时没有其共享的 App Group，重新签名（侧载）的副本通常如此，因此“文件”App 无法访问它的文件系统。“导出”仍然可用。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此 iSH-AOK 副本安裝時沒有其共享的 App Group，重新簽署（側載）的副本通常如此，因此「檔案」App 無法取用它的檔案系統。「匯出」仍可使用。"
           }
         }
       }
