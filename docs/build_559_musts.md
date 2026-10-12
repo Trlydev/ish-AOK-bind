@@ -483,7 +483,10 @@ branch tree to do one instruction.
   alternated, three rounds: RSA-2048 signing 101 -> 192 a second (90%
   faster), verifying 3,878 -> 7,811 (twice as fast); ECDSA P-256 signing
   3,919 -> 5,424 (38% faster), verifying 1,183 -> 1,849 (56%); SHA-256
-  unchanged. The usual benchmarks, four rounds: 7-Zip 2.1% faster, Python
+  unchanged. A10X, the same (with the returns change below; three rounds
+  against two): RSA-2048 signing 34.2 -> 62.9 a second (84% faster),
+  verifying 1,297 -> 2,469 (90%); ECDSA P-256 signing 53% and verifying 67%
+  faster; SHA-256 unchanged. The usual benchmarks, four rounds: 7-Zip 2.1% faster, Python
   within 1.3% either way.
 - **Proved:** tests/manual/arm64/adc_mul_ospec.c against C's 128-bit
   arithmetic: every carry form with the carry live and not, edge values of
