@@ -8,39 +8,41 @@
 #include "frag.h"
 
 // x9=rd_off, x10=rs1 value, x11=rs2 value/imm; result in x10.
-.macro alu_head
+// (`fn`, `fm`: frag.h's f_src -- rs1 or rs2 forwarded by a pair's first half)
+.macro alu_head fn=_
     ldr x9, [_ip]
     ldr x10, [_ip, #8]
     ldr x11, [_ip, #16]
-    ldr x10, [_cpu, x10]
+    f_src 10, x10, \fn
 .endm
-.macro alu_rr_head
-    alu_head
-    ldr x11, [_cpu, x11]
+.macro alu_rr_head fn=_, fm=_
+    alu_head \fn
+    f_src 11, x11, \fm
 .endm
 .macro alu_tail
     str x10, [_cpu, x9]
     gret 3
 .endm
-.macro alu_tail_f last
+.macro alu_tail_f last, res=0
     str x10, [_cpu, x9]
+    f_res \res, x10
     f_end \last, 3
 .endm
 
 // Two variants per op: _rr (reg-reg) and _ri (reg-imm) where the ISA has
 // both. Shift immediates arrive as the raw 0-63 shamt.
 .macro alu_op name, insn:vararg
-.macro f_\name\()_rr\()_body id, last
-    alu_rr_head
+.macro f_\name\()_rr\()_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     \insn
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub \name\()_rr
 f_gadget \name\()_rr
-.macro f_\name\()_ri\()_body id, last
-    alu_head
+.macro f_\name\()_ri\()_body id, last, fn=_, fm=_, res=0
+    alu_head \fn
     \insn
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub \name\()_ri
 f_gadget \name\()_ri
@@ -55,54 +57,54 @@ alu_op srl,  lsr x10, x10, x11
 alu_op sra,  asr x10, x10, x11
 // slt/sltu spelled out: `;` inside a macro argument is a statement
 // separator to gas, so the two-instruction body can't ride the vararg.
-.macro f_slt_rr_body id, last
-    alu_rr_head
+.macro f_slt_rr_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     cmp x10, x11
     cset x10, lt
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub slt_rr
 f_gadget slt_rr
-.macro f_slt_ri_body id, last
-    alu_head
+.macro f_slt_ri_body id, last, fn=_, fm=_, res=0
+    alu_head \fn
     cmp x10, x11
     cset x10, lt
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub slt_ri
 f_gadget slt_ri
-.macro f_sltu_rr_body id, last
-    alu_rr_head
+.macro f_sltu_rr_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     cmp x10, x11
     cset x10, lo
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub sltu_rr
 f_gadget sltu_rr
-.macro f_sltu_ri_body id, last
-    alu_head
+.macro f_sltu_ri_body id, last, fn=_, fm=_, res=0
+    alu_head \fn
     cmp x10, x11
     cset x10, lo
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub sltu_ri
 f_gadget sltu_ri
 
 // W-suffix 32-bit forms (sign-extended results)
 .macro alu_opw name, insn:vararg
-.macro f_\name\()w_rr\()_body id, last
-    alu_rr_head
+.macro f_\name\()w_rr\()_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     \insn
     sxtw x10, w10
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub \name\()w_rr
 f_gadget \name\()w_rr
-.macro f_\name\()w_ri\()_body id, last
-    alu_head
+.macro f_\name\()w_ri\()_body id, last, fn=_, fm=_, res=0
+    alu_head \fn
     \insn
     sxtw x10, w10
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub \name\()w_ri
 f_gadget \name\()w_ri
@@ -114,35 +116,35 @@ alu_opw srl, lsr w10, w10, w11
 alu_opw sra, asr w10, w10, w11
 
 // sub/subw have no immediate form
-.macro f_sub_rr_body id, last
-    alu_rr_head
+.macro f_sub_rr_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     sub x10, x10, x11
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub sub_rr
 f_gadget sub_rr
-.macro f_subw_rr_body id, last
-    alu_rr_head
+.macro f_subw_rr_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     sub w10, w10, w11
     sxtw x10, w10
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub subw_rr
 f_gadget subw_rr
 
 // ---- M extension ----------------------------------------------------------
-.macro f_mul_rr_body id, last
-    alu_rr_head
+.macro f_mul_rr_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     mul x10, x10, x11
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub mul_rr
 f_gadget mul_rr
-.macro f_mulw_rr_body id, last
-    alu_rr_head
+.macro f_mulw_rr_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     mul w10, w10, w11
     sxtw x10, w10
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub mulw_rr
 f_gadget mulw_rr
@@ -259,21 +261,21 @@ f_gadget mulw_rr
 // cond is the branch's condition; ncond its inverse (the _bk layout jumps on
 // it to reach the fallthrough).
 .macro branch_op name, cond, ncond
-.macro f_b\name\()_body id, last
+.macro f_b\name\()_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]
     ldr x10, [_ip, #8]
-    ldr x9, [_cpu, x9]
-    ldr x10, [_cpu, x10]
+    f_src 9, x9, \fn
+    f_src 10, x10, \fm
     cmp x9, x10
     branch_tail \cond, 16, 24, fw
 .endm
 f_nostub b\name
 f_gadget b\name
-.macro f_b\name\()_bk\()_body id, last
+.macro f_b\name\()_bk\()_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]
     ldr x10, [_ip, #8]
-    ldr x9, [_cpu, x9]
-    ldr x10, [_cpu, x10]
+    f_src 9, x9, \fn
+    f_src 10, x10, \fm
     cmp x9, x10
     branch_tail \ncond, 16, 24, bk
 .endm
@@ -293,10 +295,10 @@ branch_op geu, hs, lo
 // [gadget][t_off][rs_off][K][taken][fallthrough]. _ri compares rs against K
 // (t was rs2), _ir compares K against rs (t was rs1); eq/ne need only _ri.
 // rs is read before t is written: gen refuses rs == t.
-.macro branch_const_body cond, order, bk
+.macro branch_const_body cond, order, bk, fn=_
     ldp x9, x10, [_ip]        // t_off, rs_off
     ldr x11, [_ip, #16]       // K
-    ldr x10, [_cpu, x10]
+    f_src 10, x10, \fn
     str x11, [_cpu, x9]
 .ifc \order, ri
     cmp x10, x11
@@ -306,13 +308,13 @@ branch_op geu, hs, lo
     branch_tail \cond, 24, 32, \bk
 .endm
 .macro branch_const name, cond, ncond, order
-.macro f_b\name\()_\order\()_body id, last
-    branch_const_body \cond, \order, fw
+.macro f_b\name\()_\order\()_body id, last, fn=_, fm=_, res=0
+    branch_const_body \cond, \order, fw, \fn
 .endm
 f_nostub b\name\()_\order
 f_gadget b\name\()_\order
-.macro f_b\name\()_\order\()_bk\()_body id, last
-    branch_const_body \ncond, \order, bk
+.macro f_b\name\()_\order\()_bk\()_body id, last, fn=_, fm=_, res=0
+    branch_const_body \ncond, \order, bk, \fn
 .endm
 f_nostub b\name\()_\order\()_bk
 f_gadget b\name\()_\order\()_bk
@@ -329,22 +331,22 @@ branch_const ltu, lo, hs, ir
 branch_const geu, hs, lo, ir
 
 // andi t, rs, K ; beqz/bnez t (bit and flag tests). Same code stream as above.
-.macro andi_branch_body cond, bk
+.macro andi_branch_body cond, bk, fn=_
     ldp x9, x10, [_ip]        // t_off, rs_off
     ldr x11, [_ip, #16]       // K
-    ldr x10, [_cpu, x10]
+    f_src 10, x10, \fn
     ands x10, x10, x11
     str x10, [_cpu, x9]
     branch_tail \cond, 24, 32, \bk
 .endm
 .macro andi_branch name, cond, ncond
-.macro f_andi_\name\()_body id, last
-    andi_branch_body \cond, fw
+.macro f_andi_\name\()_body id, last, fn=_, fm=_, res=0
+    andi_branch_body \cond, fw, \fn
 .endm
 f_nostub andi_\name
 f_gadget andi_\name
-.macro f_andi_\name\()_bk\()_body id, last
-    andi_branch_body \ncond, bk
+.macro f_andi_\name\()_bk\()_body id, last, fn=_, fm=_, res=0
+    andi_branch_body \ncond, bk, \fn
 .endm
 f_nostub andi_\name\()_bk
 f_gadget andi_\name\()_bk
@@ -371,7 +373,7 @@ andi_branch bnez, ne, eq
 //
 // The link must be written before the branch, and unlike jalr below there is no
 // rd/rs1 aliasing hazard to order around: the target is a compile-time constant.
-.macro f_jal_link_body id, last
+.macro f_jal_link_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]             // rd_off
     ldr x10, [_ip, #8]        // link value (pc + insn length)
     str x10, [_cpu, x9]
@@ -429,12 +431,12 @@ f_gadget jal_link
 // Hash MUST match LINKREG_RET_CACHE_HASH in jit/frame.h bit for bit (the arm64
 // guest shares that macro and the same dispatch tail); the
 // failure mode of a mismatch is a silent 0% hit rate, not a crash.
-.macro f_jalr_cached_body id, last
+.macro f_jalr_cached_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]             // rd_off
     ldr x10, [_ip, #8]        // rs1_off
     ldr x11, [_ip, #16]       // imm
+    f_src 10, x10, \fn        // (before x12, a forward's register, is the link)
     ldr x12, [_ip, #24]       // link value (pc + insn length)
-    ldr x10, [_cpu, x10]
     add x10, x10, x11
     bic x10, x10, #1
     str x12, [_cpu, x9]       // link AFTER target is computed
@@ -465,24 +467,26 @@ f_gadget jalr_cached
 // slli rd, rs, a ; srli/srai rd, rd, b -- the zero/sign extension and
 // bit-field idiom RV64GC spells with two shifts (slli+srli 32 is zext.w):
 // [gadget][rd_off][rs_off][a][b].
-.macro f_sll_srl_body id, last
+.macro f_sll_srl_body id, last, fn=_, fm=_, res=0
     ldp x9, x10, [_ip]
     ldp x11, x12, [_ip, #16]
     ldr x10, [_cpu, x10]
     lslv x10, x10, x11
     lsrv x10, x10, x12
     str x10, [_cpu, x9]
+    f_res \res, x10
     f_end \last, 4
 .endm
 f_nostub sll_srl
 f_gadget sll_srl
-.macro f_sll_sra_body id, last
+.macro f_sll_sra_body id, last, fn=_, fm=_, res=0
     ldp x9, x10, [_ip]
     ldp x11, x12, [_ip, #16]
     ldr x10, [_cpu, x10]
     lslv x10, x10, x11
     asrv x10, x10, x12
     str x10, [_cpu, x9]
+    f_res \res, x10
     f_end \last, 4
 .endm
 f_nostub sll_sra
@@ -491,7 +495,7 @@ f_gadget sll_sra
 // slli t, rs, s ; add rd, t, rb (or rb, t) -- the scaled index RV64GC has no
 // shNadd for: [gadget][t_off][rs_off][s][rd_off][rb_off]. t is written first
 // and rb read after, so rb == t (and rd == t) come out as unfused.
-.macro f_sll_add_body id, last
+.macro f_sll_add_body id, last, fn=_, fm=_, res=0
     ldp x9, x10, [_ip]        // t_off, rs_off
     ldp x11, x12, [_ip, #16]  // s, rd_off
     ldr x13, [_ip, #32]       // rb_off
@@ -511,19 +515,19 @@ f_gadget sll_add
 // and unary [gadget][rd_off][rs1_off][imm] (unary ops ignore the imm).
 // x10 = rs1, x11 = rs2 or imm on entry; the result goes back in x10.
 .macro rv_rr name, insn:vararg
-.macro f_\name\()_rr\()_body id, last
-    alu_rr_head
+.macro f_\name\()_rr\()_body id, last, fn=_, fm=_, res=0
+    alu_rr_head \fn, \fm
     \insn
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub \name\()_rr
 f_gadget \name\()_rr
 .endm
 .macro rv_ri name, insn:vararg
-.macro f_\name\()_ri\()_body id, last
-    alu_head
+.macro f_\name\()_ri\()_body id, last, fn=_, fm=_, res=0
+    alu_head \fn
     \insn
-    alu_tail_f \last
+    alu_tail_f \last, \res
 .endm
 f_nostub \name\()_ri
 f_gadget \name\()_ri
@@ -691,6 +695,6 @@ rv_ri ror, ror x10, x10, x11
 // (gen.c's jit_pair_fuse). Here, at the end of the file that defines most of
 // the bodies; frag.h has those of core.S's and memory.S's gadgets.
 .text
-#define FUSE2(a, b) fuse2 a, b
+#define FUSE2(a, b) fuse2 a, b, HR_##a, K_##b
 #include "pairs.h"
 #undef FUSE2

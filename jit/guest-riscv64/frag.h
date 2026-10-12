@@ -12,6 +12,24 @@
 // parameter; with `last` 0 it leaves _ip after its parameters and falls
 // through, with `last` 1 it ends in the dispatch. `id` makes labels unique.
 
+// Forwarding (jit/guest-arm64/frag.h's fuse2 has the reasoning). A body that
+// produces a register leaves the value in x12 as well when the body after
+// it will take it from there (`res`, f_res), and a body's source operand comes from its cpu_state
+// slot or -- `fw` 12 -- from there (f_src). No body touches x12 before it has
+// taken its operands.
+.macro f_res res, reg
+.if \res
+    mov x12, \reg
+.endif
+.endm
+.macro f_src dst, slotreg, fw
+.ifc \fw,_
+    ldr x\dst, [_cpu, \slotreg]
+.else
+    mov x\dst, x\fw
+.endif
+.endm
+
 // A body that cannot fault: one update of _ip, in the dispatch when it is last.
 .macro f_end last, n
 .if \last
@@ -81,12 +99,26 @@
     f_\name\()_stub \name, 1
 .endm
 
-.macro fuse2 a, b
-.gadget f2_\a\()__\b
-    f_\a\()_body f2_\a\()__\b\()_a, 0
-    f_\b\()_body f2_\a\()__\b\()_b, 1
-    f_\a\()_stub f2_\a\()__\b\()_a, 0
-    f_\b\()_stub f2_\a\()__\b\()_b, 1
+.macro fuse2_one sym, a, b, fn, fm, res=0
+.gadget \sym
+    f_\a\()_body \sym\()_a, 0, _, _, \res
+    f_\b\()_body \sym\()_b, 1, \fn, \fm
+    f_\a\()_stub \sym\()_a, 0
+    f_\b\()_stub \sym\()_b, 1
+.endm
+// `hr`: the first leaves a result in x12; `kb`: how many operands the second
+// can take from there. f2n_ forwards the second's first operand, f2m_ its
+// second.
+.macro fuse2 a, b, hr, kb
+    fuse2_one f2_\a\()__\b, \a, \b, _, _
+.if \hr
+.if \kb >= 1
+    fuse2_one f2n_\a\()__\b, \a, \b, 12, _, 1
+.endif
+.if \kb >= 2
+    fuse2_one f2m_\a\()__\b, \a, \b, _, 12, 1
+.endif
+.endif
 .endm
 
 // A branch gadget's way out, its own copy (jit/guest-arm64/control.S's
@@ -121,24 +153,26 @@
 // rd = constant. [rd_off][value]
 // rd = rs1 + imm. [rd_off][rs1_off][imm]
 // Unconditional branch. [target]
-.macro f_mov_const_body id, last
+.macro f_mov_const_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]
     ldr x10, [_ip, #8]
     str x10, [_cpu, x9]
+    f_res \res, x10
     f_end \last, 2
 .endm
 f_nostub mov_const
-.macro f_addi_body id, last
+.macro f_addi_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]           // rd_off
     ldr x10, [_ip, #8]      // rs1_off
     ldr x11, [_ip, #16]     // imm
-    ldr x10, [_cpu, x10]
+    f_src 10, x10, \fn
     add x10, x10, x11
     str x10, [_cpu, x9]
+    f_res \res, x10
     f_end \last, 3
 .endm
 f_nostub addi
-.macro f_b_body id, last
+.macro f_b_body id, last, fn=_, fm=_, res=0
     ldr _ip, [_ip]
     branch_dispatch
 .endm
@@ -148,16 +182,17 @@ f_nostub b
 // (`lid`: the old label id, unused -- the labels take the body's own `id`)
 // (the bodies only: memory.S's load_gadget emits the gadgets)
 .macro def_load name, size, lid, ld_insn, reg
-.macro f_\name\()_body id, last
+.macro f_\name\()_body id, last, fn=_, fm=_, res=0
     ldr x19, [_ip]            // rd_off (callee-saved across prep)
     ldr x9, [_ip, #8]         // rs1_off
     ldr x10, [_ip, #16]       // imm
     f_ip_past \last, 4       // 3 params + trailing orig_ip (fault restart)
-    ldr x7, [_cpu, x9]
+    f_src 7, x9, \fn
     add x7, x7, x10           // effective address
     f_read_prep \last, \size, \id
     \ld_insn \reg, [x7]
     str x11, [_cpu, x19]
+    f_res \res, x11
     f_end_ahead \last
 .endm
 .macro f_\name\()_stub id, last
@@ -174,13 +209,13 @@ def_load ld,  64, rvld,  ldr,   x11
 
 // (`lid`: the old label id, unused -- the labels take the body's own `id`)
 .macro def_store name, size, lid, st_insn, reg
-.macro f_\name\()_body id, last
+.macro f_\name\()_body id, last, fn=_, fm=_, res=0
     ldr x9, [_ip]             // rs2_off (value)
     ldr x10, [_ip, #8]        // rs1_off (base)
     ldr x11, [_ip, #16]       // imm
     f_ip_past \last, 4
-    ldr x19, [_cpu, x9]       // value survives prep in callee-saved reg
-    ldr x7, [_cpu, x10]
+    f_src 19, x9, \fn        // value survives prep in callee-saved reg
+    f_src 7, x10, \fm
     add x7, x7, x11
     f_write_prep \last, \size, \id
     \st_insn \reg, [x7]

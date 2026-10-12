@@ -305,9 +305,13 @@ void jit_note_shared_write(struct jit *jit, const struct pt_entry *entry);
 // (jit/guest-riscv64/frag.h, pairs.h). "fuse2", since "pair" was taken by the
 // hand-written ld+ld and sd+sd.
 #define JIT_FUSE_RV_FUSE2 (1u << 8)
+// ...and hands the first one's result to the second in a host register when
+// the second uses it (JIT_FUSE_A64_FWD).
+#define JIT_FUSE_RV_FWD (1u << 9)
 #define JIT_FUSE_RV_ALL (JIT_FUSE_RV_FOLD | JIT_FUSE_RV_JAL | JIT_FUSE_RV_RETCACHE | \
                          JIT_FUSE_RV_PAIR | JIT_FUSE_RV_ALU | JIT_FUSE_RV_BRANCH | \
-                         JIT_FUSE_RV_BTFN | JIT_FUSE_RV_RCACHE | JIT_FUSE_RV_FUSE2)
+                         JIT_FUSE_RV_BTFN | JIT_FUSE_RV_RCACHE | JIT_FUSE_RV_FUSE2 | \
+                         JIT_FUSE_RV_FWD)
 
 // The amd64 guest's bits are not fusions in the i386 sense (two gadgets folded
 // into one) but NATIVE-vs-BRIDGE switches, which is the same A/B in the shape

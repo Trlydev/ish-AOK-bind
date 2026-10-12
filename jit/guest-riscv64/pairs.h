@@ -10,7 +10,9 @@
 // where the gadget is) and a line here: F_<gadget> marks it for the tool
 // below, and NP_<gadget> is the number of parameter words that follow it in
 // the stream. A gadget that ends its block has no NP_: it can only be the
-// second of a pair.
+// second of a pair. HR_<gadget>: its body leaves a result in x12 for the
+// next; K_<gadget>: how many of its operands a pair can forward to it, and
+// OPS_ where the translator finds each one's slot among its parameters.
 //
 // The second table is chosen by measurement: the commonest adjacent pairs of
 // such gadgets in the gadget-level JIT profiles of Python, gcc and
@@ -19,156 +21,435 @@
 //     python3 tools/jitprof-gadget-pairs.py --fuse jit/guest-riscv64/pairs.h PROFILE...
 
 #define F_add_rr 1
+#define HR_add_rr 1
+#define K_add_rr 2
+#define OPS_add_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_add_rr 3
 #define F_add_ri 1
+#define HR_add_ri 1
+#define K_add_ri 1
+#define OPS_add_ri {1, PAIR_OP_SLOT}
 #define NP_add_ri 3
 #define F_and_rr 1
+#define HR_and_rr 1
+#define K_and_rr 2
+#define OPS_and_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_and_rr 3
 #define F_and_ri 1
+#define HR_and_ri 1
+#define K_and_ri 1
+#define OPS_and_ri {1, PAIR_OP_SLOT}
 #define NP_and_ri 3
 #define F_or_rr 1
+#define HR_or_rr 1
+#define K_or_rr 2
+#define OPS_or_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_or_rr 3
 #define F_or_ri 1
+#define HR_or_ri 1
+#define K_or_ri 1
+#define OPS_or_ri {1, PAIR_OP_SLOT}
 #define NP_or_ri 3
 #define F_xor_rr 1
+#define HR_xor_rr 1
+#define K_xor_rr 2
+#define OPS_xor_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_xor_rr 3
 #define F_xor_ri 1
+#define HR_xor_ri 1
+#define K_xor_ri 1
+#define OPS_xor_ri {1, PAIR_OP_SLOT}
 #define NP_xor_ri 3
 #define F_sll_rr 1
+#define HR_sll_rr 1
+#define K_sll_rr 2
+#define OPS_sll_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sll_rr 3
 #define F_sll_ri 1
+#define HR_sll_ri 1
+#define K_sll_ri 1
+#define OPS_sll_ri {1, PAIR_OP_SLOT}
 #define NP_sll_ri 3
 #define F_srl_rr 1
+#define HR_srl_rr 1
+#define K_srl_rr 2
+#define OPS_srl_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_srl_rr 3
 #define F_srl_ri 1
+#define HR_srl_ri 1
+#define K_srl_ri 1
+#define OPS_srl_ri {1, PAIR_OP_SLOT}
 #define NP_srl_ri 3
 #define F_sra_rr 1
+#define HR_sra_rr 1
+#define K_sra_rr 2
+#define OPS_sra_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sra_rr 3
 #define F_sra_ri 1
+#define HR_sra_ri 1
+#define K_sra_ri 1
+#define OPS_sra_ri {1, PAIR_OP_SLOT}
 #define NP_sra_ri 3
 #define F_addw_rr 1
+#define HR_addw_rr 1
+#define K_addw_rr 2
+#define OPS_addw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_addw_rr 3
 #define F_addw_ri 1
+#define HR_addw_ri 1
+#define K_addw_ri 1
+#define OPS_addw_ri {1, PAIR_OP_SLOT}
 #define NP_addw_ri 3
 #define F_sllw_rr 1
+#define HR_sllw_rr 1
+#define K_sllw_rr 2
+#define OPS_sllw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sllw_rr 3
 #define F_sllw_ri 1
+#define HR_sllw_ri 1
+#define K_sllw_ri 1
+#define OPS_sllw_ri {1, PAIR_OP_SLOT}
 #define NP_sllw_ri 3
 #define F_srlw_rr 1
+#define HR_srlw_rr 1
+#define K_srlw_rr 2
+#define OPS_srlw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_srlw_rr 3
 #define F_srlw_ri 1
+#define HR_srlw_ri 1
+#define K_srlw_ri 1
+#define OPS_srlw_ri {1, PAIR_OP_SLOT}
 #define NP_srlw_ri 3
 #define F_sraw_rr 1
+#define HR_sraw_rr 1
+#define K_sraw_rr 2
+#define OPS_sraw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sraw_rr 3
 #define F_sraw_ri 1
+#define HR_sraw_ri 1
+#define K_sraw_ri 1
+#define OPS_sraw_ri {1, PAIR_OP_SLOT}
 #define NP_sraw_ri 3
 #define F_slt_rr 1
+#define HR_slt_rr 1
+#define K_slt_rr 2
+#define OPS_slt_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_slt_rr 3
 #define F_slt_ri 1
+#define HR_slt_ri 1
+#define K_slt_ri 1
+#define OPS_slt_ri {1, PAIR_OP_SLOT}
 #define NP_slt_ri 3
 #define F_sltu_rr 1
+#define HR_sltu_rr 1
+#define K_sltu_rr 2
+#define OPS_sltu_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sltu_rr 3
 #define F_sltu_ri 1
+#define HR_sltu_ri 1
+#define K_sltu_ri 1
+#define OPS_sltu_ri {1, PAIR_OP_SLOT}
 #define NP_sltu_ri 3
 #define F_sub_rr 1
+#define HR_sub_rr 1
+#define K_sub_rr 2
+#define OPS_sub_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sub_rr 3
 #define F_subw_rr 1
+#define HR_subw_rr 1
+#define K_subw_rr 2
+#define OPS_subw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_subw_rr 3
 #define F_mul_rr 1
+#define HR_mul_rr 1
+#define K_mul_rr 2
+#define OPS_mul_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_mul_rr 3
 #define F_mulw_rr 1
+#define HR_mulw_rr 1
+#define K_mulw_rr 2
+#define OPS_mulw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_mulw_rr 3
 #define F_sll_srl 1
+#define HR_sll_srl 1
+#define K_sll_srl 0
 #define NP_sll_srl 4
 #define F_sll_sra 1
+#define HR_sll_sra 1
+#define K_sll_sra 0
 #define NP_sll_sra 4
 #define F_sll_add 1
+#define HR_sll_add 0
+#define K_sll_add 0
 #define NP_sll_add 5
 #define F_sh1add_rr 1
+#define HR_sh1add_rr 1
+#define K_sh1add_rr 2
+#define OPS_sh1add_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sh1add_rr 3
 #define F_sh2add_rr 1
+#define HR_sh2add_rr 1
+#define K_sh2add_rr 2
+#define OPS_sh2add_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sh2add_rr 3
 #define F_sh3add_rr 1
+#define HR_sh3add_rr 1
+#define K_sh3add_rr 2
+#define OPS_sh3add_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sh3add_rr 3
 #define F_add_uw_rr 1
+#define HR_add_uw_rr 1
+#define K_add_uw_rr 2
+#define OPS_add_uw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_add_uw_rr 3
 #define F_sh1add_uw_rr 1
+#define HR_sh1add_uw_rr 1
+#define K_sh1add_uw_rr 2
+#define OPS_sh1add_uw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sh1add_uw_rr 3
 #define F_sh2add_uw_rr 1
+#define HR_sh2add_uw_rr 1
+#define K_sh2add_uw_rr 2
+#define OPS_sh2add_uw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sh2add_uw_rr 3
 #define F_sh3add_uw_rr 1
+#define HR_sh3add_uw_rr 1
+#define K_sh3add_uw_rr 2
+#define OPS_sh3add_uw_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_sh3add_uw_rr 3
 #define F_andn_rr 1
+#define HR_andn_rr 1
+#define K_andn_rr 2
+#define OPS_andn_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_andn_rr 3
 #define F_orn_rr 1
+#define HR_orn_rr 1
+#define K_orn_rr 2
+#define OPS_orn_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_orn_rr 3
 #define F_xnor_rr 1
+#define HR_xnor_rr 1
+#define K_xnor_rr 2
+#define OPS_xnor_rr {1, PAIR_OP_SLOT}, {2, PAIR_OP_SLOT}
 #define NP_xnor_rr 3
 #define F_mov_const 1
+#define HR_mov_const 1
+#define K_mov_const 0
 #define NP_mov_const 2
 #define F_addi 1
+#define HR_addi 1
+#define K_addi 1
+#define OPS_addi {1, PAIR_OP_SLOT}
 #define NP_addi 3
 #define F_lb 1
+#define HR_lb 1
+#define K_lb 1
+#define OPS_lb {1, PAIR_OP_SLOT}
 #define NP_lb 4
 #define F_lbu 1
+#define HR_lbu 1
+#define K_lbu 1
+#define OPS_lbu {1, PAIR_OP_SLOT}
 #define NP_lbu 4
 #define F_lh 1
+#define HR_lh 1
+#define K_lh 1
+#define OPS_lh {1, PAIR_OP_SLOT}
 #define NP_lh 4
 #define F_lhu 1
+#define HR_lhu 1
+#define K_lhu 1
+#define OPS_lhu {1, PAIR_OP_SLOT}
 #define NP_lhu 4
 #define F_lw 1
+#define HR_lw 1
+#define K_lw 1
+#define OPS_lw {1, PAIR_OP_SLOT}
 #define NP_lw 4
 #define F_lwu 1
+#define HR_lwu 1
+#define K_lwu 1
+#define OPS_lwu {1, PAIR_OP_SLOT}
 #define NP_lwu 4
 #define F_ld 1
+#define HR_ld 1
+#define K_ld 1
+#define OPS_ld {1, PAIR_OP_SLOT}
 #define NP_ld 4
 #define F_sb 1
+#define HR_sb 0
+#define K_sb 2
+#define OPS_sb {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define NP_sb 4
 #define F_sh 1
+#define HR_sh 0
+#define K_sh 2
+#define OPS_sh {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define NP_sh 4
 #define F_sw 1
+#define HR_sw 0
+#define K_sw 2
+#define OPS_sw {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define NP_sw 4
 #define F_sd 1
+#define HR_sd 0
+#define K_sd 2
+#define OPS_sd {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define NP_sd 4
 #define F_b 1
+#define HR_b 0
+#define K_b 0
 #define F_jal_link 1
+#define HR_jal_link 0
+#define K_jal_link 0
 #define F_jalr_cached 1
+#define HR_jalr_cached 0
+#define K_jalr_cached 1
+#define OPS_jalr_cached {1, PAIR_OP_SLOT}
 #define F_beq 1
+#define HR_beq 0
+#define K_beq 2
+#define OPS_beq {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_beq_bk 1
+#define HR_beq_bk 0
+#define K_beq_bk 2
+#define OPS_beq_bk {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_beq_ri 1
+#define HR_beq_ri 0
+#define K_beq_ri 1
+#define OPS_beq_ri {1, PAIR_OP_SLOT}
 #define F_beq_ri_bk 1
+#define HR_beq_ri_bk 0
+#define K_beq_ri_bk 1
+#define OPS_beq_ri_bk {1, PAIR_OP_SLOT}
 #define F_bne 1
+#define HR_bne 0
+#define K_bne 2
+#define OPS_bne {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bne_bk 1
+#define HR_bne_bk 0
+#define K_bne_bk 2
+#define OPS_bne_bk {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bne_ri 1
+#define HR_bne_ri 0
+#define K_bne_ri 1
+#define OPS_bne_ri {1, PAIR_OP_SLOT}
 #define F_bne_ri_bk 1
+#define HR_bne_ri_bk 0
+#define K_bne_ri_bk 1
+#define OPS_bne_ri_bk {1, PAIR_OP_SLOT}
 #define F_blt 1
+#define HR_blt 0
+#define K_blt 2
+#define OPS_blt {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_blt_bk 1
+#define HR_blt_bk 0
+#define K_blt_bk 2
+#define OPS_blt_bk {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_blt_ri 1
+#define HR_blt_ri 0
+#define K_blt_ri 1
+#define OPS_blt_ri {1, PAIR_OP_SLOT}
 #define F_blt_ri_bk 1
+#define HR_blt_ri_bk 0
+#define K_blt_ri_bk 1
+#define OPS_blt_ri_bk {1, PAIR_OP_SLOT}
 #define F_bge 1
+#define HR_bge 0
+#define K_bge 2
+#define OPS_bge {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bge_bk 1
+#define HR_bge_bk 0
+#define K_bge_bk 2
+#define OPS_bge_bk {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bge_ri 1
+#define HR_bge_ri 0
+#define K_bge_ri 1
+#define OPS_bge_ri {1, PAIR_OP_SLOT}
 #define F_bge_ri_bk 1
+#define HR_bge_ri_bk 0
+#define K_bge_ri_bk 1
+#define OPS_bge_ri_bk {1, PAIR_OP_SLOT}
 #define F_bltu 1
+#define HR_bltu 0
+#define K_bltu 2
+#define OPS_bltu {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bltu_bk 1
+#define HR_bltu_bk 0
+#define K_bltu_bk 2
+#define OPS_bltu_bk {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bltu_ri 1
+#define HR_bltu_ri 0
+#define K_bltu_ri 1
+#define OPS_bltu_ri {1, PAIR_OP_SLOT}
 #define F_bltu_ri_bk 1
+#define HR_bltu_ri_bk 0
+#define K_bltu_ri_bk 1
+#define OPS_bltu_ri_bk {1, PAIR_OP_SLOT}
 #define F_bgeu 1
+#define HR_bgeu 0
+#define K_bgeu 2
+#define OPS_bgeu {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bgeu_bk 1
+#define HR_bgeu_bk 0
+#define K_bgeu_bk 2
+#define OPS_bgeu_bk {0, PAIR_OP_SLOT}, {1, PAIR_OP_SLOT}
 #define F_bgeu_ri 1
+#define HR_bgeu_ri 0
+#define K_bgeu_ri 1
+#define OPS_bgeu_ri {1, PAIR_OP_SLOT}
 #define F_bgeu_ri_bk 1
+#define HR_bgeu_ri_bk 0
+#define K_bgeu_ri_bk 1
+#define OPS_bgeu_ri_bk {1, PAIR_OP_SLOT}
 #define F_blt_ir 1
+#define HR_blt_ir 0
+#define K_blt_ir 1
+#define OPS_blt_ir {1, PAIR_OP_SLOT}
 #define F_blt_ir_bk 1
+#define HR_blt_ir_bk 0
+#define K_blt_ir_bk 1
+#define OPS_blt_ir_bk {1, PAIR_OP_SLOT}
 #define F_bge_ir 1
+#define HR_bge_ir 0
+#define K_bge_ir 1
+#define OPS_bge_ir {1, PAIR_OP_SLOT}
 #define F_bge_ir_bk 1
+#define HR_bge_ir_bk 0
+#define K_bge_ir_bk 1
+#define OPS_bge_ir_bk {1, PAIR_OP_SLOT}
 #define F_bltu_ir 1
+#define HR_bltu_ir 0
+#define K_bltu_ir 1
+#define OPS_bltu_ir {1, PAIR_OP_SLOT}
 #define F_bltu_ir_bk 1
+#define HR_bltu_ir_bk 0
+#define K_bltu_ir_bk 1
+#define OPS_bltu_ir_bk {1, PAIR_OP_SLOT}
 #define F_bgeu_ir 1
+#define HR_bgeu_ir 0
+#define K_bgeu_ir 1
+#define OPS_bgeu_ir {1, PAIR_OP_SLOT}
 #define F_bgeu_ir_bk 1
+#define HR_bgeu_ir_bk 0
+#define K_bgeu_ir_bk 1
+#define OPS_bgeu_ir_bk {1, PAIR_OP_SLOT}
 #define F_andi_beqz 1
+#define HR_andi_beqz 0
+#define K_andi_beqz 1
+#define OPS_andi_beqz {1, PAIR_OP_SLOT}
 #define F_andi_beqz_bk 1
+#define HR_andi_beqz_bk 0
+#define K_andi_beqz_bk 1
+#define OPS_andi_beqz_bk {1, PAIR_OP_SLOT}
 #define F_andi_bnez 1
+#define HR_andi_bnez 0
+#define K_andi_bnez 1
+#define OPS_andi_bnez {1, PAIR_OP_SLOT}
 #define F_andi_bnez_bk 1
+#define HR_andi_bnez_bk 0
+#define K_andi_bnez_bk 1
+#define OPS_andi_bnez_bk {1, PAIR_OP_SLOT}
 
 // ---- generated: the pairs ----
 FUSE2(add_rr, add_rr)

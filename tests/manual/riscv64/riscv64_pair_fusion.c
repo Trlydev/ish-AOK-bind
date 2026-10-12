@@ -66,6 +66,13 @@ VCASE(v_ld_bne,    "ld t4, 16(t6)\n bne t4, zero, 1f\n li t5, 111\n j 2f\n 1: li
 VCASE(v_addi_bgeu, "addi t4, t3, 1\n bgeu t4, t3, 1f\n li t5, 111\n j 2f\n 1: li t5, 222\n 2:")
 VCASE(v_lbu_beq,   "lbu t4, 1(t6)\n beq t4, t3, 1f\n li t5, 111\n j 2f\n 1: li t5, 222\n 2:")
 VCASE(v_add_j,     "add t4, t3, t3\n j 1f\n li t4, 0\n 1: addi t5, t4, 1")
+// the first half's result as the second's SECOND operand, a store's base, a
+// branch's right side
+VCASE(v_add_sub_m, "add t4, t3, t3\n sub t5, t3, t4")
+VCASE(v_ld_sub_m,  "ld t4, 0(t6)\n sub t5, t3, t4")
+VCASE(v_addi_sd_b, "addi t4, t6, 8\n sd t3, 8(t4)")
+VCASE(v_addi_bltu, "addi t4, t3, 1\n bltu t3, t4, 1f\n li t5, 111\n j 2f\n 1: li t5, 222\n 2:")
+VCASE(v_ld_beq_m,  "ld t4, 8(t6)\n beq t3, t4, 1f\n li t5, 111\n j 2f\n 1: li t5, 222\n 2:")
 VCASE(v_loop,      "li t5, 0\n 1: addi t5, t5, 3\n addiw t3, t3, -1\n bnez t3, 1b")
 
 // A call and its return, as the compiler writes them.
@@ -97,6 +104,10 @@ static const struct { const char *name; void (*fn)(struct st *); struct st in, o
     {"lbu;beq",   v_lbu_beq,   {0x77, 0, 0, W}, {0x77, 0x77, 222, W}},
     {"add;j",     v_add_j,     {2, 0, 0, M}, {2, 4, 5, M}},
     {"loop",      v_loop,      {5, 6, 0, M}, {0, 6, 15, M}},
+    {"add;sub m", v_add_sub_m, {5, 0, 0, M}, {5, 10, (uint64_t) -5, M}},
+    {"ld;sub m",  v_ld_sub_m,  {0x64, 0, 0, M}, {0x64, 0x10, 0x54, M}},
+    {"addi;bltu m", v_addi_bltu, {7, 0, 0, M}, {7, 8, 222, M}},
+    {"ld;beq m",  v_ld_beq_m,  {0x20, 0, 0, M}, {0x20, 0x20, 222, M}},
 #undef M
 #undef W
 };
@@ -122,6 +133,15 @@ static int values(void) {
                 failures++;
                 break;
             }
+        }
+    }
+    {   // a store through the first half's result
+        struct st s = {0x77, 0, 0, {0x10, 0x20, 0, 0}};
+        v_addi_sd_b(&s);
+        if (s.b != (uint64_t) &s.mem[1] || s.mem[2] != 0x77 || s.mem[1] != 0x20) {
+            printf("riscv64_pair_fusion: addi;sd base: b=%#llx mem=%#llx,%#llx\n", (unsigned long long) s.b,
+                   (unsigned long long) s.mem[1], (unsigned long long) s.mem[2]);
+            failures++;
         }
     }
     {   // the dependent load: mem[3] holds a pointer to mem[1]

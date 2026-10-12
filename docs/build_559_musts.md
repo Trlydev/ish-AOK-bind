@@ -452,6 +452,14 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   alternated rounds: 7-Zip 9.9%, fib 1.1%, method 5.4%, dict 9.4%, str 36.1%
   faster. Mac, host instructions for a Python loop: 5.3% fewer. **Not timed
   on the A10X:** it was locked.
+- **A10X, the morning after** (Devuan riscv64, the pair pass off and on,
+  three rounds): 7-Zip 8.7%, fib 1.3%, method 4.3%, dict 20.1%, str 15.7%
+  faster.
+- **Forwarding, 2026-10-12** (the `fwd` bit; see the arm64 paragraph above).
+  The bodies here compute in the registers the next body's parameters land
+  in, so a first half copies its result to x12 -- only in the gadgets that
+  forward. 711 gadgets from the 332 pairs. M4, off and on, five rounds:
+  7-Zip 3.4%, fib 3.6%, method 0.7%, dict 3.2%, str 1.1% faster.
 - **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
   this guest, with the same control (a fused load's fault path naming the
   wrong instruction fails it); the standalone ALU gadgets are byte for byte

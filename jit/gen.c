@@ -20308,14 +20308,36 @@ static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
 #endif
 
 #if defined(ISH_JIT_RISCV64_GUEST)
-#define FUSE2(a, b) extern void gadget_riscv64_##a(void); extern void gadget_riscv64_##b(void); \
+// FUSE2(a, b) by whether a leaves a result in a register (HR_a) and how many
+// operands b can take from one (K_b): which gadgets exist, and b's operands.
+#define FUSE2(a, b) RV_FUSE2_SEL(HR_##a, K_##b)(a, b)
+#define RV_FUSE2_SEL(h, k) RV_FUSE2_SEL_(h, k)
+#define RV_FUSE2_SEL_(h, k) RV_FUSE2_##h##_##k
+#define RV_FUSE2_0_0(a, b) RV_PAIR(a, b, NULL, NULL, {0, PAIR_OP_NONE}, {0, PAIR_OP_NONE})
+#define RV_FUSE2_0_1(a, b) RV_FUSE2_0_0(a, b)
+#define RV_FUSE2_0_2(a, b) RV_FUSE2_0_0(a, b)
+#define RV_FUSE2_1_0(a, b) RV_FUSE2_0_0(a, b)
+#define RV_FUSE2_1_1(a, b) RV_FW1(a, b) RV_PAIR(a, b, gadget_riscv64_f2n_##a##__##b, NULL, OPS_##b, {0, PAIR_OP_NONE})
+#define RV_FUSE2_1_2(a, b) RV_FW1(a, b) RV_FW2(a, b) \
+    RV_PAIR(a, b, gadget_riscv64_f2n_##a##__##b, gadget_riscv64_f2m_##a##__##b, OPS_##b)
+
+#define RV_PAIR(a, b, fn, fm, ...) extern void gadget_riscv64_##a(void); extern void gadget_riscv64_##b(void); \
     extern void gadget_riscv64_f2_##a##__##b(void);
+#define RV_FW1(a, b) extern void gadget_riscv64_f2n_##a##__##b(void);
+#define RV_FW2(a, b) extern void gadget_riscv64_f2m_##a##__##b(void);
 #include "jit/guest-riscv64/pairs.h"
-#undef FUSE2
+#undef RV_PAIR
+#undef RV_FW1
+#undef RV_FW2
 static const struct jit_pair riscv64_pairs[] = {
-#define FUSE2(a, b) {gadget_riscv64_##a, gadget_riscv64_##b, gadget_riscv64_f2_##a##__##b, {NULL, NULL}, \
-    1 + NP_##a, {{0, PAIR_OP_NONE}, {0, PAIR_OP_NONE}}},
+#define RV_PAIR(a, b, fn, fm, ...) {gadget_riscv64_##a, gadget_riscv64_##b, gadget_riscv64_f2_##a##__##b, \
+    {fn, fm}, 1 + NP_##a, {__VA_ARGS__}},
+#define RV_FW1(a, b)
+#define RV_FW2(a, b)
 #include "jit/guest-riscv64/pairs.h"
+#undef RV_PAIR
+#undef RV_FW1
+#undef RV_FW2
 #undef FUSE2
 };
 _Static_assert(sizeof(riscv64_pairs) / sizeof(riscv64_pairs[0]) * 3 < JIT_PAIR_HASH, "riscv64 pair table: raise JIT_PAIR_HASH");
@@ -20326,12 +20348,13 @@ static void riscv64_pair_init(void) {
     jit_pair_set_init(&riscv64_pair_set);
 }
 static void riscv64_pair_fuse(struct gen_state *state, unsigned from) {
-    if (state->single_step || !(riscv64_jit_fuse_mask() & JIT_FUSE_RV_FUSE2)) {
+    unsigned mask = riscv64_jit_fuse_mask();
+    if (state->single_step || !(mask & JIT_FUSE_RV_FUSE2)) {
         state->pair_prev = UINT_MAX;
         return;
     }
     pthread_once(&riscv64_pair_once, riscv64_pair_init);
-    jit_pair_fuse(state, from, &riscv64_pair_set, false);
+    jit_pair_fuse(state, from, &riscv64_pair_set, (mask & JIT_FUSE_RV_FWD) != 0);
 }
 #else
 static void riscv64_pair_fuse(struct gen_state *state, unsigned from) {
@@ -20377,6 +20400,7 @@ static const struct jit_fuse_entry riscv64_fuse_names[] = {
     {"retcache", JIT_FUSE_RV_RETCACHE}, {"pair", JIT_FUSE_RV_PAIR},
     {"alu", JIT_FUSE_RV_ALU}, {"br", JIT_FUSE_RV_BRANCH}, {"btfn", JIT_FUSE_RV_BTFN},
     {"rcache", JIT_FUSE_RV_RCACHE}, {"fuse2", JIT_FUSE_RV_FUSE2},
+    {"fwd", JIT_FUSE_RV_FWD},
 };
 static const struct jit_fuse_entry amd64_fuse_names[] = {
     {"incdec_reg", JIT_FUSE_AMD64_INCDEC_REG}, {"deadflags", JIT_FUSE_AMD64_DEADFLAGS},
