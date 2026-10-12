@@ -154,7 +154,8 @@ COMPOSITOR_CMD="${WAYLAND_COMPOSITOR_CMD:-$COMPOSITOR_BIN}"
 # takes the card and the input devices through its seat (seatd, which
 # setup-wayland.sh installs on such a machine), nothing is headless, and no
 # VNC bridge runs. Everything else is as under iSH-AOK: the same seeded
-# configuration, menu, theme and panel. AOK_WAYLAND_BACKEND=headless or
+# configuration, menu, theme and panel, and software compositing unless
+# WLR_RENDERER says otherwise (AOK_WL_OWN_RENDERER below has why). AOK_WAYLAND_BACKEND=headless or
 # =display overrides the choice.
 AOK_WL_DISPLAY=0
 case "${AOK_WAYLAND_BACKEND:-}" in
@@ -530,10 +531,23 @@ wl_gpu_usable_for() {
     return 1
 }
 WL_GPU_COMPOSITOR=0
-# (a machine's own display: the compositor chooses its renderer for the card,
-# GLES2 where the card can and pixman where it cannot; not this path)
+# (not this path on a machine's own display: see AOK_WL_OWN_RENDERER below)
 if [ "$AOK_WL_DISPLAY" = 0 ] && [ -z "${WLR_RENDERER:-}" ] && [ "${ISH_DISPLAY_GPU:-1}" != 0 ] && wl_gpu_usable_for "$COMPOSITOR_BIN"; then
     WL_GPU_COMPOSITOR=1
+fi
+# A machine's own display is composited in software too, unless the caller
+# names another renderer (WLR_RENDERER=gles2), which then is the caller's
+# whole choice: its programs get the card as well. The one such machine there
+# is, the UTM virtual machine on its GL display device, shows nothing but the
+# cursor of a desktop composited with GLES2: the compositor draws every frame
+# (its own screenshot has them) and none reaches the screen, with atomic
+# modesetting or without, on a still desktop or a busy one. Nothing drawn
+# with GL does there: kmscube stays black too, on a GBM surface or an FBO
+# (simulator and an M4 iPad, 2026-10-12; docs/TODO.md has the entry). pixman
+# draws into dumb buffers, the path the text console uses, and is seen.
+AOK_WL_OWN_RENDERER=0
+if [ "$AOK_WL_DISPLAY" = 1 ] && [ -n "${WLR_RENDERER:-}" ] && [ "$WLR_RENDERER" != pixman ]; then
+    AOK_WL_OWN_RENDERER=1
 fi
 # Two things Wayfire cannot do, where the session is the plain labwc desktop
 # instead, and says why. It draws everything with OpenGL ES, so it cannot run
@@ -556,7 +570,7 @@ if [ -n "$wl_wayfire_cannot" ]; then
     AOK_DESKTOP=labwc COMPOSITOR_BIN=labwc COMPOSITOR_CMD=labwc
     command -v labwc >/dev/null 2>&1 || die "$wl_wayfire_cannot, and labwc is not installed to fall back to"
 fi
-[ "$AOK_WL_DISPLAY" = 1 ] || export WLR_RENDERER="${WLR_RENDERER:-pixman}"
+[ "$AOK_WL_OWN_RENDERER" = 1 ] || export WLR_RENDERER="${WLR_RENDERER:-pixman}"
 # There's no real GPU/DRM device here (matches labwc's own harmless
 # "drmGetDevices2 failed: No such file or directory" at startup). GTK3
 # apps generally cope via cairo software rendering by default, but GTK4's
@@ -566,7 +580,7 @@ fi
 # (not just set for wayvnc/foot individually) so every client an interactive
 # session launches -- typically from a shell inside foot -- inherits them
 # without the user needing to know this environment has no GPU.
-[ "$AOK_WL_DISPLAY" = 1 ] || export GSK_RENDERER=cairo
+[ "$AOK_WL_OWN_RENDERER" = 1 ] || export GSK_RENDERER=cairo
 # (Asked for /usr/bin/env, which is of the root's own architecture as the
 # programs started here are; `sh` can be iSH-AOK's native dash, no ELF at all.)
 # OpenGL programs render in software unless /etc/aok-gpu.conf (written by
@@ -577,8 +591,8 @@ if [ -z "${LIBGL_ALWAYS_SOFTWARE+set}" ] && [ -f /etc/aok-gpu.conf ] &&
    grep -q '^AOK_GL=gpu' /etc/aok-gpu.conf 2>/dev/null && wl_gpu_usable_for /usr/bin/env; then
     export LIBGL_ALWAYS_SOFTWARE=0 MESA_LOADER_DRIVER_OVERRIDE=zink
 fi
-# (a machine's own display: Mesa picks the card's driver, or its software one)
-[ "$AOK_WL_DISPLAY" = 1 ] || export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE-1}"
+# (the caller's own renderer on a machine's display: Mesa picks the card's driver)
+[ "$AOK_WL_OWN_RENDERER" = 1 ] || export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE-1}"
 # Debian/Devuan firefox-esr routes its Wayland connection through a bundled
 # "wayland-proxy-compositor" shim by default. Under iSH that relay corrupts
 # the stream: firefox dies at startup with "Wayland protocol error:
@@ -1911,7 +1925,7 @@ start_compositor() {
         WL_GPU_COMPOSITOR=0
     fi
     if [ "$AOK_WL_DISPLAY" = 1 ]; then
-        log "starting $COMPOSITOR_CMD (on this machine's display)"
+        log "starting $COMPOSITOR_CMD (on this machine's display, renderer: $WLR_RENDERER)"
     else
         log "starting $COMPOSITOR_CMD (headless)"
     fi
