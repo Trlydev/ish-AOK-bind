@@ -541,12 +541,61 @@ tests, each compared between the two:
 
 ### Not done
 
-- A UTM build with the plug-in in it. The iPad numbers come from a
-  benchmark app around the same QEMU library, not from UTM SE.
+- GL-accelerated displays in the UTM build (section 9).
 - arm64 and x86 guests. Each needs its gadgets retargeted the same way.
 - Single-precision FP natively, `ecall`/`sret` without leaving the stream,
   and AOK's fused gadgets.
 - QEMU's own TCG test suites for RISC-V have not been run against it.
+
+## 9. Inside UTM SE
+
+UTM's iOS front end (the "iOS-SE" scheme, UTM 5.0.6 at `7eadb056`) built
+around this QEMU, installed on the M4 and the A10X iPad Pro as its own app
+(`app.ish.aok.UTM-SE`, beside any UTM SE from the App Store).
+
+### What was built
+
+- **UTM itself is unmodified.** Its source at that commit, its own prebuilt
+  dependencies (the `Sysroot-ios-tci-arm64` artifact of its CI), its own
+  QEMU 10.0.12 for every guest architecture but one.
+- **RISC-V guests get the plug-in's QEMU** (11.1.2, tctiSH fork, AOK gadgets
+  on by default), built against UTM's dependencies with UTM's flags and put
+  in the sysroot in place of UTM's `qemu-riscv64-softmmu.framework`, with
+  the RISC-V firmware (OpenSBI, EDK2) of the same QEMU.
+- **Two small additions to that QEMU**, on a branch of their own (`utm-se`
+  in `~/git/qemu-aok`, local), because UTM's front end assumes UTM's QEMU
+  fork: the `virtio-ramfb` display device it gives every "virt" machine
+  (ported from the fork), and building against the spice-server 0.14.3 UTM
+  ships while accepting the `gl=off` UTM always passes.
+
+### What was checked
+
+- On the M4 iPad, by hand: a machine made the way UTM's wizard makes them
+  (UEFI, virtio-ramfb display, USB input, sound, network) reaches the
+  firmware's shell on the display, and a direct-boot Alpine guest runs the
+  six workloads and gives a shell on UTM's terminal. UTM's debug log shows
+  its ordinary argument list accepted, with only deprecation and socket
+  warnings from QEMU.
+- In the iOS simulator, driven from here: the same guest with its console on
+  the display (the guest's virtio-gpu driver on virtio-ramfb), an address by
+  DHCP from QEMU's user network, and keyboard input.
+- **The gadgets are on inside UTM.** The same VM in the same app, launched
+  with `QEMU_AOK=0` in the app's environment, is slower on every workload
+  (1.4x to 2.4x on a busy laptop's simulator, which is not a measurement).
+- Typing into the guest's display console at 20 and at 50 keys a second
+  through QEMU's monitor arrives intact with the gadgets on and off.
+
+### Limits
+
+- **No GL.** UTM's accelerated display (the `-gl` devices, `gl=on`) is a set
+  of patches to UTM's QEMU fork (ANGLE, IOSurface scanouts, virglrenderer on
+  Metal) that this tree does not carry. A RISC-V machine configured with a
+  `-gl` display card does not start.
+- Not measured against UTM SE as shipped on a device. `install-qemu-utm.sh
+  stock` puts UTM's own RISC-V QEMU back for that.
+- UTM for iOS has no way to start a VM from outside, so every device check
+  needs a tap.
+- UTM at this commit builds only with the released Xcode 27.
 
 ## Appendix: reproducing the race
 
@@ -572,3 +621,5 @@ and `build/tools/fakefsify`, plus Homebrew's `glib`, `pixman`, `meson` and
 | `prof-aok.sh` | where the plug-in build's time goes, by category |
 | `build-qemu-ios.sh` | cross-builds the plug-in QEMU and its libraries for iOS (tctiSH's recipe; `ios-app/build_dependencies.patch` is what it changes) |
 | `ios-app/` | the device benchmark app: `assemble.sh` stages QEMU and the guest and generates the project (XcodeGen), `build.sh` builds and signs, `run-device.sh` launches one run and fetches its results |
+| `utm/` | UTM SE with the plug-in (section 9): `build-qemu-utm.sh` and `install-qemu-utm.sh` build this QEMU against UTM's sysroot and put it there, `build-utm.sh` builds and signs UTM, `make-vm.py` writes ready-made virtual machines, `install-utm.sh` puts both on a device |
+| `bench/init`, `bench/udhcpc.sh` | the guest's init; in the VM image (the race's plus the kernel's modules) it also loads drivers and takes an address |

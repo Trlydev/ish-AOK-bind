@@ -16,16 +16,27 @@ for a in aarch64 riscv64; do
         mv "$W/bench/fptest.$a.tmp" "$W/bench/fptest.$a"
     fi
     "$ISH" -f "$R" /bin/sh -c 'cat > /bench/fptest && chmod +x /bench/fptest' < "$W/bench/fptest.$a"
-    tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
+    tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/udhcpc.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
     "$ISH" -f "$R" /bin/sh -e -c '
         cd /bench && rm -f ._*
         [ -f data2.bin ] || head -c 2097152 data.bin > data2.bin
         [ -f data1.bin ] || head -c 1048576 data.bin > data1.bin
-        cp init /init && chmod +x /init run.sh run1.sh check.sh
+        cp init /init && chmod +x /init run.sh run1.sh check.sh udhcpc.sh
         cd / && rm -f /bench-root.tar
         tar -cf /bench-root.tar bin etc home lib media mnt opt root run sbin srv usr var bench init
     '
     bsdtar -c --format=newc -f "$W/initramfs-$a.cpio" "@$R/data/bench-root.tar"
     ls -la "$W/initramfs-$a.cpio"
 done
+# For a VM front end (tests/bench-utm/utm): the riscv64 image followed by a second archive with the kernel
+# package's modules, which the kernel unpacks over the first. /init loads drivers only when they are there,
+# so the race's image is the same guest without them.
+M=$W/dl-kernel/modules-riscv64
+if [ ! -f "$W/modules-riscv64.cpio" ]; then
+    rm -rf "$M" && mkdir -p "$M"
+    bsdtar -xf "$W/dl-kernel/linux-lts-riscv64.apk" -C "$M" lib/modules
+    (cd "$M" && bsdtar -c --format=newc --uid 0 --gid 0 -f "$W/modules-riscv64.cpio" lib)
+fi
+cat "$W/initramfs-riscv64.cpio" "$W/modules-riscv64.cpio" > "$W/initramfs-riscv64-vm.cpio"
+ls -la "$W/modules-riscv64.cpio" "$W/initramfs-riscv64-vm.cpio"
 echo UPDATE-DONE
