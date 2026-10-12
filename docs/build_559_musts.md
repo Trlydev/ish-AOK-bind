@@ -16,7 +16,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | **prototype in, off by default** (2026-10-11): -21..-26% on short processes with addresses held still; needs a decision on ASLR before it can be on |
-| 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has all three as of the same evening (M4: 7-Zip ~16%, Python 5-45% faster than 558), untimed on the A10X |
+| 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has all three and forwarding too (M4: 7-Zip ~20%, Python 8-45% faster than 558; A10X timed for the pair pass and forwarding) |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
@@ -424,7 +424,8 @@ pairs, 207 KB.
 
 - **Numbers.** M4, arm64 Alpine, one build, forwarding off and on, five
   rounds: 7-Zip 3.8% faster, Python fib 5.0%, method 4.3%, dict 3.3%, str
-  5.2% faster.
+  5.2% faster. A10X, seven rounds: 7-Zip 1.1%, fib 3.5%, method 0.6%, dict
+  2.6%, str 1.4% faster.
 - **Proved:** tests/manual/arm64/pair_fusion.c grew cases for the second
   operand, a store's base, a load's index, a compare's right side, the
   32-bit move and an indirect branch through a loaded pointer; it passes with
@@ -459,7 +460,9 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   The bodies here compute in the registers the next body's parameters land
   in, so a first half copies its result to x12 -- only in the gadgets that
   forward. 711 gadgets from the 332 pairs. M4, off and on, five rounds:
-  7-Zip 3.4%, fib 3.6%, method 0.7%, dict 3.2%, str 1.1% faster.
+  7-Zip 3.4%, fib 3.6%, method 0.7%, dict 3.2%, str 1.1% faster. A10X,
+  three rounds: 7-Zip 1.5%, fib 4.3%, method 6.0%, dict 5.4%, str 2.5%
+  faster.
 - **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
   this guest, with the same control (a fused load's fault path naming the
   wrong instruction fails it); the standalone ALU gadgets are byte for byte
