@@ -16,12 +16,12 @@ for a in aarch64 riscv64; do
         mv "$W/bench/fptest.$a.tmp" "$W/bench/fptest.$a"
     fi
     "$ISH" -f "$R" /bin/sh -c 'cat > /bench/fptest && chmod +x /bench/fptest' < "$W/bench/fptest.$a"
-    tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/udhcpc.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
+    tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/udhcpc.sh bench/gltest.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
     "$ISH" -f "$R" /bin/sh -e -c '
         cd /bench && rm -f ._*
         [ -f data2.bin ] || head -c 2097152 data.bin > data2.bin
         [ -f data1.bin ] || head -c 1048576 data.bin > data1.bin
-        cp init /init && chmod +x /init run.sh run1.sh check.sh udhcpc.sh
+        cp init /init && chmod +x /init run.sh run1.sh check.sh udhcpc.sh gltest.sh
         cd / && rm -f /bench-root.tar
         tar -cf /bench-root.tar bin etc home lib media mnt opt root run sbin srv usr var bench init
     '

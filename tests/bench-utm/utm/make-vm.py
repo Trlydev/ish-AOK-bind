@@ -124,6 +124,20 @@ def main():
     shown["Drive"] = direct_boot(3)
     write(outdir, shown, {"Image-lts-riscv64": kernel, "initramfs-riscv64.cpio": initramfs})
 
+    # The same machine on UTM's accelerated display device. UTM then starts QEMU with -spice gl=on and,
+    # as its settings allow, venus=, neptune= and blob= on the device.
+    gl = base("AOK RISC-V Display GL",
+              "The Display machine on the GL display device (virtio-ramfb-gl). Needs a QEMU with the GL path.",
+              "A0C0A0C0-0000-4000-8000-000000000004", cpus=2, memory=2048)
+    gl["QEMU"]["AdditionalArguments"] = list(shown["QEMU"]["AdditionalArguments"])
+    gl["QEMU"]["RNGDevice"] = True
+    gl["Input"]["UsbBusSupport"] = "3.0"
+    gl["Display"] = [dict(display(), Hardware="virtio-ramfb-gl")]
+    gl["Network"] = [network("52:54:00:A0:C0:04")]
+    gl["Serial"] = [terminal()]
+    gl["Drive"] = direct_boot(4)
+    write(outdir, gl, {"Image-lts-riscv64": kernel, "initramfs-riscv64.cpio": initramfs})
+
     uefi = base("AOK RISC-V UEFI",
                 "UTM's defaults for a RISC-V virt machine with no disk attached. It ends at the UEFI shell: "
                 "attach an installer image to boot something.",

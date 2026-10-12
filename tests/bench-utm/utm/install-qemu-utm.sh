@@ -13,7 +13,7 @@ PLAT=ios-tci
 case $1 in ios-tci|ios_simulator-tci) PLAT=$1; shift ;; esac
 PREFIX=$U/UTM/sysroot-$PLAT-arm64
 STOCK=$U/stock-$PLAT
-OUT=$U/qemu-out-$PLAT
+OUT=$U/qemu-out-$PLAT${AOK_GL:+-gl}     # AOK_GL=1: the build with OpenGL and virglrenderer
 FW=$PREFIX/Frameworks/qemu-riscv64-softmmu.framework
 FILES="opensbi-riscv64-generic-fw_dynamic.bin edk2-riscv-code.fd edk2-riscv-vars.fd"
 

@@ -17,7 +17,7 @@ U=$W/utm
 PLAT=ios-tci
 case $1 in ios-tci|ios_simulator-tci) PLAT=$1; shift ;; esac
 PREFIX=$U/UTM/sysroot-$PLAT-arm64
-OUT=$U/qemu-out-$PLAT
+OUT=$U/qemu-out-$PLAT${AOK_GL:+-gl}
 export PATH=/opt/homebrew/bin:$PATH
 
 # The sysroot's .pc files name the CI machine's path. A corrected copy, so that the sysroot stays as shipped.
@@ -48,7 +48,10 @@ export LDFLAGS="-arch $ARCH -isysroot $SDKROOT_IOS -L$PREFIX/lib -F$PREFIX/Frame
 # Host tools meson builds must not get the iOS SDK.
 export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 
-mkdir -p "$U/build-qemu-$PLAT" && cd "$U/build-qemu-$PLAT"
+# GL=1: with OpenGL (UTM's ANGLE-backed epoxy) and virglrenderer, which needs the utm-gl branch.
+GL="--disable-opengl --disable-virglrenderer"
+[ -n "$AOK_GL" ] && GL="--enable-opengl --enable-virglrenderer --disable-dbus-display"
+mkdir -p "$U/build-qemu-$PLAT${AOK_GL:+-gl}" && cd "$U/build-qemu-$PLAT${AOK_GL:+-gl}"
 if [ ! -f build.ninja ] || [ "$1" = configure ]; then
     "$W/src-aok/configure" --prefix="$OUT" --host=aarch64-apple-darwin --cross-prefix="" --objcc="$OBJCC" \
         --enable-shared-lib --disable-cocoa --disable-sdl --disable-coreaudio --disable-slirp-smbd \
@@ -57,7 +60,7 @@ if [ ! -f build.ninja ] || [ "$1" = configure ]; then
         --extra-cflags=-Wno-unused-command-line-argument --extra-ldflags=-Wl,-no_deduplicate \
         --extra-ldflags=-Wl,-random_uuid --extra-ldflags=-Wl,-no_compact_unwind \
         --enable-aok-gadgets --enable-spice --enable-spice-protocol --enable-slirp --enable-fdt=system \
-        --disable-opengl --disable-virglrenderer --disable-tools --disable-guest-agent --disable-docs \
+        $GL --disable-tools --disable-guest-agent --disable-docs \
         --disable-hvf --disable-werror --disable-debug-info
 fi
 ninja

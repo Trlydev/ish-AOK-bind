@@ -587,15 +587,45 @@ around this QEMU, installed on the M4 and the A10X iPad Pro as its own app
 
 ### Limits
 
-- **No GL.** UTM's accelerated display (the `-gl` devices, `gl=on`) is a set
-  of patches to UTM's QEMU fork (ANGLE, IOSurface scanouts, virglrenderer on
-  Metal) that this tree does not carry. A RISC-V machine configured with a
-  `-gl` display card does not start.
+- **GL: OpenGL only so far.** See "The accelerated display" below.
 - Not measured against UTM SE as shipped on a device. `install-qemu-utm.sh
   stock` puts UTM's own RISC-V QEMU back for that.
 - UTM for iOS has no way to start a VM from outside, so every device check
   needs a tap.
 - UTM at this commit builds only with the released Xcode 27.
+
+### The accelerated display
+
+UTM's GL display on iOS is not in QEMU: it is changes in UTM's QEMU fork
+(10.0), about 3,000 lines over some 30 files. EGL comes from ANGLE rather
+than a GBM device, a scanout goes to UTM's SPICE client as an IOSurface
+rather than a dmabuf, and virglrenderer renders on Metal. Without them a
+machine with a `-gl` display card does not start, and that is the card UTM
+suggests.
+
+The display half is now carried to the plug-in's QEMU 11, on a third branch
+(`utm-gl`, local):
+
+- `ui/console.c`, `ui/egl-helpers.c`, the shaders and the `include/ui`
+  headers by a three-way merge of the fork's changes onto QEMU 11's files.
+- `ui/spice-display.c` could not be merged that way. QEMU 11 rewrote its GL
+  half around multi-plane dmabufs and remote clients, which do not exist
+  without GBM. The GL section therefore exists twice: QEMU 11's own where
+  there is GBM, the fork's IOSurface code where there is not.
+- `hw/display` keeps QEMU 11's own virgl code. UTM's front end asks for
+  Vulkan (`venus`), Direct3D (`neptune`) and blob resources by default; the
+  device accepts those options on Apple hosts, says so, and runs with
+  OpenGL.
+
+Checked in the iOS simulator inside UTM SE, with the arguments UTM passes by
+default: virglrenderer comes up on ANGLE's Metal renderer and a Linux
+guest's virtio-gpu console is drawn through it. That build is the one on
+both iPads now, with a fourth machine (`AOK RISC-V Display GL`).
+
+Not done: the fork's work in `virtio-gpu-virgl.c` (its in-process render
+server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
+fencing changes), which overlaps QEMU 11's own rework of the same code. A
+guest that wants Vulkan or Direct3D gets OpenGL until then.
 
 ## Appendix: reproducing the race
 
@@ -621,5 +651,6 @@ and `build/tools/fakefsify`, plus Homebrew's `glib`, `pixman`, `meson` and
 | `prof-aok.sh` | where the plug-in build's time goes, by category |
 | `build-qemu-ios.sh` | cross-builds the plug-in QEMU and its libraries for iOS (tctiSH's recipe; `ios-app/build_dependencies.patch` is what it changes) |
 | `ios-app/` | the device benchmark app: `assemble.sh` stages QEMU and the guest and generates the project (XcodeGen), `build.sh` builds and signs, `run-device.sh` launches one run and fetches its results |
-| `utm/` | UTM SE with the plug-in (section 9): `build-qemu-utm.sh` and `install-qemu-utm.sh` build this QEMU against UTM's sysroot and put it there, `build-utm.sh` builds and signs UTM, `make-vm.py` writes ready-made virtual machines, `install-utm.sh` puts both on a device |
+| `utm/` | UTM SE with the plug-in (section 9): `build-qemu-utm.sh` and `install-qemu-utm.sh` build this QEMU against UTM's sysroot and put it there (`AOK_GL=1` for the build with the accelerated display), `build-utm.sh` builds and signs UTM, `make-vm.py` writes ready-made virtual machines, `install-utm.sh` puts both on a device |
 | `bench/init`, `bench/udhcpc.sh` | the guest's init; in the VM image (the race's plus the kernel's modules) it also loads drivers and takes an address |
+| `bench/gltest.sh` | in a guest: installs Mesa and runs kmscube, which names the renderer it was given |
