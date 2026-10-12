@@ -27,6 +27,10 @@
 #   - every ancestor view controller is told which child decides on the lock, not only the parent
 #   - the keyboard's power key (HID usage 0x66) is not passed to the guest: an iPad keyboard's key arrived
 #     as one and the guest shut down under its user
+#   - a tap whose touch made UTM switch the guest between its mouse and its tablet is clicked when the
+#     switch is through, where the finger landed. UTM sent it at once: pressed on the old device, wherever
+#     its cursor was, and released on the new one (the guest's mouse kept its button down and the desktop
+#     ignored every later click), or, if the switch was already through, not at all.
 set -e
 U=${U:-$HOME/aok-utm}
 cd "$U/UTM"

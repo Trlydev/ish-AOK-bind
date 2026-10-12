@@ -736,8 +736,8 @@ try: they live in memory, and their Mesa has no virgl driver.
 
 ### First use on an iPad, and what it found
 
-The first evening of somebody using the machine on an M4 iPad found four
-things no test of mine had, each in a different layer:
+The first evening of somebody using the machine on an M4 iPad found these,
+none of which a test of mine had, each in a different layer:
 
 - **Nothing drawn with GL was shown** (the engine; "The accelerated
   display" above).
@@ -767,6 +767,29 @@ things no test of mine had, each in a different layer:
   to build against) cannot remove the keyboard interface QEMU frees first.
   `9d51cf6` leaves a server of that age standing. With it QEMU exits with
   code 0 and UTM SE quits on its own account, as it does after any VM.
+- **"I tried starting up dillo, and nothing happens"** -- and nothing else
+  in the menu did either, though as root, in a desktop started later, it all
+  worked (the engine and the front end together). The front end has two
+  pointer devices in the guest, a USB mouse and a USB tablet, and switches
+  between them with `mouse_set` as the kind of input changes. A tap that
+  caused a switch was pressed on the mouse and released on the tablet: an
+  event logger in the guest shows `Mouse BTN_LEFT down` and never an up.
+  libinput counts a button per seat, so the compositor dropped every later
+  left click from the tablet; submenus still opened, on hover. Proof before
+  any fix: the logger wrote a release into the mouse's event device, and the
+  entry under the cursor started at once. `d38b069` (ui/input.c) releases the
+  buttons a pointer holds when another takes its place, which is right for
+  any front end; the patch to UTM's sends the click of such a tap once the
+  switch is through, where the finger landed (before, it went to wherever the
+  old cursor was, or nowhere). The root desktop "worked" only because a
+  compositor that starts later does not learn of a button already down.
+- **Two faults of the desktop itself**, found on the way. Under a GL
+  compositor Xwayland draws with GL too (glamor), and on virgl every glyph of
+  an X program came out as a filled black box: `start-wayland.sh` now sets
+  `XWAYLAND_NO_GLAMOR` on a virgl card. And an apostrophe in a comment inside
+  the single-quoted awk program of `list-apps.sh` (#620) had made the script
+  a syntax error, and the Applications menu empty. The script is the one AOK
+  itself runs, so that held there too.
 
 What reading the evidence took, for the next time: the VM's `debug.log` and
 its disk come off the device with `devicectl device copy from`; crash

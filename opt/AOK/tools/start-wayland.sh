@@ -570,6 +570,16 @@ AOK_WL_OWN_RENDERER=0
 if [ "$AOK_WL_DISPLAY" = 1 ] && [ "${WLR_RENDERER:-}" != pixman ]; then
     AOK_WL_OWN_RENDERER=1
 fi
+# X programs draw through Xwayland, and beside a GL compositor Xwayland draws
+# with GL itself (glamor). On virgl that came out wrong: dillo's window was
+# there and every glyph in it a filled black box (UTM's GL device, 2026-10-12).
+# Without glamor Xwayland draws in software into shared memory, which the
+# compositor shows like any other window; an X program gains nothing from
+# glamor here that it would notice. XWAYLAND_NO_GLAMOR from the caller wins.
+if [ "$AOK_WL_OWN_RENDERER" = 1 ] && [ "$(aok_wl_virtio_gpu)" = 3d ]; then
+    export XWAYLAND_NO_GLAMOR="${XWAYLAND_NO_GLAMOR-1}"
+    [ -n "$XWAYLAND_NO_GLAMOR" ] || unset XWAYLAND_NO_GLAMOR
+fi
 # Two things Wayfire cannot do, where the session is the plain labwc desktop
 # instead, and says why. It draws everything with OpenGL ES, so it cannot run
 # in software here: wlroots' GLES renderer needs a GPU device, and pixman has
@@ -1293,7 +1303,9 @@ if [ $# -gt 0 ]; then
         /^\[/ { group = $0; next }
         group != "[Desktop Entry]" { next }
         /^Type=/ { type = substr($0, 6) }
-        # (Any capitalisation: Debian's bsdgames writes Terminal=True, #620.)
+        # (Any capitalisation: bsdgames in Debian writes Terminal=True, #620.
+        # No apostrophe in here: this awk program sits in single quotes, and one
+        # ended it -- the Applications menu was a syntax error and nothing else.)
         tolower($0) ~ /^nodisplay=true/ { hidden = 1 }
         tolower($0) ~ /^hidden=true/ { hidden = 1 }
         /^Name=/ && name == "" { name = substr($0, 6) }

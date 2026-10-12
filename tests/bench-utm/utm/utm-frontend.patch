@@ -128,8 +128,21 @@ index 73371d26..3591275d 100644
          return nil;
      }
  #endif
+diff --git a/Platform/iOS/Display/VMDisplayMetalViewController+Private.h b/Platform/iOS/Display/VMDisplayMetalViewController+Private.h
+index 25f727b4..9ef36086 100644
+--- a/Platform/iOS/Display/VMDisplayMetalViewController+Private.h
++++ b/Platform/iOS/Display/VMDisplayMetalViewController+Private.h
+@@ -38,6 +38,8 @@ NS_ASSUME_NONNULL_BEGIN
+ @property (nonatomic) CGPoint lastTapLocation;
+ @property (nonatomic) NSTimeInterval lastTapTime;
+ @property (nonatomic) BOOL isTouchScrolling;
++@property (nonatomic) BOOL touchChangedMouseType;  // the touch that is down asked for the other kind of pointer,
++@property (nonatomic) BOOL touchWantsServerCursor; // this kind: the relative one
+ @property (nonatomic) BOOL mouseLeftDown;
+ @property (nonatomic) BOOL mouseRightDown;
+ @property (nonatomic) BOOL mouseMiddleDown;
 diff --git a/Platform/iOS/Display/VMDisplayMetalViewController+Touch.m b/Platform/iOS/Display/VMDisplayMetalViewController+Touch.m
-index 6abc76eb..93f1c6b2 100644
+index 6abc76eb..9c6a0dd9 100644
 --- a/Platform/iOS/Display/VMDisplayMetalViewController+Touch.m
 +++ b/Platform/iOS/Display/VMDisplayMetalViewController+Touch.m
 @@ -17,6 +17,7 @@
@@ -150,6 +163,52 @@ index 6abc76eb..93f1c6b2 100644
  #endif
  }
  
+@@ -499,11 +501,32 @@ static CGRect CGRectClipToBounds(CGRect rect1, CGRect rect2) {
+         self.lastTapLocation = location;
+         self.lastTapTime = NSProcessInfo.processInfo.systemUptime;
+         [self mouseClick:kCSInputButtonLeft location:location];
++    } else if (self.touchChangedMouseType) {
++        // The touch under this tap asked for the other kind of pointer, so touchesBegan started no click.
++        // One sent now is pressed on the old pointer device, wherever its cursor was, and released on the
++        // new one; and if the change is already through, nothing here sends one at all.
++        self.touchChangedMouseType = NO;
++        [self mouseClickAfterTypeChange:location tries:10];
+     } else if (self.serverModeCursor) { // otherwise we handle in touchesBegan
+         [self mouseClick:kCSInputButtonLeft location:location];
+     }
+ }
+ 
++/// The click of a tap whose touch changed the kind of pointer: when the guest has the new kind, where the
++/// finger landed. After half a second without the change, as before: with whichever kind there is.
++- (void)mouseClickAfterTypeChange:(CGPoint)location tries:(NSInteger)tries {
++    if (self.vmInput.serverModeCursor != self.touchWantsServerCursor && tries > 0) {
++        [self onDelay:0.05f action:^{
++            [self mouseClickAfterTypeChange:location tries:tries - 1];
++        }];
++        return;
++    }
++    if (!self.vmInput.serverModeCursor) {
++        [self.cursor startMovement:location];
++    }
++    [self mouseClick:kCSInputButtonLeft location:location];
++}
++
+ - (IBAction)gestureTwoTap:(UITapGestureRecognizer *)sender {
+     CSInputButton button = [self buttonForGestureType:self.twoFingerTapType];
+     if (sender.state == UIGestureRecognizerStateEnded && button != kCSInputButtonNone) {
+@@ -764,9 +787,12 @@ static CGRect CGRectClipToBounds(CGRect rect1, CGRect rect2) {
+             if (event.allTouches.count == touches.count) { // a touch joining later does not change the gesture
+                 self.isTouchScrolling = (type == VMMouseTypeAbsoluteScroll);
+             }
++            self.touchChangedMouseType = NO;
+             if ([self switchMouseType:type]) {
+                 self.isTouchScrolling = NO; // the cursor mode changes under this touch
+                 [self dragCursor:UIGestureRecognizerStateEnded primary:YES secondary:YES middle:YES]; // reset drag
++                self.touchChangedMouseType = YES; // a tap of it is clicked in gestureTap, once the change is through
++                self.touchWantsServerCursor = (type == VMMouseTypeRelative);
+             } else if (!self.vmInput.serverModeCursor) { // start click for client mode
+                 if (self.isTouchScrolling) { // clicks come from the gestures instead
+                     if (event.allTouches.count == 1) {
 diff --git a/Platform/iOS/Display/VMDisplayMetalViewController.m b/Platform/iOS/Display/VMDisplayMetalViewController.m
 index 51fed91b..6326ad74 100644
 --- a/Platform/iOS/Display/VMDisplayMetalViewController.m
