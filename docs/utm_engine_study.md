@@ -37,7 +37,8 @@ pull request rather than ship a competing app.
   lead** (section 8). Inside QEMU it needs 1.5x to 2.9x fewer host cycles
   than the tctiSH fork's engine on the same six workloads, and 2.9x to 7.2x
   fewer than UTM SE as shipped, with program output and floating-point
-  results identical to QEMU's own.
+  results identical to QEMU's own. On an M4 iPad Pro it measures the same:
+  2.0x the fork's engine, the six workloads in 9.8 s instead of 20.5 s.
 
 - **Plug-in point: a second block generator inside QEMU's existing engine,
   not a new accelerator.** UTM SE's engine and AOK's use the same dispatch
@@ -205,9 +206,10 @@ design is one dispatch per intermediate operation.
   instructions run through the engine, so syscall-heavy and page-fault-heavy
   work pays for them; under AOK they are native C. `awk` is the one workload
   here where that shows.
-- **An iPad or iPhone.** The ratio between two engines that use the same
-  dispatch scheme on the same core should carry over, but it has not been
-  measured there.
+- **An iPad or iPhone**, in this race. The plug-in has since been measured
+  on one against the fork's engine (section 8, "On an iPad"), and the ratio
+  did carry over. UTM SE as shipped and AOK's own app have not been raced
+  on a device.
 - **x86 guests.** UTM SE's engine does more work per x86 instruction (flags,
   segments) than per arm64 or RISC-V instruction; AOK's x86 engines were not
   raced.
@@ -395,17 +397,19 @@ per-guest decoders in `jit/gen.c`.
 
 1. ~~Build option B for riscv64 on the tctiSH fork.~~ Done: section 8.
 2. **Talk to the fork's author and UTM's maintainer.** There is now a result
-   to show. Needs the branch published first.
-3. **Measure on an iPad**: UTM SE from the App Store against AOK, same
-   userland, to confirm the ratio on the hardware that matters.
+   to show and a published branch to point at. On hold: the project owner's
+   call, and no one has been contacted.
+3. ~~Measure on an iPad.~~ Done for the plug-in against the fork's engine on
+   an M4 iPad Pro: section 8. The A10X run is still owed.
 4. Re-run this race when either engine changes: `tests/bench-utm/`.
 
 ## 8. The RISC-V plug-in
 
-Built on `tctiSH/qemu` at `ded0cff` (QEMU 11.1.2), as a local branch
-`aok-gadgets` in `~/git/qemu-aok`: five commits, 8 new files of about 2,900
+Built on `tctiSH/qemu` at `ded0cff` (QEMU 11.1.2), as the branch
+`aok-gadgets` of `~/git/qemu-aok`: five commits, 8 new files of about 2,900
 lines, and 200 lines added to 13 existing QEMU files (4 lines changed).
-Nothing has been published.
+Published at <https://github.com/emkey1/qemu> (branch `aok-gadgets`), a fork
+of `tctiSH/qemu`. No pull request has been opened.
 Its own documentation is `docs/devel/aok-gadgets.rst` in that tree.
 
 It is option B of section 3, with one difference from section 4's sketch:
@@ -447,6 +451,41 @@ separates them is mostly what AOK's generator does beyond one gadget per
 instruction (fused pairs, cached register runs), which has not been carried
 over, and for awk the emulated kernel.
 
+### On an iPad
+
+The same QEMU, cross-built for iOS as a shared library with tctiSH's
+dependency recipe, inside a small benchmark app (`tests/bench-utm/ios-app`)
+that boots the same kernel and userland and reads its own process's cycle
+counters at the same guest marker lines. One QEMU binary, gadgets on or off
+at launch (`QEMU_AOK`), three rounds interleaved.
+
+iPad Pro 13" (M4, iPad16,4), iPadOS 27.0, thermal state nominal throughout,
+every instruction on the performance cores, so seconds mean something here:
+
+| Workload | Plug-in G cycles | Fork G cycles | Plug-in s | Fork s | Plug-in vs fork |
+|---|--:|--:|--:|--:|--:|
+| CoreMark | 6.8 | 11.9 | 1.56 | 2.75 | 1.8x |
+| n-body (floating point) | 3.8 | 10.2 | 0.90 | 2.47 | 2.7x |
+| Python | 16.1 | 38.4 | 3.73 | 8.87 | 2.4x |
+| xz | 5.9 | 9.2 | 1.38 | 2.16 | 1.6x |
+| sha256sum | 3.4 | 5.2 | 0.82 | 1.23 | 1.5x |
+| awk | 6.1 | 12.7 | 1.42 | 3.00 | 2.1x |
+| Geometric mean | | | | | **2.0x** |
+
+All six together: 9.8 s with the plug-in, 20.5 s without. The ratios are the
+Mac's to within a tenth, which is what two engines with the same dispatch
+scheme on the same kind of core should give. Python and awk cost about 20%
+more cycles on the M4 than on the M5 under both engines.
+
+On the device the program transcript and the floating-point transcript (139
+lines) are identical with the gadgets on and off, and the program
+transcript is identical to the Mac's reference.
+
+iPad Pro 12.9" (A10X): the app is installed; not run yet.
+
+Not measured on a device: UTM SE as shipped, and AOK's own app on the same
+userland.
+
 ### How it was checked
 
 The reference is QEMU's own engine in the same binary. Three guest-side
@@ -482,8 +521,8 @@ tests, each compared between the two:
 
 ### Not done
 
-- Measured on a Mac only. An iPad run needs the plug-in built into a UTM
-  build, which is the next real step.
+- A UTM build with the plug-in in it. The iPad numbers come from a
+  benchmark app around the same QEMU library, not from UTM SE.
 - arm64 and x86 guests. Each needs its gadgets retargeted the same way.
 - Single-precision FP natively, `ecall`/`sret` without leaving the stream,
   and AOK's fused gadgets.
@@ -511,3 +550,5 @@ and `build/tools/fakefsify`, plus Homebrew's `glib`, `pixman`, `meson` and
 | `boot-aok.sh`, `run-aok.sh` | boot the RISC-V guest on the plug-in build (`~/aok-vm-bench/build-aok`), gadgets on or off |
 | `bench/check.sh`, `bench/fptest.c` | the program and floating-point transcripts of section 8 |
 | `prof-aok.sh` | where the plug-in build's time goes, by category |
+| `build-qemu-ios.sh` | cross-builds the plug-in QEMU and its libraries for iOS (tctiSH's recipe; `ios-app/build_dependencies.patch` is what it changes) |
+| `ios-app/` | the device benchmark app: `assemble.sh` stages QEMU and the guest and generates the project (XcodeGen), `build.sh` builds and signs, `run-device.sh` launches one run and fetches its results |
