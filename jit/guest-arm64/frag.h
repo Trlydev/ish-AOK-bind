@@ -143,6 +143,58 @@
 .macro f_alu_reg_lsl_stub id, last, op, r, a3, a4, a5, fn=_, fm=_
 .endm
 
+// Add/subtract with carry (ADC, ADCS, SBC, SBCS): the guest's carry comes in
+// through the host's flags. `nf`: the gadget before this one left the host's
+// NZCV equal to the guest's (a flag-setting ALU gadget, or another of these --
+// the carry chain of a multi-word add), so the reload, a serialising `msr`, is
+// skipped. Either way the host's flags are the guest's when this is done.
+// [d_off][n_off][m_off]: op, r, flags, nf
+.macro f_adc_body id, last, op, r, flags, nf, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    f_src 13, x11, \fm
+    f_src 12, x10, \fn
+.if \nf == 0
+    load_flags
+.endif
+    \op \r\()12, \r\()12, \r\()13
+.if \flags
+    store_flags
+.endif
+    str x12, [_cpu, x9]
+    f_end \last, 3
+.endm
+.macro f_adc_stub id, last, op, r, flags, nf, a5, fn=_, fm=_
+.endm
+
+// Multiply-add and multiply-subtract: [d_off][n_off][m_off][a_off]: op, r.
+// (MUL, UMULH and SMULH are f_alu_reg: one operation on two registers.)
+.macro f_madd_body id, last, op, r, a3, a4, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    ldp x11, x14, [_ip, #16]
+    ldr x14, [_cpu, x14]
+    f_src 13, x11, \fm
+    f_src 12, x10, \fn
+    \op \r\()12, \r\()12, \r\()13, \r\()14
+    str x12, [_cpu, x9]
+    f_end \last, 4
+.endm
+.macro f_madd_stub id, last, op, r, a3, a4, a5, fn=_, fm=_
+.endm
+
+// UMULL and SMULL: 32 x 32 -> 64. [d_off][n_off][m_off]: op
+.macro f_mull_body id, last, op, a2, a3, a4, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    ldr x11, [_ip, #16]
+    f_src 13, x11, \fm
+    f_src 12, x10, \fn
+    \op x12, w12, w13
+    str x12, [_cpu, x9]
+    f_end \last, 3
+.endm
+.macro f_mull_stub id, last, op, a2, a3, a4, a5, fn=_, fm=_
+.endm
+
 // Bitfield extract and the immediate shifts (UBFM, SBFM and their aliases):
 // (src << L) >> S, logical or arithmetic -- dpextra.S has the lowering.
 // [d_off][n_off][L][S]: shiftop, r

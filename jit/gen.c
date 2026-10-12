@@ -2853,6 +2853,27 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
         bool S = (insn >> 29) & 1;
         bool op_sbc = (insn >> 30) & 1;
         bool sf = (insn >> 31) & 1;
+        if (rd != 31 && rn != 31 && rm != 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            // Slot-fed, and without the reload of the guest's flags when the
+            // gadget before left them in the host's (the carry chain of a
+            // multi-word add: adds, adcs, adcs...). The host's flags are the
+            // guest's after any of these, so the next one may skip it too.
+#define A64_ADC(op) extern void gadget_arm64_ospec_##op##64(void), gadget_arm64_ospec_##op##32(void), \
+                gadget_arm64_ospec_##op##64_nf(void), gadget_arm64_ospec_##op##32_nf(void);
+            A64_ADC(adc) A64_ADC(adcs) A64_ADC(sbc) A64_ADC(sbcs)
+#undef A64_ADC
+            static void (*const t[2][2][2][2])(void) = { // [sbc][S][sf][flags live]
+                {{{gadget_arm64_ospec_adc32, gadget_arm64_ospec_adc32_nf}, {gadget_arm64_ospec_adc64, gadget_arm64_ospec_adc64_nf}},
+                 {{gadget_arm64_ospec_adcs32, gadget_arm64_ospec_adcs32_nf}, {gadget_arm64_ospec_adcs64, gadget_arm64_ospec_adcs64_nf}}},
+                {{{gadget_arm64_ospec_sbc32, gadget_arm64_ospec_sbc32_nf}, {gadget_arm64_ospec_sbc64, gadget_arm64_ospec_sbc64_nf}},
+                 {{gadget_arm64_ospec_sbcs32, gadget_arm64_ospec_sbcs32_nf}, {gadget_arm64_ospec_sbcs64, gadget_arm64_ospec_sbcs64_nf}}}};
+            gen(state, (unsigned long) t[op_sbc][S][sf][arm64_flags_were_live]);
+            gen(state, arm64_x_off(rd));
+            gen(state, arm64_x_off(rn));
+            gen(state, arm64_x_off(rm));
+            state->arm64_flags_live = true;
+            return 1;
+        }
         gen(state, (unsigned long) gadget_arm64_adcsbc);
         gen(state, rd | ((uint64_t) rn << 5) | ((uint64_t) rm << 10)
             | ((uint64_t) sf << 15) | ((uint64_t) op_sbc << 16) | ((uint64_t) S << 17));
@@ -6135,6 +6156,42 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
             op = 7; // UMULH
         if (op < 0) {
             return gen_arm64_undefined(state);
+        }
+        if (rd != 31 && rn != 31 && rm != 31 && arm64_fuse_pass_enabled(JIT_FUSE_A64_OSPEC)) {
+            // Slot-fed forms of the common ones: MUL, MADD and MSUB with a
+            // real addend, UMULH/SMULH, UMULL/SMULL.
+            extern void gadget_arm64_ospec_mul64(void), gadget_arm64_ospec_mul32(void);
+            extern void gadget_arm64_ospec_umulh(void), gadget_arm64_ospec_smulh(void);
+            extern void gadget_arm64_ospec_madd64(void), gadget_arm64_ospec_madd32(void);
+            extern void gadget_arm64_ospec_msub64(void), gadget_arm64_ospec_msub32(void);
+            extern void gadget_arm64_ospec_umull(void), gadget_arm64_ospec_smull(void);
+            void (*spec)(void) = NULL;
+            bool addend = false;
+            if (op == 0 && ra == 31)
+                spec = sf ? gadget_arm64_ospec_mul64 : gadget_arm64_ospec_mul32;
+            else if (op == 0 || op == 1) {
+                if (ra != 31) {
+                    spec = op == 0 ? (sf ? gadget_arm64_ospec_madd64 : gadget_arm64_ospec_madd32)
+                                   : (sf ? gadget_arm64_ospec_msub64 : gadget_arm64_ospec_msub32);
+                    addend = true;
+                }
+            } else if (op == 4)
+                spec = gadget_arm64_ospec_smulh; // (ra is ignored: must-be-ones in the encoding)
+            else if (op == 7)
+                spec = gadget_arm64_ospec_umulh;
+            else if (op == 2 && ra == 31)
+                spec = gadget_arm64_ospec_smull;
+            else if (op == 5 && ra == 31)
+                spec = gadget_arm64_ospec_umull;
+            if (spec != NULL) {
+                gen(state, (unsigned long) spec);
+                gen(state, arm64_x_off(rd));
+                gen(state, arm64_x_off(rn));
+                gen(state, arm64_x_off(rm));
+                if (addend)
+                    gen(state, arm64_x_off(ra));
+                return 1;
+            }
         }
         gen(state, (unsigned long) gadget_arm64_dp3src);
         gen(state, rd | ((uint64_t) rn << 8) | ((uint64_t) rm << 16)

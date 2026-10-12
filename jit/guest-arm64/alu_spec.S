@@ -107,3 +107,44 @@ f_gadget ospec_ubfm64, f_bfm, lsrv, x, _, _, _
 f_gadget ospec_ubfm32, f_bfm, lsrv, w, _, _, _
 f_gadget ospec_sbfm64, f_bfm, asrv, x, _, _, _
 f_gadget ospec_sbfm32, f_bfm, asrv, w, _, _, _
+
+// Add/subtract with carry and the multiplies, with real registers: what
+// bignum arithmetic is made of (RSA and the key exchanges of ssh and TLS: 37%
+// of the gadgets an `openssl genrsa` ran), and what the generic adcsbc and
+// dp3src gadgets decoded six fields and took a branch tree to do.
+.irp op, adc, adcs, sbc, sbcs
+.ifc \op, adc
+f_gadget ospec_\op\()64, f_adc, \op, x, 0, 0, _
+f_gadget ospec_\op\()32, f_adc, \op, w, 0, 0, _
+f_gadget ospec_\op\()64_nf, f_adc, \op, x, 0, 1, _
+f_gadget ospec_\op\()32_nf, f_adc, \op, w, 0, 1, _
+.endif
+.ifc \op, sbc
+f_gadget ospec_\op\()64, f_adc, \op, x, 0, 0, _
+f_gadget ospec_\op\()32, f_adc, \op, w, 0, 0, _
+f_gadget ospec_\op\()64_nf, f_adc, \op, x, 0, 1, _
+f_gadget ospec_\op\()32_nf, f_adc, \op, w, 0, 1, _
+.endif
+.ifc \op, adcs
+f_gadget ospec_\op\()64, f_adc, \op, x, 1, 0, _
+f_gadget ospec_\op\()32, f_adc, \op, w, 1, 0, _
+f_gadget ospec_\op\()64_nf, f_adc, \op, x, 1, 1, _
+f_gadget ospec_\op\()32_nf, f_adc, \op, w, 1, 1, _
+.endif
+.ifc \op, sbcs
+f_gadget ospec_\op\()64, f_adc, \op, x, 1, 0, _
+f_gadget ospec_\op\()32, f_adc, \op, w, 1, 0, _
+f_gadget ospec_\op\()64_nf, f_adc, \op, x, 1, 1, _
+f_gadget ospec_\op\()32_nf, f_adc, \op, w, 1, 1, _
+.endif
+.endr
+f_gadget ospec_mul64, f_alu_reg, mul, x, 0, _, _
+f_gadget ospec_mul32, f_alu_reg, mul, w, 0, _, _
+f_gadget ospec_umulh, f_alu_reg, umulh, x, 0, _, _
+f_gadget ospec_smulh, f_alu_reg, smulh, x, 0, _, _
+f_gadget ospec_madd64, f_madd, madd, x, _, _, _
+f_gadget ospec_madd32, f_madd, madd, w, _, _, _
+f_gadget ospec_msub64, f_madd, msub, x, _, _, _
+f_gadget ospec_msub32, f_madd, msub, w, _, _, _
+f_gadget ospec_umull, f_mull, umull, _, _, _, _
+f_gadget ospec_smull, f_mull, smull, _, _, _, _

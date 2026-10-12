@@ -461,6 +461,52 @@ pairs, 207 KB.
   `fwd=0` and `fwd=1`. Handing the second-operand gadgets a wrong register
   does not fail the test: the guest does not reach a shell.
 
+**Carry and multiply, and a wider profile, 2026-10-12 (arm64 guest).** The
+pair list came from four workloads. Three more -- perl, a shell script
+driving find/grep/sed/awk/tar/gzip, and openssl (digests, AES, an RSA key) --
+were profiled to see how it travels. Perl and the shell script were covered
+as well as the four it was made from (30% and 29% of dispatches removed).
+openssl was not (7%), and showed why: 37% of the gadgets an RSA key
+generation runs were `adcsbc` and `dp3src`, the generic add-with-carry and
+multiply gadgets, each decoding six fields from one word and taking a
+branch tree to do one instruction.
+
+- **Slot-fed gadgets for them** (alu_spec.S, the `ospec` bit): ADC, ADCS,
+  SBC, SBCS in both widths; MUL, MADD, MSUB, UMULH, SMULH, UMULL, SMULL. The
+  carry ones come in two kinds: one reloads the guest's flags (a serialising
+  `msr nzcv`), one runs on the host's flags as the gadget before left them --
+  which is the whole of a carry chain after its first instruction.
+- **The pair list from all seven workloads**, at 0.02% of gadgets run: 499
+  pairs, 1034 gadgets with the forwarding ones. Dispatches removed: Python
+  33%, sqlite 33%, gcc 30%, 7-Zip 34%, perl 34%, shell 34%, openssl 31%.
+- **Numbers.** M4, the booted Devuan arm64 root, `openssl speed`, builds
+  alternated, three rounds: RSA-2048 signing 101 -> 192 a second (90%
+  faster), verifying 3,878 -> 7,811 (twice as fast); ECDSA P-256 signing
+  3,919 -> 5,424 (38% faster), verifying 1,183 -> 1,849 (56%); SHA-256
+  unchanged. The usual benchmarks, four rounds: 7-Zip 2.1% faster, Python
+  within 1.3% either way.
+- **Proved:** tests/manual/arm64/adc_mul_ospec.c against C's 128-bit
+  arithmetic: every carry form with the carry live and not, edge values of
+  carry, overflow and sign, 256-bit add and subtract chains, every multiply.
+  It passes with ospec, pair and fwd each off. Control: always taking the
+  no-reload carry gadget fails it 3,136 times.
+
+**Tried the same day and NOT kept.**
+
+- *Checks only on backward links.* A chained transition looks at the poke
+  flag and counts down the chain budget; a thread can only stay in
+  translated code by going round, so a bit in the link word could confine
+  both to backward links. 6.8% fewer host instructions on a Python loop; M4,
+  build against build, four rounds: 7-Zip 0.4%, fib 1.9%, dict 1.2% faster,
+  method and str unchanged. Not worth changing when a poke is noticed.
+  (Inside one build, off against on, it looked like 2.5-3.9%: the off arm
+  paid for the test of the bit. A switch that costs something when off
+  flatters what it switches.)
+- *The riscv64 register cache on by default* (`rcache`, register-only runs
+  kept in host registers). M4: 7-Zip 0.7%, method 3.2% faster, dict and str
+  in the noise; A10X: 2-6% faster across the five. And a gcc compile on the
+  M4, five rounds: 3.3% slower. It stays off.
+
 **The riscv64 guest, the same evening: the three arm64 steps in one.** Its
 gadgets had the dispatch change and the memory probe, and not the rest. Now:
 
