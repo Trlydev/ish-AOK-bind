@@ -16,7 +16,15 @@ for a in aarch64 riscv64; do
         mv "$W/bench/fptest.$a.tmp" "$W/bench/fptest.$a"
     fi
     "$ISH" -f "$R" /bin/sh -c 'cat > /bench/fptest && chmod +x /bench/fptest' < "$W/bench/fptest.$a"
-    tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/udhcpc.sh bench/gltest.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
+    # memtest: -O2, and no -mstrict-align games: one load or store instruction per access is the point.
+    if [ ! -s "$W/bench/memtest.$a" ] || [ "$W/bench/memtest.c" -nt "$W/bench/memtest.$a" ]; then
+        "$ISH" -f "$dev" /bin/sh -e -c 'mkdir -p /tmp/bench-utm && cd /tmp/bench-utm && cat > memtest.c &&
+            gcc -O2 -static -o memtest memtest.c && cat memtest' \
+            < "$W/bench/memtest.c" > "$W/bench/memtest.$a.tmp"
+        mv "$W/bench/memtest.$a.tmp" "$W/bench/memtest.$a"
+    fi
+    "$ISH" -f "$R" /bin/sh -c 'cat > /bench/memtest && chmod +x /bench/memtest' < "$W/bench/memtest.$a"
+    tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/memtest.c bench/udhcpc.sh bench/gltest.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
     "$ISH" -f "$R" /bin/sh -e -c '
         cd /bench && rm -f ._*
         [ -f data2.bin ] || head -c 2097152 data.bin > data2.bin

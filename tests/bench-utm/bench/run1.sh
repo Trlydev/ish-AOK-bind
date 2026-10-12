@@ -17,6 +17,7 @@ for w in "$@"; do
               for i in 1 2 3 4; do echo "STRESS $i $(md5sum < /tmp/check.$i | cut -c1-32)"; done
               ./timeit stress true ;;
     fptest)   ./fptest; ./timeit fptest true ;;
+    memtest)  ./memtest; ./timeit memtest true ;;
     fptestv)  ./fptest -v; ./timeit fptestv true ;;
     *)        ./timeit "$w" true ;;
     esac

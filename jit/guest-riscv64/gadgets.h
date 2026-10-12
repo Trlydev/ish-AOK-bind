@@ -23,6 +23,10 @@ _ip     .req x28
 _tmp    .req x0
 _tmp2   .req x8
 _addr   .req x7
+// What a load or store body keeps across read_prep/write_prep (frag.h):
+// callee-saved, since prep may call into C.
+_sav    .req x19
+_savw   .req w19
 
 .extern jit_ret
 .extern jit_exit
