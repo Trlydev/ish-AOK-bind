@@ -12,6 +12,30 @@
 // parameter; with `last` 0 it leaves _ip after its parameters and falls
 // through, with `last` 1 it ends in the dispatch. `id` makes labels unique.
 
+// A second host. The bodies that touch nothing but guest registers -- the
+// ALU family of alu.S, mov_const and addi below -- and the pairs made of them
+// are built by another translator as well as by AOK's: the QEMU plug-in
+// (tests/bench-utm, docs/utm_engine_study.md), which copies alu.S, this file
+// and pairs.h and assembles them with its own definitions in place of
+// gadgets.h. It defines RV_GADGET_HOST, and what the shared code may assume
+// of either host is no more than this:
+//
+//   _cpu, _ip     the guest state and the stream pointer (.req)
+//   .gadget NAME  begins a gadget; gret N ends one, past N parameter words
+//   parameters    8-byte words after the gadget's own; a register is the byte
+//                 offset of its slot from _cpu, x0 a slot that reads as zero
+//                 as a source and a slot nothing reads as a destination
+//   x0, x9-x15    free for a body's use, and nothing else is; x12 carries a
+//                 result from the first body of a pair to the second
+//   HOST_NAME     1 for a gadget the host has, 0 for one it lacks, for every
+//                 gadget pairs.h names
+//
+// A shared body does not fault, does not call out and does not end a block.
+// Anything that does one of those is a host's own (between the
+// RV_GADGET_HOST guards), under a name pairs.h may still mention.
+// tools/check-shared-gadgets.sh builds these files as such a host and fails
+// on a body that breaks the contract: run it after changing them.
+
 // Forwarding (jit/guest-arm64/frag.h's fuse2 has the reasoning). A body that
 // produces a register leaves the value in x12 as well when the body after
 // it will take it from there (`res`, f_res), and a body's source operand comes from its cpu_state
@@ -118,6 +142,13 @@
 .if \kb >= 2
     fuse2_one f2m_\a\()__\b, \a, \b, _, 12, 1
 .endif
+.endif
+.endm
+
+// (a second host: only where it has both gadgets)
+.macro fuse2_host ha, hb, a, b, hr, kb
+.if \ha && \hb
+    fuse2 \a, \b, \hr, \kb
 .endif
 .endm
 

@@ -3,8 +3,15 @@
 // Reg-imm code stream: [gadget][rd_off][rs1_off][imm] (imm sign-extended
 // to 64 bits by gen). W-suffix forms compute in 32 bits and sign-extend,
 // exactly the RV64 rule.
+//
+// SHARED SOURCE. Another host assembles this file as it is (frag.h, "A second
+// host", has the contract): everything here that is not between the
+// RV_GADGET_HOST guards is its code as much as AOK's, and must keep to the
+// registers and the stream layout the contract names.
 
+#ifndef RV_GADGET_HOST
 #include "gadgets.h"
+#endif
 #include "frag.h"
 
 // x9=rd_off, x10=rs1 value, x11=rs2 value/imm; result in x10.
@@ -231,6 +238,7 @@ f_gadget mulw_rr
 1:  sxtw x10, w10
     alu_tail
 
+#ifndef RV_GADGET_HOST   // AOK's own: how a block ends, chains and returns
 // ---- Conditional branches (fused compare+branch, the ISA's own shape) ----
 // Code stream: [gadget][rs1_off][rs2_off][taken][fallthrough]; both target
 // words use the tagged-chainable scheme (riscv64_branch_dispatch).
@@ -462,6 +470,7 @@ f_gadget jal_link
 .endm
 f_nostub jalr_cached
 f_gadget jalr_cached
+#endif // !RV_GADGET_HOST
 
 // ---- Fused ALU pairs (gen_riscv64_try_alu_pair, the "alu" fuse bit) -------
 // slli rd, rs, a ; srli/srai rd, rd, b -- the zero/sign extension and
@@ -695,6 +704,11 @@ rv_ri ror, ror x10, x10, x11
 // (gen.c's jit_pair_fuse). Here, at the end of the file that defines most of
 // the bodies; frag.h has those of core.S's and memory.S's gadgets.
 .text
+#ifdef RV_GADGET_HOST
+// A second host builds the pairs it has both halves of (frag.h's fuse2_host).
+#define FUSE2(a, b) fuse2_host HOST_##a, HOST_##b, a, b, HR_##a, K_##b
+#else
 #define FUSE2(a, b) fuse2 a, b, HR_##a, K_##b
+#endif
 #include "pairs.h"
 #undef FUSE2
