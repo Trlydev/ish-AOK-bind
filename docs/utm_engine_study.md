@@ -713,8 +713,25 @@ without the pairs (`QEMU_AOK_NO_PAIRS=1`) and with them:
 | sha256sum | 3.35 G | 3.22 G | 1.039 |
 | awk | 5.26 G | 4.96 G | 1.062 |
 
-Geometric mean 1.044. These are Mac numbers; on AOK itself shorter gadgets
-have not always been faster on the iPads, so the devices need their own run.
+Geometric mean 1.044. On AOK itself shorter gadgets have not always been
+faster on the iPads, so the M4 iPad had its own run: the benchmark app
+(section 8) with the new engine, four interleaved rounds, the guest's own
+milliseconds, median:
+
+| Workload | Without | With pairs | Ratio |
+|---|---|---|---|
+| CoreMark | 1708 | 1630 | 1.048 |
+| n-body | 942 | 934 | 1.009 |
+| Python | 3958 | 3714 | 1.066 |
+| xz -3 | 1433 | 1393 | 1.029 |
+| sha256sum | 852 | 810 | 1.052 |
+| awk | 1390 | 1336 | 1.040 |
+
+Geometric mean 1.040, thermal state nominal throughout. (Read the guest's
+times from the WL lines, not the host's: the host cuts workloads apart where
+it sees their lines on the serial port, and three of 48 samples were cut in
+the wrong place.) The A10X has the same build installed and has not been
+timed: it was locked.
 
 The program and FP transcripts are identical to QEMU's own engine with the
 pairs, with forwarding off, and with four guest CPUs.
