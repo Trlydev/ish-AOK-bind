@@ -32,6 +32,10 @@ void jitprof_note_step(struct jitprof_block *block, uint64_t gadget, unsigned wo
 // names the gadgets as translated and also says what became of them
 // (tools/jitprof-gadget-pairs.py --fused).
 void jitprof_note_fused(struct jitprof_block *block, unsigned how);
+// The step just noted and the one before it are a pair the pass knows,
+// whether or not it made one of them (it fuses the first pair it comes to,
+// and a fused step is not the head of another): how as above, as thousands.
+void jitprof_note_fusable(struct jitprof_block *block, unsigned how);
 // Write the file (main.c's cli_halt); no-op unless ISH_JIT_PROFILE.
 void jitprof_dump(void);
 

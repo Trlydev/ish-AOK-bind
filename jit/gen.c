@@ -1368,6 +1368,7 @@ bool gen_start_arm64(guest_addr_t addr, struct gen_state *state) {
     state->arm64_ip = addr;
     state->arm64_orig_ip = addr;
     state->pair_prev = UINT_MAX;
+    state->pair_seen_words = 0;
 #ifdef ISH_JIT_ARM64_GUEST
     state->jitprof = jitprof_block_new(addr, JITPROF_ARM64);
     if (unlikely(state->jitprof != NULL)) {
@@ -6566,6 +6567,7 @@ bool gen_start_riscv64(guest_addr_t addr, struct gen_state *state) {
     state->riscv64_vtype = UINT64_MAX;
     state->riscv64_v_off = false;
     state->pair_prev = UINT_MAX;
+    state->pair_seen_words = 0;
     state->jitprof = jitprof_block_new(addr, JITPROF_RISCV64);
     if (unlikely(state->jitprof != NULL)) {
         extern void gadget_riscv64_block_count(void);
@@ -20338,6 +20340,41 @@ static void jit_pair_set_init(struct jit_pair_set *set) {
     }
 }
 
+// The pair of these two gadgets, the first with `a_words` words to its step
+// (itself and its parameters, and nothing after them: or what follows the
+// parameters is not the second), or NULL.
+static const struct jit_pair *jit_pair_find(const struct jit_pair_set *set, unsigned long a, unsigned long b, unsigned a_words) {
+    unsigned slot = jit_pair_slot(a, b);
+    for (unsigned i; (i = set->hash[slot]) != 0; slot = (slot + 1) & (JIT_PAIR_HASH - 1)) {
+        const struct jit_pair *p = &set->pairs[i - 1];
+        if ((unsigned long) p->a == a && (unsigned long) p->b == b)
+            return p->a_words == a_words ? p : NULL;
+    }
+    return NULL;
+}
+// Forwarding: the first gadget's result goes to the slot named by its first
+// parameter (`dest`); if an operand of the second (its parameters at
+// `params`) is that slot, the pair that hands it over in a host register does
+// the same thing without the trip through memory. Which operand, 0 or 1; -1
+// for neither, or for a pair with no such form.
+static int jit_pair_forwards(const struct jit_pair_set *set, const struct jit_pair *p, const unsigned long *params, unsigned long dest) {
+    for (unsigned k = 0; k < 2 && p->fused_fw[k] != NULL; k++) {
+        unsigned long word = params[p->op[k].index], slot = ~0ul;
+        switch (p->op[k].kind) {
+            case PAIR_OP_SLOT: slot = word; break;
+            case PAIR_OP_REG: slot = set->reg_base + 8 * (word & 0x1f); break;
+            case PAIR_OP_REG8: slot = set->reg_base + 8 * ((word >> 8) & 0x1f); break;
+            case PAIR_OP_REG_NOT31:
+                if ((word & 0x1f) != 31)
+                    slot = set->reg_base + 8 * (word & 0x1f);
+                break;
+        }
+        if (slot == dest)
+            return (int) k;
+    }
+    return -1;
+}
+
 // `from`: where the step that just ran put its first word. The set's hash is
 // already built (the callers' pthread_once).
 static void jit_pair_fuse(struct gen_state *state, unsigned from, const struct jit_pair_set *set, bool forward) {
@@ -20346,41 +20383,29 @@ static void jit_pair_fuse(struct gen_state *state, unsigned from, const struct j
     if (state->size == from)
         return;
     unsigned long *code = state->block->code;
+    if (unlikely(state->jitprof != NULL)) {
+        // For the profile: could this step have been fused onto the one
+        // before it, had that one not been taken by a pair of its own? (The
+        // pass fuses the first pair it comes to; this is what a different
+        // choice would have had to choose from.)
+        if (state->pair_seen_words != 0) {
+            const struct jit_pair *p = jit_pair_find(set, state->pair_seen, code[from], state->pair_seen_words);
+            if (p != NULL)
+                jitprof_note_fusable(state->jitprof, forward ? 2 + (unsigned) jit_pair_forwards(set, p, &code[from + 1], state->pair_seen_dest) : 1);
+        }
+        state->pair_seen = code[from];
+        state->pair_seen_dest = state->size > from + 1 ? code[from + 1] : ~0ul;
+        state->pair_seen_words = state->size - from;
+    }
     if (prev != UINT_MAX) {
-        unsigned slot = jit_pair_slot(code[prev], code[from]);
-        for (unsigned i; (i = set->hash[slot]) != 0; slot = (slot + 1) & (JIT_PAIR_HASH - 1)) {
-            const struct jit_pair *p = &set->pairs[i - 1];
-            if ((unsigned long) p->a != code[prev] || (unsigned long) p->b != code[from])
-                continue;
-            // The previous step must have been that one gadget and nothing
-            // after it, or what follows its parameters is not this step.
-            if (from - prev != p->a_words)
-                break;
-            // Forwarding: the first gadget's result goes to the slot named by
-            // its first parameter; if an operand of the second is that slot,
-            // the pair that hands it over in a host register does the same
-            // thing without the trip through memory.
+        const struct jit_pair *p = jit_pair_find(set, code[prev], code[from], from - prev);
+        if (p != NULL) {
             void (*fused)(void) = p->fused;
-            unsigned how = 1;
-            for (unsigned k = 0; forward && k < 2 && p->fused_fw[k] != NULL; k++) {
-                unsigned long word = code[from + 1 + p->op[k].index], slot = ~0ul;
-                switch (p->op[k].kind) {
-                    case PAIR_OP_SLOT: slot = word; break;
-                    case PAIR_OP_REG: slot = set->reg_base + 8 * (word & 0x1f); break;
-                    case PAIR_OP_REG8: slot = set->reg_base + 8 * ((word >> 8) & 0x1f); break;
-                    case PAIR_OP_REG_NOT31:
-                        if ((word & 0x1f) != 31)
-                            slot = set->reg_base + 8 * (word & 0x1f);
-                        break;
-                }
-                if (slot == code[prev + 1]) {
-                    fused = p->fused_fw[k];
-                    how = 2 + k;
-                    break;
-                }
-            }
+            int fw = forward ? jit_pair_forwards(set, p, &code[from + 1], code[prev + 1]) : -1;
+            if (fw >= 0)
+                fused = p->fused_fw[fw];
             if (unlikely(state->jitprof != NULL))
-                jitprof_note_fused(state->jitprof, how);
+                jitprof_note_fused(state->jitprof, 2 + (unsigned) fw);
             code[prev] = (unsigned long) fused;
             memmove(&code[from], &code[from + 1], (state->size - from - 1) * sizeof(code[0]));
             state->size--;
@@ -20468,6 +20493,11 @@ static void arm64_pair_fuse(struct gen_state *state, unsigned from) {
     extern void gadget_riscv64_f2_##a##__##b(void);
 #define RV_FW1(a, b) extern void gadget_riscv64_f2n_##a##__##b(void);
 #define RV_FW2(a, b) extern void gadget_riscv64_f2m_##a##__##b(void);
+// (Two gadgets have the same name in both guests, and the F_ lines -- the
+// assembler's on arm64, a mark for the tool on riscv64, nothing read here --
+// differ: without this a build with both guests warns of the redefinition.)
+#undef F_mov_const
+#undef F_b
 #include "jit/guest-riscv64/pairs.h"
 #undef RV_PAIR
 #undef RV_FW1

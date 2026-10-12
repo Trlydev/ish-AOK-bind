@@ -46,6 +46,11 @@ struct gen_state {
     // Where in the stream the previous step (arm64 or riscv64) put its
     // gadget, for jit_pair_fuse; UINT_MAX when there is none to pair with.
     unsigned pair_prev;
+    // The previous step whatever became of it, kept only under
+    // ISH_JIT_PROFILE: its gadget, the slot it writes and its length (0:
+    // none), for the profile's note of what could have been paired.
+    unsigned long pair_seen, pair_seen_dest;
+    unsigned pair_seen_words;
     bool amd64_fallback_to_interp;
     // This instruction's effective address is 32 bits (an effective 0x67,
     // taken off the prefixes): gen_amd64_decode_mem_meta marks the meta word.

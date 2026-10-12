@@ -192,3 +192,8 @@ void jitprof_note_fused(struct jitprof_block *block, unsigned how) {
     if (block != NULL && block->ns >= 3)
         block->steps[block->ns - 1] += 100 * how;
 }
+
+void jitprof_note_fusable(struct jitprof_block *block, unsigned how) {
+    if (block != NULL && block->ns >= 3)
+        block->steps[block->ns - 1] += 1000 * how;
+}

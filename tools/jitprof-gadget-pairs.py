@@ -19,20 +19,39 @@ fuse = None; fuse_min = 0.01
 argv = sys.argv[1:]
 if argv and argv[0] == '--fused':
     for path in argv[1:]:
-        tot = 0; fp = collections.Counter(); kinds = collections.Counter()
+        tot = 0; fp = collections.Counter(); kinds = collections.Counter(); edges = []; lex = [0, 0]; even = [0, 0]
         for line in open(path):
             p = line.split()
             if len(p) < 4 or p[0] not in ('arm64g', 'riscv64g'): continue
             n = int(p[1]); prev = None
             for t in p[3:]:
-                name, w, c = t.rsplit('/', 2); k = int(c) // 100
+                name, w, c = t.rsplit('/', 2); k = int(c) // 100 % 10; e = int(c) // 1000
                 tot += n
                 if k:
                     fp[(prev, name, k)] += n; kinds[k] += n
                 prev = name
-        f = max(sum(kinds.values()), 1)
+                edges.append(e)
+            # The same steps paired another way: as many pairs as can be made
+            # (the pass's first-come choice already makes that many -- on a
+            # line of steps it cannot be beaten), and among those ways the
+            # one with the most forwards; then pairs and forwards counting
+            # the same. best[i]: (pairs, forwards) over the first i steps.
+            for wp, wf, acc in ((1000, 1, lex), (1, 1, even)):
+                best = [(0, 0, 0), (0, 0, 0)]
+                for i in range(1, len(edges)):
+                    skip = best[-1]; e = edges[i]
+                    if e:
+                        b = best[-2]; take = (b[0] + wp + wf * (e > 1), b[1] + 1, b[2] + (e > 1))
+                        best.append(max(skip, take))
+                    else:
+                        best.append(skip)
+                acc[0] += n * best[-1][1]; acc[1] += n * best[-1][2]
+            edges.clear()
+        f = max(sum(kinds.values()), 1); tot = max(tot, 1)
         print('%s: %.1f%% of the gadgets run were fused onto the one before; %.0f%% of those pairs forward (first operand %.0f%%, second %.0f%%)' % (
-            path.split('/')[-1], 100.0 * f / max(tot, 1), 100.0 * (kinds[2] + kinds[3]) / f, 100.0 * kinds[2] / f, 100.0 * kinds[3] / f))
+            path.split('/')[-1], 100.0 * f / tot, 100.0 * (kinds[2] + kinds[3]) / f, 100.0 * kinds[2] / f, 100.0 * kinds[3] / f))
+        print('  as shares of gadgets run: fused %.1f, forwarded %.1f; choosing for forwards among as many pairs: %.1f, %.1f; a pair and a forward counting the same: %.1f, %.1f' % (
+            100.0 * f / tot, 100.0 * (kinds[2] + kinds[3]) / tot, 100.0 * lex[0] / tot, 100.0 * lex[1] / tot, 100.0 * even[0] / tot, 100.0 * even[1] / tot))
         for (a, b, k), v in fp.most_common(40):
             print('  %-20s %-20s %s %5.2f' % (a, b, '--nm'[k], 100.0 * v / tot))
     sys.exit(0)

@@ -2,7 +2,10 @@
 # benchf.sh <label> <rounds> <arch:root> <setting>... -- one build, alternated
 # settings of /proc/ish/<arch>_jit_fuse (e.g. pair=0 pair=1 for arm64, fuse2=0
 # fuse2=1 for riscv64); appends to ~/bench558/results.txt in bench.sh's
-# format, the setting as the build tag.
+# format, the setting as the build tag. Each setting is applied to the state
+# the file was found in, which is put back at the end -- not `all=1`, which
+# is not what a build starts with: it also turns on what ships off (riscv64's
+# rcache), and an arm run after it measures something no user has.
 label=$1 rounds=$2 spec=$3; shift 3
 mkdir -p ~/bench558
 # Not on a throttled device, or one about to be (tests/bench-ab/lib.sh has the
@@ -27,11 +30,12 @@ build=$(dmesg | grep -m1 -o 'built [A-Z][a-z]* [0-9]* [0-9]* [0-9:]*')
 arch=${spec%%:*} root=${spec#*:}
 case $arch in x86_64) fuse=amd64_jit_fuse ;; *) fuse=${arch}_jit_fuse ;; esac
 run() { sudo -n /AOK/tools/mount-root.sh "$root" -- sh -c "$1"; }
+found=$(awk '{ printf "%s=%d ", $1, ($2 == "on") }' /proc/ish/$fuse)
 r=1
 while [ $r -le $rounds ]; do
     for set in "$@"; do
-        power_ok || { sudo -n sh -c "echo all=1 > /proc/ish/$fuse"; exit 3; }
-        sudo -n sh -c "echo $set > /proc/ish/$fuse" || echo "SETFAIL $set" >> ~/bench558/results.txt
+        power_ok || { sudo -n sh -c "echo $found > /proc/ish/$fuse"; exit 3; }
+        sudo -n sh -c "echo $found $set > /proc/ish/$fuse" || echo "SETFAIL $set" >> ~/bench558/results.txt
         tag=$(echo "$set" | tr -d '=, ')
         sz=$(run '7z b 1 -mmt1 -md22 2>&1' < /dev/null | awk '/^Tot:/{print $NF}' | tail -1)
         py=$(run 'python3 /AOK/fakefs/bench/pybench.py 2>&1' < /dev/null | tail -1)
@@ -39,5 +43,5 @@ while [ $r -le $rounds ]; do
     done
     r=$((r + 1))
 done
-sudo -n sh -c "echo all=1 > /proc/ish/$fuse"
+sudo -n sh -c "echo $found > /proc/ish/$fuse"
 echo DONE $label >> ~/bench558/results.txt
