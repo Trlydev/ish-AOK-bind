@@ -449,8 +449,9 @@ on the fork's engine, 6.0 G with the plug-in.
 
 The plug-in is still about 1.5x behind AOK's own CLI (1.1x to 2.1x). What
 separates them is mostly what AOK's generator does beyond one gadget per
-instruction (fused pairs, cached register runs), which has not been carried
-over, and for awk the emulated kernel.
+instruction (fused pairs, cached register runs), which had not been carried
+over when this was measured (section 10 carries over the pairs of integer
+gadgets), and for awk the emulated kernel.
 
 ### On an iPad
 
@@ -543,8 +544,9 @@ tests, each compared between the two:
 
 - GL-accelerated displays in the UTM build (section 9).
 - arm64 and x86 guests. Each needs its gadgets retargeted the same way.
-- Single-precision FP natively, `ecall`/`sret` without leaving the stream,
-  and AOK's fused gadgets.
+- Single-precision FP natively, and `ecall`/`sret` without leaving the stream.
+- AOK's fused pairs with a load, a store or a branch in them, and its cached
+  register runs (section 10 has the pairs of integer gadgets).
 - QEMU's own TCG test suites for RISC-V have not been run against it.
 
 ## 9. Inside UTM SE
@@ -655,6 +657,80 @@ Not done: the fork's work in `virtio-gpu-virgl.c` (its in-process render
 server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
 fencing changes), which overlaps QEMU 11's own rework of the same code. A
 guest that wants Vulkan or Direct3D gets OpenGL until then.
+
+## 10. One source for both
+
+Until 2026-10-12 the plug-in's integer gadgets were AOK's, copied and
+rewritten for the plug-in's registers. Whatever AOK's RISC-V engine gained
+afterwards was a port waiting to be done, and its fused pairs (two guest
+instructions in one gadget, one dispatch) had never been ported.
+
+Now the plug-in assembles AOK's files. `jit/guest-riscv64/alu.S`, `frag.h`
+and `pairs.h` build under a second host unchanged, and the plug-in keeps
+copies it does not edit:
+
+- `frag.h` states what a second host supplies ("A second host"): registers
+  for the guest state and the stream, how a gadget begins and ends, and which
+  of the gadgets the pair list names it has. A shared body may use x0 and
+  x9-x15, and does not fault, call out or end a block. What is AOK's alone
+  (how a block ends, chains and returns) sits between `RV_GADGET_HOST`
+  guards.
+- **AOK's own object code is byte for byte what it was.** The change to AOK
+  is guards and a comment.
+- `tools/check-shared-gadgets.sh` assembles the three files as a stand-in
+  host with different registers and fails on a body that needs `gadgets.h`,
+  refers to a symbol outside itself, or touches a register outside the
+  contract. Run it after changing them. All three failures were planted and
+  caught.
+- In the plug-in's tree, `scripts/aok-gadgets-sync.sh` copies the files from
+  an AOK checkout, records the commit, and works out which gadgets the
+  plug-in has from the assembled object. `--check` says whether the copies
+  are current. The plug-in's hand copies are deleted (909 lines of gadgets
+  to 570).
+- The stream pass that fuses pairs is ported as `aok_gen_pair` in the
+  plug-in's generic code. It is a second copy of `jit_pair_fuse`
+  (`jit/gen.c`), not shared source yet.
+
+So a change to an integer gadget, or a pair added to `pairs.h`, reaches UTM
+by running one script.
+
+### What came with it
+
+118 of AOK's 332 pairs: the ones made of two integer gadgets. In a boot and
+workload run 48,800 pairs were fused, 19,400 of them handing the first's
+result to the second in a host register, out of 698,000 translated
+instructions.
+
+Host cycles on the M5 (all on Super cores), three interleaved runs each,
+without the pairs (`QEMU_AOK_NO_PAIRS=1`) and with them:
+
+| Workload | Without | With pairs | Ratio |
+|---|---|---|---|
+| CoreMark | 6.60 G | 6.37 G | 1.036 |
+| n-body | 3.40 G | 3.39 G | 1.000 |
+| Python | 13.18 G | 12.20 G | 1.080 |
+| xz -3 | 5.52 G | 5.28 G | 1.046 |
+| sha256sum | 3.35 G | 3.22 G | 1.039 |
+| awk | 5.26 G | 4.96 G | 1.062 |
+
+Geometric mean 1.044. These are Mac numbers; on AOK itself shorter gadgets
+have not always been faster on the iPads, so the devices need their own run.
+
+The program and FP transcripts are identical to QEMU's own engine with the
+pairs, with forwarding off, and with four guest CPUs.
+
+### What is not shared yet
+
+- **Loads, stores and branches.** In the plug-in they go through QEMU's
+  memory TLB and block linking, so they are its own, and the 214 pairs that
+  contain one are not built. Written as bodies under the same contract (the
+  host supplying the address translation and the way out), they would bring
+  those pairs with them, and those are the pairs programs execute most.
+- **The fusing pass**, as above: two copies of one algorithm.
+- **AOK's hand-fused idioms** (`sll_srl`, `sll_sra`, `sll_add`) are assembled
+  in the plug-in, which has no selection for them yet.
+- **Cached register runs** need host registers the plug-in uses for QEMU's
+  bookkeeping.
 
 ## Appendix: reproducing the race
 
