@@ -62,6 +62,7 @@ if [ "$1" = ultimate ]; then
     [ -f devuan.img ] && [ -d "$W/aok-tools" ] || { echo "needs devuan/devuan.img and $W/aok-tools"; exit 1; }
     rm -rf job job.tar bootout.img && mkdir -p job/tools
     cp "$here/devuan-provision.sh" job/run.sh && echo tools > job/mode
+    cp "$here/vm-update.sh" job/
     for f in "$W"/aok-tools/*; do
         case $f in */provision-ultimate-alpine.sh) ;; *) cp -r "$f" job/tools/ ;; esac
     done

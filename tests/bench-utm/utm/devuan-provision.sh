@@ -54,6 +54,9 @@ install_tools() {
 exec sh /AOK/tools/start-wayland.sh "$@"
 D
         chmod 755 /mnt/usr/local/bin/desktop
+        # `sudo aok-update`: these scripts again from the repository, for a machine whose disk is by then
+        # its user's (vm-update.sh).
+        [ -f "$here/vm-update.sh" ] && install -m 755 "$here/vm-update.sh" /mnt/usr/local/bin/aok-update
     fi
     cat > /mnt/etc/rc.local <<'R'
 #!/bin/sh
