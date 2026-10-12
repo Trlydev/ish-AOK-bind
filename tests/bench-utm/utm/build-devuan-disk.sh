@@ -20,7 +20,7 @@
 # rc.local's aokjob= hook (devuan-provision.sh), exactly as its owner would run them; devuan-ultimate-job.sh
 # is the job. An hour or so, most of it package scripts.
 # build-devuan-disk.sh desktop-test -- boot it with a display, start the desktop, and leave a picture of
-# it in devuan/desktop.png. QEMU_BIN names the QEMU to do that on (default: the one that built it), so
+# it in devuan/desktop.png (none, and it says so, on a QEMU without screendump). QEMU_BIN names the QEMU to do that on (default: the one that built it), so
 #     QEMU_BIN=~/aok-vm-bench/build-aok/qemu-system-riscv64 QEMU_AOK_STATS=1 build-devuan-disk.sh desktop-test
 # is the desktop on the AOK-gadgets engine: build-desktop.log then ends with its "aok:" lines, and without
 # them it was not that engine. (This script puts Homebrew first on PATH: a PATH prefix does not choose.)
@@ -93,12 +93,12 @@ u=$(awk -F: '$3 >= 1000 && $3 < 2000 { print $1; exit }' /etc/passwd)
 echo "DESKTOP-TEST as ${u:-root}; cards: $(ls /dev/dri 2>/dev/null | tr '\n' ' ')"
 if [ -n "$u" ]; then su - "$u" -c 'sh /AOK/tools/start-wayland.sh' &
 else sh /AOK/tools/start-wayland.sh & fi
-sleep 150
+sleep 210
 echo "DESKTOP-TEST processes: $(ps -e -o comm= | grep -E 'labwc|foot|waybar|seatd|wayvnc' | sort | uniq -c | tr '\n' ' ')"
 echo "DESKTOP-TEST power key: $(grep -c 'Power key pressed' /var/log/auth.log) pressed, $(grep -c 'Powering off' /var/log/auth.log) obeyed (auth.log), and still up"
 J
     job_tar desktop-job.sh
-    rm -f mon.sock desktop.ppm
+    rm -f mon.sock desktop.ppm desktop.png     # (an old picture left lying is taken for this run's)
     devuan_boot build-desktop.log "aokjob=vdb" \
         -drive file=job.tar,format=raw,if=none,id=d1,readonly=on -device virtio-blk-pci,drive=d1 \
         -device virtio-gpu-pci -device virtio-keyboard-pci -device virtio-tablet-pci \
@@ -107,11 +107,14 @@ J
     for i in $(seq 1 1500); do grep -aq "DESKTOP-TEST as" build-desktop.log 2>/dev/null && break; sleep 1; done
     sleep 100
     # The power key, four times: the machine must note it and stay up (the job's last line says so).
-    for i in 1 2 3 4; do echo "sendkey power" | nc -U mon.sock > /dev/null 2>&1 || true; sleep 1; done
+    for i in 1 2 3 4; do echo "sendkey power" | nc -w 2 -U mon.sock > /dev/null 2>&1 || true; sleep 1; done
     sleep 16
-    echo "screendump $PWD/desktop.ppm" | nc -U mon.sock > /dev/null 2>&1 || true
+    echo "screendump $PWD/desktop.ppm" | nc -w 2 -U mon.sock > /dev/null 2>&1 || true
     wait $qemu || true
     grep -a "DESKTOP-TEST\|AOKJOB-DONE\|^aok: " build-desktop.log
+    # (A QEMU configured without pixman has no screendump: the Mac build of the plug-in is one. The lines
+    # above are then all there is; look at the desktop from inside, with grim.)
+    [ -s desktop.ppm ] || { echo "no picture: this QEMU's screendump wrote none (built without pixman?)"; exit 0; }
     sips -s format png desktop.ppm --out desktop.png > /dev/null 2>&1 || python3 - <<'PY'
 import struct, zlib
 d = open('desktop.ppm', 'rb').read()
