@@ -15,7 +15,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 1 | Vector registers held across a call that can reach C | **DONE** (2026-10-11): no other gadget has it; a checker now reads the built objects in `meson test` and the gate |
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
-| 4 | Caching translated code across exec and across runs | **prototype in, off by default** (2026-10-11): -21..-26% on short processes with addresses held still; needs a decision on ASLR before it can be on |
+| 4 | Caching translated code across exec and across runs | **in as a setting, off by default** (2026-10-12): "Cache Translated Code (arm64)" in Settings; on turns the guest's ASLR off, and the setting says so. -21..-26% on short processes |
 | 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has all three and forwarding too (M4: 7-Zip ~20%, Python 8-45% faster than 558; A10X timed for the pair pass and forwarding) |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
@@ -215,6 +215,34 @@ the vector type in force; x86's on mode and segment state -- each needs the
 "function of bytes and address" claim checked before its blocks are shared), a
 bound and eviction, and a flush when what the translator emits is changed at
 run time (`/proc/ish/arm64_jit_fuse`, `hle`).
+
+**Decided 2026-10-12 (the maintainer): the third, as a setting, off by
+default.** Settings has a "Translated Code" section with one switch, "Cache
+Translated Code (arm64)", and a footer that says what it costs: while it is
+on the Linux system's ASLR is off, what ASLR is for, and that iOS's own
+protection of the app is not involved. The switch is
+`UserPreferences.shouldEnableJITCache` (`/proc/ish/defaults/enable_jit_cache`),
+which calls `jit_xcache_set_enabled` (jit/jit.c): on sets
+`/proc/sys/kernel/randomize_va_space` to 0 and starts caching, off puts
+randomize_va_space back -- unless something else has set it meanwhile -- and
+frees the cache. `/proc/ish/jit_cache` is the same switch from inside the
+guest, with the cache's counters. Programs already running keep the layout
+they were given.
+
+- **Seen on the M4** through the preference: off, cache 0, randomize_va_space
+  2; on, cache 1, randomize_va_space 0, 28,679 hits after five `ls`; off again,
+  2 and empty.
+- **Proved:** tests/manual/jit_cache_switch.c -- the layout moves with it
+  off and does not with it on, the same program again is served from the
+  cache (arm64), off restores what was there and leaves alone a
+  randomize_va_space set meanwhile. All five roots. Both arm64 roots also ran
+  the whole suite with the cache on and ASLR off (see the commit).
+- **Still open, as before:** it is the arm64 guest only; it has a bound (96 MB)
+  and no eviction; a distribution's own `sysctl kernel.randomize_va_space=2`
+  at boot quietly makes it useless; a run-time change of what the translator
+  emits does not flush it. One base per file per boot (the first way) would
+  give most of the gain with most of ASLR, and is what to do if the setting
+  proves popular.
 
 ## 5. The RISC guests at the threaded-code floor
 

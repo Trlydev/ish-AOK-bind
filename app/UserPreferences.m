@@ -30,6 +30,7 @@ static NSString *const kPreferenceThemeKey = @"ModernTheme";
 static NSString *const kPreferenceDisableDimmingKey = @"Disable Dimming";
 static NSString *const kPreferenceEnableMulticoreKey = @"Enable Multicore";
 static NSString *const kPreferenceEnableHLEKey = @"Enable HLE Accel";
+static NSString *const kPreferenceEnableJITCacheKey = @"Enable JIT Cache";
 static NSString *const kPreferenceEnableCryptoAccelKey = @"Enable Crypto Accel";
 static NSString *const kPreferenceEnablePixAccelKey = @"Enable Pixman Accel";
 static NSString *const kPreferenceEnableExtraLockingKey = @"Enable Additional Locking";
@@ -244,6 +245,7 @@ void amd64_jit_preference_set(bool enabled) {
         [_defaults registerDefaults:@{
             kPreferenceEnableMulticoreKey: @(YES),
             kPreferenceEnableHLEKey: @(YES),
+            kPreferenceEnableJITCacheKey: @(NO),
             kPreferenceEnableCryptoAccelKey: @(NO),
             kPreferenceEnablePixAccelKey: @(NO),
             kPreferenceEnableExtraLockingKey: @(YES),
@@ -353,6 +355,7 @@ void amd64_jit_preference_set(bool enabled) {
         friendlyPreferenceMapping = @{
             @"enable_multicore": kPreferenceEnableMulticoreKey,
             @"enable_hle": kPreferenceEnableHLEKey,
+            @"enable_jit_cache": kPreferenceEnableJITCacheKey,
             @"enable_crypto_accel": kPreferenceEnableCryptoAccelKey,
             @"enable_pix_accel": kPreferenceEnablePixAccelKey,
             @"enable_extralocking": kPreferenceEnableExtraLockingKey,
@@ -408,6 +411,7 @@ void amd64_jit_preference_set(bool enabled) {
         kvoProperties = @{
             kPreferenceEnableMulticoreKey: property(shouldEnableMulticore),
             kPreferenceEnableHLEKey: property(shouldEnableHLE),
+            kPreferenceEnableJITCacheKey: property(shouldEnableJITCache),
             kPreferenceForeignExecModeKey: property(foreignExecMode),
             kPreferenceEnableCryptoAccelKey: property(shouldEnableCryptoAccel),
             kPreferenceEnablePixAccelKey: property(shouldEnablePixAccel),
@@ -1088,6 +1092,19 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 - (BOOL)validateShouldEnableHLE:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: ShouldEnableJITCache
+- (BOOL)shouldEnableJITCache {
+    return [_defaults boolForKey:kPreferenceEnableJITCacheKey];
+}
+
+- (void)setShouldEnableJITCache:(BOOL)enable {
+    [_defaults setBool:enable forKey:kPreferenceEnableJITCacheKey];
+}
+
+- (BOOL)validateShouldEnableJITCache:(id *)value error:(NSError **)error {
     return [*value isKindOfClass:NSNumber.class];
 }
 

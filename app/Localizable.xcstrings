@@ -15121,6 +15121,65 @@
         }
       }
     },
+    "Cache Translated Code (arm64)" : {
+      "comment" : "Settings switch label",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übersetzten Code zwischenspeichern (arm64)"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Guardar en caché el código traducido (arm64)"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mettre en cache le code traduit (arm64)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "変換済みコードをキャッシュ (arm64)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변환된 코드 캐시 (arm64)"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Armazenar em Cache o Código Traduzido (arm64)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Кэшировать транслированный код (arm64)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "缓存已翻译的代码 (arm64)"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "快取已轉譯的程式碼 (arm64)"
+          }
+        }
+      }
+    },
     "Can't open %@\n%@" : {
       "comment" : "File browser status: folder path, then error description",
       "localizations" : {
@@ -37048,6 +37107,65 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "要保留已儲存的副本以便再次恢復，還是在此工作階段執行後將其移除？"
+          }
+        }
+      }
+    },
+    "Keeps the code iSH-AOK has translated after the program that needed it exits, so the next program that loads the same code starts faster. It helps scripts and builds that start many short programs (about a fifth faster in tests) and does little for one long-running program.\n\nA cached translation is found by the address its code was loaded at, so while this is on, address space layout randomization (ASLR) is off in the Linux system: every program and library loads at the same addresses each time. ASLR does not prevent bugs; it makes a memory-corruption bug harder to turn into an attack, because the attacker cannot know where anything is. With it off, such a bug in a program you run here -- a network service above all -- is easier to exploit. iOS's own protection of the app is not affected.\n\nApplies to programs started after the change, on arm64 filesystems. Uses up to 96 MB of memory." : {
+      "comment" : "Translated Code section footer: what the translation cache does and that it turns ASLR off",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Behält den Code, den iSH-AOK übersetzt hat, auch nachdem das Programm, das ihn brauchte, beendet ist, sodass das nächste Programm, das denselben Code lädt, schneller startet. Das hilft Skripten und Builds, die viele kurze Programme starten (in Tests etwa ein Fünftel schneller), und bringt wenig für ein einzelnes, lange laufendes Programm.\n\nEine zwischengespeicherte Übersetzung wird über die Adresse gefunden, an die ihr Code geladen wurde. Solange dies eingeschaltet ist, ist daher die Adressraum-Randomisierung (ASLR) im Linux-System ausgeschaltet: Jedes Programm und jede Bibliothek wird jedes Mal an dieselben Adressen geladen. ASLR verhindert keine Fehler; es erschwert es, aus einem Speicherfehler einen Angriff zu machen, weil der Angreifer nicht wissen kann, wo sich etwas befindet. Ohne ASLR lässt sich ein solcher Fehler in einem Programm, das Sie hier ausführen – vor allem in einem Netzwerkdienst –, leichter ausnutzen. Der Schutz der App durch iOS selbst ist nicht betroffen.\n\nGilt für Programme, die nach der Änderung gestartet werden, auf arm64-Dateisystemen. Benötigt bis zu 96 MB Arbeitsspeicher."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conserva el código que iSH-AOK ha traducido después de que termine el programa que lo necesitaba, de modo que el siguiente programa que cargue el mismo código arranque más rápido. Ayuda a los scripts y compilaciones que inician muchos programas cortos (alrededor de una quinta parte más rápido en las pruebas) y aporta poco a un único programa de larga duración.\n\nUna traducción en caché se localiza por la dirección en la que se cargó su código, así que mientras esto esté activado, la aleatorización del espacio de direcciones (ASLR) queda desactivada en el sistema Linux: cada programa y cada biblioteca se cargan siempre en las mismas direcciones. ASLR no evita los errores; hace que un error de corrupción de memoria sea más difícil de convertir en un ataque, porque el atacante no puede saber dónde está cada cosa. Sin ella, un error así en un programa que ejecutes aquí —sobre todo un servicio de red— es más fácil de explotar. La protección propia de iOS sobre la app no se ve afectada.\n\nSe aplica a los programas iniciados después del cambio, en sistemas de archivos arm64. Usa hasta 96 MB de memoria."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Conserve le code traduit par iSH-AOK après la fin du programme qui en avait besoin, afin que le prochain programme chargeant le même code démarre plus vite. Cela aide les scripts et les compilations qui lancent beaucoup de programmes courts (environ un cinquième plus rapide lors des tests) et n'apporte pas grand-chose à un seul programme de longue durée.\n\nUne traduction en cache est retrouvée grâce à l'adresse à laquelle son code a été chargé ; tant que ce réglage est activé, la randomisation de l'espace d'adressage (ASLR) est donc désactivée dans le système Linux : chaque programme et chaque bibliothèque se chargent toujours aux mêmes adresses. L'ASLR n'empêche pas les bogues ; elle rend un bogue de corruption mémoire plus difficile à transformer en attaque, car l'attaquant ne peut pas savoir où se trouve quoi que ce soit. Sans elle, un tel bogue dans un programme exécuté ici — un service réseau surtout — est plus facile à exploiter. La protection de l'app par iOS lui-même n'est pas concernée.\n\nS'applique aux programmes lancés après le changement, sur les systèmes de fichiers arm64. Utilise jusqu'à 96 Mo de mémoire."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "iSH-AOK が変換したコードを、それを必要としたプログラムの終了後も保持し、同じコードを読み込む次のプログラムの起動を速くします。短いプログラムを多数起動するスクリプトやビルドに効果があり（テストでは約 2 割高速化）、長時間動作する 1 つのプログラムにはほとんど効果がありません。\n\nキャッシュされた変換結果は、コードが読み込まれたアドレスで検索されます。そのため、この設定がオンの間は Linux システムのアドレス空間配置のランダム化（ASLR）がオフになり、すべてのプログラムとライブラリが毎回同じアドレスに読み込まれます。ASLR はバグを防ぐものではなく、攻撃者がメモリ上の配置を知ることができないようにして、メモリ破壊のバグを攻撃に利用しにくくするものです。オフの場合、ここで実行するプログラム（特にネットワークサービス）にそのようなバグがあると、悪用されやすくなります。iOS 自体による App の保護には影響しません。\n\n変更後に起動したプログラムに、arm64 のファイルシステムで適用されます。最大 96 MB のメモリを使用します。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "iSH-AOK가 변환한 코드를 그 코드가 필요했던 프로그램이 종료된 뒤에도 보관하여, 같은 코드를 불러오는 다음 프로그램이 더 빨리 시작되게 합니다. 짧은 프로그램을 많이 실행하는 스크립트와 빌드에 도움이 되며(테스트에서 약 5분의 1 더 빠름), 오래 실행되는 프로그램 하나에는 거의 효과가 없습니다.\n\n캐시된 변환 결과는 코드가 로드된 주소로 찾습니다. 따라서 이 설정이 켜져 있는 동안에는 Linux 시스템의 주소 공간 배치 무작위화(ASLR)가 꺼지며, 모든 프로그램과 라이브러리가 매번 같은 주소에 로드됩니다. ASLR은 버그를 막는 것이 아니라, 공격자가 무엇이 어디에 있는지 알 수 없게 하여 메모리 손상 버그를 공격으로 바꾸기 어렵게 만듭니다. 꺼져 있으면 여기에서 실행하는 프로그램, 특히 네트워크 서비스의 그런 버그가 더 쉽게 악용될 수 있습니다. iOS 자체의 앱 보호에는 영향을 주지 않습니다.\n\n변경 이후에 시작된 프로그램에, arm64 파일 시스템에서 적용됩니다. 최대 96MB의 메모리를 사용합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantém o código que o iSH-AOK traduziu depois que o programa que precisava dele termina, para que o próximo programa que carregar o mesmo código inicie mais rápido. Ajuda scripts e compilações que iniciam muitos programas curtos (cerca de um quinto mais rápido nos testes) e faz pouca diferença para um único programa de longa duração.\n\nUma tradução em cache é encontrada pelo endereço em que seu código foi carregado; por isso, enquanto este ajuste estiver ativado, a aleatorização do espaço de endereços (ASLR) fica desativada no sistema Linux: cada programa e cada biblioteca é carregado sempre nos mesmos endereços. A ASLR não impede bugs; ela torna um bug de corrupção de memória mais difícil de transformar em ataque, porque o invasor não tem como saber onde as coisas estão. Sem ela, um bug desses em um programa que você executa aqui — sobretudo um serviço de rede — é mais fácil de explorar. A proteção do app pelo próprio iOS não é afetada.\n\nAplica-se a programas iniciados após a alteração, em sistemas de arquivos arm64. Usa até 96 MB de memória."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сохраняет код, транслированный iSH-AOK, после завершения программы, которой он был нужен, чтобы следующая программа, загружающая тот же код, запускалась быстрее. Это помогает скриптам и сборкам, запускающим много коротких программ (в тестах примерно на одну пятую быстрее), и почти ничего не даёт одной долго работающей программе.\n\nКэшированная трансляция находится по адресу, по которому был загружен её код, поэтому, пока эта настройка включена, рандомизация адресного пространства (ASLR) в системе Linux отключена: каждая программа и библиотека всякий раз загружаются по одним и тем же адресам. ASLR не предотвращает ошибки; она мешает превратить ошибку повреждения памяти в атаку, потому что атакующий не может знать, где что находится. Без неё такую ошибку в программе, которую вы здесь запускаете, — прежде всего в сетевой службе — проще эксплуатировать. Собственная защита приложения средствами iOS не затрагивается.\n\nДействует для программ, запущенных после изменения, в файловых системах arm64. Использует до 96 МБ памяти."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在需要这些代码的程序退出后，仍保留 iSH-AOK 已翻译的代码，使下一个加载相同代码的程序启动得更快。这对会启动许多短小程序的脚本和构建有帮助（测试中约快五分之一），对单个长时间运行的程序作用不大。\n\n缓存的翻译结果是按其代码加载的地址来查找的，因此开启此项后，Linux 系统中的地址空间布局随机化（ASLR）将被关闭：每个程序和库每次都会加载到相同的地址。ASLR 并不能防止漏洞；它让攻击者无法知道各部分的位置，从而使内存破坏类漏洞更难被用来发起攻击。关闭后，你在此处运行的程序（尤其是网络服务）中的此类漏洞会更容易被利用。iOS 自身对本 App 的保护不受影响。\n\n适用于更改之后启动的程序，仅限 arm64 文件系统。最多使用 96 MB 内存。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在需要這些程式碼的程式結束後，仍保留 iSH-AOK 已轉譯的程式碼，讓下一個載入相同程式碼的程式啟動得更快。這對會啟動許多短小程式的指令碼和建置有幫助（測試中約快五分之一），對單一長時間執行的程式作用不大。\n\n快取的轉譯結果是依其程式碼載入的位址來尋找的，因此開啟此項後，Linux 系統中的位址空間配置隨機化（ASLR）將會關閉：每個程式和函式庫每次都會載入到相同的位址。ASLR 並不能防止錯誤；它讓攻擊者無法得知各部分的位置，使記憶體損毀類的錯誤更難被用來發動攻擊。關閉後，你在此處執行的程式（尤其是網路服務）中的這類錯誤會更容易遭到利用。iOS 本身對此 App 的保護不受影響。\n\n適用於變更之後啟動的程式，僅限 arm64 檔案系統。最多使用 96 MB 記憶體。"
           }
         }
       }
@@ -75165,6 +75283,65 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "按住以取消固定。"
+          }
+        }
+      }
+    },
+    "Translated Code" : {
+      "comment" : "Settings section header",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Übersetzter Code"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Código traducido"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Code traduit"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "変換済みコード"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "변환된 코드"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Código Traduzido"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Транслированный код"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已翻译的代码"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已轉譯的程式碼"
           }
         }
       }

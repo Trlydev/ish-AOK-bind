@@ -513,7 +513,7 @@ UIViewController *ISHCreateDiagnosticsNavigationController(void) {
 
 // Appended sections live past the storyboard's static ones, in a fixed order:
 // user-account section, then LLM section, then Shortcuts section, then Other
-// Filesystems.
+// Filesystems, then Translated Code.
 - (NSInteger)_userAccountSectionIndex {
     return [self _visibleStoryboardSectionCount];
 }
@@ -528,6 +528,10 @@ UIViewController *ISHCreateDiagnosticsNavigationController(void) {
 
 - (NSInteger)_foreignExecSectionIndex {
     return [self _visibleStoryboardSectionCount] + 3;
+}
+
+- (NSInteger)_jitCacheSectionIndex {
+    return [self _visibleStoryboardSectionCount] + 4;
 }
 
 static NSString *ISHForeignExecTitle(NSString *mode) {
@@ -594,6 +598,18 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
     cell.textLabel.text = NSLocalizedString(@"LLM Settings", @"Settings row label");
     cell.detailTextLabel.text = UserPreferences.shared.llmModel;
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return cell;
+}
+
+- (UITableViewCell *)_jitCacheCell {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    cell.textLabel.text = NSLocalizedString(@"Cache Translated Code (arm64)", @"Settings switch label");
+    cell.textLabel.adjustsFontSizeToFitWidth = YES;
+    UISwitch *enabledSwitch = [UISwitch new];
+    enabledSwitch.on = UserPreferences.shared.shouldEnableJITCache;
+    [enabledSwitch addTarget:self action:@selector(jitCacheChanged:) forControlEvents:UIControlEventValueChanged];
+    cell.accessoryView = enabledSwitch;
     return cell;
 }
 
@@ -808,6 +824,10 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
         return NSLocalizedString(@"Run Inside Their Root: the program sees that filesystem's own files, as if you had chrooted into it (mount-root.sh). "
                @"Use Their Libraries Here: it sees this filesystem's files and your home, borrowing only its libraries; programs that need data files of their own may not work. "
                @"Off: it fails, as on Linux.", @"Other Filesystems section footer; option names must match their translations");
+    if (section == [self _jitCacheSectionIndex])
+        return NSLocalizedString(@"Keeps the code iSH-AOK has translated after the program that needed it exits, so the next program that loads the same code starts faster. It helps scripts and builds that start many short programs (about a fifth faster in tests) and does little for one long-running program.\n\n"
+               @"A cached translation is found by the address its code was loaded at, so while this is on, address space layout randomization (ASLR) is off in the Linux system: every program and library loads at the same addresses each time. ASLR does not prevent bugs; it makes a memory-corruption bug harder to turn into an attack, because the attacker cannot know where anything is. With it off, such a bug in a program you run here -- a network service above all -- is easier to exploit. iOS's own protection of the app is not affected.\n\n"
+               @"Applies to programs started after the change, on arm64 filesystems. Uses up to 96 MB of memory.", @"Translated Code section footer: what the translation cache does and that it turns ASLR off");
     if (section == 1) { // filesystems / upgrade
         if (!FsIsManaged()) {
             return NSLocalizedString(@"The current filesystem is not managed by iSH-AOK.", @"Filesystem section footer");
@@ -829,11 +849,13 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
         return NSLocalizedString(@"Shortcuts", @"Settings section header");
     if (section == [self _foreignExecSectionIndex])
         return NSLocalizedString(@"Other Filesystems", @"Settings section header");
+    if (section == [self _jitCacheSectionIndex])
+        return NSLocalizedString(@"Translated Code", @"Settings section header");
     return [super tableView:tableView titleForHeaderInSection:section];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return [self _visibleStoryboardSectionCount] + 4;
+    return [self _visibleStoryboardSectionCount] + 5;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
@@ -844,6 +866,8 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
     if (section == [self _shortcutsSectionIndex])
         return 1;
     if (section == [self _foreignExecSectionIndex])
+        return 1;
+    if (section == [self _jitCacheSectionIndex])
         return 1;
     return [super tableView:tableView numberOfRowsInSection:section];
 }
@@ -875,6 +899,8 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
         return [self _shortcutsRunCommandsCell];
     if (indexPath.section == [self _foreignExecSectionIndex])
         return [self _foreignExecCell];
+    if (indexPath.section == [self _jitCacheSectionIndex])
+        return [self _jitCacheCell];
     return [super tableView:tableView cellForRowAtIndexPath:indexPath];
 }
 
@@ -979,6 +1005,10 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
 
 - (void)loginAsDefaultUserChanged:(UISwitch *)sender {
     UserPreferences.shared.shouldLoginAsDefaultUser = sender.on;
+}
+
+- (void)jitCacheChanged:(UISwitch *)sender {
+    UserPreferences.shared.shouldEnableJITCache = sender.on;
 }
 
 - (void)shortcutsRunCommandsChanged:(UISwitch *)sender {

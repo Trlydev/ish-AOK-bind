@@ -292,6 +292,7 @@ seccomp_filter.c
 rlimit_enforce.c
 nx_enforce.c
 aslr_layout.c
+jit_cache_switch.c
 fs_at_validation.c
 sock_conformance_opts.c
 poll_rdhup_bounds.c

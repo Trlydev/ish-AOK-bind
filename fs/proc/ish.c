@@ -1517,6 +1517,29 @@ static int proc_ish_update_hle(struct proc_entry *UNUSED(e), struct proc_data *d
     return 0;
 }
 
+// /proc/ish/jit_cache: the cache of translated code that outlives the process
+// that made it (jit.c's exec cache; the app's "Cache Translated Code"
+// setting). Read: "1" or "0", then what it has done. Write 1 or 0 to turn it
+// on or off -- on also sets /proc/sys/kernel/randomize_va_space to 0, because
+// a cached block is found by its address; off puts that back and empties the
+// cache. arm64 guests only.
+static int proc_ish_show_jit_cache(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    struct jit_xcache_stats xc;
+    jit_xcache_get(&xc);
+    proc_printf(buf, "%d\nhits %lu\nmisses %lu\nstored %lu\nrefused %lu\nbytes %llu\n", xc.enabled ? 1 : 0,
+            xc.hits, xc.misses, xc.stored, xc.refused, xc.bytes);
+    return 0;
+}
+static int proc_ish_update_jit_cache(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    if (n != 1 || (d->data[0] != '0' && d->data[0] != '1'))
+        return _EINVAL;
+    jit_xcache_set_enabled(d->data[0] == '1');
+    return 0;
+}
+
 // /proc/ish/jit_timing: time spent translating guest code into gadget blocks.
 // Write 1 to zero the counters and start counting, 0 to stop; read for the
 // totals so far, across every process. Counting costs two clock reads per
@@ -2352,6 +2375,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"foreign_exec", S_IFREG | 0644, .show = proc_ish_show_foreign_exec, .update = proc_ish_update_foreign_exec},
     {"hle", S_IFREG | 0644, .show = proc_ish_show_hle, .update = proc_ish_update_hle},
     {"jit_inherit", S_IFREG | 0644, .show = proc_ish_show_jit_inherit, .update = proc_ish_update_jit_inherit},
+    {"jit_cache", S_IFREG | 0644, .show = proc_ish_show_jit_cache, .update = proc_ish_update_jit_cache},
     {"jit_timing", S_IFREG | 0644, .show = proc_ish_show_jit_timing, .update = proc_ish_update_jit_timing},
     {"i386_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_i386_jit_fuse, .update = proc_ish_update_i386_jit_fuse},
     {"riscv64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_riscv64_jit_fuse, .update = proc_ish_update_riscv64_jit_fuse},

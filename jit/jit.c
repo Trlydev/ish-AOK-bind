@@ -9,6 +9,7 @@
 #include "emu/interrupt.h"
 #include "emu/fpenv.h"
 #include "kernel/task.h"
+#include "kernel/personality.h"
 #include "util/list.h"
 #include "util/sync.h"
 #include <stdatomic.h>
@@ -2307,7 +2308,7 @@ static void jit_donate(struct jit *jit, const struct jit_block *block) {
     pthread_mutex_unlock(&origin->lock);
 }
 
-// ---- The exec cache (prototype, ISH_JIT_XCACHE=1) --------------------------
+// ---- The exec cache (off by default; jit_xcache_set_enabled) ---------------
 // Fork inheritance reaches a child that goes on running its parent's code. An
 // exec starts with nothing, so `sh -c true`, a configure script or a build
 // translates ld.so, libc and each program again for every process: 19-23% of
@@ -2323,11 +2324,12 @@ static void jit_donate(struct jit *jit, const struct jit_block *block) {
 // may have looked that far to decide a fusion it did not take. Blocks that are
 // not such a function are left out (jit_block.no_share).
 //
-// THE PROTOTYPE'S LIMITS, which are why it is off by default: the same
-// address means the guest's ASLR must put the file where it was before, so it
-// only pays with randomize_va_space 0 until blocks can be rebased or images
-// get one base per boot; it is the arm64 guest only; and a run-time change to
-// what the translator emits (/proc/ish/arm64_jit_fuse, hle) does not flush it.
+// ITS LIMITS, which are why it is off by default: the same address means the
+// guest's ASLR must put the file where it was before, so turning it on turns
+// ASLR off (jit_xcache_set_enabled) -- until blocks can be rebased or images
+// get one base per boot, that is the price, and it is the user's to choose;
+// it is the arm64 guest only; and a run-time change to what the translator
+// emits (/proc/ish/arm64_jit_fuse, hle) does not flush it.
 #define XC_TAIL 8
 #define XC_BUCKETS (1u << 16)
 #define XC_MAX_BYTES (96u << 20)
@@ -2345,15 +2347,55 @@ static struct xc_entry *xc_table[XC_BUCKETS];
 static unsigned long long xc_bytes;
 static atomic_ulong xc_hits, xc_misses, xc_stored, xc_refused;
 
+// -1: nobody has said (the CLI: ISH_JIT_XCACHE decides, and leaves the guest's
+// ASLR as it finds it). 0 or 1 once jit_xcache_set_enabled has been called.
+static atomic_int xc_enabled = -1;
+// What randomize_va_space was when the cache turned it off; -1: it did not.
+static int xc_aslr_before = -1;
+
 static bool jit_xcache_enabled(void) {
-    static atomic_int env = -1;
-    int e = atomic_load_explicit(&env, memory_order_relaxed);
+    int e = atomic_load_explicit(&xc_enabled, memory_order_relaxed);
     if (e == -1) {
         const char *v = getenv("ISH_JIT_XCACHE");
         e = v != NULL && strcmp(v, "1") == 0 ? 1 : 0;
-        atomic_store_explicit(&env, e, memory_order_relaxed);
+        int expected = -1;
+        if (!atomic_compare_exchange_strong(&xc_enabled, &expected, e))
+            e = expected;
     }
     return e == 1;
+}
+
+// The switch a user has: the app's "Cache Translated Code" setting, and
+// /proc/ish/jit_cache. A cached block is found by the address its code was
+// at, so the cache only pays when every process puts a file where the last
+// one did -- and turning it on turns the guest's ASLR off
+// (/proc/sys/kernel/randomize_va_space 0), for processes started from then
+// on. Turning it off puts randomize_va_space back if nothing else has moved
+// it since, and lets the cached blocks go.
+void jit_xcache_set_enabled(bool on) {
+    pthread_mutex_lock(&xc_lock);
+    bool was = atomic_load_explicit(&xc_enabled, memory_order_relaxed) == 1;
+    atomic_store_explicit(&xc_enabled, on ? 1 : 0, memory_order_relaxed);
+    if (on && !was) {
+        xc_aslr_before = aslr_randomize_va_space();
+        aslr_set_randomize_va_space(0);
+    } else if (!on && was) {
+        if (xc_aslr_before >= 0 && aslr_randomize_va_space() == 0)
+            aslr_set_randomize_va_space(xc_aslr_before);
+        xc_aslr_before = -1;
+        for (unsigned b = 0; b < XC_BUCKETS; b++) {
+            struct xc_entry *e = xc_table[b];
+            xc_table[b] = NULL;
+            while (e != NULL) {
+                struct xc_entry *next = e->next;
+                free(e->block);
+                free(e);
+                e = next;
+            }
+        }
+        xc_bytes = 0;
+    }
+    pthread_mutex_unlock(&xc_lock);
 }
 
 void jit_xcache_get(struct jit_xcache_stats *stats) {

@@ -69,6 +69,9 @@ extern NSString *const kThemeBackgroundColor;
 @property BOOL shouldDisableDimming;
 @property BOOL shouldEnableMulticore;
 @property BOOL shouldEnableHLE;
+// Keep translated code beyond the process that made it (jit.c's exec cache).
+// Off by default: turning it on turns the guest's ASLR off.
+@property BOOL shouldEnableJITCache;
 // What happens to a program from another installed root (/AOK/roots/<name>/...)
 // whose loader is not in the booted one: "root" runs it inside its root,
 // "libs" runs it here with that root's libraries, "off" fails as Linux does.

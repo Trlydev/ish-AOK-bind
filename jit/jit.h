@@ -367,14 +367,17 @@ void jit_fork(struct jit *parent, struct jit *child);
 void jit_lineage_detach(struct jit *jit);
 void jit_inherit_set(bool on);
 bool jit_inherit_enabled(void);
-// The exec cache (jit.c, "The exec cache"): a prototype, off unless
-// ISH_JIT_XCACHE=1. Counters for /proc/ish/jit_timing.
+// The exec cache (jit.c, "The exec cache"), off unless it is turned on.
+// Counters for /proc/ish/jit_timing and jit_cache.
 struct jit_xcache_stats {
     bool enabled;
     unsigned long hits, misses, stored, refused;
     unsigned long long bytes;
 };
 void jit_xcache_get(struct jit_xcache_stats *stats);
+// Turn the cache on or off. On also sets randomize_va_space to 0; off puts it
+// back and frees the cache. See jit.c.
+void jit_xcache_set_enabled(bool on);
 
 // Block translation time, per guest architecture (i386, amd64, arm64, riscv64):
 // ISH_JIT_TIMING at start-up, or /proc/ish/jit_timing at run time.

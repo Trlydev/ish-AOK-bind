@@ -5464,6 +5464,15 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
             doEnableHLE = UserPreferences.shared.shouldEnableHLE;
         });
     }];
+    // The cache of translated code (jit.c's exec cache). On turns the guest's
+    // ASLR off with it, which is what the setting's footer tells the user.
+    [UserPreferences.shared observe:@[@"shouldEnableJITCache"] options:NSKeyValueObservingOptionInitial
+                              owner:self usingBlock:^(typeof(self) self) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            extern void jit_xcache_set_enabled(bool on);
+            jit_xcache_set_enabled(UserPreferences.shared.shouldEnableJITCache);
+        });
+    }];
     [UserPreferences.shared observe:@[@"shouldEnableCryptoAccel"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
