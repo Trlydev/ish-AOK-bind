@@ -5409,6 +5409,7 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
                                    details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
     [ISHDiagnosticsStore recordBreadcrumb:@"application.didFinishLaunching"
                                   details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
+    ISHInstallHomeScreenQuickActions();
     // Re-donate the App Shortcuts phrases (app/ISHAppShortcuts.swift). Looked
     // up at runtime rather than through the generated Swift header: that
     // header belongs to the app target, and this file compiles earlier, in

@@ -27,6 +27,11 @@ extern NSString *const ISHSceneWorkspaceToolUserInfoKey;
 // process has no window scene at all. Must be called on the main thread.
 UIViewController * _Nullable ISHActivePresentationViewController(void);
 
+// The menu a long press on the app's Home Screen icon shows (#577): where to
+// open iSH-AOK this time, whatever Startup Mode says. Sets the list; call once
+// at launch, on the main thread.
+void ISHInstallHomeScreenQuickActions(void);
+
 // Switching a window between the Session Shell and the Workspace (GH #546).
 // Both modes are roots of the same window, and each switch used to build a
 // brand-new one, so leaving the Workspace threw away every open tool window and
