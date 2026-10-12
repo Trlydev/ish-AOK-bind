@@ -621,16 +621,19 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   is worth at least what a dispatch is, and on a dependent chain more. The
   A10X has always got more from a dispatch than from a forward (pairs 6-9%,
   forwarding 0.4-1%), and it wants this list. A10X, Devuan riscv64, builds
-  alternated, three rounds of the old list and two of the new (two of the
-  new list's runs lost their connection: no crash and no memory kill on the
-  device, and the cable link to it failed for the old list's build as well
-  an hour later): 7-Zip 5.9% faster, Python method 6.5%, dict 6.3% and str
-  7.3% faster, fib 2.2% slower; the coreutils digests over 48 MB: md5sum
-  10%, sha1sum 9.5% and sha256sum 9% less time, sha512sum, b2sum and cksum
-  within 5% either way. Rough numbers -- the device was warm, short of
-  power (7 W from the port it was on; it lost 5% of its battery in the
-  run) and unreachable by the end -- and all on one side. Kept: broad gains
-  on the slow device against two digests 3-5% slower on the fast one.
+  alternated, the device cool (25 C) and every run completing: the usual
+  benchmarks, three rounds: 7-Zip 2.6% faster, Python fib 1.3%, method
+  0.4%, dict 0.8% and str 2.5% faster; the coreutils digests over 48 MB,
+  two rounds: md5sum 13.6%, sha1sum 12.7%, sha256sum 10.4% and sha512sum
+  3.8% less time, b2sum and cksum 1-2% less. Nothing slower there. Kept:
+  the slow device gains on everything timed, against two digests 3-5%
+  slower on the fast one.
+  (A first A10X timing an hour earlier said 6-7% on the Python benchmarks.
+  It was two rounds on a device that was warm, discharging -- a Mac port
+  gives an iPad 7 W, less than that one uses with its screen on and a core
+  busy -- and throttling between rounds; two of its runs lost their
+  connection, which was the Mac's route to the cable address and not the
+  build. The numbers above replace it.)
 - **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
   this guest, with the same control (a fused load's fault path naming the
   wrong instruction fails it); the standalone ALU gadgets are byte for byte
