@@ -2,7 +2,10 @@
 # provision-ultimate-devuan.sh
 # ---------------------------------------------------------------------------
 # Turn a fresh Devuan 6 "Excalibur" minirootfs (i386 OR amd64) running under
-# iSH-AOK into a full-featured, terminal-only Linux system. This is the Devuan
+# iSH-AOK into a full-featured, terminal-only Linux system. (It provisions a
+# Devuan machine with a kernel of its own as well -- a virtual machine, any
+# architecture -- leaving out what only the app can do: see IN_AOK below.)
+# This is the Devuan
 # twin of provision-ultimate-alpine.sh -- same end result, translated to
 # apt/dpkg + sysvinit instead of apk + OpenRC:
 #   * generous "ultimate terminal" CLI tool set
@@ -41,6 +44,16 @@ fi
 log()  { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 
+# ---- under iSH-AOK, or on a kernel of its own? ----------------------------
+# The same script provisions a virtual machine (the UTM images of
+# tests/bench-utm ship it) or any machine running this distribution. What
+# differs there is what the app does for a root under iSH-AOK and nobody does
+# for a machine: the clock is the machine's own, so chrony keeps the
+# distribution's configuration and disciplines it; nothing names the device's
+# timezone; and there are no native programs to link.
+IN_AOK=0
+[ -d /proc/ish ] && IN_AOK=1
+
 # ---- config (env overrides; prompts interactively when run on a TTY) ------
 NEW_HOSTNAME="${NEW_HOSTNAME:-}"
 SUDO_NOPASSWD="${SUDO_NOPASSWD:-}"
@@ -50,6 +63,11 @@ SUDO_NOPASSWD="${SUDO_NOPASSWD:-}"
 HOST_TZ="$(cat /proc/ish/timezone 2>/dev/null)"
 TZ_PRESET="${TZ_NAME:+1}"
 DEF_TZ="${TZ_NAME:-${HOST_TZ:-America/Los_Angeles}}"
+# (a machine of its own: the zone it already has, else UTC)
+if [ "$IN_AOK" = 0 ] && [ -z "${TZ_NAME:-}" ]; then
+    DEF_TZ="$(cat /etc/timezone 2>/dev/null)"
+    [ -n "$DEF_TZ" ] && [ -f "/usr/share/zoneinfo/$DEF_TZ" ] || DEF_TZ=UTC
+fi
 DEF_USER="${TARGET_USER:-${SUDO_USER:-}}"
 if [ -z "$DEF_USER" ] || [ "$DEF_USER" = root ]; then
     DEF_USER="$(awk -F: '$3>=1000 && $3<2000 {print $1; exit}' /etc/passwd)"
@@ -57,6 +75,11 @@ fi
 [ -n "$DEF_USER" ] || DEF_USER="aok"
 DEF_HOSTNAME="$(cat /etc/hostname 2>/dev/null)"
 [ -n "$DEF_HOSTNAME" ] && [ "$DEF_HOSTNAME" != localhost ] || DEF_HOSTNAME="devuan-ish"
+WHERE="iSH-AOK  (terminal-only userspace)"
+if [ "$IN_AOK" = 0 ]; then
+    [ "$DEF_HOSTNAME" = "devuan-ish" ] && DEF_HOSTNAME="devuan-vm"
+    WHERE="$(uname -m), on a kernel of its own"
+fi
 
 # ask <var> <prompt> <default>: keep an env-provided value; else prompt on a
 # TTY; else use the default (so piped/ssh runs never block).
@@ -241,7 +264,7 @@ log "Hostname"
 if [ -n "$NEW_HOSTNAME" ]; then
     echo "$NEW_HOSTNAME" > /etc/hostname
 elif [ ! -s /etc/hostname ] || [ "$(cat /etc/hostname 2>/dev/null)" = localhost ]; then
-    echo "devuan-ish" > /etc/hostname
+    echo "$DEF_HOSTNAME" > /etc/hostname
 fi
 hostname "$(cat /etc/hostname)" 2>/dev/null || true
 # Make sure the hostname resolves (Debian expects a 127.0.1.1 line).
@@ -297,9 +320,9 @@ note "root + ${TARGET_USER:-} now use bash"
 # ===========================================================================
 log "MOTD"
 # ===========================================================================
-cat > /etc/motd <<'MOTD'
+cat > /etc/motd <<MOTD
 
-   Devuan GNU/Linux 6 (excalibur)  .  iSH-AOK  (terminal-only userspace)
+   Devuan GNU/Linux 6 (excalibur)  .  $WHERE
    ------------------------------------------------------------
    services :  service <name> {start|stop|status}
    on boot  :  update-rc.d <name> {enable|disable}
@@ -386,13 +409,14 @@ chmod 0644 /etc/profile.d/40-aok-tools.sh
 note "wrote /etc/profile.d/30-aok-niceties.sh and 40-aok-tools.sh"
 
 # ===========================================================================
-log "chrony (iSH-aware: monitor only, host owns the clock)"
+[ "$IN_AOK" = 1 ] && log "chrony (iSH-aware: monitor only, host owns the clock)"
+[ "$IN_AOK" = 1 ] || log "chrony (the distribution's configuration: this machine's clock is its own)"
 # ===========================================================================
 # In iSH the guest system clock IS the host (iOS) clock, already NTP-synced by
 # iOS. chronyd therefore runs with -x (no clock control). Under iSH the unix
 # command socket does not work, so reach chronyc over the localhost UDP port if
 # needed:  chronyc -h 127.0.0.1 tracking
-if [ -d /etc/chrony ]; then
+if [ "$IN_AOK" = 1 ] && [ -d /etc/chrony ]; then
     cat > /etc/chrony/chrony.conf <<'CHRONYCONF'
 # chrony.conf -- tuned for iSH-AOK (monitoring mode; chronyd runs with -x)
 pool pool.ntp.org iburst
@@ -650,7 +674,9 @@ log "iSH-AOK native programs"
 # because this script chose the login shells above. persist-links.sh links your
 # own /AOK/persist/bin into /usr/local/bin, for the sessions that never read
 # /etc/profile.d (`ssh host cmd`, cron, services). NATIVE_LINKS=0 skips both.
-if [ "${NATIVE_LINKS:-1}" = 1 ]; then
+if [ "$IN_AOK" = 0 ]; then
+    note "not under iSH-AOK: there are no native programs to link"
+elif [ "${NATIVE_LINKS:-1}" = 1 ]; then
     if [ -f /AOK/tools/native-links.sh ] && [ -x /AOK/native/smallclue ]; then
         sh /AOK/tools/native-links.sh --no-shell 2>&1 | sed 's/^/    /'
     else
@@ -698,6 +724,7 @@ cat <<EOF
     Next:
       * Re-login (or relaunch the app) to pick up bash + the new prompt/MOTD,
         and to boot real sysvinit (sysvinit-core was just installed).
-      * 'chronyc -h 127.0.0.1 tracking' / '... sources' to see NTP status.
+      * 'chronyc -h 127.0.0.1 tracking' / '... sources' to see NTP status
+        (plain 'chronyc tracking' on a machine of its own).
       * 'service --status-all' for service health;  logs in /var/log/syslog.
 EOF

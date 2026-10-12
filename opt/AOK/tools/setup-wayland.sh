@@ -152,6 +152,39 @@ for bin in labwc sway wofi foot wayvnc; do
     command -v "$bin" >/dev/null 2>&1 || die "install reported success but '$bin' is not on PATH"
 done
 
+# Not under iSH-AOK: a machine with a kernel and a display of its own (a
+# virtual machine), where start-wayland.sh puts the desktop on that display
+# instead of serving it to the app. The compositor then needs a seat to take
+# the card and the input devices through, which is seatd; a login that is to
+# start the desktop has to be in seatd's group.
+IN_AOK=0
+[ -d /proc/ish ] && IN_AOK=1
+if [ "$IN_AOK" = 0 ]; then
+    log "a machine of its own: seatd, for the compositor to take the display"
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends seatd \
+            || note "warning: seatd did not install; only root will be able to start the desktop"
+        update-rc.d seatd defaults >/dev/null 2>&1
+        service seatd start >/dev/null 2>&1 || true
+        seat_group=video
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -S --needed --noconfirm seatd || note "warning: seatd did not install"
+        seat_group=seat
+    else
+        apk_add seatd || note "warning: seatd did not install"
+        rc-update add seatd default >/dev/null 2>&1
+        rc-service seatd start >/dev/null 2>&1 || true
+        seat_group=seat
+    fi
+    for _u in $(awk -F: '$3 >= 1000 && $3 < 2000 { print $1 }' /etc/passwd); do
+        if command -v usermod >/dev/null 2>&1; then
+            usermod -a -G "$seat_group" "$_u" 2>/dev/null
+        else
+            addgroup "$_u" "$seat_group" 2>/dev/null
+        fi && note "$_u may start the desktop (group $seat_group)"
+    done
+fi
+
 # The desktop's session bus. start-wayland.sh starts one when dbus-daemon is
 # installed, and GLib and Qt programs (waybar, Falkon) need it; the Alpine
 # packages above do not pull it in. Best-effort, like the menu apps below:
@@ -272,7 +305,9 @@ esac
 # twice. Nothing but a compiler is needed; without one, start-wayland.sh
 # tries again per user, and a session runs without it as it always has.
 log "building the Wayland buffer release guard (best-effort)"
-if [ "$shims_bundled" = 1 ]; then
+if [ "$IN_AOK" = 0 ] && [ ! -f /AOK/tools/wayland/build-release-guard.sh ]; then
+    note "its source is not on this machine (/AOK/tools/wayland); skipped"
+elif [ "$IN_AOK" = 1 ] && [ "$shims_bundled" = 1 ]; then
     note "prebuilt in /AOK/bundled for this root; nothing to build"
 elif command -v cc >/dev/null 2>&1; then
     sh /AOK/tools/wayland/build-release-guard.sh 2>&1 \
@@ -290,7 +325,9 @@ fi
 # actually got built here). The pixman development headers are NOT needed:
 # the shim falls back to a copy of pixman.h vendored beside it.
 log "building pixman accelerator shim (best-effort)"
-if [ "$shims_bundled" = 1 ]; then
+if [ "$IN_AOK" = 0 ]; then
+    note "not under iSH-AOK: there is no accelerator to reach"
+elif [ "$shims_bundled" = 1 ]; then
     note "prebuilt in /AOK/bundled for this root; nothing to build"
 elif command -v cc >/dev/null 2>&1 || command -v gcc >/dev/null 2>&1; then
     if sh /AOK/tools/pixman/build-shim.sh 2>&1; then
@@ -308,7 +345,11 @@ fi
 
 log "done"
 note "labwc, sway, wofi, foot, and wayvnc are installed."
-note "The Display applet will launch the stack automatically from here on."
+if [ "$IN_AOK" = 1 ]; then
+    note "The Display applet will launch the stack automatically from here on."
+else
+    note "Start the desktop on this machine's display with:  sh /AOK/tools/start-wayland.sh"
+fi
 note "Games, desktop tools and X11 support are optional extras:"
 note "  sudo sh /AOK/tools/setup-wayland-extras.sh games tools x11"
 note "Fuller desktops, in place of labwc: setup-wayfire.sh (on the GPU) and setup-xfce.sh"

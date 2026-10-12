@@ -149,6 +149,20 @@ case "$AOK_DESKTOP" in
     *) COMPOSITOR_BIN=$AOK_DESKTOP DESKTOP_BINS=$AOK_DESKTOP DESKTOP_SETUP=setup-wayland.sh ;;
 esac
 COMPOSITOR_CMD="${WAYLAND_COMPOSITOR_CMD:-$COMPOSITOR_BIN}"
+# A machine with a display of its own -- not under iSH-AOK, and a DRM card
+# present: a virtual machine, say -- shows the desktop there. The compositor
+# takes the card and the input devices through its seat (seatd, which
+# setup-wayland.sh installs on such a machine), nothing is headless, and no
+# VNC bridge runs. Everything else is as under iSH-AOK: the same seeded
+# configuration, menu, theme and panel. AOK_WAYLAND_BACKEND=headless or
+# =display overrides the choice.
+AOK_WL_DISPLAY=0
+case "${AOK_WAYLAND_BACKEND:-}" in
+    display) AOK_WL_DISPLAY=1 ;;
+    headless) ;;
+    *) [ ! -d /proc/ish ] && ls /dev/dri/card[0-9]* >/dev/null 2>&1 && AOK_WL_DISPLAY=1 ;;
+esac
+
 READY_FILE="${ISH_DISPLAY_READY_FILE:-/tmp/ish-display.ready}"
 ERROR_FILE="$READY_FILE.error"
 
@@ -299,7 +313,9 @@ AOK_SH=/bin/sh
 
 rm -f "$READY_FILE" "$ERROR_FILE"
 
-for bin in $DESKTOP_BINS foot wayvnc; do
+_wl_vnc=wayvnc
+[ "$AOK_WL_DISPLAY" = 1 ] && _wl_vnc=""
+for bin in $DESKTOP_BINS foot $_wl_vnc; do
     command -v "$bin" >/dev/null 2>&1 \
         || die "'$bin' not found -- run 'sudo sh /AOK/tools/$DESKTOP_SETUP' first"
 done
@@ -453,8 +469,10 @@ if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] && command -v dbus-daemon >/dev/null 2
     fi
 fi
 
+if [ "$AOK_WL_DISPLAY" = 0 ]; then
 export WLR_BACKENDS=headless
 export WLR_LIBINPUT_NO_DEVICES=1
+fi
 # A headless output can never scan a client's buffer out directly, yet
 # wlroots' scene (0.18) tries it every frame for a fullscreen window: it sends
 # the surface dmabuf feedback with a scanout tranche, the test commit fails,
@@ -512,7 +530,9 @@ wl_gpu_usable_for() {
     return 1
 }
 WL_GPU_COMPOSITOR=0
-if [ -z "${WLR_RENDERER:-}" ] && [ "${ISH_DISPLAY_GPU:-1}" != 0 ] && wl_gpu_usable_for "$COMPOSITOR_BIN"; then
+# (a machine's own display: the compositor chooses its renderer for the card,
+# GLES2 where the card can and pixman where it cannot; not this path)
+if [ "$AOK_WL_DISPLAY" = 0 ] && [ -z "${WLR_RENDERER:-}" ] && [ "${ISH_DISPLAY_GPU:-1}" != 0 ] && wl_gpu_usable_for "$COMPOSITOR_BIN"; then
     WL_GPU_COMPOSITOR=1
 fi
 # Two things Wayfire cannot do, where the session is the plain labwc desktop
@@ -527,6 +547,7 @@ if [ "$AOK_DESKTOP" = wayfire ] && [ -z "${WAYLAND_COMPOSITOR_CMD:-}" ]; then
     if [ "$CURRENT_UID" = 0 ]; then
         wl_wayfire_cannot="Wayfire does not run as root -- turn on Settings > Open Everything as Default User"
     elif [ "$WL_GPU_COMPOSITOR" = 0 ]; then
+        [ "$AOK_WL_DISPLAY" = 1 ] ||
         wl_wayfire_cannot="Wayfire needs the GPU (setup-gpu.sh), which this session cannot use"
     fi
 fi
@@ -535,7 +556,7 @@ if [ -n "$wl_wayfire_cannot" ]; then
     AOK_DESKTOP=labwc COMPOSITOR_BIN=labwc COMPOSITOR_CMD=labwc
     command -v labwc >/dev/null 2>&1 || die "$wl_wayfire_cannot, and labwc is not installed to fall back to"
 fi
-export WLR_RENDERER="${WLR_RENDERER:-pixman}"
+[ "$AOK_WL_DISPLAY" = 1 ] || export WLR_RENDERER="${WLR_RENDERER:-pixman}"
 # There's no real GPU/DRM device here (matches labwc's own harmless
 # "drmGetDevices2 failed: No such file or directory" at startup). GTK3
 # apps generally cope via cairo software rendering by default, but GTK4's
@@ -545,7 +566,7 @@ export WLR_RENDERER="${WLR_RENDERER:-pixman}"
 # (not just set for wayvnc/foot individually) so every client an interactive
 # session launches -- typically from a shell inside foot -- inherits them
 # without the user needing to know this environment has no GPU.
-export GSK_RENDERER=cairo
+[ "$AOK_WL_DISPLAY" = 1 ] || export GSK_RENDERER=cairo
 # (Asked for /usr/bin/env, which is of the root's own architecture as the
 # programs started here are; `sh` can be iSH-AOK's native dash, no ELF at all.)
 # OpenGL programs render in software unless /etc/aok-gpu.conf (written by
@@ -556,7 +577,8 @@ if [ -z "${LIBGL_ALWAYS_SOFTWARE+set}" ] && [ -f /etc/aok-gpu.conf ] &&
    grep -q '^AOK_GL=gpu' /etc/aok-gpu.conf 2>/dev/null && wl_gpu_usable_for /usr/bin/env; then
     export LIBGL_ALWAYS_SOFTWARE=0 MESA_LOADER_DRIVER_OVERRIDE=zink
 fi
-export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE-1}"
+# (a machine's own display: Mesa picks the card's driver, or its software one)
+[ "$AOK_WL_DISPLAY" = 1 ] || export LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE-1}"
 # Debian/Devuan firefox-esr routes its Wayland connection through a bundled
 # "wayland-proxy-compositor" shim by default. Under iSH that relay corrupts
 # the stream: firefox dies at startup with "Wayland protocol error:
@@ -788,6 +810,7 @@ ISH_RELEASE_GUARD=$AOK_BUNDLED_LIBS/libish-wl-release-guard.so
 if [ ! -f "$ISH_RELEASE_GUARD" ]; then
     ISH_RELEASE_GUARD="$HOME/.cache/ish-wayland/libish-wl-release-guard.so"
     if [ "${ISH_WAYLAND_DISABLE_RELEASE_GUARD:-0}" != "1" ] && command -v cc >/dev/null 2>&1 \
+            && [ -f /AOK/tools/wayland/build-release-guard.sh ] \
             && { [ ! -f "$ISH_RELEASE_GUARD" ] \
                  || [ /AOK/tools/wayland/ish_wl_release_guard.c -nt "$ISH_RELEASE_GUARD" ]; }; then
         log "building the Wayland buffer release guard"
@@ -1887,7 +1910,11 @@ start_compositor() {
         rm -f "$XDG_RUNTIME_DIR"/wayland-*
         WL_GPU_COMPOSITOR=0
     fi
-    log "starting $COMPOSITOR_CMD (headless)"
+    if [ "$AOK_WL_DISPLAY" = 1 ]; then
+        log "starting $COMPOSITOR_CMD (on this machine's display)"
+    else
+        log "starting $COMPOSITOR_CMD (headless)"
+    fi
     spawn_logged compositor $COMPOSITOR_CMD
     COMPOSITOR_PID=$SPAWN_PID
 }
@@ -2097,7 +2124,8 @@ start_wayvnc() {
 
 hex_port=$(printf '%04X' "$WAYVNC_PORT")
 wayvnc_attempt=1
-while true; do
+# (not at all on a machine's own display: nothing is there to bridge)
+while [ "$AOK_WL_DISPLAY" = 0 ]; do
     log "starting wayvnc ${WAYVNC_VERSION:-(version unknown)} on :$WAYVNC_PORT (attempt $wayvnc_attempt)"
     start_wayvnc
 
@@ -2407,7 +2435,8 @@ aok_repair_after_early_boot() {
         printf '%s\n' "$WAYVNC_PORT" > "$READY_FILE" 2>/dev/null
     fi
 }
-if [ "$UPTIME_AT_START" -lt 300 ] 2>/dev/null; then
+# (not on a machine's own display: there is no applet to hand a session to)
+if [ "$AOK_WL_DISPLAY" = 0 ] && [ "$UPTIME_AT_START" -lt 300 ] 2>/dev/null; then
     aok_repair_after_early_boot &
     REPAIR_PID=$!
 fi
