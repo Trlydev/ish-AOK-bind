@@ -182,6 +182,10 @@ extern NSString *const kThemeBackgroundColor;
 // Cell height as a multiple of the font's measured maximum extent. 1 is that
 // height unchanged, which is what every build before this one did.
 @property NSNumber *lineHeight;
+// Points left clear below the terminal while no on-screen keyboard covers the
+// bottom of the screen (#616): its last rows otherwise sit in the Home
+// indicator's swipe area. 0, the default, is the layout as it always was.
+@property NSNumber *terminalBottomPadding;
 @property (readonly) NSNumber *defaultFontSize;
 @property ColorScheme colorScheme;
 @property (readonly) BOOL requestingDarkAppearance;

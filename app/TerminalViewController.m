@@ -297,6 +297,12 @@ static NSArray<NSString *> *ISHSessionCommandWithFallback(NSArray<NSString *> *c
 @property (nonatomic) NSInteger consecutiveQuickSessionExits;
 @property BOOL ignoreKeyboardMotion;
 @property (nonatomic) BOOL hasExternalKeyboard;
+// For the bottom padding (-_idleBottomPadding): whether an on-screen keyboard
+// was covering the bottom of the view at the last keyboard notification, and
+// the inset that notification worked out when one was not.
+@property (nonatomic) BOOL softwareKeyboardCoversBottom;
+@property (nonatomic) BOOL haveBottomInsetWithoutKeyboard;
+@property (nonatomic) CGFloat bottomInsetWithoutKeyboard;
 @property (nonatomic) BOOL didApplyDeferredSafeAreaUpdate;
 // See -_installWindowingControlsProbe.
 @property (strong, nonatomic) UIView *windowingControlsProbe;
@@ -685,6 +691,12 @@ static const NSInteger kMaximumTerminalFontSize = 72;
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self _updateStyleFromPreferences:YES];
+        });
+    }];
+    [UserPreferences.shared observe:@[@"terminalBottomPadding"]
+                            options:0 owner:self usingBlock:^(typeof(self) self) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self _bottomPaddingPreferenceChanged];
         });
     }];
     [UserPreferences.shared observe:@[@"maximizeScreenSpace", @"hideExtraKeysWithExternalKeyboard"]
@@ -2469,6 +2481,17 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     [self.termView.terminal.webView evaluateJavaScript:script completionHandler:nil];
 }
 
+// The margin the user asked for below the terminal (#616, Settings >
+// Appearance > Bottom Padding). Only while no on-screen keyboard covers the
+// bottom of the screen: with one up, the terminal already ends well above the
+// Home indicator, and the margin would only cost rows. A Workspace window's
+// terminal is not at the bottom of the screen at all.
+- (CGFloat)_idleBottomPadding {
+    if (self.embeddedInWorkspaceWindow)
+        return 0;
+    return MAX(0, UserPreferences.shared.terminalBottomPadding.doubleValue);
+}
+
 - (void)_updateSafeAreaCompensation {
     if (self.embeddedInWorkspaceWindow) {
         if (!UIEdgeInsetsEqualToEdgeInsets(self.additionalSafeAreaInsets, UIEdgeInsetsZero)) {
@@ -2506,9 +2529,26 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     }
 
     if (self.hasExternalKeyboard) {
-        self.bottomConstraint.constant = [self _externalKeyboardBottomInset];
+        self.bottomConstraint.constant = [self _externalKeyboardBottomInset] + [self _idleBottomPadding];
     }
     [self _updateFloatingSettingsButtonVisibility];
+}
+
+// The margin was changed in Settings. With a hardware keyboard the line above
+// has it; with no keyboard at all the inset is the one the last keyboard
+// notification worked out, plus the margin as it is now. (Only here, and not
+// on every safe-area change: -_keepClearOfExtraKeys may have raised the inset
+// since, and nothing but a new keyboard frame should lower it again.)
+- (void)_bottomPaddingPreferenceChanged {
+    [self _updateSafeAreaCompensation];
+    if (!self.embeddedInWorkspaceWindow && !self.hasExternalKeyboard &&
+        self.haveBottomInsetWithoutKeyboard && !self.softwareKeyboardCoversBottom) {
+        self.bottomConstraint.constant = self.bottomInsetWithoutKeyboard + [self _idleBottomPadding];
+        [self.view layoutIfNeeded];
+        [self _keepClearOfExtraKeys];
+    }
+    [self.view setNeedsUpdateConstraints];
+    [self.view setNeedsLayout];
 }
 
 - (void)viewSafeAreaInsetsDidChange {
@@ -2643,6 +2683,13 @@ static const NSInteger kMaxConsecutiveQuickSessionExits = 3;
     // inset for the embedded case, so match it here.
     if (self.embeddedInWorkspaceWindow)
         pad = 0;
+    // (smallKeyboard: nothing on screen, or a hardware keyboard's bar.)
+    self.softwareKeyboardCoversBottom = !smallKeyboard;
+    if (smallKeyboard) {
+        self.bottomInsetWithoutKeyboard = pad;
+        self.haveBottomInsetWithoutKeyboard = YES;
+        pad += [self _idleBottomPadding];
+    }
     self.bottomConstraint.constant = pad;
     [self _updateFloatingSettingsButtonVisibility];
 

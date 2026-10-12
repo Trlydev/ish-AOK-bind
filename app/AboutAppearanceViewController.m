@@ -65,7 +65,7 @@ char *previewString = "# cat /proc/ish/colors\r\n"
 - (void)viewDidLoad {
     [super viewDidLoad];
     ISHSizeTableSectionTitlesOnMac(self.tableView);
-    [UserPreferences.shared observe:@[@"theme", @"fontSize", @"lineHeight", @"fontFamily", @"colorScheme", @"workspaceStyle"]
+    [UserPreferences.shared observe:@[@"theme", @"fontSize", @"lineHeight", @"terminalBottomPadding", @"fontFamily", @"colorScheme", @"workspaceStyle"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.tableView reloadData];
@@ -111,6 +111,7 @@ enum {
     WorkspaceStyleSection,
     CursorSection,
     StatusBarSection,
+    BottomPaddingSection,
     TerminalButtonsSection,
     WorkspaceLaunchSection,
     NumberOfSections,
@@ -133,6 +134,7 @@ enum {
         case WorkspaceStyleSection: return 2;
         case CursorSection: return 2;
         case StatusBarSection: return 1;
+        case BottomPaddingSection: return 1;
         case TerminalButtonsSection: return 1;
         case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? 4 : 0;
         default: NSAssert(NO, @"unhandled section"); return 0;
@@ -156,6 +158,7 @@ enum {
     switch (section) {
         case PreviewSection: return NSLocalizedString(@"Change the color scheme used for the preview.", @"Appearance settings section footer");
         case WorkspaceStyleSection: return NSLocalizedString(@"Modern is a flat, redesigned desktop; Classic keeps the original look. Both stay available and only restyle the Workspace.", @"Appearance settings section footer");
+        case BottomPaddingSection: return NSLocalizedString(@"Leaves this much space below the terminal while no on-screen keyboard is showing, so its last rows stay clear of the Home indicator and the swipe area around it.", @"Appearance settings section footer");
         case TerminalButtonsSection: return NSLocalizedString(@"Show the settings (gear) and terminal-switcher buttons on the terminal. Turn this off for a cleaner terminal.", @"Appearance settings section footer");
         case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? NSLocalizedString(@"How many in-app Desktops to open automatically at launch.", @"Appearance settings section footer") : nil;
         default: return nil;
@@ -174,6 +177,7 @@ enum {
         case WorkspaceStyleSection: return @"Color Scheme";
         case CursorSection: return @[@"Cursor Style", @"Blink Cursor"][indexPath.row];
         case StatusBarSection: return @"Status Bar";
+        case BottomPaddingSection: return @"Font Size";
         case TerminalButtonsSection: return @"Color Scheme";
         case WorkspaceLaunchSection: return @"Color Scheme";
         default: return nil;
@@ -320,6 +324,25 @@ enum {
             }
             break;
 
+        case BottomPaddingSection: {
+            // The stepper row Font Size and Line Height use (see there).
+            UILabel *title = [cell viewWithTag:3];
+            UILabel *label = [cell viewWithTag:1];
+            UIStepper *stepper = [cell viewWithTag:2];
+            [stepper removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
+            NSInteger points = UserPreferences.shared.terminalBottomPadding.integerValue;
+            title.text = NSLocalizedString(@"Bottom Padding", @"Appearance settings row label");
+            stepper.minimumValue = 0;
+            stepper.maximumValue = 120;
+            stepper.stepValue = 4;
+            stepper.value = points;
+            label.text = points == 0 ? NSLocalizedString(@"Off", @"Appearance settings value: no bottom padding") : [NSString stringWithFormat:NSLocalizedString(@"%ld pt", @"Appearance settings value; %ld is a number of points"), (long) points];
+            [stepper addTarget:self action:@selector(bottomPaddingChanged:)
+              forControlEvents:UIControlEventValueChanged];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            break;
+        }
+
         case TerminalButtonsSection:
             cell.textLabel.text = NSLocalizedString(@"Show Settings & Switcher", @"Appearance settings toggle for the terminal quick buttons");
             if (UserPreferences.shared.showTerminalQuickButtons) {
@@ -406,6 +429,10 @@ enum {
     // Rounded because a stepper accumulates its step in binary: 0.05 twenty
     // times is not 1, and the value label would show 0.95000000000000007.
     UserPreferences.shared.lineHeight = @(round(sender.value * 100) / 100);
+}
+
+- (IBAction)bottomPaddingChanged:(UIStepper *)sender {
+    UserPreferences.shared.terminalBottomPadding = @((int) sender.value);
 }
 
 - (IBAction)fontSizeChanged:(UIStepper *)sender {

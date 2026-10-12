@@ -3815,6 +3815,65 @@
         }
       }
     },
+    "%ld pt" : {
+      "comment" : "Appearance settings value; %ld is a number of points",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld pt"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld pt"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld pt"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld pt"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld pt"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld pt"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld пт"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld 点"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%ld 點"
+          }
+        }
+      }
+    },
     "%ld tool call" : {
       "comment" : "chat status, singular",
       "localizations" : {
@@ -13760,6 +13819,65 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "下次開機使用 · %@"
+          }
+        }
+      }
+    },
+    "Bottom Padding" : {
+      "comment" : "Appearance settings row label",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abstand unten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Margen inferior"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Marge inférieure"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "下部の余白"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "하단 여백"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Margem Inferior"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Отступ снизу"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "底部留白"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "底部留白"
           }
         }
       }
@@ -38175,6 +38293,65 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "指令留空則只打開終端機。"
+          }
+        }
+      }
+    },
+    "Leaves this much space below the terminal while no on-screen keyboard is showing, so its last rows stay clear of the Home indicator and the swipe area around it." : {
+      "comment" : "Appearance settings section footer",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lässt so viel Platz unter dem Terminal frei, solange keine Bildschirmtastatur angezeigt wird, damit die letzten Zeilen nicht im Bereich des Home-Indikators und der Wischgesten liegen."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deja este espacio debajo del terminal mientras no se muestre el teclado en pantalla, para que sus últimas filas queden fuera del indicador de inicio y de la zona de deslizamiento que lo rodea."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Laisse cet espace sous le terminal tant qu’aucun clavier à l’écran n’est affiché, afin que ses dernières lignes restent à l’écart de l’indicateur d’accueil et de la zone de balayage qui l’entoure."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オンスクリーンキーボードが表示されていない間、ターミナルの下にこの分の余白を空けます。最後の数行がホームインジケータとその周囲のスワイプ領域に重ならなくなります。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면 키보드가 표시되지 않는 동안 터미널 아래에 이만큼의 공간을 비워 두어, 마지막 줄이 홈 인디케이터와 그 주변의 쓸어넘기기 영역에 걸리지 않게 합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deixa este espaço abaixo do terminal enquanto nenhum teclado na tela estiver visível, para que as últimas linhas fiquem fora do indicador de Início e da área de deslizar ao redor dele."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оставляет столько места под терминалом, пока экранная клавиатура не показана, чтобы его последние строки не попадали в область индикатора «Домой» и жестов смахивания вокруг него."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未显示屏幕键盘时，在终端下方留出这么多空间，使最后几行避开主屏幕指示条及其周围的轻扫区域。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未顯示螢幕鍵盤時，在終端機下方留出這麼多空間，讓最後幾行避開主畫面指示器及其周圍的滑動區域。"
           }
         }
       }

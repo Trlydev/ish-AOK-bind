@@ -26,6 +26,7 @@ static NSString *const kPreferenceOverrideControlSpaceKey = @"Override Control S
 static NSString *const kPreferenceFontFamilyKey = @"Font Family";
 static NSString *const kPreferenceFontSizeKey = @"Font Size";
 static NSString *const kPreferenceLineHeightKey = @"Line Height";
+static NSString *const kPreferenceTerminalBottomPaddingKey = @"Terminal Bottom Padding";
 static NSString *const kPreferenceThemeKey = @"ModernTheme";
 static NSString *const kPreferenceDisableDimmingKey = @"Disable Dimming";
 static NSString *const kPreferenceEnableMulticoreKey = @"Enable Multicore";
@@ -287,6 +288,7 @@ void amd64_jit_preference_set(bool enabled) {
             // 1 = the height hterm measures, i.e. exactly what every build
             // before this one did. Nobody's terminal moves until they ask.
             kPreferenceLineHeightKey: @(1),
+            kPreferenceTerminalBottomPaddingKey: @(0),
             kPreferenceCapsLockMappingKey: @(CapsLockMapControl),
             kPreferenceOptionMappingKey: @(OptionMapNone),
             kPreferenceBacktickEscapeKey: @(NO),
@@ -374,6 +376,7 @@ void amd64_jit_preference_set(bool enabled) {
             @"font_family": kPreferenceFontFamilyKey,
             @"font_size": kPreferenceFontSizeKey,
             @"line_height": kPreferenceLineHeightKey,
+            @"terminal_bottom_padding": kPreferenceTerminalBottomPaddingKey,
             @"disable_dimming": kPreferenceDisableDimmingKey,
             @"custom_dns_servers": kPreferenceCustomDnsServersKey,
             @"disable_resolv_conf_rewrite": kPreferenceDisableResolvConfRewriteKey,
@@ -436,6 +439,7 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceFontFamilyKey: property(fontFamily),
             kPreferenceFontSizeKey: property(fontSize),
             kPreferenceLineHeightKey: property(lineHeight),
+            kPreferenceTerminalBottomPaddingKey: property(terminalBottomPadding),
             kPreferenceDisableDimmingKey: property(shouldDisableDimming),
             kPreferenceEnableLLMClientKey: property(shouldEnableLLMClient),
             kPreferenceLLMProviderKey: property(llmProvider),
@@ -624,6 +628,25 @@ void amd64_jit_preference_set(bool enabled) {
         return NO;
     double scale = [*value doubleValue];
     return scale > 0.5 && scale <= 2;
+}
+
+// MARK: terminalBottomPadding
+- (NSNumber *)terminalBottomPadding {
+    NSNumber *value = [_defaults objectForKey:kPreferenceTerminalBottomPaddingKey];
+    return value != nil ? value : @(0);
+}
+
+- (void)setTerminalBottomPadding:(NSNumber *)terminalBottomPadding {
+    [_defaults setObject:terminalBottomPadding forKey:kPreferenceTerminalBottomPaddingKey];
+}
+
+// Up to a quarter of the shortest screen iSH-AOK runs on: more than that is a
+// terminal somebody cannot find, not a margin.
+- (BOOL)validateTerminalBottomPadding:(id *)value error:(NSError **)error {
+    if (![*value isKindOfClass:NSNumber.class])
+        return NO;
+    double points = [*value doubleValue];
+    return points >= 0 && points <= 120;
 }
 
 - (NSNumber *)defaultFontSize {
