@@ -532,8 +532,11 @@ how a carry is collected) behind it.
   speed`, three rounds: ECDSA P-256 signing 6% and verifying 4% faster,
   RSA-2048 signing 1-3% faster. The usual benchmarks, five rounds: 7-Zip
   2.5% faster, Python fib and dict 1.3% faster, method 0.6% faster, str
-  unchanged. Nothing slower. **Not timed on the A10X:** its battery was at
-  36% and not gaining on the Mac's USB port.
+  unchanged. Nothing slower. A10X the same evening (Arch arm64, three
+  rounds, the last of this build cut short; the device warm and one of the
+  old build's rounds throttled): 7-Zip about 10% faster than the morning's
+  build before the carry gadgets, and level with the build after them;
+  Python within the device's noise that day (2-8% either way).
 - **Proved:** tests/manual/arm64/alu_shift_ospec.c, every new form against
   the same operation computed in C, at edge shifts and values, each feeding
   a fused pair and not. It passes with ospec, pair and fwd each off.
@@ -595,8 +598,8 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   7-Zip 3.4%, fib 3.6%, method 0.7%, dict 3.2%, str 1.1% faster. A10X,
   four rounds: 7-Zip 0.4%, fib 2.7%, method 7.2%, dict 4.3%, str 3.0%
   faster.
-- **The list from seven workloads, 2026-10-12: built, measured, NOT
-  committed -- it waits for the A10X.** The same look the arm64 guest had,
+- **The list from seven workloads, 2026-10-12** (committed after the A10X
+  timing at the end of this paragraph; 535 pairs, 1,173 gadgets)**.** The same look the arm64 guest had,
   with digests and Python big numbers: this guest has no generic gadgets to
   find (its hot ones in a digest are xor, addw, add, srlw, sllw: one
   instruction each already), only pairs its three-workload list lacked. A
@@ -617,7 +620,17 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   moved the time by 3-5%: on that host a result handed over in a register
   is worth at least what a dispatch is, and on a dependent chain more. The
   A10X has always got more from a dispatch than from a forward (pairs 6-9%,
-  forwarding 0.4-1%), so it may well want this list; it was charging.
+  forwarding 0.4-1%), and it wants this list. A10X, Devuan riscv64, builds
+  alternated, three rounds of the old list and two of the new (two of the
+  new list's runs lost their connection: no crash and no memory kill on the
+  device, and the cable link to it failed for the old list's build as well
+  an hour later): 7-Zip 5.9% faster, Python method 6.5%, dict 6.3% and str
+  7.3% faster, fib 2.2% slower; the coreutils digests over 48 MB: md5sum
+  10%, sha1sum 9.5% and sha256sum 9% less time, sha512sum, b2sum and cksum
+  within 5% either way. Rough numbers -- the device was warm, short of
+  power (7 W from the port it was on; it lost 5% of its battery in the
+  run) and unreachable by the end -- and all on one side. Kept: broad gains
+  on the slow device against two digests 3-5% slower on the fast one.
 - **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
   this guest, with the same control (a fused load's fault path naming the
   wrong instruction fails it); the standalone ALU gadgets are byte for byte
