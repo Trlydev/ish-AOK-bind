@@ -391,6 +391,7 @@ does not say what it is for.
 | `syslog_read_blocks.c` | yes | syslog(2) SYSLOG_ACTION_READ waits for something unread instead of answering 0. |
 | `syslog_read_clear.c` | yes | syslog(2) SYSLOG_ACTION_READ_CLEAR returns the byte count, not 0. |
 | `sysv_ipc.c` | yes | SysV message queues + semaphores (fakeroot's IPC substrate). |
+| `tcp_suspend_reset.c` | — | Guest half of tcp_suspend_reset.sh: a TCP connection an iOS suspension took away reads as reset (ECONNRESET) from recv, read and SO_ERROR, polled first or not -- never as EBADF, the pending error XNU leaves on a defunct socket (GH #631). |
 | `taskstats_genl.c` | yes | taskstats_genl.c — self-checking regression lock for generic netlink (NETLINK_GENERIC) and the TASKSTATS family, iotop's only per-pid data source... |
 | `thread.c` | — |  |
 | `time64_nsec_padding.c` | yes | A 32-bit guest's 64-bit timespec has a padding word the kernel must ignore. |

@@ -1995,6 +1995,28 @@ static bool guest_sockaddr_is_abstract_local(guest_addr_t sockaddr_addr, uint_t 
     return path_size != 0 && fake_addr.data[0] == '\0';
 }
 
+// The host's pending error for a socket (SO_ERROR, read and cleared), as the
+// guest is to hear it. Every such read goes through here.
+//
+// One value needs changing. iOS takes a suspended app's connections away
+// once the device locks -- it "defuncts" them -- and XNU leaves EBADF as the
+// pending error of a defunct socket, on a descriptor that is as good as it
+// ever was. AOK reads the pending error itself whenever the guest polls a
+// stream socket (socket_tcp_connect_write_ready) and keeps it for the guest's
+// next call, so a client that sat in poll() across the suspension -- every
+// ssh session there is -- came back to "Read from remote host: Bad file
+// descriptor" (GH #631). No Linux socket reports EBADF for a connection the
+// network took away; it says the connection was reset, and that is the word
+// a program that reconnects is waiting for. A plain recv() on such a socket
+// already said so (sock_translate_err); this is the same answer for the
+// error that was read ahead of it.
+static int sock_host_so_error(int real_fd, int *so_error, socklen_t *len) {
+    int res = getsockopt(real_fd, SOL_SOCKET, SO_ERROR, so_error, len);
+    if (res == 0 && *len == sizeof(*so_error) && *so_error == EBADF)
+        *so_error = ECONNRESET;
+    return res;
+}
+
 #if defined(__APPLE__)
 static void sock_trace_tcp_info(const char *label, struct fd *sock) {
     if (!sock_trace_enabled() || sock == NULL || sock->real_fd < 0)
@@ -2011,7 +2033,7 @@ static void sock_trace_tcp_info(const char *label, struct fd *sock) {
 
     int so_error = 0;
     socklen_t so_error_len = sizeof(so_error);
-    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0)
+    if (sock_host_so_error(sock->real_fd, &so_error, &so_error_len) < 0)
         so_error = -1;
     // This read-and-clears the host's SO_ERROR same as socket_tcp_connect_
     // write_ready; cache it too so an strace-enabled run doesn't itself steal
@@ -2479,7 +2501,7 @@ static bool socket_tcp_connect_write_ready(struct fd *sock) {
 
     int so_error = 0;
     socklen_t so_error_len = sizeof(so_error);
-    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0)
+    if (sock_host_so_error(sock->real_fd, &so_error, &so_error_len) < 0)
         return true;
     if (so_error != 0) {
         // This read just cleared the host's SO_ERROR (read-and-clear
@@ -2513,7 +2535,7 @@ static int socket_finish_blocking_connect(struct fd *sock) {
 
         int real_error = 0;
         socklen_t real_error_len = sizeof(real_error);
-        if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len) < 0)
+        if (sock_host_so_error(sock->real_fd, &real_error, &real_error_len) < 0)
             return errno_map();
 #if defined(__APPLE__)
         // A concurrent poll/epoll scan on another thread (socket_tcp_connect_
@@ -6397,7 +6419,7 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
             !socket_tcp_connect_established(sock)) {
         int real_error = 0;
         socklen_t real_error_len = sizeof(real_error);
-        if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len) == 0) {
+        if (sock_host_so_error(sock->real_fd, &real_error, &real_error_len) == 0) {
             // A concurrent poll/epoll scan on another thread may have already
             // read-and-cleared SO_ERROR; fall back to what it cached.
             if (real_error == 0 && sock->socket.host_connect_error != 0)
@@ -8670,7 +8692,7 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         } else {
             int real_error;
             socklen_t real_error_len = sizeof(real_error);
-            int err = getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len);
+            int err = sock_host_so_error(sock->real_fd, &real_error, &real_error_len);
             if (err < 0)
                 return errno_map();
             if (sock_host_error_is_peer_gone(sock, real_error))
@@ -10677,7 +10699,7 @@ static bool sock_io_drop_peer_gone(struct fd *fd, bool *dropped) {
         return false;
     int so_error;
     socklen_t so_error_len = sizeof(so_error);
-    getsockopt(fd->real_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len);
+    sock_host_so_error(fd->real_fd, &so_error, &so_error_len);
     *dropped = true;
     return true;
 }
@@ -10766,7 +10788,7 @@ static int sock_poll(struct fd *fd) {
     if ((types & POLL_READ) && sock_is_unix_dgram(fd)) {
         int so_error = 0;
         socklen_t so_error_len = sizeof(so_error);
-        if (getsockopt(fd->real_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) == 0 &&
+        if (sock_host_so_error(fd->real_fd, &so_error, &so_error_len) == 0 &&
                 so_error != 0) {
             if (sock_host_error_is_peer_gone(fd, so_error))
                 types = realfs_poll(fd);
