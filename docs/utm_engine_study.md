@@ -651,21 +651,29 @@ disk on virtio-blk, the GL display device, four CPUs.
   through this QEMU. (Devuan's kmscube ran its frames and exited without an
   error; no frame of it was captured.)
 
-**And none of those frames is shown.** That last parenthesis was the gap.
+**And none of those frames was shown.** That last parenthesis was the gap.
 The first real use of the GL device, the desktop below started on an M4
 iPad, was a black screen with a cursor that moved, and the simulator showed
-why: the compositor draws every frame with GLES2 (its own screenshot has the
-terminal window) and none reaches UTM's screen, with atomic modesetting or
-legacy, on a still desktop or one whose terminal prints four times a second.
-kmscube is black too, on a GBM surface and on an FBO. What does reach the
-screen is whatever goes through a dumb buffer: the text console, and a
-compositor that draws in software (pixman). So in this build the guest
-renders with the host's GPU and the picture is lost between the rendered
-resource and the scanout. The likely place is the part of the fork's work
-this port left out (below): QEMU 11's own `virtio-gpu-virgl.c` hands the
-display a texture where the fork's hands UTM's client the resource's
-IOSurface and has its own fencing. Until that is carried over, the GL device
-is good for the console and for software-composited desktops only.
+why: the compositor drew every frame with GLES2 (its own screenshot had the
+terminal window) and none reached UTM's screen, with atomic modesetting or
+legacy, on a still desktop or one whose terminal printed four times a
+second. kmscube was black too. What did reach the screen went through a
+dumb buffer: the text console, and a compositor drawing in software.
+
+The cause was in the port. UTM's virglrenderer, drawing on Metal through
+ANGLE, names a resource's Metal texture in a field that is a union with the
+Direct3D one, and says which it is in another. QEMU 11's
+`virgl_cmd_set_scanout()`, which the port had kept, knows only Direct3D, so
+the display code was handed a Metal texture labelled as something it has no
+path for, turned its Metal scanout off, and blitted the resource's GL
+texture id: right for a resource the guest only uploads to, empty for one a
+guest context renders into. `524b5e9` on `utm-gl` takes the type into
+account, as UTM's fork does.
+
+With it, in the simulator: kmscube's cube is on UTM's screen, labwc
+composites with GLES2 and is on the screen, and es2gears turns in a window
+on that desktop, drawn by the host's GPU from end to end. The lesson is in
+the first paragraph: a renderer string and a frame count are not a picture.
 
 Not done: the fork's work in `virtio-gpu-virgl.c` (its in-process render
 server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
@@ -713,13 +721,15 @@ engine: 1280x800, and the two differ in nine rows of the panel, where the
 clock and the load figures are. 1.3 million pairs were fused getting there.
 
 The desktop on the GL display device was not run before the image went to
-the iPads, and there it was a black screen (above). `start-wayland.sh` let
-the compositor choose its renderer on a machine's own display, and it chose
-GLES2. Since `e9c583c78` it composites in software there by default, as
-under the app, and the same machine in the simulator shows the whole desktop
-on UTM's screen, started as its owner starts it (`desktop`).
-`WLR_RENDERER=gles2 desktop` is the old behaviour, for whoever fixes the
-scanout.
+the iPads, and there it was a black screen: the engine's GL scanout (above),
+which no desktop had exercised. While that was open `start-wayland.sh`
+composited in software there (`e9c583c78`); with the engine fixed, the card
+decides (`ca22eab3c`): GLES2 on a virtio-gpu that negotiated virgl, pixman
+on one that did not, wlroots' own choice on any other card, and
+`desktop soft` for pixman whatever the card. In the simulator, on the fixed
+engine, `desktop` says `renderer: gles2` and is on UTM's screen with
+es2gears turning in a window, and `desktop soft` says pixman and is on the
+screen too. On an iPad it has been seen by nobody yet.
 
 The Alpine guests carry the Alpine script and the Wayland ones as well, to
 try: they live in memory, and their Mesa has no virgl driver.
