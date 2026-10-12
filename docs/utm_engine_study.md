@@ -37,8 +37,9 @@ pull request rather than ship a competing app.
   lead** (section 8). Inside QEMU it needs 1.5x to 2.9x fewer host cycles
   than the tctiSH fork's engine on the same six workloads, and 2.9x to 7.2x
   fewer than UTM SE as shipped, with program output and floating-point
-  results identical to QEMU's own. On an M4 iPad Pro it measures the same:
-  2.0x the fork's engine, the six workloads in 9.8 s instead of 20.5 s.
+  results identical to QEMU's own. On iPads it measures the same: 2.0x the
+  fork's engine on an M4 (the six workloads in 9.8 s instead of 20.5 s) and
+  1.8x on an A10X (31 s instead of 58 s).
 
 - **Plug-in point: a second block generator inside QEMU's existing engine,
   not a new accelerator.** UTM SE's engine and AOK's use the same dispatch
@@ -399,8 +400,8 @@ per-guest decoders in `jit/gen.c`.
 2. **Talk to the fork's author and UTM's maintainer.** There is now a result
    to show and a published branch to point at. On hold: the project owner's
    call, and no one has been contacted.
-3. ~~Measure on an iPad.~~ Done for the plug-in against the fork's engine on
-   an M4 iPad Pro: section 8. The A10X run is still owed.
+3. ~~Measure on an iPad.~~ Done for the plug-in against the fork's engine, on
+   an M4 iPad Pro and an A10X one: section 8.
 4. Re-run this race when either engine changes: `tests/bench-utm/`.
 
 ## 8. The RISC-V plug-in
@@ -477,11 +478,30 @@ Mac's to within a tenth, which is what two engines with the same dispatch
 scheme on the same kind of core should give. Python and awk cost about 20%
 more cycles on the M4 than on the M5 under both engines.
 
-On the device the program transcript and the floating-point transcript (139
-lines) are identical with the gadgets on and off, and the program
-transcript is identical to the Mac's reference.
+iPad Pro 12.9" (A10X, iPad7,2), iPadOS 17.7, the oldest core this is likely
+to meet, thermal state nominal throughout:
 
-iPad Pro 12.9" (A10X): the app is installed; not run yet.
+| Workload | Plug-in G cycles | Fork G cycles | Plug-in s | Fork s | Plug-in vs fork |
+|---|--:|--:|--:|--:|--:|
+| CoreMark | 10.3 | 15.9 | 4.20 | 6.49 | 1.5x |
+| n-body (floating point) | 7.0 | 15.6 | 2.83 | 6.36 | 2.2x |
+| Python | 29.8 | 58.1 | 12.18 | 23.76 | 2.0x |
+| xz | 11.2 | 18.9 | 4.59 | 7.71 | 1.7x |
+| sha256sum | 6.3 | 7.8 | 2.55 | 3.21 | 1.3x |
+| awk | 12.1 | 25.5 | 4.96 | 10.42 | 2.1x |
+| Geometric mean | | | | | **1.8x** |
+
+All six together: 31.3 s with the plug-in, 57.9 s without. The lead is a
+little smaller than on the M4. The host instruction counts are the same on
+both devices (the plug-in runs fewer, except for sha256sum, where the two
+engines run the same number); what differs is how much faster the plug-in's
+instructions go than the fork's: 1.4x the instructions per cycle on the M4
+for CoreMark, 1.2x here. Why the older core gains less has not been looked
+into.
+
+On both devices the program transcript and the floating-point transcript
+(139 lines) are identical with the gadgets on and off, identical between the
+two devices, and the program transcript is identical to the Mac's reference.
 
 Not measured on a device: UTM SE as shipped, and AOK's own app on the same
 userland.
