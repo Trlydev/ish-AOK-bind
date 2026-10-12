@@ -675,15 +675,8 @@ hle_call_return:
 
 .macro f_br_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
 .ifc \fn,_
-    ldr x8, [_ip]
-    and x8, x8, #0x1f
-    add x9, _cpu, #CPU_x0
-    cmp x8, #31
-    b.eq 1f
-    ldr x10, [x9, x8, lsl #3]
-    b 2f
-1:  mov x10, #0
-2:
+    ldr x8, [_ip]             // the register's cpu_state offset (gen.c: never XZR)
+    ldr x10, [_cpu, x8]
 .else
     mov x10, x\fn            // the target, from the pair's first half
 .endif
@@ -696,20 +689,12 @@ f_gadget br_cached, f_br_cached, _, _, _, _, _
 .macro f_blr_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
 .ifc \fn,_
     ldr x8, [_ip]
-    and x8, x8, #0x1f
-    add x9, _cpu, #CPU_x0
-    cmp x8, #31
-    b.eq 1f
-    ldr x10, [x9, x8, lsl #3]
-    b 2f
-1:  mov x10, #0
-2:
+    ldr x10, [_cpu, x8]
 .else
     mov x10, x\fn
-    add x9, _cpu, #CPU_x0
 .endif
     ldr x11, [_ip, #8]      // return address
-    str x11, [x9, #(30*8)]  // X30 = return address, AFTER the target is read
+    str x11, [_cpu, #(CPU_x0 + 30*8)]  // X30 = return address, AFTER the target is read
     ret_cache_dispatch x10
 .endm
 .macro f_blr_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_

@@ -630,17 +630,17 @@
 #define R_br_cached _
 #define HR_br_cached 0
 #define K_br_cached 1
-#define OPS_br_cached {0, PAIR_OP_REG_NOT31}
+#define OPS_br_cached {0, PAIR_OP_SLOT}
 #define F_blr_cached f_blr_cached, _, _, _, _, _
 #define R_blr_cached _
 #define HR_blr_cached 0
 #define K_blr_cached 1
-#define OPS_blr_cached {0, PAIR_OP_REG_NOT31}
+#define OPS_blr_cached {0, PAIR_OP_SLOT}
 #define F_ret_cached f_br_cached, _, _, _, _, _
 #define R_ret_cached _
 #define HR_ret_cached 0
 #define K_ret_cached 1
-#define OPS_ret_cached {0, PAIR_OP_REG_NOT31}
+#define OPS_ret_cached {0, PAIR_OP_SLOT}
 #define F_cbz_x f_cb, x9, cbz, _, _, _
 #define R_cbz_x _
 #define HR_cbz_x 0

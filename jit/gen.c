@@ -5936,23 +5936,25 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
         extern void gadget_arm64_br_cached(void);
         extern void gadget_arm64_blr_cached(void);
         extern void gadget_arm64_ret_cached(void);
-        bool retcache = (arm64_jit_fuse_mask() & JIT_FUSE_A64_RETCACHE) != 0;
+        // The _cached gadgets take the register as its cpu_state offset; a
+        // branch through XZR (to address 0) has no slot and is the plain one.
+        bool retcache = (arm64_jit_fuse_mask() & JIT_FUSE_A64_RETCACHE) != 0 && rn != 31;
         switch (opc) {
         case 0: // BR
             gen(state, (unsigned long) (retcache ? gadget_arm64_br_cached
                                                  : gadget_arm64_br));
-            gen(state, rn);
+            gen(state, retcache ? arm64_x_off(rn) : rn);
             break;
         case 1: // BLR
             gen(state, (unsigned long) (retcache ? gadget_arm64_blr_cached
                                                  : gadget_arm64_blr));
-            gen(state, rn);
+            gen(state, retcache ? arm64_x_off(rn) : rn);
             gen(state, state->arm64_ip); // return address
             break;
         case 2: // RET
             gen(state, (unsigned long) (retcache ? gadget_arm64_ret_cached
                                                  : gadget_arm64_ret));
-            gen(state, rn);
+            gen(state, retcache ? arm64_x_off(rn) : rn);
             break;
         default:
             return gen_arm64_undefined(state);

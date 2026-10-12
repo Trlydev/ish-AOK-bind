@@ -491,6 +491,13 @@ branch tree to do one instruction.
   It passes with ospec, pair and fwd each off. Control: always taking the
   no-reload carry gadget fails it 3,136 times.
 
+- **And the returns.** `ret`, `br` and `blr` (ret_cached and the others: 2.6%
+  of the gadgets Python and gcc run) masked a register number out of their
+  word, compared it with 31 and branched twice before loading it. They take
+  the register's slot now; a branch through XZR keeps the plain gadget. M4,
+  builds alternated, five rounds: 7-Zip 0.8% faster, Python method 8.6% and
+  dict 1.9% faster, fib and str within 1.6% either way.
+
 **Tried the same day and NOT kept.**
 
 - *Checks only on backward links.* A chained transition looks at the poke
