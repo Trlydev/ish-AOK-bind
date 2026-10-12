@@ -43,10 +43,20 @@ CODE_SIGN_IDENTITY_IOS = Apple Development
 CODE_SIGN_STYLE_IOS = Automatic
 XC
 case ${1:-device} in
-    device) dest='generic/platform=iOS'; extra=-allowProvisioningUpdates ;;
-    sim)    dest='generic/platform=iOS Simulator'; extra=ONLY_ACTIVE_ARCH=NO ;;
+    device) dest='generic/platform=iOS'; extra=-allowProvisioningUpdates; products=Release-iphoneos ;;
+    sim)    dest='generic/platform=iOS Simulator'; extra=ONLY_ACTIVE_ARCH=NO; products=Release-iphonesimulator ;;
 esac
+# The settings page (Settings.bundle) holds every edition's and platform's entries; UTM's "Patch Settings
+# bundle" build phase removes the ones that are not this target's. Its declared input is the bundle's
+# directory, so after an edit to Root.plist an incremental build copied the file again and did not patch
+# it: the SE app then showed JitStreamer and other entries of the JIT editions, and took its defaults from
+# whichever platform's entry came last. Make both steps run, and check below that they did.
+touch Platform/iOS/Settings.bundle
+rm -rf "$U/dd/Build/Products/$products/UTM SE.app/Settings.bundle"
 xcodebuild -scheme iOS-SE -destination "$dest" -configuration Release ARCHS=arm64 -derivedDataPath "$U/dd" \
     -skipPackagePluginValidation -skipMacroValidation $extra build > "$U/build-${1:-device}.log" 2>&1 ||
     { grep "error:" "$U/build-${1:-device}.log" | sort -u | head -20; exit 1; }
-ls -d "$U"/dd/Build/Products/Release-*/"UTM SE.app"
+if plutil -p "$U/dd/Build/Products/$products/UTM SE.app/Settings.bundle/Root.plist" | grep -q 'ExcludeTargets\|"Platform"'; then
+    echo "the settings page was not patched for this target (Patch Settings bundle did not run)"; exit 1
+fi
+ls -d "$U/dd/Build/Products/$products/UTM SE.app"
