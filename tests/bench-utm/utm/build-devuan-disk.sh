@@ -94,6 +94,7 @@ if [ -n "$u" ]; then su - "$u" -c 'sh /AOK/tools/start-wayland.sh' &
 else sh /AOK/tools/start-wayland.sh & fi
 sleep 150
 echo "DESKTOP-TEST processes: $(ps -e -o comm= | grep -E 'labwc|foot|waybar|seatd|wayvnc' | sort | uniq -c | tr '\n' ' ')"
+echo "DESKTOP-TEST power key: $(grep -c 'Power key pressed' /var/log/auth.log) pressed, $(grep -c 'Powering off' /var/log/auth.log) obeyed (auth.log), and still up"
 J
     job_tar desktop-job.sh
     rm -f mon.sock desktop.ppm
@@ -103,7 +104,10 @@ J
         -monitor unix:mon.sock,server,nowait -snapshot &
     qemu=$!
     for i in $(seq 1 1500); do grep -aq "DESKTOP-TEST as" build-desktop.log 2>/dev/null && break; sleep 1; done
-    sleep 120
+    sleep 100
+    # The power key, four times: the machine must note it and stay up (the job's last line says so).
+    for i in 1 2 3 4; do echo "sendkey power" | nc -U mon.sock > /dev/null 2>&1 || true; sleep 1; done
+    sleep 16
     echo "screendump $PWD/desktop.ppm" | nc -U mon.sock > /dev/null 2>&1 || true
     wait $qemu || true
     grep -a "DESKTOP-TEST\|AOKJOB-DONE\|^aok: " build-desktop.log

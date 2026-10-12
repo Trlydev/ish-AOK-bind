@@ -16,9 +16,24 @@
 # cannot compile the SwiftTerm it depends on. CodeSigning.xcconfig (written here if absent) gives the app a
 # bundle id of our own, so that it installs beside a UTM SE from the App Store, and asks for none of the
 # entitlements UTM's paid-account configuration adds.
+#
+# The front end is UTM's with utm-frontend.patch (beside this script; copy it to ~/aok-utm) applied when
+# it is there and not applied yet. What it changes, all in Platform/iOS:
+#   - a mouse or trackpad positions the guest's cursor through the system's pointer, with no pointer lock.
+#     UTM asks for the lock whenever a VM runs and takes movement from GCMouse, which reports none unless
+#     the system grants it; on an M4 iPad the trackpad of a keyboard did nothing. Capture (relative
+#     movement) remains for a guest without a tablet, and as a setting ("Capture Mouse and Trackpad").
+#   - what it asks for and what the system granted goes to the VM's debug.log ("pointer lock: ...")
+#   - every ancestor view controller is told which child decides on the lock, not only the parent
+#   - the keyboard's power key (HID usage 0x66) is not passed to the guest: an iPad keyboard's key arrived
+#     as one and the guest shut down under its user
 set -e
 U=${U:-$HOME/aok-utm}
 cd "$U/UTM"
+if [ -f "$U/utm-frontend.patch" ] && git apply --check "$U/utm-frontend.patch" 2> /dev/null; then
+    git apply "$U/utm-frontend.patch"
+    echo "applied utm-frontend.patch"
+fi
 [ -f CodeSigning.xcconfig ] || cat > CodeSigning.xcconfig <<'XC'
 DEVELOPMENT_TEAM = UYU5FM4LQ4
 PRODUCT_BUNDLE_PREFIX = app.ish.aok

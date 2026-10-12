@@ -17,6 +17,17 @@ sh /AOK/tools/setup-wayland.sh || exit 2
 # X11 programs on the desktop, and a browser and file manager for its menu: best-effort.
 sh /AOK/tools/setup-wayland-extras.sh x11 tools || echo "wayland extras: not all installed"
 id aok
+# The power key. A key of the host's keyboard can arrive as one: an iPad keyboard's did, through UTM, and
+# elogind shut the machine down under its user twice in twenty minutes ("Power key pressed short.
+# Powering off..." in auth.log). The machine is stopped from its front end, or by its owner's poweroff.
+mkdir -p /etc/elogind/logind.conf.d
+cat > /etc/elogind/logind.conf.d/50-aok-vm-keys.conf <<'L'
+# (devuan-ultimate-job.sh) A host keyboard's lock or power key must not take the machine down.
+[Login]
+HandlePowerKey=ignore
+HandleSuspendKey=ignore
+HandleHibernateKey=ignore
+L
 # aok on the display's console; root stays on the serial port.
 sed -i 's|^1:2345:respawn:.*|1:2345:respawn:/sbin/agetty --autologin aok --noclear tty1 linux|' /etc/inittab
 cat > /etc/motd <<'M'

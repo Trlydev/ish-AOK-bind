@@ -734,6 +734,45 @@ screen too. On an iPad it has been seen by nobody yet.
 The Alpine guests carry the Alpine script and the Wayland ones as well, to
 try: they live in memory, and their Mesa has no virgl driver.
 
+### First use on an iPad, and what it found
+
+The first evening of somebody using the machine on an M4 iPad found four
+things no test of mine had, each in a different layer:
+
+- **Nothing drawn with GL was shown** (the engine; "The accelerated
+  display" above).
+- **The trackpad of the keyboard did nothing** (UTM's front end). UTM asks
+  the system for the pointer lock whenever a VM runs and takes movement from
+  GCMouse, which reports none without the lock; the VM's log showed mouse
+  devices coming and going and not one movement. Finger drags worked, so the
+  path into the guest was sound. `utm-frontend.patch` makes the system's own
+  pointer position the guest's cursor, with no lock, for any guest that has a
+  tablet; capture remains for one that has not, and as a setting. What was
+  asked and what the system granted now goes to the VM's log. In the
+  simulator the tablet path works end to end on this QEMU (the QMP switch to
+  the tablet, a tap landing where it was made); a trackpad itself the
+  simulator cannot be given, so that half is the user's to confirm.
+- **The machine shut down under its user, twice in twenty minutes** (the
+  guest and the front end together). Its own `auth.log`, read off the disk
+  pulled from the iPad, has `Power key pressed short. Powering off...` each
+  time: UTM passes a keyboard's power key (HID usage 0x66) to the guest, and
+  elogind obeys it. Which key of that keyboard it is, is not known. The
+  patch stops passing it, and the image tells elogind to ignore it
+  (`build-devuan-disk.sh desktop-test` now presses it four times: "4
+  pressed, 0 obeyed, and still up").
+- **UTM SE crashed whenever a guest powered off** (the engine): three crash
+  reports, one stack, a use after free in spice-server's
+  `inputs_release_keys` under `qemu_spice_cleanup`. QEMU 11 tears its spice
+  server down at exit; UTM's spice-server (0.14.3, which this tree was made
+  to build against) cannot remove the keyboard interface QEMU frees first.
+  `9d51cf6` leaves a server of that age standing. With it QEMU exits with
+  code 0 and UTM SE quits on its own account, as it does after any VM.
+
+What reading the evidence took, for the next time: the VM's `debug.log` and
+its disk come off the device with `devicectl device copy from`; crash
+reports with `idevicecrashreport -k -f UTM`; and the disk's logs through the
+build VM (the image as a read-only second disk, a job that tars `/var/log`).
+
 ## 10. One source for both
 
 Until 2026-10-12 the plug-in's integer gadgets were AOK's, copied and
