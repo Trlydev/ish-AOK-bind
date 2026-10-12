@@ -461,7 +461,7 @@ gadgets had the dispatch change and the memory probe, and not the rest. Now:
   in, so a first half copies its result to x12 -- only in the gadgets that
   forward. 711 gadgets from the 332 pairs. M4, off and on, five rounds:
   7-Zip 3.4%, fib 3.6%, method 0.7%, dict 3.2%, str 1.1% faster. A10X,
-  three rounds: 7-Zip 1.5%, fib 4.3%, method 6.0%, dict 5.4%, str 2.5%
+  four rounds: 7-Zip 0.4%, fib 2.7%, method 7.2%, dict 4.3%, str 3.0%
   faster.
 - **Proved:** tests/manual/riscv64/riscv64_pair_fusion.c, the arm64 test for
   this guest, with the same control (a fused load's fault path naming the
