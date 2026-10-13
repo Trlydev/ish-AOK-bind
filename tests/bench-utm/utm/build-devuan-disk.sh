@@ -71,7 +71,10 @@ job_tar() {       # job_tar SCRIPT: job.tar with it as run.sh
     rm -rf job job.tar && mkdir job && cp "$1" job/run.sh
     tar -cf job.tar -C job . && truncate -s 2M job.tar
 }
-if [ "$1" = ultimate ]; then
+# build-devuan-disk.sh tools -- only bring an existing machine's /AOK/tools, its rc.local hooks and its
+# helpers (desktop, aok-update, aok-engine) up to date, and write the qcow2 again. Minutes, on either
+# architecture, where "ultimate" provisions the whole machine again.
+if [ "$1" = ultimate ] || [ "$1" = tools ]; then
     [ -f devuan.img ] && [ -d "$W/aok-tools" ] || { echo "needs devuan/devuan.img and $W/aok-tools"; exit 1; }
     rm -rf job job.tar bootout.img && mkdir -p job/tools
     cp "$here/devuan-provision.sh" job/run.sh && echo tools > job/mode
@@ -89,6 +92,11 @@ if [ "$1" = ultimate ]; then
         -drive file=bootout.img,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2 \
         -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -device virtio-rng-pci < /dev/null > build-tools.log 2>&1
     grep -q DEVUAN-TOOLS-OK build-tools.log || { tail -25 build-tools.log; exit 1; }
+    if [ "$1" = tools ]; then
+        qemu-img convert -O qcow2 -c devuan.img "devuan-$ARCH.qcow2"
+        ls -la "devuan-$ARCH.qcow2"
+        exit 0
+    fi
     job_tar "$here/devuan-ultimate-job.sh"
     devuan_boot build-ultimate.log "aokjob=vdb" \
         -drive file=job.tar,format=raw,if=none,id=d1,readonly=on -device virtio-blk-pci,drive=d1

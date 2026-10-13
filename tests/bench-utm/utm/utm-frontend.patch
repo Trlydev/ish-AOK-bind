@@ -21,6 +21,28 @@ index 7670d96d..b6bc9005 100644
      }
  }
  
+diff --git a/Platform/VMData.swift b/Platform/VMData.swift
+index fb70720b..1b922daf 100644
+--- a/Platform/VMData.swift
++++ b/Platform/VMData.swift
+@@ -348,7 +348,16 @@ extension VMData {
+     
+     /// Display subtitle for UI elements
+     var detailsSubtitleLabel: String {
+-        detailsSystemTargetLabel
++        #if WITH_QEMU_TCI
++        // iSH-AOK's build: which engine will run this machine's CPU comes first, where a
++        // narrow list still shows it. The guest architectures its QEMU has AOK gadgets for
++        // (target/*/tcg/aok there); every other one runs on QEMU's own interpreter.
++        if let qemuConfig = config as? UTMQemuConfiguration {
++            let aok = ["riscv64", "aarch64"].contains(qemuConfig.system.architecture.rawValue)
++            return (aok ? "AOK gadgets · " : "QEMU · ") + detailsSystemTargetLabel
++        }
++        #endif
++        return detailsSystemTargetLabel
+     }
+     
+     /// Display icon path for UI elements
 diff --git a/Platform/iOS/Display/VMDisplayMetalViewController+Keyboard.m b/Platform/iOS/Display/VMDisplayMetalViewController+Keyboard.m
 index 3bafa9a7..d37655a9 100644
 --- a/Platform/iOS/Display/VMDisplayMetalViewController+Keyboard.m

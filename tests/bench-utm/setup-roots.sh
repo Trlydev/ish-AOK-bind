@@ -1,6 +1,8 @@
 #!/bin/bash
 # Builds one benchmark userland per guest arch as an AOK root, and the same tree as a QEMU initramfs.
+# ARCHES names the ones to build (default: aarch64 riscv64; x86_64 is the third).
 set -euo pipefail
+ARCHES=${ARCHES:-"aarch64 riscv64"}
 export PATH=/opt/homebrew/bin:$PATH
 W=$HOME/aok-vm-bench
 ISH=$HOME/git/ish-AOK/build/ish
@@ -8,7 +10,7 @@ FAKEFSIFY=$HOME/git/ish-AOK/build/tools/fakefsify
 ALPINE=https://dl-cdn.alpinelinux.org/alpine/v3.24
 mkdir -p "$W/dl-roots" "$W/dl-coremark" "$W/dl-kernel" "$W/kernel"
 cd "$W/dl-roots"
-for a in aarch64 riscv64; do
+for a in $ARCHES; do
     [ -f alpine-minirootfs-3.24.2-$a.tar.gz ] || curl -fsLO $ALPINE/releases/$a/alpine-minirootfs-3.24.2-$a.tar.gz
 done
 cd "$W/dl-coremark"
@@ -18,9 +20,14 @@ cd "$W/dl-kernel"
 [ -f linux-lts-riscv64.apk ] || curl -fsL -o linux-lts-riscv64.apk $ALPINE/main/riscv64/linux-lts-6.18.55-r0.apk
 [ -f "$W/kernel/vmlinuz-virt-aarch64" ] || { bsdtar -xOf linux-virt-aarch64.apk boot/vmlinuz-virt > "$W/kernel/vmlinuz-virt-aarch64"; }
 [ -f "$W/kernel/vmlinuz-lts-riscv64" ] || { bsdtar -xOf linux-lts-riscv64.apk boot/vmlinuz-lts > "$W/kernel/vmlinuz-lts-riscv64"; }
+case " $ARCHES " in *" x86_64 "*)
+    [ -f linux-virt-x86_64.apk ] || curl -fsL -o linux-virt-x86_64.apk $ALPINE/main/x86_64/linux-virt-6.18.55-r0.apk
+    [ -f "$W/kernel/vmlinuz-virt-x86_64" ] || { bsdtar -xOf linux-virt-x86_64.apk boot/vmlinuz-virt > "$W/kernel/vmlinuz-virt-x86_64"; }
+    ;;
+esac
 file "$W"/kernel/*
 
-for a in aarch64 riscv64; do
+for a in $ARCHES; do
     R=$W/root-$a
     if [ ! -d "$R" ]; then
         "$FAKEFSIFY" "$W/dl-roots/alpine-minirootfs-3.24.2-$a.tar.gz" "$R"

@@ -70,8 +70,27 @@ D
         # its user's (vm-update.sh).
         [ -f "$here/vm-update.sh" ] && install -m 755 "$here/vm-update.sh" /mnt/usr/local/bin/aok-update
     fi
+    # `aok-engine`, and a line at login: which engine runs this machine (the AOK gadget engine says so).
+    cat > /mnt/usr/local/bin/aok-engine <<'E'
+#!/bin/sh
+# aok-engine -- which engine runs this machine's CPU. The AOK gadget engine says so itself: in the device
+# tree (/chosen, "aok,engine") where the machine has one, and in a fw_cfg file that rc.local copies to
+# /run/aok-engine at boot. Neither is there under QEMU's own engine.
+if [ -d /proc/ish ]; then echo "iSH-AOK"; exit 0; fi
+e=$(tr -d '\000' < /proc/device-tree/chosen/aok,engine 2> /dev/null)
+[ -n "$e" ] || e=$(cat /run/aok-engine 2> /dev/null)
+echo "${e:-QEMU, without the AOK gadgets}"
+E
+    chmod 755 /mnt/usr/local/bin/aok-engine
+    cat > /mnt/etc/profile.d/aok-engine.sh <<'E'
+# (aok-engine) one line at login: which engine this machine runs on
+case $- in *i*) command -v aok-engine > /dev/null 2>&1 && printf '  engine: \033[1m%s\033[0m\n' "$(aok-engine)" ;; esac
+E
     cat > /mnt/etc/rc.local <<'R'
 #!/bin/sh
+# (aok-engine) the engine's fw_cfg file, for machines with no device tree
+modprobe -q qemu_fw_cfg 2> /dev/null
+cat /sys/firmware/qemu_fw_cfg/by_name/opt/aok/engine/raw > /run/aok-engine 2> /dev/null || rm -f /run/aok-engine
 for x in $(cat /proc/cmdline); do
     case $x in
     gltest=*) (sleep 4; /usr/local/bin/gltest "${x#gltest=}" > /dev/console 2>&1) & ;;

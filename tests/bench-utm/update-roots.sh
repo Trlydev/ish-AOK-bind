@@ -1,14 +1,17 @@
 #!/bin/bash
 # Pushes changed benchmark scripts into both AOK roots and rebuilds the QEMU initramfs images from them.
+# ARCHES names the guests (default: aarch64 riscv64; x86_64 once setup-roots.sh has built it).
 set -euo pipefail
 export PATH=/opt/homebrew/bin:$PATH COPYFILE_DISABLE=1
+ARCHES=${ARCHES:-"aarch64 riscv64"}
 W=$HOME/aok-vm-bench; ISH=$HOME/git/ish-AOK/build/ish
 # fptest is compiled in the AOK checkout's own test roots, which have a compiler: installing one into
 # the benchmark root means a 200 MB download per arch through the guest, and apk has hung on it.
 DEV=$HOME/git/ish-AOK/build
-for a in aarch64 riscv64; do
+for a in $ARCHES; do
     R=$W/root-$a
-    case $a in aarch64) dev=$DEV/alpine-arm64-324 ;; riscv64) dev=$DEV/alpine-riscv64-test ;; esac
+    case $a in aarch64) dev=$DEV/alpine-arm64-324 ;; riscv64) dev=$DEV/alpine-riscv64-test ;;
+               x86_64) dev=$DEV/alpine-amd64-test ;; esac
     if [ ! -s "$W/bench/fptest.$a" ] || [ "$W/bench/fptest.c" -nt "$W/bench/fptest.$a" ]; then
         "$ISH" -f "$dev" /bin/sh -e -c 'mkdir -p /tmp/bench-utm && cd /tmp/bench-utm && cat > fptest.c &&
             gcc -O1 -static -ffp-contract=off -fno-math-errno -o fptest fptest.c -lm && cat fptest' \

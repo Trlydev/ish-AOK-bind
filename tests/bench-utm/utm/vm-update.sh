@@ -53,6 +53,36 @@ HandleHibernateKey=ignore
 L
     echo "  $k: written (in force from the next boot)"
 fi
+# Which engine runs the machine (2026-10-13: the AOK gadget engine says so; `aok-engine`, and a line at login).
+cat > "$t/aok-engine" <<'E'
+#!/bin/sh
+# aok-engine -- which engine runs this machine's CPU. The AOK gadget engine says so itself: in the device
+# tree (/chosen, "aok,engine") where the machine has one, and in a fw_cfg file that rc.local copies to
+# /run/aok-engine at boot. Neither is there under QEMU's own engine.
+if [ -d /proc/ish ]; then echo "iSH-AOK"; exit 0; fi
+e=$(tr -d '\000' < /proc/device-tree/chosen/aok,engine 2> /dev/null)
+[ -n "$e" ] || e=$(cat /run/aok-engine 2> /dev/null)
+echo "${e:-QEMU, without the AOK gadgets}"
+E
+put "$t/aok-engine" /usr/local/bin/aok-engine
+cat > "$t/aok-engine.sh" <<'E'
+# (aok-engine) one line at login: which engine this machine runs on
+case $- in *i*) command -v aok-engine > /dev/null 2>&1 && printf '  engine: \033[1m%s\033[0m\n' "$(aok-engine)" ;; esac
+E
+if ! cmp -s "$t/aok-engine.sh" /etc/profile.d/aok-engine.sh; then
+    install -m 644 "$t/aok-engine.sh" /etc/profile.d/aok-engine.sh && echo "  /etc/profile.d/aok-engine.sh: written"
+fi
+if [ -f /etc/rc.local ] && ! grep -q "(aok-engine)" /etc/rc.local; then
+    cat > "$t/rc-hook" <<'E'
+# (aok-engine) the engine's fw_cfg file, for machines with no device tree
+modprobe -q qemu_fw_cfg 2> /dev/null
+cat /sys/firmware/qemu_fw_cfg/by_name/opt/aok/engine/raw > /run/aok-engine 2> /dev/null || rm -f /run/aok-engine
+E
+    # (after the #! line: rc.local ends in "exit 0")
+    { sed -n 1p /etc/rc.local; cat "$t/rc-hook"; sed 1d /etc/rc.local; } > "$t/rc.local" &&
+        install -m 755 "$t/rc.local" /etc/rc.local && echo "  /etc/rc.local: reads the engine's name at boot"
+fi
+echo "  this machine runs on: $(/usr/local/bin/aok-engine)"
 # Vulkan: the engine offers it since 2026-10-13 (venus); the guest's half is Mesa's virtio driver, which
 # images before that did not carry.
 if ! dpkg -s mesa-vulkan-drivers vulkan-tools > /dev/null 2>&1; then

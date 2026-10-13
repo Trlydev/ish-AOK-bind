@@ -40,7 +40,9 @@ if [ -d "/lib/modules/$(uname -r)" ]; then
             echo "NET $n $(ifconfig "$n" | sed -n 's/.*inet addr:\([^ ]*\).*/\1/p')"
     done
 fi
-echo "BENCH-START $(uname -m) $(uname -r) $B"
+# (which engine: the AOK gadget engine says so in the device tree; nothing there is QEMU's own)
+E=$(tr -d '\000' < /proc/device-tree/chosen/aok,engine 2> /dev/null)
+echo "BENCH-START $(uname -m) $(uname -r) $B [engine: ${E:-QEMU, without the AOK gadgets}]"
 /bench/run1.sh $(echo "$B" | tr , ' ')
 echo BENCH-END
 [ -n "$GLTEST" ] && /bench/gltest.sh "$GLTEST"
