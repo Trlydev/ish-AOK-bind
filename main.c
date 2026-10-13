@@ -444,6 +444,24 @@ static void setup_host_mounts(void) {
     }
 }
 
+// Dev harness for mount_detach_tree, which only the app calls (renaming or
+// deleting an installed root): ISH_TEST_DETACH_TREE="<point>:<ms>" detaches
+// the tree at <point> that long after boot, as the app would, and says what
+// came of it. With ISH_FAKE_MNT2, <point> is /fakemnt2.
+static void *test_detach_tree_thread(void *arg) {
+    char *spec = arg;
+    char *colon = strrchr(spec, ':');
+    long ms = colon != NULL ? atol(colon + 1) : 0;
+    if (colon != NULL)
+        *colon = '\0';
+    struct timespec delay = {ms / 1000, (ms % 1000) * 1000000};
+    nanosleep(&delay, NULL);
+    int err = mount_detach_tree(spec);
+    fprintf(stderr, "ISH_TEST_DETACH_TREE %s -> %d\n", spec, err);
+    free(spec);
+    return NULL;
+}
+
 // Dev harness for the fakefs suspension quiesce gate (ISH_TEST_QUIESCE), run
 // alongside ISH_TEST_GUEST_CMD so there is real transaction traffic to drain.
 static void *quiesce_test_thread(void *arg) {
@@ -800,6 +818,14 @@ int main(int argc, char *const argv[]) {
             pthread_create(&th, NULL, cli_sockrestart_after, NULL);
             pthread_detach(th);
         }
+    }
+    // See test_detach_tree_thread.
+    const char *detach_tree = getenv("ISH_TEST_DETACH_TREE");
+    if (detach_tree != NULL && detach_tree[0] != '\0') {
+        pthread_t th;
+        char *spec = strdup(detach_tree);
+        if (spec != NULL && pthread_create(&th, NULL, test_detach_tree_thread, spec) == 0)
+            pthread_detach(th);
     }
     halt_hook = cli_halt;
     // hle_stats_dump runs from cli_halt, after guest teardown has closed the

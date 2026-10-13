@@ -24,9 +24,12 @@ struct user_namespace;
 // then touch only that namespace's region. The initial namespace is the table
 // as it has always been (root ""), and nothing about it changes.
 //
-// Nothing propagates between namespaces: every tree is private, the state
-// mount --make-rprivate gives on Linux. A mount made in the parent after the
-// copy does not appear in the child.
+// A copy is what Linux's is: each mount of the parent's that was private is
+// private in the copy, and nothing mounted on either side afterwards reaches
+// the other. One that was shared has a peer in the copy -- or, when the new
+// namespace belongs to another user namespace, a slave -- and what is
+// mounted under either then appears under the other (fs/mount.c,
+// "Propagation").
 struct mnt_namespace {
     unsigned refcount;   // guarded by mounts_lock; tasks, and /proc ns descriptors
     unsigned long inode; // its identity in /proc/<pid>/ns/mnt. Immutable.
@@ -36,6 +39,9 @@ struct mnt_namespace {
     // initial one: CAP_SYS_ADMIN there is what mounting here takes. Owns a
     // reference. Immutable.
     struct user_namespace *user_ns;
+    // Every namespace but the initial one, for finding whose tree a point is
+    // in. Guarded by mounts_lock.
+    struct mnt_namespace *next_ns;
 };
 
 // The namespace every task starts in. A task's mnt_ns is NULL for it.

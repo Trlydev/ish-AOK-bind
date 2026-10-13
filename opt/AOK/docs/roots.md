@@ -219,11 +219,21 @@ mount --bind  /a /b     # anything mounted *under* /a is not visible under /b
 mount --rbind /a /c     # it is under /c
 ```
 
-Propagation flags (`--make-rprivate` and friends) are accepted and do
-nothing. Every mount here is private: a mount namespace (`unshare -m`, since
-559) gets a copy of the tree, and nothing mounted on either side afterwards
-reaches the other. That is what `--make-private` and `--make-slave` ask for;
-`--make-shared` is the one that is accepted without being true.
+Propagation works as on Linux (since 559). A mount starts private: a mount
+namespace (`unshare -m`) gets a copy of the tree, and nothing mounted on
+either side afterwards reaches the other. `mount --make-shared` puts a mount
+in a peer group, which a bind of it, or a namespace's copy of it, joins: a
+mount or unmount under one member happens under all of them.
+`--make-slave` receives without giving back, `--make-private` and
+`--make-unbindable` leave, and `r` in front of any of them means everything
+mounted below as well. `findmnt -o TARGET,PROPAGATION` shows which is which.
+
+```sh
+mount --make-shared /mnt/a
+mount --bind /mnt/a /mnt/b          # a peer of /mnt/a
+mount -t tmpfs none /mnt/a/x        # is under /mnt/b/x too
+umount /mnt/b/x                     # and gone from both
+```
 
 Mounting over a directory hides what was mounted below it, as on Linux, and
 unmounting brings it back:

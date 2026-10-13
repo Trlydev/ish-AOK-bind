@@ -1187,6 +1187,14 @@ int proc_show_mountinfo(struct proc_entry *entry, struct proc_data *buf) {
             proc_printf(buf, ",nodev");
         if (mount->flags & MS_NOEXEC_)
             proc_printf(buf, ",noexec");
+        // The optional fields: how it propagates (fs/mount.c). None for a
+        // private mount.
+        if (mount->shared_id != 0)
+            proc_printf(buf, " shared:%d", mount->shared_id);
+        if (mount->master_id != 0)
+            proc_printf(buf, " master:%d", mount->master_id);
+        if (mount->unbindable)
+            proc_printf(buf, " unbindable");
         proc_printf(buf, " - %s ", mount->fs->name);
         const char *source = mount_display_source(mount);
         proc_print_escaped(buf, source[0] == '\0' ? "/" : source);

@@ -79,9 +79,11 @@ only signals it handles, orphans go to it, and when it exits everything
 left inside is killed and nothing more can be forked in. `RLIMIT_NPROC` and
 the load average still count the machine.
 
-A mount namespace here is not everything Linux's is. Nothing propagates:
-every mount is private, so `--make-shared` is accepted and not done. A mount
-that is covered when the namespace is copied is not in the copy. A session
+A mount namespace here is not everything Linux's is. Propagation is real
+(559): peer groups, slaves, and mounts and unmounts repeated through them,
+across namespaces too — but a mount that is covered receives nothing while
+it is, and `mountinfo` has no `propagate_from`. A mount that is covered
+when the namespace is copied is not in the copy. A session
 with a process in a mount namespace of its own cannot be saved (the save is
 refused, and says which process). And on its own it confines nothing — a
 process in one is still root over the one machine, which is why a sandbox

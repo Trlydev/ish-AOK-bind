@@ -156,6 +156,7 @@ void mount_retain(struct mount *mount) {
 }
 
 static void mount_destroy(struct mount *mount);
+static void mount_leave_group_locked(struct mount *mount);
 
 void mount_release(struct mount *mount) {
     lock(&mounts_lock, 0);
@@ -495,6 +496,8 @@ static void mount_destroy(struct mount *mount) {
     // What it covered is in view again (and, when a whole namespace is going,
     // is found there and taken in its turn).
     mount_uncover_locked(mount);
+    // Its peers and slaves go on without it (see "Propagation").
+    mount_leave_group_locked(mount);
     // A mount umount -l parked at a staging point goes as the mount it was:
     // its filesystem is told the point it was attached at. So does one that
     // was covered.
@@ -768,6 +771,416 @@ static void mount_subtree_notify(struct mount_subtree *tree) {
     mount_subtree_free(tree);
 }
 
+// ---- Propagation ------------------------------------------------------------
+//
+// Linux's shared subtrees. A mount is private, or in a peer group
+// (shared_id), or a slave of one (master_id), or both; a mount made or
+// unmounted under a member of a peer group is repeated at the same place
+// under every other member, and under every slave of the group, and so on
+// down through any slave that is itself shared. A bind of a shared mount is
+// its peer, and so is a mount namespace's copy of one -- unless the
+// namespace belongs to another user namespace, where the copy is a slave.
+//
+// "The same place" is by filesystem and path within it, which is all a
+// mount is here: a bind of the same origin with a prefix (kernel/fs.h). A
+// point under mount A is A's prefix plus the rest of the point; under a
+// receiver that shows that directory -- whose own prefix is a prefix of it
+// -- it is the receiver's point plus what is left.
+//
+// Groups are numbers handed out once. A slave names a group rather than a
+// mount, so nothing has to be re-linked when a master goes: when the last
+// member of a group leaves it, its slaves pass to that member's own master,
+// as Linux hands them on.
+//
+// Not here: a mount that is covered (parked under the one mounted over it)
+// receives nothing while it is, and mountinfo has no propagate_from.
+
+static _Atomic int next_peer_group = 1;
+
+static struct mnt_namespace *mnt_namespaces;    // all but the initial one; mounts_lock
+
+static struct mount *mount_fs_origin(struct mount *mount) {
+    return mount->bind_origin != NULL ? mount->bind_origin : mount;
+}
+static const char *mount_fs_prefix(const struct mount *mount) {
+    return mount->bind_prefix != NULL ? mount->bind_prefix : "";
+}
+static bool mount_in_view(const struct mount *mount) {
+    return !mount->detached && !mount->lazy_umount;
+}
+
+// The namespace whose tree `point` is in: NULL for one in no tree.
+static struct mnt_namespace *mnt_ns_of_point_locked(const char *point) {
+    if (mount_staging_point_len(point, strlen(point)) == 0)
+        return &init_mnt_ns;
+    for (struct mnt_namespace *ns = mnt_namespaces; ns != NULL; ns = ns->next_ns)
+        if (mnt_ns_has_point(ns, point))
+            return ns;
+    return NULL;
+}
+
+// What `child` is mounted on: the mount directly beneath it at its own
+// point, or the one whose tree its point is in. NULL for the root of a tree.
+// (The list keeps equal points newest first and one length together.)
+static struct mount *mount_parent_locked(const struct mount *child) {
+    for (struct list *item = child->mounts.next; item != &mounts; item = item->next) {
+        struct mount *mount = list_entry(item, struct mount, mounts);
+        if (mount->point_len != child->point_len)
+            break;
+        if (mount_in_view(mount) && strcmp(mount->point, child->point) == 0)
+            return mount;
+    }
+    size_t tree = mount_staging_point_len(child->point, child->point_len);
+    if (tree == child->point_len && child->point_len != 0)
+        return NULL;
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (!mount_in_view(mount) || mount->point_len >= child->point_len)
+            continue;
+        if (mount_staging_point_len(mount->point, mount->point_len) != tree)
+            continue;
+        if (strncmp(child->point, mount->point, mount->point_len) == 0 &&
+                child->point[mount->point_len] == '/')
+            return mount;
+    }
+    return NULL;
+}
+
+// Out of its peer group. If that leaves the group empty, its slaves are the
+// slaves of whatever this mount was a slave of.
+static void mount_leave_group_locked(struct mount *mount) {
+    int group = mount->shared_id;
+    if (group == 0)
+        return;
+    mount->shared_id = 0;
+    struct mount *other;
+    list_for_each_entry(&mounts, other, mounts)
+        if (other->shared_id == group)
+            return;
+    list_for_each_entry(&mounts, other, mounts)
+        if (other->master_id == group)
+            other->master_id = mount->master_id;
+}
+
+// mount --make-{shared,slave,private,unbindable} for one mount.
+static void mount_set_propagation_locked(struct mount *mount, int type) {
+    switch (type) {
+        case MS_SHARED_:
+            if (mount->shared_id == 0)
+                mount->shared_id = next_peer_group++;
+            break;
+        case MS_SLAVE_: {
+            // A slave of the peers it leaves; with none, of what it was a
+            // slave of already.
+            int group = mount->shared_id;
+            mount_leave_group_locked(mount);
+            struct mount *other;
+            list_for_each_entry(&mounts, other, mounts) {
+                if (group != 0 && other->shared_id == group) {
+                    mount->master_id = group;
+                    break;
+                }
+            }
+            break;
+        }
+        case MS_PRIVATE_:
+        case MS_UNBINDABLE_:
+            mount_leave_group_locked(mount);
+            mount->master_id = 0;
+            break;
+    }
+    mount->unbindable = type == MS_UNBINDABLE_;
+}
+
+// The mount at exactly `point` in the caller's tree gets propagation `type`,
+// and with `recursive` so does every mount below it. EINVAL for a point that
+// is not a mount point.
+static int mount_change_propagation(const char *point, int type, bool recursive) {
+    size_t point_len = strlen(point);
+    lock(&mounts_lock, 0);
+    struct mount *top = NULL, *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount_in_view(mount) && strcmp(mount->point, point) == 0) {
+            top = mount;
+            break;
+        }
+    }
+    if (top == NULL) {
+        unlock(&mounts_lock);
+        return _EINVAL;
+    }
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount != top) {
+            if (!recursive || !mount_in_view(mount))
+                continue;
+            if (strncmp(mount->point, point, point_len) != 0 || mount->point[point_len] != '/')
+                continue;
+            // (The initial root's "" is a prefix of every other tree's
+            // points too, and those are not below it.)
+            if (!mnt_ns_has_point(mnt_ns_current(), mount->point))
+                continue;
+        }
+        mount_set_propagation_locked(mount, type);
+    }
+    unlock(&mounts_lock);
+    proc_mountinfo_notify_changed();
+    return 0;
+}
+
+// Where `point`, which is under `parent`, is under `receiver`. False when
+// the receiver shows another filesystem, or a part of this one that the
+// point is not in.
+static bool mount_propagated_point(struct mount *parent, const char *point, struct mount *receiver,
+        char *out, size_t size) {
+    if (mount_fs_origin(parent) != mount_fs_origin(receiver))
+        return false;
+    char in_fs[MAX_PATH];
+    int n = snprintf(in_fs, sizeof(in_fs), "%s%s", mount_fs_prefix(parent), point + parent->point_len);
+    if (n < 0 || (size_t) n >= sizeof(in_fs))
+        return false;
+    const char *shown = mount_fs_prefix(receiver);
+    size_t shown_len = strlen(shown);
+    if (strncmp(in_fs, shown, shown_len) != 0 || (in_fs[shown_len] != '/' && in_fs[shown_len] != '\0'))
+        return false;
+    n = snprintf(out, size, "%s%s", receiver->point, in_fs + shown_len);
+    return n >= 0 && (size_t) n < size;
+}
+
+// Everything that receives what happens under `parent`: the other members
+// of its peer group, the slaves of that group, the peers of any slave that
+// is shared as well, their slaves, and on down. For a mount being
+// propagated, each comes with what its copy is to be: `shared` and `master`
+// (0 for none), given the mount's own group and master. For an unmount
+// (`mount_group` 0) those are not asked for, and no group is made.
+struct propagation_target {
+    struct mount *receiver;
+    int shared, master;
+};
+
+static struct propagation_target *mount_propagation_targets_locked(struct mount *parent,
+        int mount_group, int mount_master, size_t *count_out) {
+    *count_out = 0;
+    if (parent == NULL || parent->shared_id == 0)
+        return NULL;
+    struct { int group, copy_group, copy_master; } levels[32];
+    size_t n_levels = 1, count = 0, cap = 0;
+    levels[0].group = parent->shared_id;
+    levels[0].copy_group = mount_group;
+    levels[0].copy_master = mount_master;
+    struct propagation_target *targets = NULL;
+    for (size_t i = 0; i < n_levels; i++) {
+        struct mount *mount;
+        list_for_each_entry(&mounts, mount, mounts) {
+            if (mount == parent || !mount_in_view(mount))
+                continue;
+            int shared, master;
+            if (mount->shared_id == levels[i].group) {
+                shared = levels[i].copy_group;
+                master = levels[i].copy_master;
+            } else if (mount->master_id == levels[i].group && mount->shared_id == 0) {
+                shared = 0;
+                master = levels[i].copy_group;
+            } else if (mount->master_id == levels[i].group) {
+                // A slave that is shared: it and its peers are a level of
+                // their own, whose copies share a group between them.
+                bool seen = false;
+                for (size_t k = 0; k < n_levels && !seen; k++)
+                    seen = levels[k].group == mount->shared_id;
+                if (!seen && n_levels < sizeof(levels) / sizeof(levels[0])) {
+                    levels[n_levels].group = mount->shared_id;
+                    levels[n_levels].copy_group = mount_group != 0 ? next_peer_group++ : 0;
+                    levels[n_levels].copy_master = levels[i].copy_group;
+                    n_levels++;
+                }
+                continue;
+            } else {
+                continue;
+            }
+            if (count == cap) {
+                size_t new_cap = cap == 0 ? 8 : cap * 2;
+                struct propagation_target *grown = realloc(targets, new_cap * sizeof(*targets));
+                if (grown == NULL)
+                    break;
+                targets = grown;
+                cap = new_cap;
+            }
+            targets[count++] = (struct propagation_target) {mount, shared, master};
+        }
+    }
+    *count_out = count;
+    return targets;
+}
+
+// `mount` again at `point`: a bind of the same filesystem showing the same
+// part of it. Caller holds mounts_lock.
+static struct mount *mount_clone_at_locked(struct mount *mount, const char *point) {
+    struct mount *origin = mount_fs_origin(mount);
+    // calloc for the same reason as do_mount.
+    struct mount *copy = calloc(1, sizeof(struct mount));
+    if (copy == NULL)
+        return NULL;
+    copy->point = strdup(point);
+    copy->point_len = strlen(point);
+    copy->source = strdup(mount->source != NULL ? mount->source : "");
+    copy->display_source = mount->display_source != NULL ? strdup(mount->display_source) : NULL;
+    copy->info = strdup(mount->info != NULL ? mount->info : "");
+    copy->bind_prefix = strdup(mount_fs_prefix(mount));
+    if (copy->point == NULL || copy->source == NULL || copy->info == NULL || copy->bind_prefix == NULL ||
+            (mount->display_source != NULL && copy->display_source == NULL)) {
+        free((void *) copy->point);
+        free((void *) copy->source);
+        free((void *) copy->display_source);
+        free((void *) copy->info);
+        free((void *) copy->bind_prefix);
+        free(copy);
+        return NULL;
+    }
+    copy->flags = mount->flags;
+    copy->fs = origin->fs;
+    copy->root_fd = -1;
+    copy->fake_dev = origin->fake_dev;
+    copy->bind_origin = origin;
+    origin->refcount++; // a bind owns one reference on its origin (mount_destroy)
+    copy->id = mount_new_id();
+    mount_list_insert(copy);
+    return copy;
+}
+
+// `mount` has just been attached somewhere under `parent`: it appears at the
+// same place under everything that receives from `parent`. As on Linux the
+// mount itself becomes shared for it, if it was not.
+static void mount_propagate_locked(struct mount *parent, struct mount *mount) {
+    if (parent == NULL || parent->shared_id == 0 || !mount_in_view(mount))
+        return;
+    if (mount->shared_id == 0)
+        mount->shared_id = next_peer_group++;
+    mount->unbindable = false;
+    size_t count;
+    struct propagation_target *targets = mount_propagation_targets_locked(parent,
+            mount->shared_id, mount->master_id, &count);
+    struct mnt_namespace *from_ns = mnt_ns_of_point_locked(mount->point);
+    for (size_t i = 0; i < count; i++) {
+        char point[MAX_PATH];
+        if (!mount_propagated_point(parent, mount->point, targets[i].receiver, point, sizeof(point)))
+            continue;
+        if (strcmp(point, mount->point) == 0)
+            continue;
+        struct mount *copy = mount_clone_at_locked(mount, point);
+        if (copy == NULL)
+            continue;
+        copy->shared_id = targets[i].shared;
+        copy->master_id = targets[i].master;
+        // In a tree that belongs to another user namespace it keeps the
+        // restrictions it arrived with.
+        struct mnt_namespace *to_ns = mnt_ns_of_point_locked(point);
+        if (to_ns != NULL && from_ns != NULL && to_ns->user_ns != from_ns->user_ns)
+            copy->locked_flags = mount->flags & (MS_READONLY_ | MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_);
+        // It covers what was mounted below its point there.
+        mount_cover_below_locked(copy, MOUNT_COVER_ALL);
+    }
+    free(targets);
+}
+
+// The mount at `point` has just been made by a guest or the app: propagate
+// it, and with `newer_below` whatever was mounted under it with it (a
+// recursive bind's copies), shallowest first.
+static void mount_propagate_at_locked(const char *point, bool newer_below) {
+    size_t point_len = strlen(point);
+    struct mount *top = NULL, *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount_in_view(mount) && strcmp(mount->point, point) == 0) {
+            top = mount;
+            break;
+        }
+    }
+    if (top == NULL)
+        return;
+    struct mount *parent = mount_parent_locked(top);
+    if (parent == NULL || parent->shared_id == 0)
+        return;
+    // What is below it, before any copy is made: a copy may land below it
+    // too (a bind into its own source's tree).
+    size_t n = 0, cap = 0;
+    struct mount **below = NULL;
+    for (struct list *item = mounts.prev; newer_below && item != &mounts; item = item->prev) {
+        mount = list_entry(item, struct mount, mounts);
+        if (!mount_in_view(mount) || mount->id <= top->id || !mount_point_below(mount->point, point, point_len))
+            continue;
+        if (n == cap) {
+            size_t new_cap = cap == 0 ? 8 : cap * 2;
+            struct mount **grown = realloc(below, new_cap * sizeof(*below));
+            if (grown == NULL)
+                break;
+            below = grown;
+            cap = new_cap;
+        }
+        below[n++] = mount;
+    }
+    mount_propagate_locked(parent, top);
+    for (size_t i = 0; i < n; i++)
+        mount_propagate_locked(parent, below[i]);
+    free(below);
+}
+
+// A mount that has just been moved to a new place, with what is mounted in
+// it (already placed): the same, for a tree.
+static void mount_propagate_tree_locked(struct mount *top, struct mount_subtree *tree) {
+    struct mount *parent = mount_parent_locked(top);
+    if (parent == NULL || parent->shared_id == 0)
+        return;
+    mount_propagate_locked(parent, top);
+    // (The list was collected deepest first.)
+    for (size_t i = tree->n; i-- > 0;)
+        mount_propagate_locked(parent, tree->subs[i]);
+}
+
+// What an unmount of `mount` takes with it: the mount at the same place
+// under each thing that receives from what it is mounted on, when that is
+// the same filesystem showing the same part of it. The caller frees the
+// list. Caller holds mounts_lock.
+static struct mount **mount_propagated_twins_locked(struct mount *mount, size_t *count_out) {
+    *count_out = 0;
+    if (!mount_in_view(mount))
+        return NULL;
+    struct mount *parent = mount_parent_locked(mount);
+    size_t n_targets, count = 0;
+    struct propagation_target *targets = mount_propagation_targets_locked(parent, 0, 0, &n_targets);
+    if (targets == NULL)
+        return NULL;
+    struct mount **twins = calloc(n_targets, sizeof(*twins));
+    for (size_t i = 0; twins != NULL && i < n_targets; i++) {
+        char point[MAX_PATH];
+        if (!mount_propagated_point(parent, mount->point, targets[i].receiver, point, sizeof(point)))
+            continue;
+        struct mount *other;
+        list_for_each_entry(&mounts, other, mounts) {
+            if (!mount_in_view(other) || strcmp(other->point, point) != 0)
+                continue;
+            // (The one on top there, and only if it is this mount again.)
+            bool again = other != mount && mount_fs_origin(other) == mount_fs_origin(mount) &&
+                strcmp(mount_fs_prefix(other), mount_fs_prefix(mount)) == 0;
+            for (size_t k = 0; again && k < count; k++)
+                again = twins[k] != other;
+            if (again)
+                twins[count++] = other;
+            break;
+        }
+    }
+    free(targets);
+    *count_out = count;
+    return twins;
+}
+
+static bool mount_has_submounts_locked(const struct mount *mount) {
+    struct mount *below;
+    list_for_each_entry(&mounts, below, mounts)
+        if (below != mount && mount_in_view(below) &&
+                mount_point_below(below->point, mount->point, mount->point_len) &&
+                mount_points_same_tree(below->point, below->point_len, mount->point, mount->point_len))
+            return true;
+    return false;
+}
+
 // Take one mount out of the tree for umount -l, as the last step of
 // mount_remove_lazy. Caller holds mounts_lock.
 static void mount_detach_one(struct mount *mount) {
@@ -776,6 +1189,9 @@ static void mount_detach_one(struct mount *mount) {
         return;
     }
     mount_uncover_locked(mount);
+    // Mounted nowhere: it gives and receives nothing more.
+    mount_leave_group_locked(mount);
+    mount->master_id = 0;
     mount->lazy_umount = true;
     // Already parked: fsmount() made it and nothing placed it.
     if (mount->detached)
@@ -868,6 +1284,8 @@ int mount_remove_lazy(struct mount *mount) {
 // kernel's own unmounts are not held to a mount's lock.
 static bool guest_umount;
 
+static int do_umount_one(struct mount *mount, bool lazy);
+static bool mount_busy_beyond_locked(const struct mount *mount, unsigned held);
 static int do_umount_flags(const char *point, bool lazy) {
     struct mount *mount;
     bool found = false;
@@ -886,6 +1304,74 @@ static int do_umount_flags(const char *point, bool lazy) {
     // in when the mount above it is unmounted (Linux's MNT_LOCKED).
     if (mount->locked && guest_umount)
         return _EINVAL;
+    // Under a shared mount: the same mount under each of its peers and
+    // slaves goes too (Linux's propagate_umount). They go as one: each copy
+    // is a bind of the original and holds it, so every one of them would
+    // find the next busy. One that is in use by anything else refuses the
+    // whole unmount, as a busy mount does, unless this is a lazy one; one
+    // with something mounted in it is left where it is.
+    size_t n_twins;
+    struct mount **twins = mount_propagated_twins_locked(mount, &n_twins);
+    if (n_twins == 0) {
+        free(twins);
+        return do_umount_one(mount, lazy);
+    }
+    size_t n = n_twins + 1;
+    struct mount **set = calloc(n, sizeof(*set));
+    if (set == NULL) {
+        free(twins);
+        return _ENOMEM;
+    }
+    // Binds before what they are binds of. Those staying are left out.
+    size_t members = 0;
+    for (int binds = 1; binds >= 0; binds--) {
+        for (size_t i = 0; i < n; i++) {
+            struct mount *member = i == 0 ? mount : twins[i - 1];
+            if ((member->bind_origin != NULL) != (binds == 1))
+                continue;
+            if (member != mount && !lazy && mount_has_submounts_locked(member))
+                continue;
+            set[members++] = member;
+        }
+    }
+    free(twins);
+    int err = 0;
+    for (size_t i = 0; !lazy && err == 0 && i < members; i++) {
+        unsigned held = 0;
+        for (size_t k = 0; k < members; k++)
+            held += set[k]->bind_origin == set[i];
+        if (mount_busy_beyond_locked(set[i], held))
+            err = _EBUSY;
+    }
+    for (size_t i = 0; err == 0 && i < members; i++) {
+        int one = do_umount_one(set[i], lazy);
+        if (set[i] == mount)
+            err = one;
+    }
+    free(set);
+    return err;
+}
+
+// Is `mount` in use by more than `held` references and the copies other
+// mount namespaces have of it (which do not keep it from being unmounted
+// here: see do_umount_one)?
+static bool mount_busy_beyond_locked(const struct mount *mount, unsigned held) {
+    if (mount->refcount <= held)
+        return false;
+    unsigned foreign = 0;
+    size_t own = mount_staging_point_len(mount->point, mount->point_len);
+    struct mount *other;
+    list_for_each_entry(&mounts, other, mounts) {
+        if (other->bind_origin != mount)
+            continue;
+        size_t theirs = mount_staging_point_len(other->point, other->point_len);
+        if (theirs != own || memcmp(other->point, mount->point, own) != 0)
+            foreign++;
+    }
+    return foreign == 0 || mount->refcount - held != foreign;
+}
+
+static int do_umount_one(struct mount *mount, bool lazy) {
     if (lazy)
         return mount_remove_lazy(mount);
     // What other mount namespaces hold of it is no business of an unmount
@@ -942,6 +1428,8 @@ int do_umount_lazy(const char *point) {
 int mount_attach(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags) {
     lock(&mounts_lock, 0);
     int err = do_mount(fs, source, point, info, flags);
+    if (err >= 0)
+        mount_propagate_at_locked(point, false);
     unlock(&mounts_lock);
     if (err >= 0)
         proc_mountinfo_notify_changed();
@@ -984,11 +1472,65 @@ int mount_detach_tree(const char *point) {
             break;
         }
     }
-    if (root != NULL && root->refcount != 0) {
+    // What other trees have of it: a mount namespace's copy of the mount
+    // (every namespace made while the root was exposed has one), and the
+    // copy propagation put under a peer or a slave of what it is mounted
+    // on. They are the same mount to the user, who is asking for the root
+    // to go; and each holds the root, so with one long-lived namespace -- a
+    // sandbox someone left running, every service of a systemd root -- the
+    // root was "in use" for good and could not be renamed or deleted.
+    // Whoever really is in the root through one of them (a descriptor, a
+    // working directory) holds that copy, and that is still EBUSY.
+    size_t n_copies = 0, cap = 0;
+    struct mount **copies = NULL;
+    bool busy = false;
+    if (root != NULL) {
+        size_t n_twins;
+        struct mount **twins = mount_propagated_twins_locked(root, &n_twins);
+        size_t tree = mount_staging_point_len(root->point, root->point_len);
+        list_for_each_entry(&mounts, mount, mounts) {
+            if (mount == root || mount->lazy_umount || mount->bind_origin != root)
+                continue;
+            bool copy = false;
+            for (size_t i = 0; i < n_twins && !copy; i++)
+                copy = twins[i] == mount;
+            // (A covered copy is parked at a staging point of its own, which
+            // is another tree too.)
+            if (!copy && mount->bind_prefix != NULL && mount->bind_prefix[0] == '\0') {
+                size_t theirs = mount_staging_point_len(mount->point, mount->point_len);
+                copy = theirs != tree || memcmp(mount->point, root->point, tree) != 0;
+            }
+            if (!copy)
+                continue;
+            if (mount->refcount != 0)
+                busy = true;
+            if (n_copies == cap) {
+                size_t new_cap = cap == 0 ? 8 : cap * 2;
+                struct mount **grown = realloc(copies, new_cap * sizeof(*copies));
+                if (grown == NULL) {
+                    busy = true;    // (not safely countable: leave it alone)
+                    break;
+                }
+                copies = grown;
+                cap = new_cap;
+            }
+            copies[n_copies++] = mount;
+        }
+        free(twins);
+        if (root->refcount != n_copies)
+            busy = true;
+    }
+    if (busy) {
+        free(copies);
         unlock(&mounts_lock);
         return _EBUSY;
     }
-    bool changed = mount_detach_below(point);
+    // The copies first, each with what is mounted in it where it is: they
+    // let go of the root as they go.
+    for (size_t i = 0; i < n_copies; i++)
+        mount_remove_lazy(copies[i]);
+    free(copies);
+    bool changed = mount_detach_below(point) || n_copies != 0;
     // Still unused: a bind of something in the root would have held it (its
     // origin) and made it busy above, and the lock has kept everyone else out.
     int err = root != NULL ? mount_remove(root) : _EINVAL;
@@ -1062,6 +1604,12 @@ void mnt_ns_release(struct mnt_namespace *ns) {
         unlock(&mounts_lock);
         return;
     }
+    for (struct mnt_namespace **link = &mnt_namespaces; *link != NULL; link = &(*link)->next_ns) {
+        if (*link == ns) {
+            *link = ns->next_ns;
+            break;
+        }
+    }
     // Deepest first, which is the list's order; and from the top each time,
     // since taking one mount out can take others with it.
     bool again = true;
@@ -1129,6 +1677,16 @@ static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespa
     copy->bind_origin = origin;
     origin->refcount++; // a bind owns one reference on its origin (mount_destroy)
     copy->id = mount_new_id();
+    // A peer of the mount it copies, and a slave of the same master -- or,
+    // in a namespace that belongs to another user namespace, a slave of a
+    // shared mount and never its peer: what is mounted there stays there.
+    if (locked) {
+        copy->master_id = mount->shared_id != 0 ? mount->shared_id : mount->master_id;
+    } else {
+        copy->shared_id = mount->shared_id;
+        copy->master_id = mount->master_id;
+    }
+    copy->unbindable = mount->unbindable;
     mount_list_insert(copy);
     return 0;
 }
@@ -1161,6 +1719,10 @@ struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from, struct user_namesp
                 break;
         }
         item = prev;
+    }
+    if (err >= 0) {
+        ns->next_ns = mnt_namespaces;
+        mnt_namespaces = ns;
     }
     unlock(&mounts_lock);
     if (err < 0) {
@@ -1304,9 +1866,10 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
 
     lock(&mounts_lock, 0);
     // new_root has to be a mount point.
-    struct mount *mount;
+    struct mount *mount, *new_mount = NULL, *old_holder = NULL;
     bool is_point = false, new_is_locked = false;
     size_t count = 0;
+    size_t put_old_len = strlen(put_old);
     list_for_each_entry(&mounts, mount, mounts) {
         if (!mount_in_ns_locked(mount, ns))
             continue;
@@ -1315,9 +1878,25 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
         if (strcmp(mount->point, new_root) == 0 && !is_point) {
             is_point = true;
             new_is_locked = mount->locked;
+            new_mount = mount;
         }
+        // The mount put_old is on: the longest point that holds it.
+        if (old_holder == NULL && mount->point_len <= put_old_len &&
+                strncmp(put_old, mount->point, mount->point_len) == 0 &&
+                (put_old[mount->point_len] == '/' || put_old[mount->point_len] == '\0'))
+            old_holder = mount;
     }
     if (!is_point || new_is_locked) {
+        unlock(&mounts_lock);
+        fd_close(root_fd);
+        return _EINVAL;
+    }
+    // Not while what moves would have to be propagated: the mount put_old
+    // is on, and the one the new root is mounted on, may not be shared
+    // (which is why a sandbox makes its tree private or slave first).
+    struct mount *new_parent = mount_parent_locked(new_mount);
+    if ((old_holder != NULL && old_holder->shared_id != 0) ||
+            (new_parent != NULL && new_parent->shared_id != 0)) {
         unlock(&mounts_lock);
         fd_close(root_fd);
         return _EINVAL;
@@ -1585,6 +2164,28 @@ static int do_bind_mount(const char *norm_source, const char *point, const char 
     if (origin == NULL)
         return _EINVAL;
 
+    // The mount the source is on, for what a bind takes from it: its peer
+    // group and its master (a bind of a shared mount is its peer). An
+    // unbindable one is what the name says.
+    int source_shared = 0, source_master = 0;
+    bool source_unbindable = false;
+    lock(&mounts_lock, 0);
+    struct mount *holder;
+    list_for_each_entry(&mounts, holder, mounts) {
+        size_t n = holder->point_len;
+        if (strncmp(norm_source, holder->point, n) == 0 && (norm_source[n] == '/' || norm_source[n] == '\0')) {
+            source_shared = holder->shared_id;
+            source_master = holder->master_id;
+            source_unbindable = holder->unbindable;
+            break;
+        }
+    }
+    unlock(&mounts_lock);
+    if (source_unbindable) {
+        mount_release(origin);
+        return _EINVAL;
+    }
+
     // calloc for the same reason as do_mount above.
     struct mount *bind = calloc(1, sizeof(struct mount));
     if (bind == NULL) {
@@ -1618,6 +2219,8 @@ static int do_bind_mount(const char *norm_source, const char *point, const char 
     bind->bind_origin = origin; // keeps the reference returned above
     // A mount of its own, so an ID of its own, as a Linux bind has.
     bind->id = mount_new_id();
+    bind->shared_id = source_shared;
+    bind->master_id = source_master;
 
     lock(&mounts_lock, 0);
     // keep the mounts list ordered by descending mount-point length
@@ -1762,8 +2365,12 @@ int mount_bind_dir(const char *source, const char *point) {
     if ((err = path_normalize(AT_PWD, point, norm_point, N_SYMLINK_FOLLOW)) < 0)
         return err;
     err = do_bind_mount(norm_source, norm_point, "", 0);
-    if (err >= 0)
+    if (err >= 0) {
+        lock(&mounts_lock, 0);
+        mount_propagate_at_locked(norm_point, false);
+        unlock(&mounts_lock);
         proc_mountinfo_notify_changed();
+    }
     return err;
 }
 
@@ -1805,15 +2412,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         return _EINVAL;
     }
 
-    // A propagation-type change (mount --make-[r]private/shared/slave/unbindable)
-    // is its own operation that carries no new filesystem. AOK has no peer
-    // groups: every mount is private, a mount namespace's copy of the tree
-    // included (kernel/mnt_ns.h), and nothing ever propagates. Private and
-    // slave are therefore what is already true; shared is accepted and not
-    // done, which is the one a caller could notice (systemd issues these at
-    // boot, and a sandbox makes its tree private or slave before anything else).
-    if ((flags & MS_PROPAGATION) && !(flags & MS_BIND_))
-        return 0;
+    // A propagation-type change (mount --make-[r]private/shared/slave/
+    // unbindable) is its own operation that carries no new filesystem: see
+    // "Propagation" above. systemd issues these at boot, and a sandbox makes
+    // its tree private or slave before anything else.
+    bool change_type = (flags & MS_PROPAGATION) && !(flags & (MS_BIND_ | MS_REMOUNT_));
 
     struct statbuf stat;
     int err = generic_statat(AT_PWD, point_raw, &stat, 0);
@@ -1822,8 +2425,9 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // A bind is exempt from the directory requirement: Linux allows binding a
     // single file over another file. Dir-onto-dir or non-dir-onto-non-dir;
     // the mixed cases are rejected in the bind branch once the source has
-    // been stat'd too.
-    if (!S_ISDIR(stat.mode) && !(flags & MS_BIND_))
+    // been stat'd too. Nor does changing a mount's propagation ask what it
+    // is mounted on.
+    if (!S_ISDIR(stat.mode) && !(flags & MS_BIND_) && !change_type)
         return _ENOTDIR;
 
     char point[MAX_PATH];
@@ -1837,6 +2441,14 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // not this: its points are in the caller's tree. kernel/mnt_ns.h.)
     if (!mnt_ns_has_point(mnt_ns_current(), point))
         return _EINVAL;
+
+    if (change_type) {
+        // One kind at a time (Linux's flags_to_propagation_type).
+        int kind = flags & MS_PROPAGATION;
+        if (kind & (kind - 1))
+            return _EINVAL;
+        return mount_change_propagation(strcmp(point, "/") == 0 ? "" : point, kind, (flags & MS_REC_) != 0);
+    }
 
     // MS_MOVE and MS_BIND name an existing path as their "source"; resolve it
     // before taking mounts_lock (path_normalize / find_mount_and_trim_path
@@ -1885,6 +2497,7 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
             // copies a recursive bind has just made there: they are its own.
             lock(&mounts_lock, 0);
             mount_cover_at_locked(point, true);
+            mount_propagate_at_locked(point, (flags & MS_REC_) != 0);
             unlock(&mounts_lock);
             proc_mountinfo_notify_changed();
         }
@@ -1919,6 +2532,13 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         // (A locked mount stays where it is: moving it would show what is
         // under it.)
         if (found == NULL || found->locked) {
+            unlock(&mounts_lock);
+            return _EINVAL;
+        }
+        // Nor one that sits under a shared mount: taking it away there would
+        // be an unmount to propagate, and Linux refuses instead.
+        struct mount *moved_from = mount_parent_locked(found);
+        if (moved_from != NULL && moved_from->shared_id != 0) {
             unlock(&mounts_lock);
             return _EINVAL;
         }
@@ -1957,6 +2577,8 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         list_add_before(&after->mounts, &found->mounts);
         mount_cover_below_locked(found, MOUNT_COVER_ALL);
         mount_subtree_place_locked(&tree, op_source, point);
+        // Where it lands it is a new mount, to whatever receives from there.
+        mount_propagate_tree_locked(found, &tree);
         found->refcount++;  // for mount_notify_relocated
         unlock(&mounts_lock);
         mount_notify_relocated(found, op_source, point);
@@ -2041,8 +2663,10 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // The kernel's own mounts (do_mount from boot, the app, a restored
     // session) come in no particular order and cover nothing; a guest's
     // covers what was mounted below its point, as on Linux.
-    if (err >= 0)
+    if (err >= 0) {
         mount_cover_at_locked(point, false);
+        mount_propagate_at_locked(point, false);
+    }
     unlock(&mounts_lock);
     if (err >= 0)
         proc_mountinfo_notify_changed();
@@ -2758,6 +3382,8 @@ dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags,
             continue;
         }
         mount->flags = (mount->flags & ~clear) | set;
+        if (attr.propagation != 0)
+            mount_set_propagation_locked(mount, (int) attr.propagation);
     }
     unlock(&mounts_lock);
     proc_mountinfo_notify_changed();
@@ -2822,6 +3448,13 @@ static int mount_relocate(const char *from_point, const char *to_point) {
         unlock(&mounts_lock);
         return _EINVAL;
     }
+    // Nor out from under a shared mount (see MS_MOVE). One fsmount() made
+    // and nothing has placed yet sits on nothing.
+    struct mount *moved_from = found->detached ? NULL : mount_parent_locked(found);
+    if (moved_from != NULL && moved_from->shared_id != 0) {
+        unlock(&mounts_lock);
+        return _EINVAL;
+    }
     // Not onto itself, nor into its own tree.
     size_t from_len = strlen(from_point);
     if (strncmp(to_point, from_point, from_len) == 0 &&
@@ -2865,6 +3498,9 @@ static int mount_relocate(const char *from_point, const char *to_point) {
     mount_cover_below_locked(found, MOUNT_COVER_ALL);
     found->detached = was_detached;
     mount_subtree_place_locked(&tree, from_point, to_point);
+    found->detached = false;
+    mount_propagate_tree_locked(found, &tree);
+    found->detached = was_detached;
     found->refcount++;  // for mount_notify_relocated
     unlock(&mounts_lock);
     mount_notify_relocated(found, from_point, to_point);

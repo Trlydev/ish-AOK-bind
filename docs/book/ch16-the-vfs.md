@@ -59,6 +59,19 @@ ID of the mount covering it, and put back when that one is unmounted. What is
 open in it goes on working in the meantime, which is the reason a parked mount
 keeps a point at all.
 
+A third is **propagation** (559): Linux's shared subtrees, where a mount made
+under one member of a peer group appears under every other, and under their
+slaves. Linux walks pointers between mounts to find where. Here a mount is
+only ever a filesystem and a path within it — a bind is its origin plus a
+prefix — so "the same place under a peer" is arithmetic on strings: the
+point's path within the filesystem, with the peer's prefix taken off the
+front and its point put on. A peer group is a number the members share, and
+a slave names the group it listens to rather than a mount, so nothing is
+re-linked when a master goes: the last member to leave a group hands its
+slaves to its own master, as Linux does. systemd makes `/` shared at boot and
+each service's namespace a slave of it, which is how a filesystem mounted
+after a service started appears inside that service.
+
 ## 16.2 One funnel: `path_normalize`
 
 Every path that enters the kernel goes through `path_normalize`, which converts

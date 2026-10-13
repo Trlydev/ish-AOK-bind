@@ -282,6 +282,16 @@ struct mount {
     // by itself there, nor to lose the restrictive flags it arrived with.
     bool locked;
     int locked_flags;
+
+    // Propagation (fs/mount.c, "Propagation"). shared_id is the peer group
+    // the mount is in, 0 for none: a mount or unmount under one member is
+    // repeated under every other. master_id is the peer group it receives
+    // from without giving back (a slave), 0 for none; a mount can have both.
+    // Neither: private. unbindable is private, and not to be bound either.
+    // What /proc/self/mountinfo prints as shared:N, master:N and unbindable.
+    int shared_id;
+    int master_id;
+    bool unbindable;
 };
 extern lock_t mounts_lock;
 
