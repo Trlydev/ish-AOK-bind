@@ -2,7 +2,8 @@
 //
 // Boots the same RISC-V guest (kernel, initramfs and OpenSBI in the bundle) on the QEMU in
 // Frameworks/qemu-riscv64-softmmu.framework -- or, for a label that begins "aarch64", the arm64 guest on
-// qemu-aarch64-softmmu.framework -- which is the tctiSH fork built with --enable-aok-gadgets, and
+// qemu-aarch64-softmmu.framework; for "x86_64" and "i386", the 64-bit and the 32-bit PC guest, both on
+// qemu-x86_64-softmmu.framework -- which is the tctiSH fork built with --enable-aok-gadgets, and
 // measures each workload the way cycwrap.c does on a Mac: this process's cycle and instruction counters
 // read at the guest's WL-START and RESULT lines. Results are appended to Documents/results.txt, one WL line
 // per workload in cycwrap's format, then "DONE label".
@@ -102,25 +103,38 @@ static void *reader(void *arg) {
 
 static void *run_qemu(void *arg) {
     NSString *bundle = NSBundle.mainBundle.resourcePath;
-    // The label's first part is the guest: riscv64-..., or aarch64-... for the arm64 guest of the Mac race.
-    BOOL arm = strncmp(env_or("AOKQ_LABEL", "riscv64-aokq-1"), "aarch64", 7) == 0;
-    NSString *name = arm ? @"qemu-aarch64-softmmu" : @"qemu-riscv64-softmmu";
+    // The label's first part is the guest, one of the Mac race's four. The 32-bit PC guest runs on the
+    // x86-64 QEMU, as it does in the VM app. An x86 guest gets rdrand and a kernel told to trust it: with
+    // no source of entropy it waits a quarter of a minute for some, whichever engine runs it.
+    static const struct { const char *label, *qemu, *machine, *cpu, *console, *kernel, *initrd, *extra; } guests[] = {
+        { "riscv64", "riscv64", "virt", "rv64", "ttyS0", "Image-lts-riscv64", "initramfs-riscv64.cpio", "" },
+        { "aarch64", "aarch64", "virt", "cortex-a72", "ttyAMA0", "vmlinuz-virt-aarch64", "initramfs-aarch64.cpio", "" },
+        { "x86_64", "x86_64", "q35", "qemu64,+rdrand", "ttyS0", "vmlinuz-virt-x86_64", "initramfs-x86_64.cpio",
+          "random.trust_cpu=on " },
+        { "i386", "x86_64", "q35", "qemu32,+rdrand", "ttyS0", "vmlinuz-virt-x86", "initramfs-x86.cpio",
+          "random.trust_cpu=on " },
+    };
+    const char *label = env_or("AOKQ_LABEL", "riscv64-aokq-1");
+    int g = 0;
+    for (int i = 0; i < 4; i++) {
+        if (strncmp(label, guests[i].label, strlen(guests[i].label)) == 0) g = i;
+    }
+    NSString *name = [NSString stringWithFormat:@"qemu-%s-softmmu", guests[g].qemu];
     NSString *framework = [NSBundle.mainBundle.privateFrameworksPath
         stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.framework/%@", name, name]];
     NSString *serial = [documents stringByAppendingPathComponent:@"serial.log"];
-    NSString *append = [NSString stringWithFormat:@"console=%@ rdinit=/init quiet bench=%s",
-                        arm ? @"ttyAMA0" : @"ttyS0",
+    NSString *append = [NSString stringWithFormat:@"console=%s rdinit=/init quiet %sbench=%s",
+                        guests[g].console, guests[g].extra,
                         env_or("AOKQ_WORKLOADS", "coremark,nbody,python,xz,sha256,awk")];
     NSArray<NSString *> *args = @[
-        arm ? @"qemu-system-aarch64" : @"qemu-system-riscv64", @"-M", @"virt",
-        @"-cpu", @(env_or("AOKQ_CPU", arm ? "cortex-a72" : "rv64")), @"-smp", @(env_or("AOKQ_SMP", "1")),
+        [NSString stringWithFormat:@"qemu-system-%s", guests[g].qemu], @"-M", @(guests[g].machine),
+        @"-cpu", @(env_or("AOKQ_CPU", guests[g].cpu)), @"-smp", @(env_or("AOKQ_SMP", "1")),
         @"-m", @"1024", @"-accel", @"tcg,tb-size=256", @"-display", @"none", @"-monitor", @"none",
         @"-serial", [@"file:" stringByAppendingString:serial], @"-no-reboot", @"-L", bundle,
-        @"-kernel", [bundle stringByAppendingPathComponent:arm ? @"vmlinuz-virt-aarch64" : @"Image-lts-riscv64"],
-        @"-initrd", [bundle stringByAppendingPathComponent:arm ? @"initramfs-aarch64.cpio"
-                                                               : @"initramfs-riscv64.cpio"],
+        @"-kernel", [bundle stringByAppendingPathComponent:@(guests[g].kernel)],
+        @"-initrd", [bundle stringByAppendingPathComponent:@(guests[g].initrd)],
         @"-append", append,
-        // (the arm64 machine's default network card wants an option ROM the bundle does not carry)
+        // (a machine's default network card wants an option ROM the bundle does not carry)
         @"-nic", @"none",
     ];
     int argc = (int) args.count;

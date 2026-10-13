@@ -4,7 +4,7 @@
 # The recipe is tctiSH's: its app's build_dependencies.sh builds pkg-config for the host, then libffi,
 # libiconv, gettext-runtime, glib and pixman for the device, then QEMU as a shared library, and wraps every
 # dylib as a framework in ios/sysroot-iOS-arm64/Frameworks. ios-app/build_dependencies.patch is what this
-# build changes in that script: the riscv64 target with its device tree, TCTI plus --enable-aok-gadgets
+# build changes in that script: the riscv64, aarch64 and x86_64 targets (riscv64 with its device tree), TCTI plus --enable-aok-gadgets
 # instead of the hybrid backend, a deployment target of iOS 17 so that the A10X can run it, no offline
 # Python (Homebrew's has no setuptools), no bison check, and a way to rebuild QEMU alone.
 #

@@ -15,6 +15,11 @@ cp "$W/kernel/Image-lts-riscv64" "$W/initramfs-riscv64.cpio" \
 if [ -d Frameworks/qemu-aarch64-softmmu.framework ]; then
     cp "$W/kernel/vmlinuz-virt-aarch64" "$W/initramfs-aarch64.cpio" Resources/
 fi
+# The two PC guests (labels "x86_64" and "i386"), and the firmware a PC starts with.
+if [ -d Frameworks/qemu-x86_64-softmmu.framework ]; then
+    cp "$W/kernel/vmlinuz-virt-x86_64" "$W/initramfs-x86_64.cpio" "$W/kernel/vmlinuz-virt-x86" "$W/initramfs-x86.cpio" Resources/
+    for f in bios-256k.bin linuxboot_dma.bin kvmvapic.bin vgabios-stdvga.bin; do cp "$W/src-aok/pc-bios/$f" Resources/; done
+fi
 
 # Every framework is embedded and signed; none is linked, since the app dlopen()s QEMU and QEMU finds the
 # rest through the app's rpath.
