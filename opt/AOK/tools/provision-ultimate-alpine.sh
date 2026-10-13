@@ -44,7 +44,7 @@ note() { printf '    %s\n' "$*"; }
 
 # ---- under iSH-AOK, or on a kernel of its own? ----------------------------
 # The same script provisions a virtual machine (the UTM images of
-# tests/bench-utm ship it) or any machine running this distribution. What
+# the AOK VM project ship it) or any machine running this distribution. What
 # differs there is what the app does for a root under iSH-AOK and nobody does
 # for a machine: the clock is the machine's own, so chrony keeps the
 # distribution's configuration and disciplines it; nothing names the device's
