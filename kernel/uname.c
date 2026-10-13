@@ -1,5 +1,6 @@
 #include <sys/utsname.h>
 #include <string.h>
+#include "kernel/user_ns.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
 #include "kernel/uts.h"
@@ -69,8 +70,10 @@ void uts_ns_release(struct uts_namespace *ns) {
     // can never reach zero here -- provided every task that points at it took a
     // reference. construct_task() used to inherit the pointer without one; see
     // the comment there.
-    if (dead)
+    if (dead) {
+        user_ns_release(ns->user_ns);
         free(ns);
+    }
 }
 
 struct uts_namespace *uts_ns_copy(struct uts_namespace *ns) {
@@ -185,7 +188,7 @@ dword_t sys_sethostname(addr_t hostname_addr, dword_t hostname_len) {
 dword_t sys_sethostname_guest(guest_addr_t hostname_addr, dword_t hostname_len) {
     struct uname uts;
 
-    if (!superuser()) {
+    if (!ns_capable(uts_ns_current()->user_ns, CAP_SYS_ADMIN_)) {
         return _EPERM;
     }
 
@@ -211,7 +214,8 @@ dword_t sys_setdomainname(addr_t domainname_addr, dword_t domainname_len) {
 }
 
 dword_t sys_setdomainname_guest(guest_addr_t domainname_addr, dword_t domainname_len) {
-    if (!superuser())
+    // CAP_SYS_ADMIN in the user namespace this UTS namespace belongs to.
+    if (!ns_capable(uts_ns_current()->user_ns, CAP_SYS_ADMIN_))
         return _EPERM;
     if (domainname_len >= UNAME_LENGTH)
         return _EINVAL;

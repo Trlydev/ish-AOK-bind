@@ -118,21 +118,31 @@ The implemented flag set is explicit in `kernel/fork.c`:
 CLONE_VM CLONE_FILES CLONE_FS CLONE_SIGHAND CLONE_SYSVSEM CLONE_VFORK
 CLONE_THREAD CLONE_SETTLS CLONE_CHILD_SETTID CLONE_PARENT_SETTID
 CLONE_CHILD_CLEARTID CLONE_DETACHED CLONE_PARENT CLONE_PIDFD CLONE_IO
-CLONE_NEWUTS CLONE_NEWIPC CLONE_NEWNS
+CLONE_NEWUTS CLONE_NEWIPC CLONE_NEWNS CLONE_NEWUSER
 ```
 
 That covers everything a threading library or a shell needs. Of the namespace
-family it covers three. `CLONE_NEWUTS` is cheap because a UTS namespace is a
+family it covers four. `CLONE_NEWUTS` is cheap because a UTS namespace is a
 hostname and a domain name in a refcounted struct; `CLONE_NEWIPC` is System V
 IPC kept per namespace; and `CLONE_NEWNS`, since 559, gives the child a mount
 table of its own — a copy of its parent's tree in which nothing it mounts,
 unmounts or pivots is seen by anyone else (`kernel/mnt_ns.h`; Chapter 16 has
-how a table of path strings holds more than one tree). `CLONE_NEWPID`,
-`CLONE_NEWNET`, `CLONE_NEWUSER` and `CLONE_NEWCGROUP` are refused.
+how a table of path strings holds more than one tree). `CLONE_NEWUSER`, also
+since 559, makes the child root in a user namespace of its own: the ids a task
+carries stay the machine's, and the namespace is a pair of maps through which
+they are read and written, plus the rule that its capabilities reach only
+what belongs to it (`kernel/user_ns.h`). That rule is the delicate part in a
+kernel that had decided privilege by "is euid 0" since its first day:
+`superuser()` and `current_capable()` now also ask "and in the initial user
+namespace", so nothing they guard is reachable from inside one, and the few
+things a namespace's root *is* given — the mount, UTS and user namespaces it
+makes, the ids its maps cover, the files those ids own — are asked for by
+name with `ns_capable()`. `CLONE_NEWPID`, `CLONE_NEWNET` and `CLONE_NEWCGROUP`
+are refused.
 
 The absent ones are why nothing container-shaped runs here, and they are absent
-architecturally rather than accidentally: there is one pid space, one set of
-user ids, and one network. Chapter 21 shows the one place that turns out to be an
+architecturally rather than accidentally: there is one pid space and one
+network. Chapter 21 shows the one place that turns out to be an
 advantage, and Chapter 41 is honest about the rest. `CLONE_IO` is accepted
 because on Linux it is only a hint about I/O scheduling, and AOK has no I/O
 scheduler for it to hint at.

@@ -7,6 +7,7 @@
 #include "fs/dev.h"
 #include "kernel/binfmt_misc.h"
 #include "kernel/mnt_ns.h"
+#include "kernel/user_ns.h"
 #include "kernel/ipc_ns.h" // ns_alloc_inum
 
 // Sized for the static set below plus the two the iOS app registers at
@@ -743,6 +744,10 @@ int mount_remove_lazy(struct mount *mount) {
     return 0;
 }
 
+// Set around a guest's umount2() by sys_umount2_guest, under mounts_lock: the
+// kernel's own unmounts are not held to a mount's lock.
+static bool guest_umount;
+
 static int do_umount_flags(const char *point, bool lazy) {
     struct mount *mount;
     bool found = false;
@@ -756,6 +761,10 @@ static int do_umount_flags(const char *point, bool lazy) {
         }
     }
     if (!found)
+        return _EINVAL;
+    // Not by itself, to show what it covers; it goes with the tree it came
+    // in when the mount above it is unmounted (Linux's MNT_LOCKED).
+    if (mount->locked && guest_umount)
         return _EINVAL;
     if (lazy)
         return mount_remove_lazy(mount);
@@ -882,6 +891,23 @@ struct mnt_namespace *mnt_ns_current(void) {
     return mnt_ns_or_init(current != NULL ? current->mnt_ns : NULL);
 }
 
+// Linux's may_mount(): CAP_SYS_ADMIN in the user namespace the caller's
+// mount namespace belongs to. In the machine's own that is the machine's
+// CAP_SYS_ADMIN, as it always was; a mount namespace made inside a user
+// namespace is its maker's to arrange.
+static bool current_may_mount(void) {
+    return ns_capable(mnt_ns_current()->user_ns, CAP_SYS_ADMIN_);
+}
+
+// The filesystems a caller without the machine's CAP_SYS_ADMIN may mount
+// afresh (Linux's FS_USERNS_MOUNT): ones that are made of nothing but memory
+// and the kernel's own state. Never one that is a window onto storage --
+// that is how a sandbox would mount its way to files it was not given.
+static bool fs_type_unprivileged_ok(const char *type) {
+    return strcmp(type, "tmpfs") == 0 || strcmp(type, "proc") == 0 ||
+        strcmp(type, "sysfs") == 0 || strcmp(type, "devpts") == 0;
+}
+
 bool mnt_ns_has_point(const struct mnt_namespace *ns, const char *point) {
     size_t staging = mount_staging_point_len(point, strlen(point));
     if (ns->root_len == 0)
@@ -932,13 +958,14 @@ void mnt_ns_release(struct mnt_namespace *ns) {
     }
     unlock(&mounts_lock);
     proc_mountinfo_notify_changed();
+    user_ns_release(ns->user_ns);
     free(ns);
 }
 
 // `mount`, which is in `from`, as it appears in `to`: a bind of the same
 // filesystem at the same place in the tree. Caller holds mounts_lock.
 static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespace *from,
-        const struct mnt_namespace *to) {
+        const struct mnt_namespace *to, bool locked) {
     struct mount *origin = mount->bind_origin != NULL ? mount->bind_origin : mount;
     const char *rel = mount->point + from->root_len;
     // calloc for the same reason as do_mount: a field nobody names starts zero.
@@ -969,6 +996,11 @@ static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespa
         return _ENOMEM;
     }
     copy->flags = mount->flags;
+    // (Not the root of the tree: there is nothing under it to show, and
+    // pivot_root has to be able to put it aside.)
+    copy->locked = (locked && mount->point_len != from->root_len) || mount->locked;
+    copy->locked_flags = mount->locked_flags |
+        (locked ? mount->flags & (MS_READONLY_ | MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_) : 0);
     copy->fs = origin->fs;
     copy->refcount = 0;
     copy->root_fd = -1;
@@ -981,11 +1013,13 @@ static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespa
     return 0;
 }
 
-struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from) {
+struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from, struct user_namespace *owner) {
     from = mnt_ns_or_init(from);
     struct mnt_namespace *ns = calloc(1, sizeof(*ns));
     if (ns == NULL)
         return NULL;
+    ns->user_ns = user_ns_retain(owner);
+    bool locked = owner != from->user_ns;
     ns->refcount = 1;
     ns->inode = ns_alloc_inum();
     mount_staging_point(ns->root, sizeof(ns->root));
@@ -1002,7 +1036,7 @@ struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from) {
         struct list *prev = item->prev;
         struct mount *mount = list_entry(item, struct mount, mounts);
         if (mount_in_ns_locked(mount, from)) {
-            err = mount_copy_to_ns_locked(mount, from, ns);
+            err = mount_copy_to_ns_locked(mount, from, ns, locked);
             if (err < 0)
                 break;
         }
@@ -1151,16 +1185,19 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
     lock(&mounts_lock, 0);
     // new_root has to be a mount point.
     struct mount *mount;
-    bool is_point = false;
+    bool is_point = false, new_is_locked = false;
     size_t count = 0;
     list_for_each_entry(&mounts, mount, mounts) {
         if (!mount_in_ns_locked(mount, ns))
             continue;
         count++;
-        if (strcmp(mount->point, new_root) == 0)
+        // (The first match is the one on top there.)
+        if (strcmp(mount->point, new_root) == 0 && !is_point) {
             is_point = true;
+            new_is_locked = mount->locked;
+        }
     }
-    if (!is_point) {
+    if (!is_point || new_is_locked) {
         unlock(&mounts_lock);
         fd_close(root_fd);
         return _EINVAL;
@@ -1486,12 +1523,62 @@ static int do_bind_mount(const char *norm_source, const char *point, const char 
 // runs -- when the target sits inside the source subtree it matches the scan
 // and would clone itself (/mnt/x/mnt/x), which Linux's clone-then-attach
 // order never produces, so it is excluded by exact point.
+// The flags the mount holding `path` is locked with (kernel/fs.h): a bind of
+// anything on it carries them, and they stay locked on the bind, or binding
+// a read-only mount somewhere else would be the way to write to it.
+static int mount_locked_flags_at(const char *path) {
+    char copy[MAX_PATH];
+    if (strlen(path) >= sizeof(copy))
+        return 0;
+    strcpy(copy, path);
+    struct mount *mount = mount_find(copy);
+    if (mount == NULL)
+        return 0;
+    int locked_flags = mount->locked_flags;
+    mount_release(mount);
+    return locked_flags;
+}
+
+// Is a locked mount mounted below `path`? A bind that is not recursive would
+// show what it covers (Linux's has_locked_children).
+static bool mount_locked_below(const char *path) {
+    size_t len = strlen(path);
+    bool found = false;
+    lock(&mounts_lock, 0);
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount->locked && !mount->detached && !mount->lazy_umount && mount->point_len > len &&
+                strncmp(mount->point, path, len) == 0 && mount->point[len] == '/') {
+            found = true;
+            break;
+        }
+    }
+    unlock(&mounts_lock);
+    return found;
+}
+
+// The mount on top at `point` takes this lock state. (A bind just made.)
+static void mount_set_lock_at(const char *point, bool locked, int locked_flags) {
+    lock(&mounts_lock, 0);
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (!mount->detached && !mount->lazy_umount && strcmp(mount->point, point) == 0) {
+            mount->locked = locked;
+            mount->locked_flags = locked_flags;
+            break;
+        }
+    }
+    unlock(&mounts_lock);
+}
+
 static void bind_replicate_submounts(const char *norm_source, const char *point, const char *info, int flags) {
     size_t src_len = strlen(norm_source);
     // Collect the submount points under the lock, then bind with it dropped:
     // do_bind_mount resolves paths and takes mounts_lock itself.
     size_t count = 0, cap = 0;
     char **subs = NULL;
+    // Each copy is locked as the mount it is a copy of is, flags included.
+    struct { bool locked; int flags; } *locks = NULL;
     lock(&mounts_lock, 0);
     struct mount *mount;
     list_for_each_entry(&mounts, mount, mounts) {
@@ -1506,11 +1593,17 @@ static void bind_replicate_submounts(const char *norm_source, const char *point,
             if (grown == NULL)
                 break;
             subs = grown;
+            void *grown_locks = realloc(locks, new_cap * sizeof(*locks));
+            if (grown_locks == NULL)
+                break;
+            locks = grown_locks;
             cap = new_cap;
         }
         subs[count] = strdup(mount->point);
         if (subs[count] == NULL)
             break;
+        locks[count].locked = mount->locked;
+        locks[count].flags = mount->locked_flags;
         count++;
     }
     unlock(&mounts_lock);
@@ -1518,11 +1611,14 @@ static void bind_replicate_submounts(const char *norm_source, const char *point,
     for (size_t i = 0; i < count; i++) {
         char sub_point[MAX_PATH];
         int n = snprintf(sub_point, sizeof(sub_point), "%s%s", point, subs[i] + src_len);
-        if (n > 0 && (size_t) n < sizeof(sub_point))
-            do_bind_mount(subs[i], sub_point, info, flags);
+        if (n > 0 && (size_t) n < sizeof(sub_point) &&
+                do_bind_mount(subs[i], sub_point, info, flags | locks[i].flags) >= 0 &&
+                (locks[i].locked || locks[i].flags != 0))
+            mount_set_lock_at(sub_point, locks[i].locked, locks[i].flags);
         free(subs[i]);
     }
     free(subs);
+    free(locks);
 }
 
 // A directory bind made by the kernel itself, as `mount --bind SOURCE POINT`
@@ -1555,7 +1651,7 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // Linux requires CAP_SYS_ADMIN for every door into the mount table.
     // The app's own boot-time mounts go through do_mount() directly and are
     // unaffected; this gate is only on the guest syscall path.
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     // source/data/type are copy_mount_string() args in Linux (strndup_user,
     // EINVAL when over-long), NOT getname() pathnames -- so they keep the plain
@@ -1656,8 +1752,13 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
             return err;
         if (S_ISDIR(source_stat.mode) != S_ISDIR(stat.mode))
             return _ENOTDIR;
-        err = do_bind_mount(op_source, point, data, flags & MS_FLAGS);
+        if (!(flags & MS_REC_) && mount_locked_below(op_source))
+            return _EINVAL;
+        int inherited = mount_locked_flags_at(op_source);
+        err = do_bind_mount(op_source, point, data, (flags & MS_FLAGS) | inherited);
         if (err >= 0) {
+            if (inherited != 0)
+                mount_set_lock_at(point, false, inherited);
             if (flags & MS_REC_)
                 bind_replicate_submounts(op_source, point, data, flags & MS_FLAGS);
             // What was mounted below the point is under the bind now. Not the
@@ -1669,6 +1770,12 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         }
         return err;
     }
+
+    // A new filesystem, by a caller whose CAP_SYS_ADMIN is a user namespace's
+    // and not the machine's: only the kinds that give it nothing but memory.
+    if (!(flags & (MS_MOVE_ | MS_REMOUNT_)) && !current_capable(CAP_SYS_ADMIN_) &&
+            !fs_type_unprivileged_ok(type))
+        return _EPERM;
 
     // Before taking the lock: both helpers resolve guest paths, which re-enters
     // mount_find() and takes mounts_lock (it isn't recursive). MS_MOVE/MS_REMOUNT
@@ -1689,7 +1796,9 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
                 break;
             }
         }
-        if (found == NULL) {
+        // (A locked mount stays where it is: moving it would show what is
+        // under it.)
+        if (found == NULL || found->locked) {
             unlock(&mounts_lock);
             return _EINVAL;
         }
@@ -1738,6 +1847,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
                         unlock(&mounts_lock);
                         return err;
                     }
+                }
+                // A flag the mount was locked with stays on (kernel/fs.h).
+                if (mount->locked_flags & ~flags) {
+                    unlock(&mounts_lock);
+                    return _EPERM;
                 }
                 mount->flags = (mount->flags & ~MS_FLAGS) | (flags & MS_FLAGS);
                 found = true;
@@ -1811,7 +1925,7 @@ dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags) {
     // Linux requires CAP_SYS_ADMIN for every door into the mount table.
     // The app's own boot-time mounts go through do_mount() directly and are
     // unaffected; this gate is only on the guest syscall path.
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     char target_raw[MAX_PATH];
     int path_err = user_read_path(target_addr, target_raw, sizeof(target_raw));
@@ -1824,7 +1938,9 @@ dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags) {
         return err;
 
     lock(&mounts_lock, 0);
+    guest_umount = true;
     err = do_umount_flags(target, (flags & MNT_DETACH_) != 0);
+    guest_umount = false;
     unlock(&mounts_lock);
     if (err >= 0)
         proc_mountinfo_notify_changed();
@@ -1837,7 +1953,7 @@ dword_t sys_umount2(addr_t target_addr, dword_t flags) {
 
 // pivot_root(new_root, put_old): see mnt_ns_pivot_root.
 dword_t sys_pivot_root_guest(guest_addr_t new_root_addr, guest_addr_t put_old_addr) {
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     char new_raw[MAX_PATH], old_raw[MAX_PATH];
     int path_err = user_read_path(new_root_addr, new_raw, sizeof(new_raw));
@@ -1936,7 +2052,7 @@ fd_t sys_fsopen_guest(guest_addr_t fsname_addr, dword_t flags) {
     // Linux requires CAP_SYS_ADMIN for every door into the mount table.
     // The app's own boot-time mounts go through do_mount() directly and are
     // unaffected; this gate is only on the guest syscall path.
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     char fsname[100] = "";
     if (user_read_string(fsname_addr, fsname, sizeof(fsname)))
@@ -1955,6 +2071,9 @@ fd_t sys_fsopen_guest(guest_addr_t fsname_addr, dword_t flags) {
     bool is_binfmt = fs == NULL && strcmp(fsname, "binfmt_misc") == 0;
     if (fs == NULL && !is_binfmt)
         return _ENODEV;
+    // As for mount(2): see fs_type_unprivileged_ok.
+    if (!current_capable(CAP_SYS_ADMIN_) && !fs_type_unprivileged_ok(fsname))
+        return _EPERM;
 
     struct fscontext_data *data = malloc(sizeof(struct fscontext_data));
     if (data == NULL)
@@ -2261,7 +2380,7 @@ fd_t sys_fsmount_guest(fd_t f, dword_t flags, dword_t attr_flags) {
     // Linux requires CAP_SYS_ADMIN for every door into the mount table.
     // The app's own boot-time mounts go through do_mount() directly and are
     // unaffected; this gate is only on the guest syscall path.
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     STRACE("fsmount(%d, %#x, %#x)", f, flags, attr_flags);
     if (flags & ~FSMOUNT_CLOEXEC_)
@@ -2379,7 +2498,7 @@ dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags,
         return _E2BIG;
     if (size < sizeof(attr))
         return _EINVAL;
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     if (user_read(attr_addr, &attr, sizeof(attr)))
         return _EFAULT;
@@ -2480,6 +2599,9 @@ dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags,
         unlock(&mounts_lock);
         return _EINVAL;
     }
+    // A flag a mount was locked with stays on: one such mount among them
+    // and nothing changes (can_change_locked_flags).
+    for (int pass = 0; pass < 2; pass++)
     list_for_each_entry(&mounts, mount, mounts) {
         if (mount != top) {
             if (!(flags & AT_RECURSIVE_) || mount->detached || mount->lazy_umount)
@@ -2490,6 +2612,13 @@ dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags,
             // trees of the others included, and those are not below it.
             if (!mnt_ns_has_point(mnt_ns_current(), mount->point))
                 continue;
+        }
+        if (pass == 0) {
+            if (mount->locked_flags & clear) {
+                unlock(&mounts_lock);
+                return _EPERM;
+            }
+            continue;
         }
         mount->flags = (mount->flags & ~clear) | set;
     }
@@ -2596,7 +2725,7 @@ dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to
     // Linux requires CAP_SYS_ADMIN for every door into the mount table.
     // The app's own boot-time mounts go through do_mount() directly and are
     // unaffected; this gate is only on the guest syscall path.
-    if (!current_capable(CAP_SYS_ADMIN_))
+    if (!current_may_mount())
         return _EPERM;
     char from_path[MAX_PATH] = "";
     if (from_path_addr != 0 && user_read_string(from_path_addr, from_path, sizeof(from_path)))

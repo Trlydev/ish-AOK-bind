@@ -4,6 +4,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/task.h"
@@ -379,7 +380,14 @@ int access_check(struct statbuf *stat, int check) {
     // read this?". Consulting euid there answered yes for everything, which is
     // the opposite of what the caller wanted to know and exactly the check
     // setuid programs use before opening a file on the user's behalf.
-    if (current != NULL && current->fsuid == 0) {
+    //
+    // In a user namespace the override is a capability held there, and
+    // reaches only files whose owner and group that namespace maps
+    // (kernel/user_ns.h) -- and, as here, only while fsuid is its root.
+    bool override = current != NULL && (current->user_ns == NULL
+            ? current->fsuid == 0
+            : current->fsuid == task_root_kuid(current) && capable_wrt_inode(stat, CAP_DAC_OVERRIDE_));
+    if (override) {
         // Linux's generic_permission(): CAP_DAC_OVERRIDE does not conjure
         // execute permission out of nothing. Root may read or write anything,
         // but X_OK on a regular file still needs at least one execute bit --
@@ -424,7 +432,7 @@ int setattr_check(struct statbuf *stat, struct attr *attr) {
     switch (attr->type) {
         case attr_mode:
             // Linux's inode_owner_or_capable(): the owner, or CAP_FOWNER.
-            if (current->fsuid != stat->uid && !current_capable(CAP_FOWNER_))
+            if (current->fsuid != stat->uid && !capable_wrt_inode(stat, CAP_FOWNER_))
                 return _EPERM;
             // setattr_prepare()'s "Also check the setgid bit!": a caller
             // outside the file's group, without CAP_FSETID, cannot set
@@ -433,7 +441,7 @@ int setattr_check(struct statbuf *stat, struct attr *attr) {
             // belongs to a group it is not in (root chowned it over) could
             // make it a program that runs as that group.
             if ((attr->mode & S_ISGID) && !current_in_group(stat->gid) &&
-                    !current_capable(CAP_FSETID_))
+                    !capable_wrt_inode(stat, CAP_FSETID_))
                 attr->mode &= ~S_ISGID;
             return 0;
         case attr_uid:
@@ -445,8 +453,10 @@ int setattr_check(struct statbuf *stat, struct attr *attr) {
             // would be the wrong answer, not a safe one.
             if (attr->uid == (uid_t_) -1)
                 return 0;
-            // Linux's chown_ok(): CAP_CHOWN may hand a file to anyone.
-            if (current_capable(CAP_CHOWN_))
+            // Linux's chown_ok(): CAP_CHOWN may hand a file to anyone -- in a
+            // user namespace, a file it maps to anyone it maps (the new id
+            // arrived here through its map already).
+            if (capable_wrt_inode(stat, CAP_CHOWN_))
                 return 0;
             // Handing a file to another user needs privilege; "changing" it to
             // the current owner is a no-op Linux permits.
@@ -465,7 +475,7 @@ int setattr_check(struct statbuf *stat, struct attr *attr) {
             // shadow, chmod g+s, and it runs with egid shadow and reads
             // /etc/shadow. Measured on Linux 6.12 as an unprivileged user:
             // chgrp to a group it is not in is EPERM, to its own is 0.
-            if (current_capable(CAP_CHOWN_))
+            if (capable_wrt_inode(stat, CAP_CHOWN_))
                 return 0;
             if (current->fsuid != stat->uid)
                 return _EPERM;
@@ -2671,7 +2681,7 @@ static dword_t sys_utime_common(fd_t at_f, guest_addr_t path_addr, struct timesp
     // Linux (setattr_prepare): setting EXPLICIT times requires ownership or
     // CAP_FOWNER, and is EPERM otherwise; setting them to "now" requires
     // ownership OR write permission, and is EACCES otherwise. Both measured.
-    if (!(current != NULL && current->fsuid == 0)) {
+    if (!(current != NULL && current->fsuid == 0 && current->user_ns == NULL)) {
         struct statbuf owner = {};
         int owner_err;
         if (path_addr == 0)
@@ -3073,8 +3083,20 @@ static mode_t_ chown_privs_to_drop(struct statbuf *stat) {
     return drop;
 }
 
+// The ids a chown was given, as kernel ids. -1 is "leave it"; an id the
+// caller's user namespace does not map is EINVAL (Linux's chown_common).
+static bool chown_ids_to_kernel(uid_t_ *owner, uid_t_ *group) {
+    if (*owner != (uid_t_) -1 && (*owner = current_make_kuid(*owner)) == USER_NS_INVALID_ID)
+        return false;
+    if (*group != (uid_t_) -1 && (*group = current_make_kgid(*group)) == USER_NS_INVALID_ID)
+        return false;
+    return true;
+}
+
 static dword_t sys_fchown_common(fd_t f, uid_t_ owner, uid_t_ group) {
     STRACE("fchown(%d, %d, %d)", f, owner, group);
+    if (!chown_ids_to_kernel(&owner, &group))
+        return _EINVAL;
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
@@ -3117,6 +3139,8 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
     if (path_err)
         return path_err;
     STRACE("fchownat(%d, \"%s\", %d, %d, %d)", at_f, path, owner, group, flags);
+    if (!chown_ids_to_kernel(&owner, &group))
+        return _EINVAL;
     // Linux: only these two flags exist here, and anything else is EINVAL
     // before any lookup. Accepting an unknown bit and ignoring it tells a
     // caller its request was honoured when it was not.

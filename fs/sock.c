@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include "util/wait_spin.h"
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/checkpoint.h"
 #include "kernel/native.h"
@@ -3934,7 +3935,7 @@ static int netlink_handle_generic_request(struct fd *sock, const struct nlmsghdr
         // The kernel registers taskstats ops with GENL_ADMIN_PERM
         // (CAP_NET_ADMIN) since CVE-2011-2494; genl_rcv_msg fails them with
         // EPERM for unprivileged callers.
-        if (current->euid != 0)
+        if (!superuser())
             return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EPERM);
         if (genl->cmd != TASKSTATS_CMD_GET_)
             return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
@@ -4046,7 +4047,7 @@ static int netlink_handle_audit_request(struct fd *sock, const struct nlmsghdr_ 
     }
     // Control needs CAP_AUDIT_CONTROL, user messages CAP_AUDIT_WRITE;
     // approximate both as euid==0 (same policy as the taskstats handler).
-    if (current->euid != 0)
+    if (!superuser())
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EPERM);
 
     int err = 0;
@@ -5860,15 +5861,18 @@ static bool unix_listener_cred_for(const char *path, struct ucred_ *cred) {
 // thread; comparing with that thread's own id refused every such connection
 // ("Error sending credentials" from waybar).
 static int scm_check_creds(const struct ucred_ *cred) {
-    if (cred->uid == (uid_t_) -1 || cred->gid == (uid_t_) -1)
+    // The ids are the sender's user namespace's (kernel/user_ns.h): one it
+    // does not map is no id at all.
+    uid_t_ uid = current_make_kuid(cred->uid), gid = current_make_kgid(cred->gid);
+    if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID)
         return _EINVAL;
     if (cred->pid != current->tgid && !current_capable(CAP_SYS_ADMIN_))
         return _EPERM;
-    if (cred->uid != current->uid && cred->uid != current->euid && cred->uid != current->suid &&
-            !current_capable(CAP_SETUID_))
+    if (uid != current->uid && uid != current->euid && uid != current->suid &&
+            !ns_capable(current_user_ns(), CAP_SETUID_))
         return _EPERM;
-    if (cred->gid != current->gid && cred->gid != current->egid && cred->gid != current->sgid &&
-            !current_capable(CAP_SETGID_))
+    if (gid != current->gid && gid != current->egid && gid != current->sgid &&
+            !ns_capable(current_user_ns(), CAP_SETGID_))
         return _EPERM;
     return 0;
 }
@@ -8538,6 +8542,11 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             cred.uid = cred.gid = -1;
         }
         unlock(&peer_lock);
+        // As the asker's user namespace names the peer.
+        if (cred.uid != (uid_t_) -1)
+            cred.uid = current_uid_shown(cred.uid);
+        if (cred.gid != (uid_t_) -1)
+            cred.gid = current_gid_shown(cred.gid);
         sockopt_store_value(value, user_value_len, &value_len, &cred, sizeof(cred));
     } else if (level == SOL_SOCKET_ && option == SO_PASSCRED_) {
         dword_t passcred;
@@ -10457,6 +10466,11 @@ out_recvmsg_done:
                 assert(appended);
             }
             if (have_passcred) {
+                // As the receiver's user namespace names the sender.
+                if (cred.uid != (uid_t_) -1)
+                    cred.uid = current_uid_shown(cred.uid);
+                if (cred.gid != (uid_t_) -1)
+                    cred.gid = current_gid_shown(cred.gid);
                 bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
                         SOL_SOCKET_, SCM_CREDENTIALS_, &cred, sizeof(cred));
                 assert(appended);

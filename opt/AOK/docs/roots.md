@@ -436,9 +436,10 @@ an `/etc/pacman.conf`; it goes quiet once the three things above are dealt
 with, and replacing its contents with a comment turns it off for good.
 
 `/AOK/fixes/codex` is for OpenAI's Codex CLI, which works until it runs a shell
-command: it runs each one inside bubblewrap, which needs user and PID
-namespaces AOK does not have (it has mount namespaces, since 559, and
-`bwrap` asked for one alone works), and it has no fallback. The script tells Codex to
+command: it runs each one inside bubblewrap, which needs PID and network
+namespaces AOK does not have (it has mount and user namespaces, since 559,
+and `bwrap --unshare-user` with binds works, for an ordinary user too), and
+it has no fallback. The script tells Codex to
 run commands without that sandbox, by putting
 `sandbox_mode = "danger-full-access"` at the top of `~/.codex/config.toml`;
 Codex's approval policy is unchanged, so it still asks before what it would

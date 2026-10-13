@@ -2918,6 +2918,13 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
     // recorded by where they are on their filesystems, and a restore would
     // put it back in the machine's own tree -- out of whatever it had been
     // confined to. Refuse rather than do that.
+    // Nor a user namespace: restored outside it, a task that was root only
+    // in a namespace of its own would be whatever its ids say on the machine.
+    if (task->user_ns != NULL && w->err == 0) {
+        ckpt_refuse("pid %d is in a user namespace of its own (a sandbox), which a "
+                    "saved session does not carry", task->pid);
+        w->err = _EBUSY;
+    }
     if (task->mnt_ns != NULL && w->err == 0) {
         ckpt_refuse("pid %d is in a mount namespace of its own (a sandbox, or a "
                     "service with private mounts), which a saved session does not carry", task->pid);

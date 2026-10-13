@@ -276,6 +276,12 @@ struct mount {
     // fs/mount.c, mount_cover_below_locked.
     int covered_by;
     const char *covered_point;
+
+    // Copied into a mount namespace owned by a less privileged user
+    // namespace than the one it came from (mnt_ns_copy): not to be unmounted
+    // by itself there, nor to lose the restrictive flags it arrived with.
+    bool locked;
+    int locked_flags;
 };
 extern lock_t mounts_lock;
 

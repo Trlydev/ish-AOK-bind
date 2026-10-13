@@ -1,3 +1,4 @@
+#include "kernel/user_ns.h"
 #include "kernel/signal.h"
 #include "task.h"
 #include "kernel/foreign_exec.h"
@@ -2466,6 +2467,18 @@ static bool exec_gain_unsafe(void) {
 // malformed attribute), which this plan then carries.
 static void exec_setid_plan(struct exec_setid *plan, bool setuid, uid_t_ owner,
         bool setgid, uid_t_ group, const struct file_caps *caps, int caps_error) {
+    // In a user namespace: "root" is the id that is 0 there; the set-id bits
+    // count only when the namespace maps the file's owner and group both
+    // (bprm_fill_uid), so a setuid-root program run in a sandbox is an
+    // ordinary one; and a file's capabilities are not granted at all.
+    const uid_t_ root = task_root_kuid(current);
+    if (current->user_ns != NULL) {
+        caps = NULL;
+        caps_error = 0;
+        if (user_ns_from_kuid(current->user_ns, owner) == USER_NS_INVALID_ID ||
+                user_ns_from_kgid(current->user_ns, group) == USER_NS_INVALID_ID)
+            setuid = setgid = false;
+    }
     *plan = (struct exec_setid) {.euid = current->euid, .egid = current->egid,
             .error = caps_error};
     // no_new_privs: the set-id bits are not even looked at.
@@ -2498,12 +2511,12 @@ static void exec_setid_plan(struct exec_setid *plan, bool setuid, uid_t_ owner,
     // Root's capabilities, whatever the file says -- except for a setuid-root
     // file with capabilities of its own, run by someone else, which gets only
     // those (Linux's handle_privileged_root).
-    if (!(caps != NULL && current->uid != 0 && plan->euid == 0)) {
-        if (plan->euid == 0 || current->uid == 0) {
+    if (!(caps != NULL && current->uid != root && plan->euid == root)) {
+        if (plan->euid == root || current->uid == root) {
             prm[0] = current->cap_bounding[0] | current->cap_inheritable[0];
             prm[1] = current->cap_bounding[1] | current->cap_inheritable[1];
         }
-        if (plan->euid == 0)
+        if (plan->euid == root)
             effective = true;
     }
 
@@ -2527,7 +2540,7 @@ static void exec_setid_plan(struct exec_setid *plan, bool setuid, uid_t_ owner,
     bool gains_caps = (prm[0] & ~current->cap_permitted[0]) != 0 ||
             (prm[1] & ~current->cap_permitted[1]) != 0;
     if ((is_setid || gains_caps) && exec_gain_unsafe()) {
-        if (current->no_new_privs || !current_capable(CAP_SETUID_)) {
+        if (current->no_new_privs || !ns_capable(current_user_ns(), CAP_SETUID_)) {
             plan->euid = current->uid;
             plan->egid = current->gid;
         }
@@ -2543,7 +2556,7 @@ static void exec_setid_plan(struct exec_setid *plan, bool setuid, uid_t_ owner,
         plan->eff[i] = effective ? plan->prm[i] : plan->amb[i];
     }
 
-    plan->secure = is_setid || (current->uid != 0 &&
+    plan->secure = is_setid || (current->uid != root &&
             (effective || (plan->prm[0] & ~plan->amb[0]) != 0 ||
              (plan->prm[1] & ~plan->amb[1]) != 0));
 }
@@ -2554,10 +2567,12 @@ static void exec_setid_plan(struct exec_setid *plan, bool setuid, uid_t_ owner,
 // hardcoded 0, so a setuid-root binary looked like an ordinary one and
 // honoured LD_PRELOAD, giving any local user root.
 static void exec_setid_stage(const struct exec_setid *plan) {
-    current->exec_auxv_uid = current->uid;
-    current->exec_auxv_gid = current->gid;
-    current->exec_auxv_euid = plan->euid;
-    current->exec_auxv_egid = plan->egid;
+    // (As the program's user namespace names them: it compares these with
+    // what getuid() tells it.)
+    current->exec_auxv_uid = current_uid_shown(current->uid);
+    current->exec_auxv_gid = current_gid_shown(current->gid);
+    current->exec_auxv_euid = current_uid_shown(plan->euid);
+    current->exec_auxv_egid = current_gid_shown(plan->egid);
     current->exec_secure = plan->secure;
     exec_plan_error = plan->error;
 }

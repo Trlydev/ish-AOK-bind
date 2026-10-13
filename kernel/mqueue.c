@@ -636,7 +636,7 @@ static int mq_unlink_name(struct ipc_namespace *ns, const char *name) {
     }
     // The queues' directory is sticky and world-writable: only a queue's
     // owner, or someone with CAP_FOWNER, may remove it (may_delete's EPERM).
-    if (current->fsuid != q->uid && current->fsuid != 0 && !current_capable(CAP_FOWNER_)) {
+    if (current->fsuid != q->uid && !current_capable(CAP_FOWNER_)) {
         unlock(&ns->mq_lock);
         return _EPERM;
     }

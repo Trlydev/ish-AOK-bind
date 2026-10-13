@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 struct fs_info;
+struct user_namespace;
 
 // A mount namespace: a mount table of a process's own (CLONE_NEWNS).
 //
@@ -31,6 +32,10 @@ struct mnt_namespace {
     unsigned long inode; // its identity in /proc/<pid>/ns/mnt. Immutable.
     char root[48];       // "" for the initial namespace. Immutable.
     size_t root_len;
+    // The user namespace it was made in (kernel/user_ns.h), NULL for the
+    // initial one: CAP_SYS_ADMIN there is what mounting here takes. Owns a
+    // reference. Immutable.
+    struct user_namespace *user_ns;
 };
 
 // The namespace every task starts in. A task's mnt_ns is NULL for it.
@@ -48,8 +53,12 @@ struct mnt_namespace *mnt_ns_retain(struct mnt_namespace *ns);
 void mnt_ns_release(struct mnt_namespace *ns);
 
 // A new namespace holding a copy of `from`'s tree, with one reference; NULL
-// when out of memory.
-struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from);
+// when out of memory. `owner` is the user namespace it is made in. When that
+// is not the one `from` belongs to -- a less privileged one -- every mount
+// in the copy is LOCKED: it cannot be unmounted on its own to show what it
+// covers, and the read-only, nosuid, nodev and noexec it came with cannot be
+// taken off (Linux's MNT_LOCKED and MNT_LOCK_*).
+struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from, struct user_namespace *owner);
 
 // Move `fs`'s root and working directory from where they are in `from` to
 // the same directories in `to` (for a copy), or to `to`'s root (setns, where

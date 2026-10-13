@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/errno.h"
@@ -845,8 +846,10 @@ static int tmpfs_mount(struct mount *mount) {
     // made every tmpfs world-writable with NO sticky bit, so any guest user
     // could delete or replace another's files in it.
     mode_t_ root_mode = S_IFDIR | 01777;
-    uid_t_ root_uid = 0;
-    uid_t_ root_gid = 0;
+    // The mounter's, as Linux's shmem has it (current_fsuid): root's for
+    // every mount there was before a user namespace's root could make one.
+    uid_t_ root_uid = current != NULL ? current->fsuid : 0;
+    uid_t_ root_gid = current != NULL ? current->fsgid : 0;
     // size= and nr_blocks=, Linux's defaults and syntax (shmem_parse_one):
     // bytes with an optional k/m/g/t/p/e suffix or a percentage of RAM,
     // rounded up to pages; nr_blocks= counts pages; 0 is no limit. Neither
@@ -858,11 +861,17 @@ static int tmpfs_mount(struct mount *mount) {
         size_t len = end != NULL ? (size_t) (end - opt) : strlen(opt);
         if (len > 5 && strncmp(opt, "mode=", 5) == 0)
             root_mode = S_IFDIR | (mode_t_) (strtoul(opt + 5, NULL, 8) & 07777);
-        else if (len > 4 && strncmp(opt, "uid=", 4) == 0)
-            root_uid = (uid_t_) strtoul(opt + 4, NULL, 10);
-        else if (len > 4 && strncmp(opt, "gid=", 4) == 0)
-            root_gid = (uid_t_) strtoul(opt + 4, NULL, 10);
-        else if (tmpfs_limit_option(opt, len, &max_pages) < 0)
+        // The mounter's ids, as its user namespace maps them; one it does
+        // not map is no id (kernel/user_ns.h).
+        else if (len > 4 && strncmp(opt, "uid=", 4) == 0) {
+            root_uid = current_make_kuid((uid_t_) strtoul(opt + 4, NULL, 10));
+            if (root_uid == USER_NS_INVALID_ID)
+                return _EINVAL;
+        } else if (len > 4 && strncmp(opt, "gid=", 4) == 0) {
+            root_gid = current_make_kgid((uid_t_) strtoul(opt + 4, NULL, 10));
+            if (root_gid == USER_NS_INVALID_ID)
+                return _EINVAL;
+        } else if (tmpfs_limit_option(opt, len, &max_pages) < 0)
             return _EINVAL;
         opt = end != NULL ? end + 1 : "";
     }

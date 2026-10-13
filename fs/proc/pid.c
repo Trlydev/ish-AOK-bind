@@ -5,6 +5,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#include "kernel/user_ns.h"
 #include "emu/memory.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/uts.h"
@@ -470,6 +471,75 @@ static int proc_pid_oom_score_adj_show(struct proc_entry *entry, struct proc_dat
     return 0;
 }
 
+// /proc/<pid>/uid_map, gid_map and setgroups: the maps of the user namespace
+// the process is in, and whether setgroups() works there (kernel/user_ns.h).
+// The rules for writing them -- once, by the namespace's creator or someone
+// with the capability over its parent -- are the namespace's own.
+//
+// *held is the task's namespace with a reference, NULL for the initial one;
+// false when there is no such task any more.
+static bool proc_pid_user_ns(struct proc_entry *entry, struct user_namespace **held) {
+    struct task *task = proc_get_task(entry);
+    if (task == NULL)
+        return false;
+    bool alive = task_lock_unless_exiting(task);
+    if (alive) {
+        *held = user_ns_retain(task->user_ns);
+        unlock(&task->general_lock);
+    }
+    proc_put_task(task);
+    return alive;
+}
+
+static int proc_pid_uid_map_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    user_ns_show_map(ns, false, buf);
+    user_ns_release(ns);
+    return 0;
+}
+static int proc_pid_gid_map_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    user_ns_show_map(ns, true, buf);
+    user_ns_release(ns);
+    return 0;
+}
+static int proc_pid_setgroups_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    user_ns_show_setgroups(ns, buf);
+    user_ns_release(ns);
+    return 0;
+}
+static int proc_pid_uid_map_update(struct proc_entry *entry, struct proc_data *data) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    int err = user_ns_write_map(ns, false, data->data, data->size);
+    user_ns_release(ns);
+    return err;
+}
+static int proc_pid_gid_map_update(struct proc_entry *entry, struct proc_data *data) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    int err = user_ns_write_map(ns, true, data->data, data->size);
+    user_ns_release(ns);
+    return err;
+}
+static int proc_pid_setgroups_update(struct proc_entry *entry, struct proc_data *data) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    int err = user_ns_write_setgroups(ns, data->data, data->size);
+    user_ns_release(ns);
+    return err;
+}
+
 static int proc_pid_oom_score_adj_update(struct proc_entry *entry, struct proc_data *data) {
     size_t start = 0;
     size_t end = data->size;
@@ -784,12 +854,15 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     proc_printf(buf, "Pid:\t%d\n", task->pid);
     proc_printf(buf, "PPid:\t%d\n", ppid);
     proc_printf(buf, "TracerPid:\t0\n");
-    proc_printf(buf, "Uid:\t%u\t%u\t%u\t%u\n", task->uid, task->euid, task->suid, task->fsuid);
-    proc_printf(buf, "Gid:\t%u\t%u\t%u\t%u\n", task->gid, task->egid, task->sgid, task->fsgid);
+    // As the READER's user namespace names them (kernel/user_ns.h).
+    proc_printf(buf, "Uid:\t%u\t%u\t%u\t%u\n", current_uid_shown(task->uid), current_uid_shown(task->euid),
+            current_uid_shown(task->suid), current_uid_shown(task->fsuid));
+    proc_printf(buf, "Gid:\t%u\t%u\t%u\t%u\n", current_gid_shown(task->gid), current_gid_shown(task->egid),
+            current_gid_shown(task->sgid), current_gid_shown(task->fsgid));
     proc_printf(buf, "FDSize:\t%u\n", fd_size);
     proc_printf(buf, "Groups:\t");
     for (unsigned i = 0; i < task->ngroups; i++)
-        proc_printf(buf, "%s%u", i == 0 ? "" : " ", task->groups[i]);
+        proc_printf(buf, "%s%u", i == 0 ? "" : " ", current_gid_shown(task->groups[i]));
     proc_printf(buf, "\n");
     proc_printf(buf, "VmPeak:\t%lu kB\n", (unsigned long) usage.vm_peak * page_kb);
     proc_printf(buf, "VmSize:\t%lu kB\n", (unsigned long) usage.vm * page_kb);
@@ -1939,7 +2012,8 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
     unsigned nstype = proc_ns_types[index].nstype;
     if (ns_out != NULL)
         *ns_out = NULL;
-    if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_ && nstype != CLONE_NEWNS_)
+    if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_ && nstype != CLONE_NEWNS_ &&
+            nstype != CLONE_NEWUSER_)
         return inode;
     // Not a plain lock: see task_lock_unless_exiting.
     if (!task_lock_unless_exiting(task))
@@ -1950,6 +2024,15 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
         inode = mnt_ns_or_init(task->mnt_ns)->inode;
         if (ns_out != NULL)
             *ns_out = mnt_ns_retain(task->mnt_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    if (nstype == CLONE_NEWUSER_) {
+        // NULL is the initial one here too, with the number it has always had.
+        if (task->user_ns != NULL)
+            inode = task->user_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = user_ns_retain(task->user_ns);
         unlock(&task->general_lock);
         return inode;
     }
@@ -1981,6 +2064,8 @@ static void proc_ns_release(unsigned index, void *ns) {
         ipc_ns_release(ns);
     else if (proc_ns_types[index].nstype == CLONE_NEWNS_)
         mnt_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWUSER_)
+        user_ns_release(ns);
 }
 
 static int proc_pid_ns_readlink(struct proc_entry *entry, char *buf) {
@@ -2151,6 +2236,8 @@ bool proc_ns_fd_is_initial(struct fd *fd) {
         return ns == NULL || ns == &init_ipc_ns;
     if (nstype == CLONE_NEWNS_)
         return ns == NULL || ns == &init_mnt_ns;
+    if (nstype == CLONE_NEWUSER_)
+        return ns == NULL;
     return true;
 }
 
@@ -2276,6 +2363,7 @@ struct proc_children proc_pid_children = PROC_CHILDREN({
     {"fd", S_IFDIR | 0500, .readdir = proc_pid_fd_readdir, .ptrace_read = true},
     {"fdinfo", S_IFDIR, .readdir = proc_pid_fdinfo_readdir, .ptrace_read = true},
     // 0400 like Linux, not the 0444 default.
+    {"gid_map", S_IFREG | 0644, .show = proc_pid_gid_map_show, .update = proc_pid_gid_map_update},
     {"io", S_IFREG | 0400, .show = proc_pid_io_show, .ptrace_read = true},
     {"maps", .show = proc_pid_maps_show, .ptrace_read = true},
     // 0600 like Linux, not the 0444 default: the mode is the first gate, and
@@ -2293,12 +2381,14 @@ struct proc_children proc_pid_children = PROC_CHILDREN({
     {"oom_score_adj", S_IFREG | 0644, .show = proc_pid_oom_score_adj_show, .update = proc_pid_oom_score_adj_update},
     {"root", S_IFLNK, .readlink = proc_pid_root_readlink, .ptrace_read = true},
     {"sched", .show = proc_pid_sched_show},
+    {"setgroups", S_IFREG | 0644, .show = proc_pid_setgroups_show, .update = proc_pid_setgroups_update},
     {"smaps", .show = proc_pid_smaps_show, .ptrace_read = true},
     {"smaps_rollup", .show = proc_pid_smaps_rollup_show, .ptrace_read = true},
     {"stat", .show = proc_pid_stat_show},
     {"statm", .show = proc_pid_statm_show},
     {"status", .show = proc_pid_status_show},
     {"task", S_IFDIR, .readdir = proc_pid_task_readdir},
+    {"uid_map", S_IFREG | 0644, .show = proc_pid_uid_map_show, .update = proc_pid_uid_map_update},
 });
 
 struct proc_dir_entry proc_pid = {NULL, S_IFDIR,

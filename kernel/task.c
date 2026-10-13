@@ -1338,6 +1338,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->native_helper_threads = 0;
     task->native_delivering = 0;
     task->mnt_ns = NULL; // copy_task gives a clone its parent's
+    task->user_ns = NULL; // likewise
     task->exit_arch = NULL;
     memset(task->ptrace_debugreg, 0, sizeof(task->ptrace_debugreg));
     task->ptrace_singlestep = false;

@@ -1,4 +1,5 @@
 #include <string.h>
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/seccomp.h"
 #include "jit/jit.h"
@@ -194,7 +195,7 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t arg4, 
             // answer, because EINVAL aborted every such spawn ("Failed to drop
             // capabilities" for systemd-logind); now it does what it says.
             // CAP_SETPCAP first, then the number: Linux's cap_prctl_drop.
-            if (!current_capable(CAP_SETPCAP_))
+            if (!ns_capable(current_user_ns(), CAP_SETPCAP_))
                 return _EPERM;
             if (!prctl_cap_valid(arg2))
                 return _EINVAL;

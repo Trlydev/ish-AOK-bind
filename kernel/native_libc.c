@@ -27,6 +27,7 @@
 #include <unistd.h>
 #include <utmpx.h>
 
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/nlibc_shadow.h"
 #include "kernel/sha_crypt.h"
@@ -6419,7 +6420,7 @@ int nlibc_deliver_signals_count(void) {
                     info.si_errno = taken.sig_errno;
                     info.si_code = taken.code;
                     info.si_pid = (pid_t) taken.pid;
-                    info.si_uid = (uid_t) taken.uid;
+                    info.si_uid = (uid_t) current_uid_shown(taken.uid);
                     info.si_status = taken.status;
                 }
                 nlibc_sigaction_handler h3 = nlibc_info_handlers[host_sig];

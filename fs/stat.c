@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
@@ -160,8 +161,8 @@ struct newstat64 stat_convert_newstat64(struct statbuf stat) {
     newstat.ino = stat.inode;
     newstat.mode = stat.mode;
     newstat.nlink = stat.nlink;
-    newstat.uid = stat.uid;
-    newstat.gid = stat.gid;
+    newstat.uid = current_uid_shown(stat.uid);
+    newstat.gid = current_gid_shown(stat.gid);
     newstat.rdev = stat.rdev;
     newstat.size = stat.size;
     newstat.blksize = stat.blksize;
@@ -181,8 +182,8 @@ static struct amd64_stat_ stat_convert_amd64(struct statbuf stat) {
     out.ino = stat.inode;
     out.nlink = stat.nlink;
     out.mode = stat.mode;
-    out.uid = stat.uid;
-    out.gid = stat.gid;
+    out.uid = current_uid_shown(stat.uid);
+    out.gid = current_gid_shown(stat.gid);
     out.rdev = stat.rdev;
     out.size = stat.size;
     out.blksize = stat.blksize;
@@ -202,8 +203,8 @@ static struct arm64_stat_ stat_convert_arm64(struct statbuf stat) {
     out.ino = stat.inode;
     out.mode = stat.mode;
     out.nlink = stat.nlink;
-    out.uid = stat.uid;
-    out.gid = stat.gid;
+    out.uid = current_uid_shown(stat.uid);
+    out.gid = current_gid_shown(stat.gid);
     out.rdev = stat.rdev;
     out.size = stat.size;
     out.blksize = (sdword_t) stat.blksize;
@@ -221,8 +222,8 @@ static int stat_convert_newstat(struct statbuf stat, struct newstat *out) {
     if (stat.dev > UINT32_MAX ||
             stat.mode > UINT16_MAX ||
             stat.nlink > UINT16_MAX ||
-            stat.uid > UINT16_MAX ||
-            stat.gid > UINT16_MAX ||
+            current_uid_shown(stat.uid) > UINT16_MAX ||
+            current_gid_shown(stat.gid) > UINT16_MAX ||
             stat.rdev > UINT32_MAX ||
             stat.size > UINT32_MAX ||
             stat.blksize > UINT32_MAX ||
@@ -238,8 +239,8 @@ static int stat_convert_newstat(struct statbuf stat, struct newstat *out) {
     newstat.ino = (dword_t) stat.inode;
     newstat.mode = stat.mode;
     newstat.nlink = stat.nlink;
-    newstat.uid = stat.uid;
-    newstat.gid = stat.gid;
+    newstat.uid = current_uid_shown(stat.uid);
+    newstat.gid = current_gid_shown(stat.gid);
     newstat.rdev = stat.rdev;
     newstat.size = stat.size;
     newstat.blksize = stat.blksize;
@@ -265,8 +266,8 @@ static struct statx_ stat_convert_statx(struct statbuf stat) {
     statx.stx_mask = STATX_BASIC_STATS_;
     statx.stx_blksize = stat.blksize;
     statx.stx_nlink = stat.nlink;
-    statx.stx_uid = stat.uid;
-    statx.stx_gid = stat.gid;
+    statx.stx_uid = current_uid_shown(stat.uid);
+    statx.stx_gid = current_gid_shown(stat.gid);
     statx.stx_mode = stat.mode;
     statx.stx_ino = stat.inode;
     statx.stx_size = stat.size;

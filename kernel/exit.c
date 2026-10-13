@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <string.h>
 #include "emu/cpu.h"
+#include "kernel/user_ns.h"
 #include "kernel/rseq.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/mnt_ns.h"
@@ -901,6 +902,9 @@ noreturn void do_exit(struct task *task, int status) {
     struct mnt_namespace *dead_mnt = task->mnt_ns;
     task->mnt_ns = NULL;
     mnt_ns_release(dead_mnt);
+    struct user_namespace *dead_user = task->user_ns;
+    task->user_ns = NULL;
+    user_ns_release(dead_user);
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads
 

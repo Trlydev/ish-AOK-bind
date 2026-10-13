@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include "fs/poll.h"
+#include "kernel/user_ns.h"
 #include "kernel/rseq.h"
 #include "kernel/calls.h"
 #include "kernel/futex.h"
@@ -1871,14 +1872,14 @@ static void siginfo_to_i386_user(struct i386_siginfo_ *out, const struct siginfo
     out->code = info->code;
     if (siginfo_code_is_rt(info->code)) {
         out->rt.pid = info->rt.pid;
-        out->rt.uid = info->rt.uid;
+        out->rt.uid = current_uid_shown(info->rt.uid);
         memcpy(&out->rt.value, &info->rt.value, sizeof(out->rt.value));
         return;
     }
     switch (info->sig) {
         case SIGCHLD_:
             out->child.pid = info->child.pid;
-            out->child.uid = info->child.uid;
+            out->child.uid = current_uid_shown(info->child.uid);
             out->child.status = info->child.status;
             out->child.utime = info->child.utime;
             out->child.stime = info->child.stime;
@@ -1895,10 +1896,10 @@ static void siginfo_to_i386_user(struct i386_siginfo_ *out, const struct siginfo
             } else if ((info->code >> 8) != 0) {
                 // Ptrace event-stop: Linux populates si_pid/si_uid, not si_addr.
                 out->kill.pid = info->kill.pid;
-                out->kill.uid = info->kill.uid;
+                out->kill.uid = current_uid_shown(info->kill.uid);
             } else if (info->code <= 0 || info->code == SI_KERNEL_) {
                 out->kill.pid = info->kill.pid;
-                out->kill.uid = info->kill.uid;
+                out->kill.uid = current_uid_shown(info->kill.uid);
             } else {
                 out->fault.addr = (addr_t) info->fault.addr;
             }
@@ -1916,7 +1917,7 @@ static void siginfo_to_i386_user(struct i386_siginfo_ *out, const struct siginfo
                 out->timer._private = info->timer._private;
             } else {
                 out->kill.pid = info->kill.pid;
-                out->kill.uid = info->kill.uid;
+                out->kill.uid = current_uid_shown(info->kill.uid);
             }
             break;
     }
@@ -1929,14 +1930,14 @@ static void siginfo_to_amd64_user(struct amd64_siginfo_ *out, const struct sigin
     out->code = info->code;
     if (siginfo_code_is_rt(info->code)) {
         out->rt.pid = info->rt.pid;
-        out->rt.uid = info->rt.uid;
+        out->rt.uid = current_uid_shown(info->rt.uid);
         out->rt.value = info->rt.value;
         return;
     }
     switch (info->sig) {
         case SIGCHLD_:
             out->child.pid = info->child.pid;
-            out->child.uid = info->child.uid;
+            out->child.uid = current_uid_shown(info->child.uid);
             out->child.status = info->child.status;
             out->child.utime = info->child.utime;
             out->child.stime = info->child.stime;
@@ -1952,10 +1953,10 @@ static void siginfo_to_amd64_user(struct amd64_siginfo_ *out, const struct sigin
                 // Ptrace syscall-stop: Linux reports only si_signo/si_code.
             } else if ((info->code >> 8) != 0) {
                 out->kill.pid = info->kill.pid;
-                out->kill.uid = info->kill.uid;
+                out->kill.uid = current_uid_shown(info->kill.uid);
             } else if (info->code <= 0 || info->code == SI_KERNEL_) {
                 out->kill.pid = info->kill.pid;
-                out->kill.uid = info->kill.uid;
+                out->kill.uid = current_uid_shown(info->kill.uid);
             } else {
                 out->fault.addr = info->fault.addr;
             }
@@ -1980,13 +1981,13 @@ static void siginfo_to_amd64_user(struct amd64_siginfo_ *out, const struct sigin
                 // alone. (The i386 layout is left alone: Linux's -m32 view on
                 // x86_64 reads si_status 0 as well.)
                 out->child.pid = info->child.pid;
-                out->child.uid = info->child.uid;
+                out->child.uid = current_uid_shown(info->child.uid);
                 out->child.status = info->child.status;
                 out->child.utime = info->child.utime;
                 out->child.stime = info->child.stime;
             } else {
                 out->kill.pid = info->kill.pid;
-                out->kill.uid = info->kill.uid;
+                out->kill.uid = current_uid_shown(info->kill.uid);
             }
             break;
     }
@@ -2082,7 +2083,7 @@ static void signalfd_info_from_siginfo(struct signalfd_siginfo_ *out, struct sig
         out->sig_ptr = info->timer.value.sv_ptr;
     } else if (info->sig == SIGCHLD_ && info->code > 0) {
         out->pid = info->child.pid;
-        out->uid = info->child.uid;
+        out->uid = current_uid_shown(info->child.uid);
         out->status = info->child.status;
         out->utime = info->child.utime;
         out->stime = info->child.stime;
@@ -2100,13 +2101,13 @@ static void signalfd_info_from_siginfo(struct signalfd_siginfo_ *out, struct sig
         out->addr = info->fault.addr;
     } else if (rt_layout) {
         out->pid = info->rt.pid;
-        out->uid = info->rt.uid;
+        out->uid = current_uid_shown(info->rt.uid);
         out->sig_int = info->rt.value.sv_int;
         out->sig_ptr = info->rt.value.sv_ptr;
     } else {
         // SI_USER, SI_KERNEL and the rest: sender identity only.
         out->pid = info->kill.pid;
-        out->uid = info->kill.uid;
+        out->uid = current_uid_shown(info->kill.uid);
     }
 }
 
@@ -4719,6 +4720,12 @@ int_t sys_rt_sigtimedwait_time64_guest(guest_addr_t set_addr, guest_addr_t info_
 // refusal for the whole process group.
 bool may_signal_task(struct task *task, dword_t sig) {
     if (superuser())
+        return true;
+    // CAP_KILL held in a user namespace reaches the tasks in that namespace.
+    // (Only the pointers are compared: the target's namespace is its own to
+    // let go of.)
+    if (current->user_ns != NULL && task->user_ns == current->user_ns &&
+            ns_capable(current->user_ns, CAP_KILL_))
         return true;
     // A thread signalling its own process never needs a credential check.
     if (task->tgid == current->tgid)

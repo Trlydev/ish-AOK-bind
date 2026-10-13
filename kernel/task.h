@@ -94,6 +94,7 @@ struct native_exec_pending; // opaque; defined in kernel/native.c
 struct native_program;   // kernel/native.h
 
 struct mnt_namespace;
+struct user_namespace;
 struct task {
     enum guest_abi abi;
     // Ticks since boot when this task was created -- /proc/<pid>/stat field 22
@@ -773,6 +774,12 @@ struct task {
     // the initial namespace whatever its parent did. At the end for the
     // reason given above.
     struct mnt_namespace *mnt_ns;
+
+    // The user namespace this task is in (kernel/user_ns.h), NULL for the
+    // initial one. Owns a reference. Like mnt_ns, not inherited by
+    // task_create_: copy_task hands it on, and nothing else may -- a task
+    // that came by it any other way would be the machine's root again.
+    struct user_namespace *user_ns;
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {
@@ -1236,8 +1243,13 @@ unsigned host_thread_backtrace(pthread_t thread, uintptr_t *frames, unsigned max
 
 extern void (*halt_hook)(int status);
 
-#define superuser() (current != NULL && current->euid == 0)
+// Root over the machine: euid 0 in the initial user namespace. A task in a
+// user namespace of its own is never this, whatever its ids -- there it has
+// the capabilities ns_capable() finds (kernel/user_ns.h), and nothing else.
+#define superuser() (current != NULL && current->euid == 0 && current->user_ns == NULL)
 
+#define CAP_DAC_OVERRIDE_ 1
+#define CAP_KILL_ 5
 // Linux capability numbers, for the gates below. Only the ones something
 // actually checks are listed; add as needed rather than transcribing all 40.
 #define CAP_CHOWN_       0
