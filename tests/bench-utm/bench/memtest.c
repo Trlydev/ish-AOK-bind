@@ -180,9 +180,28 @@ VMEM(10, "    stp d0, d1, [x0]\n    ldp d2, d3, [x0]\n")
 VMEM(11, "    stp q0, q1, [x0]\n    ldp q2, q3, [x0]\n")
 VMEM(12, "    sub x9, x9, #32\n    stp q0, q1, [x9, #32]!\n    ldp q2, q3, [x9], #32\n" \
          "    stp d1, d0, [x9, #-16]!\n    ldp d3, d2, [x9, #-16]\n")
+// The structure loads and stores: whole registers (one to four, with and without post-index), the
+// interleaved ones, one lane, and the replicating loads. And ldpsw, which is of X registers but no body
+// of the plain pairs.
+VMEM(13, "    st1 {v0.16b}, [x0]\n    ld1 {v2.4s}, [x0]\n    st1 {v1.1d}, [x0]\n    ld1 {v3.8b}, [x0]\n")
+VMEM(14, "    st1 {v0.2d, v1.2d}, [x9], #32\n    sub x9, x9, #32\n    ld1 {v2.16b, v3.16b}, [x9], #32\n")
+VMEM(15, "    mov x10, #24\n    st1 {v0.8b, v1.8b}, [x9], x10\n    sub x9, x9, #24\n" \
+         "    ld1 {v2.4h, v3.4h}, [x9], x10\n    st1 {v0.2s}, [x9], #8\n")
+VMEM(16, "    st1 {v0.16b, v1.16b, v2.16b}, [x0]\n    ld1 {v2.8h, v3.8h, v4.8h, v5.8h}, [x9], #64\n" \
+         "    st1 {v2.2d, v3.2d, v4.2d, v5.2d}, [x0]\n    ld1 {v3.2d, v4.2d, v5.2d}, [x0]\n")
+VMEM(17, "    st2 {v0.4s, v1.4s}, [x0]\n    ld2 {v2.8h, v3.8h}, [x0]\n    st3 {v0.8b, v1.8b, v2.8b}, [x9], #24\n" \
+         "    ld4 {v2.2d, v3.2d, v4.2d, v5.2d}, [x0]\n    eor v2.16b, v2.16b, v4.16b\n    eor v3.16b, v3.16b, v5.16b\n")
+VMEM(18, "    st1 {v0.s}[3], [x0]\n    st1 {v1.b}[9], [x0]\n    ld1 {v2.h}[5], [x0]\n" \
+         "    ld1 {v3.d}[1], [x9], #8\n    st2 {v0.h, v1.h}[6], [x9], #4\n    ld3 {v2.b, v3.b, v4.b}[14], [x0]\n")
+VMEM(19, "    str q0, [x0]\n    ld1r {v2.4s}, [x0]\n    ld2r {v3.8b, v4.8b}, [x9], #2\n" \
+         "    eor v3.16b, v3.16b, v4.16b\n    ld1r {v4.2d}, [x9]\n    eor v2.16b, v2.16b, v4.16b\n")
+VMEM(20, "    stp q0, q1, [x0]\n    ldpsw x11, x12, [x0]\n    fmov d2, x11\n    ldpsw x13, x14, [x9], #8\n" \
+         "    ldpsw x15, x16, [x9, #-4]!\n    eor x12, x12, x13\n    eor x14, x14, x15\n" \
+         "    eor x12, x12, x16\n    fmov d3, x12\n    mov v3.d[1], x14\n")
 typedef void vmem_fn(unsigned char *, const uint64_t *, uint64_t *);
 static vmem_fn *const vmems[] = { vmem_0, vmem_1, vmem_2, vmem_3, vmem_4, vmem_5, vmem_6, vmem_7, vmem_8,
-                                  vmem_9, vmem_10, vmem_11, vmem_12 };
+                                  vmem_9, vmem_10, vmem_11, vmem_12, vmem_13, vmem_14, vmem_15, vmem_16,
+                                  vmem_17, vmem_18, vmem_19, vmem_20 };
 #define NVMEM (sizeof(vmems) / sizeof(vmems[0]))
 
 static uint64_t vmem_step(unsigned k, unsigned char *p, uint64_t h) {
