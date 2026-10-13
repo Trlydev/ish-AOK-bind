@@ -19,6 +19,7 @@ cat /proc/ish/UIDevice       # the UIDevice the app sees: model, OS, orientation
 cat /proc/ish/applets        # the Workspace applets that are open
 cat /proc/ish/arch           # every process's guest architecture, one line each
 cat /proc/ish/host_ports     # Mach port usage -- a leak diagnostic
+cat /proc/ish/host_fds       # the host descriptors behind the guest's open files, and the host's limit
 cat /proc/ish/host_vm        # where the app's own memory is -- GPU included
 cat /proc/ish/hle            # 1 when libc calls are run as host code
 ```
@@ -70,6 +71,17 @@ dead names (a right to something that no longer exists — a thread that already
 exited, typically). iOS kills the app outright at a per-process port limit;
 this file is how you catch a leak before that happens rather than after. A
 host with no Mach ports (the Linux CLI build) says so.
+
+`host_fds` is its neighbour. Every file, socket and pipe a guest process has
+open is a descriptor of the one host process, for all guest processes
+together, so the host's limit on open files is shared by the whole machine and
+is nothing the guest's own `ulimit -n` shows. The file gives the count now
+(`open`, and by kind: `files`, `dirs`, `sockets`, `pipes`, `other`), the
+limits (`soft_limit`, `hard_limit`) and `started`, the soft limit the host
+launched the process with. AOK raises the soft limit as far as the host allows
+when it mounts the root -- to 10240 on an iPad that starts an app at 4864 --
+so "Too many open files" with a count near `soft_limit` here is the host's
+limit, and one near 1024 is the guest's own.
 
 ## Battery, heat and the time zone
 

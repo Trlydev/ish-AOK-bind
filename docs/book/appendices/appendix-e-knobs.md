@@ -85,6 +85,8 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_JIT_INHERIT` | `jit/jit.c` |
 | `ISH_JIT_PROFILE` | `jit/jitprof.c` |
 | `ISH_JIT_TIMING` | `jit/jit.c`, `main.c` |
+| `ISH_JIT_XCACHE` | `jit/jit.c` |
+| `ISH_KQ_TEST_FAIL` | `kernel/native_kqueue.c` |
 | `ISH_LAZY_TRACE` | `emu/memory.c` |
 | `ISH_LOCKSTATS` | `main.c`, `util/lockstats.c` |
 | `ISH_MEM_CLASS_CHECK` | `fs/proc/root.c` |

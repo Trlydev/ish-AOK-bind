@@ -139,6 +139,8 @@ unix_path_name_release.c
 unix_sock_host_isolation.c
 unix_bind_dir_perms.c
 scm_rights_stress.c
+scm_rights_bad_fd.c
+host_fd_limit.c
 ambient_caps.c
 fs_conformance.c
 process_conformance.c

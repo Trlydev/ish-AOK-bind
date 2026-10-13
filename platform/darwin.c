@@ -1648,3 +1648,84 @@ int host_mem_release_probe(unsigned long mb, char *report, size_t report_size) {
         release_probe_printf(&r, "PAGER DESIGN: NOT VIABLE on this host -- no release primitive moved phys_footprint on ordinary anonymous memory, so there is no headroom for a pager to buy back and the design family in docs/simulated_swap_plan.md is dead here.\n");
     return 0;
 }
+
+// ---- the host's descriptor limit -------------------------------------------
+#include <sys/stat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+static long long host_fd_limit_started = -2; // -2: not recorded yet
+
+static long long host_fd_rlim(rlim_t v) {
+    return v == RLIM_INFINITY ? -1 : (long long) v;
+}
+
+void host_raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return;
+    if (host_fd_limit_started == -2)
+        host_fd_limit_started = host_fd_rlim(rl.rlim_cur);
+    rlim_t want = rl.rlim_max;
+    // Darwin refuses a soft limit above kern.maxfilesperproc, RLIM_INFINITY
+    // included, with EINVAL.
+    int per_proc = 0;
+    size_t len = sizeof(per_proc);
+    if (sysctlbyname("kern.maxfilesperproc", &per_proc, &len, NULL, 0) == 0 && per_proc > 0) {
+        if (want == RLIM_INFINITY || want > (rlim_t) per_proc)
+            want = (rlim_t) per_proc;
+    } else if (want == RLIM_INFINITY) {
+        want = 10240; // OPEN_MAX, which every Darwin accepts
+    }
+    if (rl.rlim_cur != RLIM_INFINITY && (want == RLIM_INFINITY || want > rl.rlim_cur)) {
+        rl.rlim_cur = want;
+        // A refusal leaves the limit where it was, which is where it has
+        // always been.
+        (void) setrlimit(RLIMIT_NOFILE, &rl);
+    }
+}
+
+struct host_fd_usage host_fd_usage(void) {
+    struct host_fd_usage usage = {.highest = -1, .soft = -1, .hard = -1, .started = -1};
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        usage.soft = host_fd_rlim(rl.rlim_cur);
+        usage.hard = host_fd_rlim(rl.rlim_max);
+    }
+    usage.started = host_fd_limit_started == -2 ? usage.soft : host_fd_limit_started;
+    // Ask about each number the table has had room for. The table only
+    // grows, so this covers every descriptor open now; it is bounded so that
+    // an enormous limit does not make the reading itself slow.
+    long top = getdtablesize();
+    if (top < 0 || top > 1 << 20)
+        top = 1 << 20;
+    int misses = 0;
+    for (long fd = 0; fd < top; fd++) {
+        struct stat st;
+        int res = fstat((int) fd, &st);
+        if (res == 0 || errno != EBADF) {
+            usage.open++;
+            usage.highest = fd;
+            misses = 0;
+            // (A failure other than EBADF is something open that fstat
+            // will not describe. It counts as other.)
+            if (res != 0)
+                usage.other++;
+            else if (S_ISREG(st.st_mode))
+                usage.files++;
+            else if (S_ISDIR(st.st_mode))
+                usage.dirs++;
+            else if (S_ISSOCK(st.st_mode))
+                usage.sockets++;
+            else if (S_ISFIFO(st.st_mode))
+                usage.pipes++;
+            else
+                usage.other++;
+        } else if (++misses > 65536) {
+            break; // a long way past the last one in use
+        }
+    }
+    return usage;
+}

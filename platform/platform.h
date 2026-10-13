@@ -135,6 +135,24 @@ struct uptime_info get_uptime(void);
 // CPUs 0..N-1 -- what sched_getaffinity, Cpus_allowed and so nproc report. On
 // iOS the second is smaller, keeping cores back for the UI; see
 // platform/darwin.c.
+// The host's limit on this process's open descriptors, and how many it has
+// open now. Every guest descriptor that is a real file, socket or pipe is a
+// host descriptor, for every guest process at once, so the host's limit is
+// one the whole machine shares -- and the soft limit a process starts with
+// (256 from launchd for an app, and over ssh) is far below the hard one.
+struct host_fd_usage {
+    long open;          // descriptors open now
+    long highest;       // the highest descriptor number in use, -1 if none
+    long files, dirs, sockets, pipes, other; // `open`, by what fstat says each is
+    long long soft;     // RLIMIT_NOFILE now, -1 for no limit
+    long long hard;
+    long long started;  // the soft limit this process was started with
+};
+struct host_fd_usage host_fd_usage(void);
+// Raises the soft limit as far as the host allows. Called once, before the
+// guest runs; safe to call again.
+void host_raise_fd_limit(void);
+
 int get_cpu_count(void);
 int get_cpu_count_allowed(void);
 

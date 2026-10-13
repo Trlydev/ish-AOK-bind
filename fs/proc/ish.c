@@ -2131,6 +2131,32 @@ static int proc_ish_show_host_ports(struct proc_entry *UNUSED(entry), struct pro
     return 0;
 }
 
+// /proc/ish/host_fds -- the host descriptors this process has open, and the
+// host's limit on them. Every guest file, socket and pipe is one of these,
+// across every guest process, so "Too many open files" from the HOST arrives
+// at a count the guest's own ulimit knows nothing about. `started` is the
+// soft limit the process was launched with, before mount_root raised it.
+static void proc_ish_print_fd_limit(struct proc_data *buf, const char *name, long long value) {
+    if (value < 0)
+        proc_printf(buf, "%s unlimited\n", name);
+    else
+        proc_printf(buf, "%s %lld\n", name, value);
+}
+static int proc_ish_show_host_fds(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct host_fd_usage usage = host_fd_usage();
+    proc_printf(buf, "open       %ld\n", usage.open);
+    proc_printf(buf, "highest    %ld\n", usage.highest);
+    proc_printf(buf, "files      %ld\n", usage.files);
+    proc_printf(buf, "dirs       %ld\n", usage.dirs);
+    proc_printf(buf, "sockets    %ld\n", usage.sockets);
+    proc_printf(buf, "pipes      %ld\n", usage.pipes);
+    proc_printf(buf, "other      %ld\n", usage.other);
+    proc_ish_print_fd_limit(buf, "soft_limit", usage.soft);
+    proc_ish_print_fd_limit(buf, "hard_limit", usage.hard);
+    proc_ish_print_fd_limit(buf, "started   ", usage.started);
+    return 0;
+}
+
 // /proc/ish/host_vm -- where the app's own memory is, by the host's region
 // tags: the footprint jetsam kills on, then each tag's resident, dirty and
 // compressed megabytes, largest first. Guest memory is untagged (0); Metal's is
@@ -2392,6 +2418,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
     {"documents", .show = proc_ish_show_documents},
     {"host_info", .show = proc_ish_show_host_info},  // Add host hardware related information
+    {"host_fds", .show = proc_ish_show_host_fds},
     {"host_ports", .show = proc_ish_show_host_ports},
     {"host_vm", .show = proc_ish_show_host_vm},
     {"ips", .show = proc_ish_show_ips},

@@ -12,6 +12,7 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "fs/tty.h"
+#include "platform/platform.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
 #include "kernel/init.h"
@@ -25,6 +26,11 @@
 void (*ish_boot_setup_hook)(void) = NULL;
 
 int mount_root(const struct fs_ops *fs, const char *source) {
+    // The first thing the CLI and the app both do. A guest's open files are
+    // the host's, and a host that starts this process with room for 256 of
+    // them (launchd does, for an app; sshd does, for a suite leg) hands a
+    // busy guest EMFILE long before the guest's own limits say so.
+    host_raise_fd_limit();
     char source_realpath[MAX_PATH + 1];
     if (realpath(source, source_realpath) == NULL)
         return errno_map();

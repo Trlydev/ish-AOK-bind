@@ -393,4 +393,71 @@ void host_mem_pressure_start(void) {
     // Nothing to subscribe to.
 }
 
+// ---- the host's descriptor limit -------------------------------------------
+#include <sys/stat.h>
+static long long host_fd_limit_started = -2; // -2: not recorded yet
+
+static long long host_fd_rlim(rlim_t v) {
+    return v == RLIM_INFINITY ? -1 : (long long) v;
+}
+
+void host_raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return;
+    if (host_fd_limit_started == -2)
+        host_fd_limit_started = host_fd_rlim(rl.rlim_cur);
+    rlim_t want = rl.rlim_max;
+    // (Linux takes any soft limit up to the hard one.)
+    if (rl.rlim_cur != RLIM_INFINITY && (want == RLIM_INFINITY || want > rl.rlim_cur)) {
+        rl.rlim_cur = want;
+        // A refusal leaves the limit where it was, which is where it has
+        // always been.
+        (void) setrlimit(RLIMIT_NOFILE, &rl);
+    }
+}
+
+struct host_fd_usage host_fd_usage(void) {
+    struct host_fd_usage usage = {.highest = -1, .soft = -1, .hard = -1, .started = -1};
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        usage.soft = host_fd_rlim(rl.rlim_cur);
+        usage.hard = host_fd_rlim(rl.rlim_max);
+    }
+    usage.started = host_fd_limit_started == -2 ? usage.soft : host_fd_limit_started;
+    // Ask about each number the table has had room for. The table only
+    // grows, so this covers every descriptor open now; it is bounded so that
+    // an enormous limit does not make the reading itself slow.
+    long top = getdtablesize();
+    if (top < 0 || top > 1 << 20)
+        top = 1 << 20;
+    int misses = 0;
+    for (long fd = 0; fd < top; fd++) {
+        struct stat st;
+        int res = fstat((int) fd, &st);
+        if (res == 0 || errno != EBADF) {
+            usage.open++;
+            usage.highest = fd;
+            misses = 0;
+            // (A failure other than EBADF is something open that fstat
+            // will not describe. It counts as other.)
+            if (res != 0)
+                usage.other++;
+            else if (S_ISREG(st.st_mode))
+                usage.files++;
+            else if (S_ISDIR(st.st_mode))
+                usage.dirs++;
+            else if (S_ISSOCK(st.st_mode))
+                usage.sockets++;
+            else if (S_ISFIFO(st.st_mode))
+                usage.pipes++;
+            else
+                usage.other++;
+        } else if (++misses > 65536) {
+            break; // a long way past the last one in use
+        }
+    }
+    return usage;
+}
+
 #endif
