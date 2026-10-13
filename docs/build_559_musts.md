@@ -708,6 +708,42 @@ with §6).
   29.2 -> 9.9. Databases and compiles did not move: they are bound by guest
   code (79-88% of their busy time), which is item 5's subject.
 
+- **A native program's abort() is its own, and tokio's reactor shim was
+  wrong four ways** (2026-10-13, from build 558's one new crash signature:
+  native helix on an iPad, a tokio panic -- "unexpected error when polling the
+  I/O driver" -- that was the app's abort, the Rust crate being
+  `panic = "abort"`).
+  - *abort().* It and Darwin's assert handler were the two libc calls left
+    to the host on the grounds that it is "a crash either way". They are
+    routed: the program dies of SIGABRT and its shell says "Aborted".
+    `tests/manual/native_abort.c` asks rust-probe to panic, to panic on a
+    second thread and to abort, and reads SIGABRT in the wait status each
+    time; with abort() left to the host the emulator dies at the first.
+  - *The reactor.* tokio on Apple is kqueue, which here is a shim over the
+    guest's ppoll (kernel/native_kqueue.c). Running its probe found: queues
+    looked up by descriptor number across every program in the app, so two
+    tokio programs at once used each other's; a descriptor that had been
+    reported left out of the wait until a later call saw it drained, so a
+    reactor that went back to sleep first never saw the next data (the
+    probe's TCP round trip hung every time); a descriptor registered while
+    the reactor slept never added to the sleeper's set; and two threads of
+    one program collecting one pending signal at once, which is an assertion
+    in the kernel. A queue belongs to its program run now, the shim's read
+    and write paths re-arm a drained descriptor, registering wakes the
+    sleeper, and one thread at a time collects a program's signals.
+  - *tokio* (the emkey1/tokio fork) retries a failed poll with a doubling
+    pause for about two seconds before it panics.
+  - `tests/manual/native_tokio_poll_error.sh`, on a CLI built with
+    `-Dnative_rust_features=tokio-probe`: the probe alone, eight pairs at
+    once, five injected poll failures, and failures without end (the program
+    dies of SIGABRT, the shell goes on). Each fix has its control: number-
+    only lookup hangs the pairs, tokio without the retry dies at five
+    failures, and before the re-arm the probe alone hung. 360 pairs in a loop
+    ran clean on two roots.
+  - *Not shown:* which of these the reported panic was. *Not fixed:* a
+    native program's own threads share its one task and are not stopped when
+    it ends (docs/TODO.md).
+
 - **The native applet that ran under the wrong name** (2026-10-11). It
   happened a second time, on the same host and the same line, during this
   cycle's own suite run. Darwin's `basename()` answers from one buffer for the
