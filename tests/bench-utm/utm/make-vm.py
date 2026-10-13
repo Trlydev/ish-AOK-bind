@@ -118,6 +118,9 @@ def devuan(outdir, d):
     vm["Input"]["UsbBusSupport"] = "3.0"
     vm["Display"] = [dict(display(), Hardware="virtio-ramfb-gl")]
     vm["Network"] = [network("52:54:00:A0:C0:06")]
+    # A sound card the Debian riscv64 kernel has a driver for (snd-hda-intel; also virtio-sound and
+    # usb-audio, not AC97 or ES1370). The games of /AOK/tools/setup-games.sh play through it with ALSA.
+    vm["Sound"] = [{"Hardware": "intel-hda"}]
     vm["Serial"] = [terminal()]
     def ident(n):
         return str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000E0 + n)).upper()

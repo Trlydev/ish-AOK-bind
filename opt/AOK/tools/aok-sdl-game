@@ -13,6 +13,14 @@
 # The desktop exports LIBGL_ALWAYS_SOFTWARE=1 to everything it starts, so the
 # GPU list overrides it; AOK_GAMES_GL=gpu or =software in the environment
 # overrides the list for one run. Sound and video variables already set win.
+#
+# The same script serves a machine of its own (a VM made from these tools,
+# no /proc/ish): there sound is the machine's ALSA card, and "the GPU" is the
+# GL driver of its display device (virgl on a virtio-gpu) for what draws with
+# GLES or SDL's renderer, and zink on its Vulkan device for the games named in
+# AOK_GAMES_ZINK: the ones that draw with OpenGL's fixed pipeline, which
+# virgl on a GLES host cannot (UTM's: every draw is dropped, a black window).
+# AOK_GAMES_GL=virgl or =zink picks one of the two for a run.
 name=${0##*/}
 if [ "$name" = aok-sdl-game ]; then
     echo "aok-sdl-game: run it through a game's symlink (see /AOK/tools/setup-games.sh)" >&2
@@ -20,12 +28,26 @@ if [ "$name" = aok-sdl-game ]; then
 fi
 
 AOK_GAMES_GPU=
+AOK_GAMES_ZINK=
 [ -r /etc/aok-games.conf ] && . /etc/aok-games.conf
+IN_AOK=0; [ -d /proc/ish ] && IN_AOK=1
 
-# Sound: SDL's OSS driver, and OpenAL's, on the app's /dev/dsp.
+# Sound: SDL's OSS driver, and OpenAL's, on the app's /dev/dsp. On a machine
+# of its own, its sound card through ALSA, unless a sound server is running
+# for SDL to find by itself.
 if [ -w /dev/dsp ]; then
     export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dsp}"
     export ALSOFT_DRIVERS="${ALSOFT_DRIVERS:-oss}"
+elif [ "$IN_AOK" = 0 ] && [ -e /proc/asound/card0 ]; then
+    if ! [ -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse/native" ]; then
+        export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-alsa}"
+        export ALSOFT_DRIVERS="${ALSOFT_DRIVERS:-alsa}"
+    fi
+elif [ "$IN_AOK" = 0 ]; then
+    # No sound card at all: silent, rather than a game that gives up because
+    # no device opens (Trigger Rally did, with OpenAL).
+    export SDL_AUDIODRIVER="${SDL_AUDIODRIVER:-dummy}"
+    export ALSOFT_DRIVERS="${ALSOFT_DRIVERS:-null}"
 fi
 [ -n "${WAYLAND_DISPLAY:-}" ] && export SDL_VIDEODRIVER="${SDL_VIDEODRIVER:-wayland}"
 
@@ -121,7 +143,13 @@ if [ -z "$gl" ]; then
         *) gl=software ;;
     esac
 fi
-if [ "$gl" = gpu ]; then
+if [ "$IN_AOK" = 0 ] && [ "$gl" = gpu ]; then
+    case " $AOK_GAMES_ZINK " in *" $name "*) gl=zink ;; *) gl=virgl ;; esac
+fi
+if [ "$gl" = virgl ]; then
+    export LIBGL_ALWAYS_SOFTWARE=0      # the display device's own driver
+    unset MESA_LOADER_DRIVER_OVERRIDE
+elif [ "$gl" = gpu ] || [ "$gl" = zink ]; then
     export LIBGL_ALWAYS_SOFTWARE=0 MESA_LOADER_DRIVER_OVERRIDE=zink
 else
     export LIBGL_ALWAYS_SOFTWARE=1 SDL_RENDER_DRIVER="${SDL_RENDER_DRIVER:-software}"

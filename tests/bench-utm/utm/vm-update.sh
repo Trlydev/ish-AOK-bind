@@ -13,7 +13,7 @@ set -e
 [ "$(id -u)" = 0 ] || { echo "aok-update: run it as root (sudo)"; exit 1; }
 [ -d /proc/ish ] && { echo "aok-update: for a VM; an AOK root has /AOK/tools from the app"; exit 1; }
 base=${AOK_UPDATE_URL:-https://raw.githubusercontent.com/emkey1/ish-AOK/working}
-tools="start-wayland.sh setup-wayland.sh provision-ultimate-devuan.sh"
+tools="start-wayland.sh setup-wayland.sh provision-ultimate-devuan.sh setup-games.sh aok-sdl-game"
 t=$(mktemp -d)
 trap 'rm -rf "${t:?}"' EXIT
 for f in $tools vm-update.sh; do

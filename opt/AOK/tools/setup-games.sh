@@ -20,6 +20,15 @@
 # which plays sound through the app's /dev/dsp and draws on the GPU for the
 # games listed in /etc/aok-games.conf, in software for the rest.
 #
+# On a machine of its own (a VM made from these tools: no /proc/ish) the same
+# games are installed; sound is the machine's ALSA card (give the VM one). The
+# GPU there is two things: the display device's own GL driver (virgl on a
+# virtio-gpu), which runs what draws with GLES or SDL's renderer (Doom,
+# ScummVM), and its Vulkan device (venus), which Warzone 2100 uses directly
+# and the fixed-pipeline OpenGL games through zink -- virgl on UTM's GLES host
+# drops every draw of theirs (black windows). With no Vulkan device those
+# games draw in software.
+#
 # The GPU is used where it works: an arm64 or amd64 root, the GPU device, and
 # a GPU zink can draw on (A9 and newer; the A10X needs MoltenVK 67d3f726).
 # --gpu and --software override that. Freedoom's timedemo: 280 fps on an M4's
@@ -44,6 +53,7 @@ log()  { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 die()  { printf 'setup-games.sh: %s\n' "$*" >&2; exit 1; }
 
+IN_AOK=0; [ -d /proc/ish ] && IN_AOK=1
 CONF=/etc/aok-games.conf
 WRAPPER=/usr/local/bin/aok-sdl-game
 WRAPPER_SRC="$(dirname "$0")/aok-sdl-game"   # /AOK/tools, beside this script
@@ -88,6 +98,11 @@ host_chip() {
 
 # Why the GPU cannot draw these games here; nothing when it can.
 gpu_blocker() {
+    if [ "$IN_AOK" = 0 ]; then
+        # A machine of its own: whatever GL driver its display device has.
+        [ -c /dev/dri/renderD128 ] || echo "this machine has no GPU device"
+        return
+    fi
     case "$(uname -m)" in
         x86_64|amd64|aarch64|arm64) : ;;
         *) echo "Mesa has no GPU driver for $(uname -m) guests"; return ;;
@@ -98,13 +113,31 @@ gpu_blocker() {
     esac
 }
 
-# zink gives an OpenGL context (it can still fail at the first draw on a GPU
-# gpu_blocker does not know about; --software is the way out).
-zink_context() {
+# The GPU gives an OpenGL context: zink under iSH-AOK (it can still fail at
+# the first draw on a GPU gpu_blocker does not know about; --software is the
+# way out), the machine's own driver on a machine of its own -- and there not
+# Mesa's software renderer standing in for it.
+gpu_context() {
     command -v eglinfo >/dev/null 2>&1 || return 1
-    if command -v timeout >/dev/null 2>&1; then _t="timeout 30"; else _t=""; fi
-    LIBGL_ALWAYS_SOFTWARE=0 MESA_LOADER_DRIVER_OVERRIDE=zink $_t eglinfo -B -p surfaceless 2>/dev/null |
-        grep -q 'profile version:.*Mesa'
+    if command -v timeout >/dev/null 2>&1; then _t="timeout 60"; else _t=""; fi
+    if [ "$IN_AOK" = 1 ]; then
+        LIBGL_ALWAYS_SOFTWARE=0 MESA_LOADER_DRIVER_OVERRIDE=zink $_t eglinfo -B -p surfaceless 2>/dev/null |
+            grep -q 'profile version:.*Mesa'
+        return
+    fi
+    _gl=$(LIBGL_ALWAYS_SOFTWARE=0 $_t eglinfo -B -p surfaceless 2>/dev/null)
+    echo "$_gl" | grep -q 'profile version:.*Mesa' &&
+        ! echo "$_gl" | grep -qi 'renderer:.*\(llvmpipe\|softpipe\)'
+}
+# What the GPU is called in what this prints.
+gpu_name() {
+    if [ "$IN_AOK" = 1 ]; then host_chip; else echo "this machine's display device"; fi
+}
+# A machine of its own has a Vulkan device of the host's GPU (venus).
+venus_device() {
+    command -v vulkaninfo >/dev/null 2>&1 || return 1
+    if command -v timeout >/dev/null 2>&1; then _t="timeout 180"; else _t=""; fi
+    $_t vulkaninfo --summary 2>/dev/null | grep -q 'deviceName.*Venus'
 }
 
 CHECK_FAILED=0
@@ -136,11 +169,19 @@ check() {
     [ -x "$WRAPPER" ] && ok "$WRAPPER" || bad "$WRAPPER is not installed"
     if [ -w /dev/dsp ] || [ -c /dev/dsp ]; then
         ok "sound: /dev/dsp"
+    elif [ "$IN_AOK" = 0 ] && [ -e /proc/asound/card0 ]; then
+        ok "sound: $(sed -n '1s/^ *[0-9]* *\[[^]]*\]: *//p' /proc/asound/cards)"
+    elif [ "$IN_AOK" = 0 ]; then
+        info "no sound card: the games play silently. Give the VM one (in UTM: the VM's"
+        info "settings, Sound, Intel HD Audio or Virtio Sound) and they have sound."
     else
         info "no /dev/dsp (the command-line build has none); the games play silently"
     fi
     gpu=""
     [ -r "$CONF" ] && gpu=$(. "$CONF"; echo "${AOK_GAMES_GPU:-}")
+    zink=""
+    [ -r "$CONF" ] && zink=$(. "$CONF"; echo "${AOK_GAMES_ZINK:-}")
+    [ -n "$zink" ] && info "through zink on the Vulkan device: $zink"
     if [ -n "$gpu" ]; then
         info "on the GPU: $gpu"
     else
@@ -166,7 +207,7 @@ if [ "$GL_CHOICE" = auto ]; then
         log "drawing in software: $why"
     else
         GL_CHOICE=gpu
-        log "drawing on the GPU ($(host_chip))"
+        log "drawing on the GPU ($(gpu_name))"
     fi
 fi
 
@@ -175,6 +216,9 @@ MESA="libgl1-mesa-dri libegl-mesa0"
 [ "$GL_CHOICE" = gpu ] && MESA="$MESA mesa-vulkan-drivers mesa-utils"
 # Warzone 2100 draws with Vulkan: the GPU's, or Mesa's software one.
 [ "$MINIMAL" = 0 ] && MESA="$MESA mesa-vulkan-drivers"
+# A machine of its own: the tools to see and set its sound card's mixer, and
+# vulkaninfo to ask whether it has a Vulkan device.
+[ "$IN_AOK" = 0 ] && MESA="$MESA alsa-utils mesa-vulkan-drivers vulkan-tools"
 
 SOURCES=/etc/apt/sources.list
 if [ -f "$SOURCES" ] && grep -q 'deb\.devuan\.org' "$SOURCES" 2>/dev/null; then
@@ -200,18 +244,42 @@ DEBIAN_FRONTEND=noninteractive apt-get $APT_OPTS install -y --no-install-recomme
 # times out: try a few times before settling for software.
 if [ "$GL_CHOICE" = gpu ] && [ "$GL_FORCED" = 0 ]; then
     tries=1
-    until zink_context; do
+    until gpu_context; do
         if [ "$tries" -ge 3 ]; then
             GL_CHOICE=software
-            log "zink gave no OpenGL context: drawing in software"
-            note "If iSH-AOK was in the background just now, the GPU was paused; run this"
-            note "again with the app in front, or with --gpu to skip the check."
+            log "the GPU gave no OpenGL context: drawing in software"
+            if [ "$IN_AOK" = 1 ]; then
+                note "If iSH-AOK was in the background just now, the GPU was paused; run this"
+                note "again with the app in front, or with --gpu to skip the check."
+            else
+                note "(eglinfo -B -p surfaceless names the renderer programs get; --gpu skips"
+                note "this check.)"
+            fi
             break
         fi
         tries=$((tries + 1))
-        note "zink gave no OpenGL context; trying again ($tries of 3)"
+        note "the GPU gave no OpenGL context; trying again ($tries of 3)"
         sleep 5
     done
+fi
+
+# A machine of its own, and its sound card: a card starts with its outputs
+# down or muted, and a login reaches /dev/snd only on the machine's own
+# console (the seat's ACL) unless it is in the audio group. Best effort.
+if [ "$IN_AOK" = 0 ]; then
+    if [ -e /proc/asound/card0 ] && command -v amixer >/dev/null 2>&1; then
+        for ctl in Master PCM Speaker Headphone; do
+            amixer -q sset "$ctl" 85% unmute 2>/dev/null
+        done
+        command -v alsactl >/dev/null 2>&1 && alsactl store 2>/dev/null
+    fi
+    player=${SUDO_USER:-}
+    [ -n "$player" ] && [ "$player" != root ] ||
+        player=$(awk -F: '$3 >= 1000 && $3 < 2000 { print $1; exit }' /etc/passwd)
+    if [ -n "$player" ] && getent group audio >/dev/null 2>&1; then
+        usermod -aG audio "$player" 2>/dev/null &&
+            note "$player is in the audio group (for logins other than the console's: log in again)"
+    fi
 fi
 
 log "installing $WRAPPER"
@@ -260,11 +328,28 @@ for game in Heretic Hexen Strife; do
 done
 
 log "writing $CONF"
-if [ "$GL_CHOICE" = gpu ]; then gpu_list="$GPU_GAMES $MORE_GPU"; else gpu_list=""; fi
+zink_list=""
+if [ "$GL_CHOICE" != gpu ]; then
+    gpu_list=""
+elif [ "$IN_AOK" = 1 ]; then
+    gpu_list="$GPU_GAMES $MORE_GPU"
+elif venus_device; then
+    # (Warzone 2100 too: its own Vulkan, and not Mesa's software device)
+    gpu_list="$GPU_GAMES $MORE_GPU warzone2100"
+    zink_list="$MORE_GPU"
+    note "the fixed-pipeline OpenGL games go through zink on the Vulkan device"
+else
+    gpu_list="$GPU_GAMES"
+    note "no Vulkan device (venus): Doom and ScummVM on the GPU, the OpenGL games in"
+    note "software. In UTM: the app's settings, Vulkan Driver, anything but Disabled."
+fi
 {
     echo "# Written by /AOK/tools/setup-games.sh; /usr/local/bin/aok-sdl-game reads it."
-    echo "# The games that draw on the GPU (zink); the rest draw in software."
+    echo "# The games that draw on the GPU; the rest draw in software."
     echo "AOK_GAMES_GPU=\"$gpu_list\""
+    echo "# Of those, on a machine of its own: the ones that go through zink on its"
+    echo "# Vulkan device instead of the display device's GL driver."
+    echo "AOK_GAMES_ZINK=\"$zink_list\""
 } > "$CONF"
 
 check

@@ -41,6 +41,7 @@ cat > /etc/motd <<'M'
                desktop soft             (the same, drawn without the GPU)
    display  :  gltest                   which GL renderer programs get
                vulkaninfo --summary     the Vulkan device (venus), vkcube
+   games    :  sudo sh /AOK/tools/setup-games.sh   (Doom, ScummVM, Warzone 2100, ...)
    re-setup :  sudo sh /AOK/tools/provision-ultimate-devuan.sh
                (timezone, login, hostname: it asks)
    services :  service <name> {start|stop|status}
