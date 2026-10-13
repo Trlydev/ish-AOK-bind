@@ -171,6 +171,7 @@ native_ln.c
 native_coreutils.c
 native_applet_race.c
 native_abort.c
+native_net_options.c
 unaligned_page_edge.c
 tlb_collide.c
 devtmpfs_mount.c
