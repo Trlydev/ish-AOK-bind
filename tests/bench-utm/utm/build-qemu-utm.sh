@@ -1,9 +1,9 @@
 #!/bin/bash
 # build-qemu-utm.sh [ios-tci|ios_simulator-tci] [configure] -- cross-build the AOK-gadgets QEMU (src-aok,
-# branch utm-se) as UTM SE's RISC-V engine, for devices (the default) or for the arm64 simulator.
+# branch utm-se) as UTM SE's RISC-V and ARM64 engines, for devices (the default) or for the arm64 simulator.
 #
 # UTM's iOS-SE app loads one QEMU shared library per guest architecture from its sysroot's Frameworks. This
-# builds ours for riscv64 the way UTM's scripts/build_dependencies.sh builds QEMU for the "ios-tci" platform
+# builds ours for riscv64 and aarch64 the way UTM's scripts/build_dependencies.sh builds QEMU for the "ios-tci" platform
 # (same compiler setup, same configure flags, same deployment target) against UTM's prebuilt dependencies,
 # plus --enable-aok-gadgets, and without OpenGL: UTM's GL display path is patches to its own QEMU fork that
 # this tree does not carry. The result is installed under utm/qemu-out-PLATFORM; install-qemu-utm.sh puts it
@@ -56,7 +56,7 @@ if [ ! -f build.ninja ] || [ "$1" = configure ]; then
     "$W/src-aok/configure" --prefix="$OUT" --host=aarch64-apple-darwin --cross-prefix="" --objcc="$OBJCC" \
         --enable-shared-lib --disable-cocoa --disable-sdl --disable-coreaudio --disable-slirp-smbd \
         --enable-ucontext --with-coroutine=libucontext \
-        --enable-tcg-threaded-interpreter --target-list=riscv64-softmmu \
+        --enable-tcg-threaded-interpreter --target-list=riscv64-softmmu,aarch64-softmmu \
         --extra-cflags=-Wno-unused-command-line-argument --extra-ldflags=-Wl,-no_deduplicate \
         --extra-ldflags=-Wl,-random_uuid --extra-ldflags=-Wl,-no_compact_unwind \
         --enable-aok-gadgets --enable-spice --enable-spice-protocol --enable-slirp --enable-fdt=system \
@@ -65,4 +65,4 @@ if [ ! -f build.ninja ] || [ "$1" = configure ]; then
 fi
 ninja
 ninja install
-ls -la "$OUT/lib/libqemu-riscv64-softmmu.dylib"
+ls -la "$OUT/lib/libqemu-riscv64-softmmu.dylib" "$OUT/lib/libqemu-aarch64-softmmu.dylib"

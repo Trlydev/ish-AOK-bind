@@ -38,6 +38,26 @@ import uuid
 
 WORKLOADS = "coremark,nbody,python,xz,sha256,awk"
 
+# ARCH=aarch64 in the environment makes the arm64 machines instead: "AOK ARM64 Console.utm" (KERNEL and
+# INITRAMFS are then the arm64 guest's: kernel/vmlinuz-virt-aarch64, initramfs-aarch64-vm.cpio) and, with
+# DEVUAN_DIR (devuan-aarch64/), "Devuan Ultimate ARM64.utm". UTM gives an arm64 machine a cortex-a72.
+# Their UUIDs and MAC addresses are the RISC-V ones plus 0x10.
+ARCH = os.environ.get("ARCH", "riscv64")
+A = {
+    "riscv64": {"label": "RISC-V", "serial": "ttyS0", "kernel": "Image-lts-riscv64",
+                "initramfs": "initramfs-riscv64.cpio", "n": 0},
+    "aarch64": {"label": "ARM64", "serial": "ttyAMA0", "kernel": "vmlinuz-virt-aarch64",
+                "initramfs": "initramfs-aarch64.cpio", "n": 0x10},
+}[ARCH]
+
+
+def vm_uuid(n):
+    return "A0C0A0C0-0000-4000-8000-%012X" % (n + A["n"])
+
+
+def mac(n):
+    return "52:54:00:A0:C0:%02X" % (n + A["n"])
+
 
 def base(name, notes, vm_uuid, cpus, memory):
     return {
@@ -45,7 +65,7 @@ def base(name, notes, vm_uuid, cpus, memory):
         "ConfigurationVersion": 4,
         "Information": {"Name": name, "IconCustom": False, "Icon": "linux", "Notes": notes, "UUID": vm_uuid},
         "System": {
-            "Architecture": "riscv64", "Target": "virt", "CPU": "default",
+            "Architecture": ARCH, "Target": "virt", "CPU": "default",
             "CPUFlagsAdd": [], "CPUFlagsRemove": [],
             "CPUCount": cpus, "ForceMulticore": False, "MemorySize": memory, "JITCacheSize": 0,
         },
@@ -74,11 +94,11 @@ def display():
 def direct_boot(n):
     """The kernel and initramfs as UTM's -kernel and -initrd "drives"."""
     return [
-        {"ImageName": "Image-lts-riscv64", "ImageType": "LinuxKernel", "Interface": "None",
-         "InterfaceVersion": 1, "Identifier": str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000A0 + n)).upper(),
+        {"ImageName": A["kernel"], "ImageType": "LinuxKernel", "Interface": "None", "InterfaceVersion": 1,
+         "Identifier": str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000A0 + n + A["n"] * 0x100)).upper(),
          "ReadOnly": True},
-        {"ImageName": "initramfs-riscv64.cpio", "ImageType": "LinuxInitrd", "Interface": "None",
-         "InterfaceVersion": 1, "Identifier": str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000B0 + n)).upper(),
+        {"ImageName": A["initramfs"], "ImageType": "LinuxInitrd", "Interface": "None", "InterfaceVersion": 1,
+         "Identifier": str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000B0 + n + A["n"] * 0x100)).upper(),
          "ReadOnly": True},
     ]
 
@@ -104,35 +124,35 @@ def write(outdir, config, files):
 
 def devuan(outdir, d):
     # (a name and a UUID of its own: an earlier, unprovisioned "Devuan RISC-V" may be installed and running)
-    vm = base("Devuan Ultimate RISC-V",
-              "Devuan 6 (Excalibur) riscv64 with its own kernel, provisioned by iSH-AOK's scripts "
+    vm = base("Devuan Ultimate " + A["label"],
+              "Devuan 6 (Excalibur) " + ARCH + " with its own kernel, provisioned by iSH-AOK's scripts "
               "(/AOK/tools). The login aok is on the display: `desktop` starts the Wayland desktop, "
               "`gltest` says which GL renderer programs get. root is on the serial terminal. Neither has a "
               "password.",
-              "A0C0A0C0-0000-4000-8000-000000000006", cpus=4, memory=2048)
+              vm_uuid(6), cpus=4, memory=2048)
     # net.ifnames=0: the image's network configuration names eth0.
     vm["QEMU"]["AdditionalArguments"] = [
-        '-append "root=/dev/vda rw console=ttyS0 console=tty0 net.ifnames=0 quiet"',
+        '-append "root=/dev/vda rw console=%s console=tty0 net.ifnames=0 quiet"' % A["serial"],
     ]
     vm["QEMU"]["RNGDevice"] = True
     vm["Input"]["UsbBusSupport"] = "3.0"
     vm["Display"] = [dict(display(), Hardware="virtio-ramfb-gl")]
-    vm["Network"] = [network("52:54:00:A0:C0:06")]
+    vm["Network"] = [network(mac(6))]
     # A sound card the Debian riscv64 kernel has a driver for (snd-hda-intel; also virtio-sound and
     # usb-audio, not AC97 or ES1370). The games of /AOK/tools/setup-games.sh play through it with ALSA.
     vm["Sound"] = [{"Hardware": "intel-hda"}]
     vm["Serial"] = [terminal()]
     def ident(n):
-        return str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000E0 + n)).upper()
+        return str(uuid.UUID(int=0xA0C0A0C0_0000_4000_8000_0000000000E0 + n + A["n"] * 0x100)).upper()
     vm["Drive"] = [
         {"ImageName": "vmlinuz", "ImageType": "LinuxKernel", "Interface": "None", "InterfaceVersion": 1,
          "Identifier": ident(1), "ReadOnly": True},
         {"ImageName": "initrd.img", "ImageType": "LinuxInitrd", "Interface": "None", "InterfaceVersion": 1,
          "Identifier": ident(2), "ReadOnly": True},
-        {"ImageName": "devuan-riscv64.qcow2", "ImageType": "Disk", "Interface": "VirtIO",
+        {"ImageName": "devuan-%s.qcow2" % ARCH, "ImageType": "Disk", "Interface": "VirtIO",
          "InterfaceVersion": 1, "Identifier": ident(3), "ReadOnly": False},
     ]
-    write(outdir, vm, {n: os.path.join(d, n) for n in ("vmlinuz", "initrd.img", "devuan-riscv64.qcow2")})
+    write(outdir, vm, {n: os.path.join(d, n) for n in ("vmlinuz", "initrd.img", "devuan-%s.qcow2" % ARCH)})
 
 
 def main():
@@ -142,17 +162,19 @@ def main():
     os.makedirs(outdir, exist_ok=True)
 
     # Fixed UUIDs: copying a rebuilt bundle over an installed one keeps it the same machine to UTM.
-    console = base("AOK RISC-V Console",
+    console = base("AOK %s Console" % A["label"],
                    "Alpine 6.18 kernel and the benchmark userland, booted directly. Runs six workloads, then "
                    "leaves a shell on the terminal.",
-                   "A0C0A0C0-0000-4000-8000-000000000001", cpus=1, memory=1024)
+                   vm_uuid(1), cpus=1, memory=1024)
     console["QEMU"]["AdditionalArguments"] = [
-        f'-append "console=ttyS0 rdinit=/init quiet bench={WORKLOADS} then=shell"',
+        f'-append "console={A["serial"]} rdinit=/init quiet bench={WORKLOADS} then=shell"',
     ]
     console["Serial"] = [terminal()]
-    console["Network"] = [network("52:54:00:A0:C0:01")]
+    console["Network"] = [network(mac(1))]
     console["Drive"] = direct_boot(1)
-    write(outdir, console, {"Image-lts-riscv64": kernel, "initramfs-riscv64.cpio": initramfs})
+    write(outdir, console, {A["kernel"]: kernel, A["initramfs"]: initramfs})
+    if ARCH != "riscv64":
+        return      # (the display and firmware machines below are the RISC-V study's)
 
     # console=tty0 last makes the display the console: /init's output and its shell go there, and the
     # kernel's messages to the serial terminal as well.

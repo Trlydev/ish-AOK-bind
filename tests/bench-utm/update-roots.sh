@@ -74,4 +74,14 @@ fi
 cat "$W/initramfs-riscv64.cpio" "$W/modules-riscv64.cpio" $(ls "$W/aoktools-riscv64.cpio" 2>/dev/null) \
     > "$W/initramfs-riscv64-vm.cpio"
 ls -la "$W/modules-riscv64.cpio" "$W/initramfs-riscv64-vm.cpio"
+# The arm64 guest with its kernel's modules as well: the machine build-devuan-disk.sh builds Devuan arm64
+# in (ARCH=aarch64) needs the disk, network and ext4 drivers.
+M=$W/dl-kernel/modules-aarch64
+if [ ! -f "$W/modules-aarch64.cpio" ]; then
+    rm -rf "${M:?}" && mkdir -p "$M"
+    bsdtar -xf "$W/dl-kernel/linux-virt-aarch64.apk" -C "$M" lib/modules
+    (cd "$M" && bsdtar -c --format=newc --uid 0 --gid 0 -f "$W/modules-aarch64.cpio" lib)
+fi
+cat "$W/initramfs-aarch64.cpio" "$W/modules-aarch64.cpio" > "$W/initramfs-aarch64-vm.cpio"
+ls -la "$W/modules-aarch64.cpio" "$W/initramfs-aarch64-vm.cpio"
 echo UPDATE-DONE

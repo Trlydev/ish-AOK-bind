@@ -13,8 +13,13 @@
 set -ex
 MODE=$(cat "$(dirname "$0")/mode")
 MIRROR=http://pkgmaster.devuan.org/merged
+# The build VM's architecture is the machine's: Debian's name for it, and its serial console.
+case $(uname -m) in
+aarch64) DEB=arm64; SER=ttyAMA0 ;;
+*) DEB=riscv64; SER=ttyS0 ;;
+esac
 PKGS="sysvinit-core eudev kmod ifupdown isc-dhcp-client iproute2 iputils-ping netbase procps less nano
-    curl wget pciutils e2fsprogs linux-image-riscv64 initramfs-tools
+    curl wget pciutils e2fsprogs linux-image-$DEB initramfs-tools
     libgl1-mesa-dri libegl1 libgles2 libgbm1 kmscube mesa-utils"
 apk add --no-cache debootstrap e2fsprogs > /dev/null
 modprobe ext4
@@ -25,14 +30,21 @@ if ! mount /dev/vda /mnt 2>/dev/null || [ ! -f /mnt/etc/devuan_version ]; then
     mount /dev/vda /mnt
     # Alpine's debootstrap does not know Devuan's suite names: Debian's script for sid is the one they use.
     # The archive key comes in with devuan-keyring, so apt checks signatures from then on.
-    debootstrap --arch=riscv64 --variant=minbase --no-check-gpg \
+    debootstrap --arch=$DEB --variant=minbase --no-check-gpg \
         --include=devuan-keyring,ca-certificates excalibur /mnt $MIRROR /usr/share/debootstrap/scripts/sid
 fi
 mount -t proc proc /mnt/proc; mount -t sysfs sys /mnt/sys; mount -o bind /dev /mnt/dev
 cp /etc/resolv.conf /mnt/etc/resolv.conf
 echo "deb $MIRROR excalibur main" > /mnt/etc/apt/sources.list
 printf 'Acquire::http::Timeout "30";\nAcquire::Retries "5";\n' > /mnt/etc/apt/apt.conf.d/80aok-build
-finish() { umount /mnt/dev /mnt/sys /mnt/proc; umount /mnt; sync; }
+# (On a fast machine apt's helpers can still be leaving the chroot when the script gets here: the arm64
+# build, on the Mac's own CPU, found /mnt busy.)
+finish() {
+    umount /mnt/dev /mnt/sys /mnt/proc
+    sync
+    umount /mnt || { sleep 3; umount /mnt || umount -l /mnt; }
+    sync
+}
 
 # What the machine carries of iSH-AOK's tools (the job brings them in tools/): the provisioning and
 # Wayland scripts that the same distribution uses under the app, which know a machine of its own when they
@@ -116,9 +128,9 @@ echo "deb http://deb.devuan.org/merged excalibur main" > /mnt/etc/apt/sources.li
 printf 'auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet dhcp\n' > /mnt/etc/network/interfaces
 # root on the display's console and on the serial port, without asking.
 sed -i -e 's|^1:2345:respawn:.*|1:2345:respawn:/sbin/agetty --autologin root --noclear tty1 linux|' \
-       -e 's|^#T0:23:respawn:.*|T0:23:respawn:/sbin/agetty --autologin root -L ttyS0 115200 vt100|' /mnt/etc/inittab
+       -e "s|^#T0:23:respawn:.*|T0:23:respawn:/sbin/agetty --autologin root -L $SER 115200 vt100|" /mnt/etc/inittab
 grep -q '^T0:' /mnt/etc/inittab ||
-    echo 'T0:23:respawn:/sbin/agetty --autologin root -L ttyS0 115200 vt100' >> /mnt/etc/inittab
+    echo "T0:23:respawn:/sbin/agetty --autologin root -L $SER 115200 vt100" >> /mnt/etc/inittab
 # gltest: which renderer a GL program gets -- "virgl (...)" is the host's GPU, "llvmpipe" the guest's CPU.
 cat > /mnt/usr/local/bin/gltest <<'G'
 #!/bin/sh
@@ -130,11 +142,11 @@ grep "Rendered" /tmp/gltest.log | tail -1 | sed 's/^/GLTEST /'
 G
 chmod +x /mnt/usr/local/bin/gltest
 install_tools
-echo 'Devuan 6 (Excalibur) riscv64, built for the AOK QEMU. gltest: is the display accelerated?' > /mnt/etc/motd
+echo "Devuan 6 (Excalibur) $DEB, built for the AOK QEMU. gltest: is the display accelerated?" > /mnt/etc/motd
 ls -la /mnt/boot
 (cd /mnt/boot && tar -cf /dev/vdc vmlinu* initrd.img* config-*)
-chroot /mnt dpkg-query -W -f '${Package} ${Version}\n' linux-image-riscv64 libgl1-mesa-dri kmscube
-ls /mnt/usr/lib/riscv64-linux-gnu/dri 2>/dev/null | tr '\n' ' '
+chroot /mnt dpkg-query -W -f '${Package} ${Version}\n' linux-image-$DEB libgl1-mesa-dri kmscube
+ls /mnt/usr/lib/$(uname -m)-linux-gnu/dri 2>/dev/null | tr '\n' ' '
 df -h /mnt | tail -1
 finish
 echo DEVUAN-PROVISION-OK

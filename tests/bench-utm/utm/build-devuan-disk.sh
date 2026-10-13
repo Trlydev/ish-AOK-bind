@@ -24,11 +24,24 @@
 #     QEMU_BIN=~/aok-vm-bench/build-aok/qemu-system-riscv64 QEMU_AOK_STATS=1 build-devuan-disk.sh desktop-test
 # is the desktop on the AOK-gadgets engine: build-desktop.log then ends with its "aok:" lines, and without
 # them it was not that engine. (This script puts Homebrew first on PATH: a PATH prefix does not choose.)
+#
+# ARCH=aarch64 builds the arm64 machine the same way, in devuan-aarch64/ (devuan-aarch64.qcow2): the build
+# VM is the arm64 Alpine guest (initramfs-aarch64-vm.cpio), on the Mac's own CPU (hvf). DEVUAN_MACH names
+# another machine for QEMU_BIN, e.g. "-M virt -cpu cortex-a72" for a QEMU without hvf.
 set -e
 W=${W:-$HOME/aok-vm-bench}
 here=$(cd "$(dirname "$0")" && pwd)
 export PATH=/opt/homebrew/bin:$PATH
-D=$W/devuan; mkdir -p "$D"; cd "$D"
+ARCH=${ARCH:-riscv64}
+case $ARCH in
+riscv64) SYS=qemu-system-riscv64; MACH="-M virt"; CON=ttyS0; KERNEL=$W/kernel/Image-lts-riscv64; D=$W/devuan ;;
+aarch64) SYS=qemu-system-aarch64; MACH="-M virt -accel hvf -cpu host"; CON=ttyAMA0
+         KERNEL=$W/kernel/vmlinuz-virt-aarch64; D=$W/devuan-aarch64 ;;
+*) echo "ARCH: riscv64 or aarch64"; exit 1 ;;
+esac
+MACH=${DEVUAN_MACH:-$MACH}
+VMCPIO=$W/initramfs-$ARCH-vm.cpio
+mkdir -p "$D"; cd "$D"
 [ -f devuan.img ] || qemu-img create -q -f raw devuan.img "${1:-6G}"
 pass() {    # pass MODE: one run of the build VM
     rm -rf job job.tar bootout.img && mkdir job
@@ -36,21 +49,21 @@ pass() {    # pass MODE: one run of the build VM
     [ -f uris.txt ] && cp uris.txt job/
     tar -cf job.tar -C job . && truncate -s 2M job.tar
     qemu-img create -q -f raw bootout.img 256M
-    qemu-system-riscv64 -M virt -smp 8 -m 4096 -display none -serial stdio -monitor none -no-reboot \
-        -kernel "$W/kernel/Image-lts-riscv64" -initrd "$W/initramfs-riscv64-vm.cpio" \
-        -append "console=ttyS0 rdinit=/init quiet bench=none script=vdb" \
+    $SYS $MACH -smp 8 -m 4096 -display none -serial stdio -monitor none -no-reboot \
+        -kernel "$KERNEL" -initrd "$VMCPIO" \
+        -append "console=$CON rdinit=/init quiet bench=none script=vdb" \
         -drive file=devuan.img,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 \
         -drive file=job.tar,format=raw,if=none,id=d1,readonly=on -device virtio-blk-pci,drive=d1 \
         -drive file=bootout.img,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2 \
         -netdev user,id=n0 -device virtio-net-pci,netdev=n0 -device virtio-rng-pci < /dev/null > "build-$1.log" 2>&1
 }
-QEMU_BIN=${QEMU_BIN:-qemu-system-riscv64}
+QEMU_BIN=${QEMU_BIN:-$SYS}
 devuan_boot() {   # devuan_boot LOG APPEND [qemu args...]: the machine itself, with its own kernel
     local log=$1 append=$2 net=; shift 2
     # (a QEMU built without the user-mode network: the machine boots without one, a minute slower)
     "$QEMU_BIN" -netdev help 2>&1 | grep -qx user && net="-netdev user,id=n0 -device virtio-net-pci,netdev=n0"
-    "$QEMU_BIN" -M virt -smp 8 -m 4096 -display none -serial stdio -monitor none -no-reboot \
-        -kernel vmlinuz -initrd initrd.img -append "root=/dev/vda rw console=ttyS0 net.ifnames=0 $append" \
+    "$QEMU_BIN" $MACH -smp 8 -m 4096 -display none -serial stdio -monitor none -no-reboot \
+        -kernel vmlinuz -initrd initrd.img -append "root=/dev/vda rw console=$CON net.ifnames=0 $append" \
         -drive file=devuan.img,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 \
         $net -device virtio-rng-pci "$@" < /dev/null > "$log" 2>&1
 }
@@ -68,9 +81,9 @@ if [ "$1" = ultimate ]; then
     done
     tar -cf job.tar -C job . && truncate -s 2M job.tar
     qemu-img create -q -f raw bootout.img 16M
-    qemu-system-riscv64 -M virt -smp 8 -m 4096 -display none -serial stdio -monitor none -no-reboot \
-        -kernel "$W/kernel/Image-lts-riscv64" -initrd "$W/initramfs-riscv64-vm.cpio" \
-        -append "console=ttyS0 rdinit=/init quiet bench=none script=vdb" \
+    $SYS $MACH -smp 8 -m 4096 -display none -serial stdio -monitor none -no-reboot \
+        -kernel "$KERNEL" -initrd "$VMCPIO" \
+        -append "console=$CON rdinit=/init quiet bench=none script=vdb" \
         -drive file=devuan.img,format=raw,if=none,id=d0 -device virtio-blk-pci,drive=d0 \
         -drive file=job.tar,format=raw,if=none,id=d1,readonly=on -device virtio-blk-pci,drive=d1 \
         -drive file=bootout.img,format=raw,if=none,id=d2 -device virtio-blk-pci,drive=d2 \
@@ -80,8 +93,8 @@ if [ "$1" = ultimate ]; then
     devuan_boot build-ultimate.log "aokjob=vdb" \
         -drive file=job.tar,format=raw,if=none,id=d1,readonly=on -device virtio-blk-pci,drive=d1
     grep -q "AOKJOB-DONE rc=0" build-ultimate.log || { tail -40 build-ultimate.log; exit 1; }
-    qemu-img convert -O qcow2 -c devuan.img devuan-riscv64.qcow2
-    ls -la devuan-riscv64.qcow2
+    qemu-img convert -O qcow2 -c devuan.img "devuan-$ARCH.qcow2"
+    ls -la "devuan-$ARCH.qcow2"
     exit 0
 fi
 if [ "$1" = desktop-test ]; then
@@ -137,5 +150,5 @@ pass install
 grep -q DEVUAN-PROVISION-OK build-install.log || { tail -25 build-install.log; exit 1; }
 rm -rf boot && mkdir boot && tar -xf bootout.img -C boot
 cp boot/vmlinu* vmlinuz && cp boot/initrd.img* initrd.img
-qemu-img convert -O qcow2 -c devuan.img devuan-riscv64.qcow2
-ls -la devuan-riscv64.qcow2 vmlinuz initrd.img
+qemu-img convert -O qcow2 -c devuan.img "devuan-$ARCH.qcow2"
+ls -la "devuan-$ARCH.qcow2" vmlinuz initrd.img

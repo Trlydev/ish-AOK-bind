@@ -1101,14 +1101,54 @@ transcript is identical.
   the stream. QEMU's own code looks it up again at run time, and so does
   the plug-in now.
 
+### On an iPad, and in UTM SE
+
+The on-device test app (`tests/bench-utm/ios-app`, a label that begins
+`aarch64`) ran the gates on the M4 iPad, 2026-10-13: the check, FP and
+memory transcripts are identical to the Mac's reference, simdtest to stock
+QEMU's JIT, and the four-CPU stress hashes to the Mac's. The six workloads
+there, in the guest's own milliseconds, QEMU's engine against the gadgets:
+
+| Workload | QEMU's engine | AOK gadgets | Ratio |
+|----------|--------------:|------------:|------:|
+| CoreMark | 2,614 | 1,058 | 2.5 |
+| n-body | 2,527 | 904 | 2.8 |
+| Python | 8,974 | 2,798 | 3.2 |
+| xz -3 | 3,282 | 1,167 | 2.8 |
+| sha256sum | 1,174 | 529 | 2.2 |
+| awk | 3,031 | 1,101 | 2.8 |
+
+UTM SE (section 9) is now built with both engines: `build-qemu-utm.sh` and
+`install-qemu-utm.sh` build and install the riscv64 and the aarch64
+library, and the rest of the pipeline takes `ARCH=aarch64`:
+`update-roots.sh` makes the arm64 guest with its kernel's modules,
+`build-devuan-disk.sh` builds Devuan arm64 in it (on the Mac's own CPU, so
+the whole "ultimate" machine takes ten minutes where RISC-V's takes over an
+hour), and `make-vm.py` writes "AOK ARM64 Console.utm" and "Devuan Ultimate
+ARM64.utm". UTM starts an arm64 machine as `-cpu cortex-a72 -machine
+virt,virtualization=on,gic-version=3`: EL2 present and a GIC of system
+registers, neither of which the first gates had. They pass with those
+options too.
+
+In the simulator the Devuan machine boots through UTM's front end in about a
+minute and `desktop` brings up labwc, waybar and foot on the GL display
+(`tests/bench-utm/a64/pictures/devuan-arm64-desktop-sim.png`). Both iPads
+have the app and the two machines; on a device the machines have not been
+started yet, which takes a tap.
+
+On that desktop the main loop still enters QEMU's code a third as often as
+streams (6.4 million times in a boot and three minutes of desktop), almost
+all of it for `ld1`/`st1`, which the check programs hardly use.
+
 ### Not done
 
+- `ld1`/`st1` and the other structure loads and stores: the one class a
+  desktop still hands to QEMU in numbers. Then the LSE atomics.
 - Fused pairs (AOK's arm64 pair list, `jit/guest-arm64/pairs.h`).
-- The structure loads and stores (`ld1` and the like), the LSE atomics.
 - A CPU newer than the base: with `-cpu max` the guest is correct but
   hardly faster, because pointer authentication, BTI's indirect branches,
   LSE and LSE2 are all left to QEMU.
-- A UTM SE build with it, and an arm64 Linux machine on the iPads.
+- The A10X: it has the app and the machines, and has run nothing of this.
 
 ## Appendix: reproducing the race
 

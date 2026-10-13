@@ -48,6 +48,7 @@ cat > /etc/motd <<'M'
    ------------------------------------------------------------
 
 M
+sed -i "s/riscv64/$(dpkg --print-architecture)/" /etc/motd
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 df -h / | tail -1
