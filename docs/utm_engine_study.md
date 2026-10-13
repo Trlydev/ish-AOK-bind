@@ -1153,6 +1153,146 @@ M4 passes the gates with that engine too, and both iPads' UTM SE have it.
   LSE and LSE2 are all left to QEMU.
 - The A10X: it has the app and the machines, and has run nothing of this.
 
+## 12. The x86 plug-in
+
+Added 2026-10-13/14, in the same fork (`target/i386/tcg/aok`, commits
+6ddec90 to 05421d9). The user's aim for it is a PC guest on an iPad, down to
+Windows XP, so it translates two kinds of code with one translator: long
+mode's 64-bit code, and 32-bit protected-mode code with flat segments and a
+32-bit stack, which is what a 32-bit system and its programs run in. Real
+mode, 16-bit segments and virtual-8086 mode stay QEMU's: they are a
+firmware's and a boot loader's.
+
+Nothing in it is AOK's. AOK's own x86 gadgets are built around its register
+cache and its flags; these are written against QEMU's `CPUX86State`, and
+the fork's `docs/devel/aok-gadgets.rst` has the design. The two things worth
+knowing here:
+
+- **The flags are QEMU's lazy ones.** A gadget that sets flags stores
+  `cc_dst`, `cc_src` and `cc_op` as QEMU's own code would, so an exception,
+  an interrupt or one of QEMU's blocks finds them right. It computes with
+  the host's flag-setting instruction, and the translator tracks what the
+  host's NZCV then says of the guest's flags: a `jcc` after a `cmp` tests
+  the host's and reads nothing.
+- **A 32-bit guest runs on the x86-64 engine.** The gadgets' operands are
+  offsets into a CPU state whose registers are 64 bits wide, which the i386
+  build's are not, so there is no front end there. For the VM app the
+  x86-64 engine is installed a second time under the i386 name: a 32-bit
+  system finds a CPU that could do more than it asks of it, as on any PC
+  made since 2004.
+
+### Results
+
+All four guests the engine has a front end for, the six workloads, one
+guest CPU, on an Apple M5, in host CPU cycles between a workload's first
+line and its last (`tests/bench-utm/cyc4.sh`, the least of three
+interleaved runs), against the same binary with the plug-in off
+(`QEMU_AOK=0`: QEMU's threaded interpreter, which is what UTM SE ships):
+
+| Workload | RISC-V | | ARM64 | | x86-64 | | x86 32-bit | |
+|----------|-------:|--:|------:|--:|-------:|--:|-----------:|--:|
+| CoreMark | 11.92 → 6.12 | 1.9 | 10.72 → 4.26 | 2.5 | 11.26 → 4.72 | 2.4 | 13.28 → 5.23 | 2.5 |
+| n-body (doubles) | 10.10 → 3.26 | 3.1 | 10.93 → 3.08 | 3.6 | 9.22 → 5.19 | 1.8 | 10.62 → 5.38 | 2.0 |
+| Python | 33.32 → 10.40 | 3.2 | 31.62 → 9.78 | 3.2 | 31.02 → 9.31 | 3.3 | 49.05 → 14.18 | 3.5 |
+| xz -3 | 8.45 → 4.69 | 1.8 | 9.84 → 4.37 | 2.3 | 9.38 → 4.63 | 2.0 | 17.63 → 7.65 | 2.3 |
+| sha256sum | 4.95 → 3.09 | 1.6 | 4.35 → 1.97 | 2.2 | 3.94 → 2.37 | 1.7 | 7.68 → 3.27 | 2.4 |
+| awk | 11.82 → 4.63 | 2.6 | 10.73 → 4.23 | 2.5 | 32.69 → 13.35 | 2.5 | 16.64 → 7.18 | 2.3 |
+
+(Billions of cycles, QEMU's engine → the gadgets, and how many times fewer.
+The guests are Alpine 3.24's own builds of the same programs, so columns
+compare engines and not architectures: awk is busybox's on three of them.)
+
+Floating point on x86 is the weak column. Doubles in SSE run on the host's
+FP unit only where it gives softfloat's answer and flags (normal numbers
+and zeros under a plain MXCSR); single precision, x87 and MMX are still
+QEMU's helpers, and a 32-bit guest's FP is x87.
+
+### How it was checked
+
+Against the same binary with the plug-in off, as the other two: the check
+programs, the FP test and the memory test with one CPU, four, and four on
+threads of their own (QEMU's multi-threaded mode, which is its default for
+an x86 guest here), the FP test printing every result (370,000 lines), all
+identical, for the 64-bit guest and the 32-bit one
+(`tests/bench-utm/x64/x64gate.sh`).
+
+Two programs are new. `bench/x86test.c` is the integer instructions on
+awkward and random operands with the flags hashed in: what Linux's
+compilers seldom emit and other systems' code is full of (`rep` with the
+direction flag set, `repne scas`, `loop`, `cmpxchg8b`, rotates whose flags
+are read, segment registers pushed and loaded, `lahf`/`sahf`, every
+condition after every kind of flag-setting instruction with a load or a
+store between). And `poke` (`bench/run1.sh`) is not a transcript but a
+guest that must stay up: three CPUs busy in the scheduler while the fourth
+flips the scheduler's static key three thousand times, which makes Linux
+patch its own running code.
+
+### Bugs worth remembering
+
+- **A store into a page with code is invalidated before it is made, and
+  nothing held the page in between** (QEMU's own, in `notdirty_write`). A
+  block another CPU translates in that gap is made of the old bytes and
+  stays valid. Linux patches running code with a breakpoint first and
+  counts on no CPU meeting it afterwards; a block with the breakpoint in it
+  that outlived the patch was `Oops: int3` at `sched_clock_cpu+0xd`, in 9 of
+  180 boots of the 32-bit guest with four CPUs beside other load. QEMU's
+  engine seldom loses the race, because its block there begins some
+  instructions earlier; the front end ends a block before a breakpoint, so
+  the next one begins at the very byte. With the gap made a few microseconds
+  wider QEMU's engine died the same way in 5 of 6. Fixed in the store path
+  for both engines (qemu-aok 4f86691): the storing CPU leaves its block at
+  the block's end and invalidates the range once more. After: `poke` 16 of
+  16 (0 of 16 before), the boot 100 of 100. What told them apart was a
+  detector, not thought: a line printed whenever a breakpoint was executed
+  that memory no longer had, with the block's flags (valid, QEMU's, one
+  byte long), and then the same guest under QEMU's engine as the control.
+- A gadget that calls C after it has set the host's flags must save them:
+  the slow path of a read-modify-write store did not, `lock sub; je` read
+  garbage, and the boot died in `__put_cred`.
+- QEMU's per-CPU jump cache holds one block per pc, and kernel code is
+  entered under two flag sets (the stack segment a system call leaves and
+  the one an interrupt leaves). The lookup gadget tried its second slot only
+  when the pc differed: 265 million lookups went to C until it also tried it
+  on a flags mismatch. One macro for the three front ends now.
+- QEMU never links a jump into a block that spans two pages; a hot loop with
+  an instruction across a page boundary went through the main loop every
+  time round until its jump was pointed at the stream's own lookup.
+- **An x86 Linux guest with no entropy source spends a quarter of a minute
+  in its scheduler making some** before the first program that asks for
+  random numbers runs, under any engine. It looked like "Python is no
+  faster". Every x86 machine here has `rdrand` and `random.trust_cpu=on`.
+- A test line that read the flags after a call hashed the stack pointer's,
+  and stack randomisation gave it one of two values at every start, on
+  either engine: it looked like a 32-bit-only difference in the newest
+  instructions. Flags are read in the statement that sets them.
+- Two compare scripts run at once shared their temporary files and could
+  call a difference identical. Each has its own now, and every gate was
+  compared again one at a time.
+
+### In the app
+
+AOK VM is built with the x86-64 engine as its `x86_64` and `i386` QEMU, and
+`make-vm.py` makes "AOK x86-64 Console" and "AOK x86 32-bit Console" (the
+same Alpine guests, `ARCH=x86_64` and `ARCH=i386`). In the simulator both
+boot through UTM's front end and run the six workloads. A PC has no device
+tree to say which engine runs it, so with the gadgets on the processor's
+name ends in "(AOK gadgets)": `model name` in `/proc/cpuinfo`, and the
+processor line of a Windows system's properties.
+
+### Not done
+
+- **Windows XP itself.** No image here; nothing of Windows has run on it.
+  What XP adds to what Linux exercises: a BIOS boot through real mode
+  (QEMU's), far more 16-bit-operand code, x87 everywhere, `sysenter` and
+  `int 2e`, and data and code sharing pages.
+- x87 and MMX, single-precision SSE on the host, anything with VEX.
+- The rotates through carry, 16-bit `adc`/`sbb` and stack operations,
+  16-bit addressing, string I/O, `cmpxchg16b`.
+- A store into the block that is running does not stop that block at the
+  store (QEMU's "precise" self-modifying code): an instruction that rewrites
+  one further on in its own block still runs the old one once.
+- On a device: see `docs/TODO.md`.
+
 ## Appendix: reproducing the race
 
 The harness is in `tests/bench-utm/`, exactly as it ran. It expects to be
