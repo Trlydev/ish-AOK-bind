@@ -42,6 +42,18 @@
 //                machine's: the port the listener has inside is refused from
 //                outside, and a listener on the machine's loopback is refused
 //                from inside
+//   ports        IPv4 and IPv6 each have their own: 127.0.0.1:P and [::1]:P
+//                are both bound, and a listener on one is not reached at the
+//                other; 0.0.0.0:P and [::]:P are both bound when the second
+//                has IPV6_V6ONLY, and without it the IPv6 one takes the
+//                port for both (the IPv4 bind is EADDRINUSE, and an IPv4
+//                connect reaches the IPv6 listener)
+//   ping         a raw ICMP socket inside hears its own echo request to
+//                127.0.0.1 and then the reply, each under an IP header; over
+//                ::1 the same without one, the checksums filled in; before
+//                "lo" is up, and to an address outside, a send is
+//                ENETUNREACH; a datagram ICMP socket is EACCES (a new
+//                namespace's ping_group_range admits nobody)
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -61,6 +73,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -381,6 +394,146 @@ static struct sockaddr_un abstract_name(socklen_t *len) {
 
 static char unix_path[64];
 
+static struct sockaddr_in6 in6_addr(const struct in6_addr *addr, uint16_t port) {
+    struct sockaddr_in6 sa = {.sin6_family = AF_INET6, .sin6_port = port, .sin6_addr = *addr};
+    return sa;
+}
+
+static void case_ports(void) {
+    enter(CLONE_NEWNET);
+    bring_lo_up();
+    const struct in6_addr lo6 = IN6ADDR_LOOPBACK_INIT, any6 = IN6ADDR_ANY_INIT;
+    int one = 1;
+
+    // One port, on each family's loopback address.
+    int l4 = socket(AF_INET, SOCK_STREAM, 0), l6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in a4 = in_addr("127.0.0.1", 0);
+    socklen_t len = sizeof(a4);
+    MUST(bind(l4, (struct sockaddr *) &a4, sizeof(a4)) == 0 && listen(l4, 4) == 0 &&
+         getsockname(l4, (struct sockaddr *) &a4, &len) == 0, "an IPv4 listener on 127.0.0.1 failed");
+    struct sockaddr_in6 a6 = in6_addr(&lo6, a4.sin_port);
+    int c = socket(AF_INET6, SOCK_STREAM, 0);
+    errno = 0;
+    MUST(connect(c, (struct sockaddr *) &a6, sizeof(a6)) == -1 && errno == ECONNREFUSED,
+         "a connect to [::1] reached a listener on 127.0.0.1 (or failed some other way)");
+    close(c);
+    MUST(bind(l6, (struct sockaddr *) &a6, sizeof(a6)) == 0 && listen(l6, 4) == 0,
+         "[::1] could not have the port 127.0.0.1 has");
+    c = socket(AF_INET6, SOCK_STREAM, 0);
+    MUST(connect(c, (struct sockaddr *) &a6, sizeof(a6)) == 0, "a connect to the [::1] listener failed");
+    close(c);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    MUST(connect(c, (struct sockaddr *) &a4, sizeof(a4)) == 0, "a connect to the 127.0.0.1 listener failed");
+    close(c);
+    close(l4);
+    close(l6);
+
+    // The wildcard, with IPV6_V6ONLY: both.
+    int w4 = socket(AF_INET, SOCK_STREAM, 0), w6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in w4a = in_addr("0.0.0.0", 0);
+    len = sizeof(w4a);
+    MUST(bind(w4, (struct sockaddr *) &w4a, sizeof(w4a)) == 0 && listen(w4, 4) == 0 &&
+         getsockname(w4, (struct sockaddr *) &w4a, &len) == 0, "an IPv4 listener on the wildcard failed");
+    struct sockaddr_in6 w6a = in6_addr(&any6, w4a.sin_port);
+    MUST(setsockopt(w6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) == 0, "IPV6_V6ONLY failed");
+    MUST(bind(w6, (struct sockaddr *) &w6a, sizeof(w6a)) == 0 && listen(w6, 4) == 0,
+         "[::] with IPV6_V6ONLY could not have the port 0.0.0.0 has");
+    int v6only = -1;
+    len = sizeof(v6only);
+    MUST(getsockopt(w6, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, &len) == 0 && v6only == 1, "IPV6_V6ONLY reads back %d", v6only);
+    errno = 0;
+    MUST(setsockopt(w6, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) == -1 && errno == EINVAL,
+         "IPV6_V6ONLY on a bound socket did not fail with EINVAL");
+    close(w4);
+    close(w6);
+
+    // Without it: the IPv6 socket has the port for both families.
+    int d6 = socket(AF_INET6, SOCK_STREAM, 0), d4 = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in6 d6a = in6_addr(&any6, 0);
+    len = sizeof(d6a);
+    MUST(bind(d6, (struct sockaddr *) &d6a, sizeof(d6a)) == 0 && listen(d6, 4) == 0 &&
+         getsockname(d6, (struct sockaddr *) &d6a, &len) == 0, "an IPv6 listener on the wildcard failed");
+    struct sockaddr_in d4a = in_addr("0.0.0.0", 0);
+    d4a.sin_port = d6a.sin6_port;
+    errno = 0;
+    MUST(bind(d4, (struct sockaddr *) &d4a, sizeof(d4a)) == -1 && errno == EADDRINUSE,
+         "0.0.0.0 could have a port [::] holds for both families");
+    struct sockaddr_in to = in_addr("127.0.0.1", 0);
+    to.sin_port = d6a.sin6_port;
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    MUST(connect(c, (struct sockaddr *) &to, sizeof(to)) == 0, "an IPv4 connect did not reach the IPv6 listener that holds the port for both");
+    close(c);
+}
+
+static uint16_t checksum(const uint8_t *data, size_t len) {
+    uint32_t sum = 0;
+    for (size_t i = 0; i + 1 < len; i += 2)
+        sum += (uint32_t) data[i] << 8 | data[i + 1];
+    if (len & 1)
+        sum += (uint32_t) data[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t) ~sum;
+}
+
+static void case_ping(void) {
+    enter(CLONE_NEWNET);
+    errno = 0;
+    MUST(socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP) == -1 && errno == EACCES, "a datagram ICMP socket in a new namespace did not fail with EACCES");
+    errno = 0;
+    MUST(socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6) == -1 && errno == EACCES, "a datagram ICMPv6 socket in a new namespace did not fail with EACCES");
+
+    int raw = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    MUST(raw >= 0, "a raw ICMP socket in a namespace of one's own failed");
+    struct timeval wait = {.tv_sec = 5};
+    setsockopt(raw, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+    // type 8 (echo), id 0x1234, sequence 7, eight bytes of payload.
+    uint8_t echo[16] = {8, 0, 0, 0, 0x12, 0x34, 0, 7, 'p', 'a', 'y', 'l', 'o', 'a', 'd', '!'};
+    uint16_t sum = checksum(echo, sizeof(echo));
+    echo[2] = (uint8_t) (sum >> 8);
+    echo[3] = (uint8_t) sum;
+    struct sockaddr_in lo = in_addr("127.0.0.1", 0), out = in_addr("10.0.0.1", 0);
+    errno = 0;
+    MUST(sendto(raw, echo, sizeof(echo), 0, (struct sockaddr *) &lo, sizeof(lo)) == -1 && errno == ENETUNREACH,
+         "an echo request to 127.0.0.1 before \"lo\" is up did not fail with ENETUNREACH");
+    bring_lo_up();
+    errno = 0;
+    MUST(sendto(raw, echo, sizeof(echo), 0, (struct sockaddr *) &out, sizeof(out)) == -1 && errno == ENETUNREACH,
+         "an echo request to an address outside did not fail with ENETUNREACH");
+    MUST(sendto(raw, echo, sizeof(echo), 0, (struct sockaddr *) &lo, sizeof(lo)) == sizeof(echo), "the echo request to 127.0.0.1 was not sent");
+    for (int want = 8; want >= 0; want -= 8) {
+        uint8_t got[128];
+        struct sockaddr_in from = {0};
+        socklen_t from_len = sizeof(from);
+        ssize_t n = recvfrom(raw, got, sizeof(got), 0, (struct sockaddr *) &from, &from_len);
+        MUST(n == 20 + (ssize_t) sizeof(echo), "the raw socket read %zd bytes, wanted an IP header and the %s", n, want == 8 ? "request" : "reply");
+        MUST(got[0] == 0x45 && got[9] == IPPROTO_ICMP && got[2] == 0 && got[3] == 36 && checksum(got, 20) == 0,
+             "the IP header is not one: version %#x, protocol %d, length %d", got[0], got[9], got[2] << 8 | got[3]);
+        MUST(memcmp(got + 12, "\x7f\0\0\1\x7f\0\0\1", 8) == 0, "the packet is not from 127.0.0.1 to 127.0.0.1");
+        MUST(got[20] == want, "ICMP type %d where %d was wanted (the request comes first, then the reply)", got[20], want);
+        MUST(memcmp(got + 24, echo + 4, sizeof(echo) - 4) == 0 && checksum(got + 20, sizeof(echo)) == 0,
+             "the %s does not carry the id, sequence and payload sent, or its checksum is wrong", want == 8 ? "request" : "reply");
+        MUST(from.sin_family == AF_INET && from.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "the sender is not named as 127.0.0.1");
+    }
+
+    int raw6 = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6);
+    MUST(raw6 >= 0, "a raw ICMPv6 socket in a namespace of one's own failed");
+    setsockopt(raw6, SOL_SOCKET, SO_RCVTIMEO, &wait, sizeof(wait));
+    // type 128, id 0x4321, sequence 9, "six"; the kernel fills the checksum.
+    uint8_t echo6[11] = {128, 0, 0, 0, 0x43, 0x21, 0, 9, 's', 'i', 'x'};
+    struct sockaddr_in6 lo6 = {.sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT};
+    MUST(sendto(raw6, echo6, sizeof(echo6), 0, (struct sockaddr *) &lo6, sizeof(lo6)) == sizeof(echo6), "the echo request to ::1 was not sent");
+    static const uint8_t want6[2][4] = {{128, 0, 0x51, 0x24}, {129, 0, 0x50, 0x24}};
+    for (int i = 0; i < 2; i++) {
+        uint8_t got[128];
+        ssize_t n = recv(raw6, got, sizeof(got), 0);
+        MUST(n == sizeof(echo6), "the raw ICMPv6 socket read %zd bytes, wanted %zu", n, sizeof(echo6));
+        MUST(memcmp(got, want6[i], 4) == 0, "message %d over ::1 starts %02x %02x %02x %02x, wanted %02x %02x %02x %02x",
+             i, got[0], got[1], got[2], got[3], want6[i][0], want6[i][1], want6[i][2], want6[i][3]);
+        MUST(memcmp(got + 4, echo6 + 4, sizeof(echo6) - 4) == 0, "message %d over ::1 does not carry what was sent", i);
+    }
+}
+
 static void case_unix(void) {
     // The parent (outside) holds an abstract listener and a pathname one.
     socklen_t len;
@@ -523,6 +676,8 @@ int main(void) {
     }
     udp_port = ntohs(got.sin_port);
     run("sockets made before the unshare", case_old_sockets);
+    run("ports", case_ports);
+    run("ping", case_ping);
     // Exactly one datagram: the one from the socket that was made outside.
     char received[8] = "";
     int count = 0;

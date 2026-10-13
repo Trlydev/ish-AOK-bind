@@ -2943,7 +2943,7 @@ static int sock_net_dest_gate(const struct fd *sock, const void *addr) {
 // receives whatever the LAN sends it). To the wildcard address, or to a
 // loopback address the namespace's "lo" has been given.
 static _Atomic unsigned net_ns_next_port = 0;
-static int net_emul_bind_port(struct fd *sock, uint16_t port);
+static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard);
 static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
     struct net_namespace *ns = sock->socket.net_ns;
     struct sockaddr *sa = addr;
@@ -2965,13 +2965,21 @@ static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
                                                : &((struct sockaddr_in6 *) sa)->sin6_port;
     if (*port != 0 && ntohs(*port) < 1024 && !ns_capable(ns->user_ns, CAP_NET_BIND_SERVICE_))
         return _EACCES;
+    if (sock->socket.net_emul_icmp) {
+        // A raw socket's bind names an address and no port: recorded.
+        memcpy(sock->socket.deferred_addr, addr,
+               addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
+        sock->socket.deferred_addr_len = (socklen_t) addr_len;
+        sock->socket.bind_deferred = true;
+        return 0;
+    }
     if (sock->socket.net_emul) {
         // Recorded first, so that the binding fills the port into it.
         memcpy(sock->socket.deferred_addr, addr,
                addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
         sock->socket.deferred_addr_len = (socklen_t) addr_len;
         sock->socket.bind_deferred = true;
-        int err = net_emul_bind_port(sock, *port);
+        int err = net_emul_bind_port(sock, *port, wildcard);
         if (err < 0)
             sock->socket.bind_deferred = false;
         return err;
@@ -3005,14 +3013,20 @@ static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
 //                         bound first, to a port of its own, as Linux binds
 //                         it), and that is read back as 127.0.0.1:port
 //
-// One port space serves both address families and the wildcard, so a
-// listener on [::1]:P is reached at 127.0.0.1:P; nothing has wanted them
-// apart. The socket stays AF_INET or AF_INET6 to everything the guest can
-// ask of it.
+// IPv4 and IPv6 each have their ports, as on Linux: a server binds
+// 0.0.0.0:P and [::]:P both (nginx and sshd do, with IPV6_V6ONLY on the
+// second), and a listener on [::1]:P is not reached at 127.0.0.1:P. The one
+// place they meet is Linux's too: an IPv6 socket bound to the wildcard
+// WITHOUT IPV6_V6ONLY is "dual", takes IPv4's port with it, and is what an
+// IPv4 destination finds when no IPv4 socket has the port. Within a family
+// one port is one binding, whatever address it named. The socket stays
+// AF_INET or AF_INET6 to everything the guest can ask of it.
 
 struct net_emul_bind {
     const struct net_namespace *ns; // compared, never followed
     bool dgram;
+    bool v6;                        // an AF_INET6 socket's
+    bool dual;                      // ...that takes IPv4's traffic too
     uint16_t port;                  // network order
     uint32_t id;                    // unix_socket_next_id(): names the host path
     struct list links;
@@ -3022,18 +3036,44 @@ static struct list net_emul_binds;
 static uint32_t unix_socket_next_id(void);
 static int unix_host_sun_path(uint32_t socket_id, struct sockaddr_un *addr, size_t *len_out);
 
-static struct net_emul_bind *net_emul_find_locked(const struct net_namespace *ns, bool dgram, uint16_t port) {
+// The binding a destination of the given family finds, or with `any` the
+// first one of either family (is the port free for anyone?).
+static struct net_emul_bind *net_emul_find_locked(const struct net_namespace *ns, bool dgram,
+        uint16_t port, bool v6, bool any) {
+    if (list_null(&net_emul_binds))
+        list_init(&net_emul_binds);
+    struct net_emul_bind *bind, *dual = NULL;
+    list_for_each_entry(&net_emul_binds, bind, links) {
+        if (bind->ns != ns || bind->dgram != dgram || bind->port != port)
+            continue;
+        if (any || bind->v6 == v6)
+            return bind;
+        if (!v6 && bind->dual)
+            dual = bind;
+    }
+    return dual;
+}
+
+// Would a new binding of the port collide with one that is there? Its own
+// family's always; the other family's when either of the two is dual.
+static bool net_emul_conflict_locked(const struct net_namespace *ns, bool dgram, uint16_t port,
+        bool v6, bool dual) {
     if (list_null(&net_emul_binds))
         list_init(&net_emul_binds);
     struct net_emul_bind *bind;
-    list_for_each_entry(&net_emul_binds, bind, links)
-        if (bind->ns == ns && bind->dgram == dgram && bind->port == port)
-            return bind;
-    return NULL;
+    list_for_each_entry(&net_emul_binds, bind, links) {
+        if (bind->ns != ns || bind->dgram != dgram || bind->port != port)
+            continue;
+        if (bind->v6 == v6 || bind->dual || dual)
+            return true;
+    }
+    return false;
 }
 
 static bool sock_net_emul_dgram(const struct fd *sock) {
-    return (sock->socket.type & SOCKET_TYPE_MASK) == SOCK_DGRAM_;
+    // (Everything but a stream: a raw ICMP socket is connectionless too,
+    // though nothing of its is ever looked up in the table.)
+    return (sock->socket.type & SOCKET_TYPE_MASK) != SOCK_STREAM_;
 }
 
 // The host address of binding `id`.
@@ -3052,12 +3092,15 @@ static int net_emul_host_addr(uint32_t id, struct sockaddr_un *un, uint_t *len) 
 }
 
 // Bind `sock` to `port` (network order; 0 for a free one of the kernel's
-// choosing). EADDRINUSE for a port something in the namespace has.
+// choosing), on the wildcard address or a loopback one. EADDRINUSE for a
+// port something in the namespace has.
 static _Atomic unsigned net_emul_next_port = 0;
-static int net_emul_bind_port(struct fd *sock, uint16_t port) {
+static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard) {
     if (sock->socket.net_emul_bound)
         return _EINVAL;
     bool dgram = sock_net_emul_dgram(sock);
+    bool v6 = sock->socket.domain == AF_INET6_;
+    bool dual = v6 && wildcard && !sock->socket.net_emul_v6only;
     struct net_emul_bind *entry = calloc(1, sizeof(*entry));
     if (entry == NULL)
         return _ENOMEM;
@@ -3065,10 +3108,11 @@ static int net_emul_bind_port(struct fd *sock, uint16_t port) {
     if (port == 0) {
         for (int tries = 0; tries < 28000 && port == 0; tries++) {
             uint16_t candidate = htons((uint16_t) (32768 + atomic_fetch_add(&net_emul_next_port, 1) % 28000));
-            if (net_emul_find_locked(sock->socket.net_ns, dgram, candidate) == NULL)
+            // (A port nobody has in either family: what Linux hands out.)
+            if (net_emul_find_locked(sock->socket.net_ns, dgram, candidate, false, true) == NULL)
                 port = candidate;
         }
-    } else if (net_emul_find_locked(sock->socket.net_ns, dgram, port) != NULL) {
+    } else if (net_emul_conflict_locked(sock->socket.net_ns, dgram, port, v6, dual)) {
         port = 0;
     }
     if (port == 0) {
@@ -3076,8 +3120,8 @@ static int net_emul_bind_port(struct fd *sock, uint16_t port) {
         free(entry);
         return _EADDRINUSE;
     }
-    *entry = (struct net_emul_bind) {.ns = sock->socket.net_ns, .dgram = dgram, .port = port,
-                                     .id = unix_socket_next_id()};
+    *entry = (struct net_emul_bind) {.ns = sock->socket.net_ns, .dgram = dgram, .v6 = v6, .dual = dual,
+                                     .port = port, .id = unix_socket_next_id()};
     list_add(&net_emul_binds, &entry->links);
     unlock(&net_emul_lock);
 
@@ -3166,12 +3210,16 @@ static int net_emul_dest(struct fd *sock, void *addr, uint_t *addr_len) {
         return _ENETUNREACH;
     uint16_t port = ((const struct sockaddr_in *) sa)->sin_port;
     if (!sock->socket.net_emul_bound) {
-        int err = net_emul_bind_port(sock, 0);
+        int err = net_emul_bind_port(sock, 0, true);
         if (err < 0)
             return err;
     }
+    // (An IPv4 address written as an IPv6 one is IPv4's.)
+    bool dest_v6 = sa->sa_family == AF_INET6 &&
+        !IN6_IS_ADDR_V4MAPPED(&((const struct sockaddr_in6 *) sa)->sin6_addr);
     lock(&net_emul_lock, 0);
-    struct net_emul_bind *entry = net_emul_find_locked(sock->socket.net_ns, sock_net_emul_dgram(sock), port);
+    struct net_emul_bind *entry = net_emul_find_locked(sock->socket.net_ns, sock_net_emul_dgram(sock),
+            port, dest_v6, false);
     uint32_t id = entry != NULL ? entry->id : 0;
     unlock(&net_emul_lock);
     if (entry == NULL)
@@ -3266,6 +3314,114 @@ static int net_emul_send_dest(struct fd *sock, bool have_addr, void *addr, uint_
         return err;
     *use_addr = true;
     return 0;
+}
+
+// ---- ICMP on a private network namespace's loopback -------------------------
+//
+// `ping 127.0.0.1` in a sandbox. A raw ICMP (or ICMPv6) socket there is a
+// host AF_UNIX datagram pair: the guest reads one end, and what it sends is
+// answered here into the other. An echo request to a loopback address, once
+// "lo" is up, comes back twice, as it does on Linux, where a raw socket hears
+// everything its protocol carries on the interface: the request itself, and
+// the reply to it. IPv4 arrives under an IP header, IPv6 without one, and an
+// ICMPv6 message leaves with the checksum the kernel fills in. Anything else
+// sent is carried nowhere. Measured on Linux 6.12 in `unshare -r -n`.
+//
+// A datagram ICMP socket ("ping socket") is EACCES there: a new network
+// namespace's ping_group_range admits nobody, on Linux too.
+
+static uint16_t net_emul_checksum(const uint8_t *data, size_t len, uint32_t sum) {
+    for (size_t i = 0; i + 1 < len; i += 2)
+        sum += (uint32_t) data[i] << 8 | data[i + 1];
+    if (len & 1)
+        sum += (uint32_t) data[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t) ~sum;
+}
+
+static void net_emul_icmp_set_checksum(uint8_t *msg, size_t len, bool v6) {
+    msg[2] = msg[3] = 0;
+    uint32_t pseudo = 0;
+    if (v6) {
+        // ::1 to ::1, the length, and the next header (58).
+        pseudo = 1 + 1 + (uint32_t) (len >> 16) + (uint32_t) (len & 0xffff) + IPPROTO_ICMPV6;
+    }
+    uint16_t sum = net_emul_checksum(msg, len, pseudo);
+    msg[2] = (uint8_t) (sum >> 8);
+    msg[3] = (uint8_t) sum;
+}
+
+static bool net_emul_icmp_unwanted(const struct fd *sock, uint8_t type) {
+    if (sock->socket.domain == AF_INET6_)
+        return sock->socket.icmp6_filter_valid &&
+            (sock->socket.icmp6_filter[type >> 5] & (1u << (type & 31))) != 0;
+    return type < 32 && (sock->socket.net_emul_icmp_filter & (1u << type)) != 0;
+}
+
+// One message arriving at the socket: under an IP header for IPv4, from
+// `from` to `to` (both loopback addresses, network order).
+static void net_emul_icmp_deliver(struct fd *sock, const uint8_t *msg, size_t len,
+        uint32_t from, uint32_t to, bool request) {
+    if (net_emul_icmp_unwanted(sock, msg[0]))
+        return;
+    static _Atomic unsigned next_ip_id = 1;
+    size_t header = sock->socket.domain == AF_INET6_ ? 0 : 20;
+    uint8_t *packet = malloc(header + len);
+    if (packet == NULL)
+        return;
+    if (header != 0) {
+        unsigned id = atomic_fetch_add(&next_ip_id, 1);
+        size_t total = header + len;
+        uint8_t ip[20] = {
+            0x45, 0, (uint8_t) (total >> 8), (uint8_t) total,
+            (uint8_t) (id >> 8), (uint8_t) id, request ? 0x40 : 0, 0,   // DF on what was sent
+            64, IPPROTO_ICMP, 0, 0,
+        };
+        memcpy(ip + 12, &from, 4);
+        memcpy(ip + 16, &to, 4);
+        uint16_t sum = net_emul_checksum(ip, sizeof(ip), 0);
+        ip[10] = (uint8_t) (sum >> 8);
+        ip[11] = (uint8_t) sum;
+        memcpy(packet, ip, sizeof(ip));
+    }
+    memcpy(packet + header, msg, len);
+    // (A full queue drops it, as a full receive buffer drops a packet.)
+    (void) send(sock->socket.net_emul_icmp_fd, packet, header + len, MSG_DONTWAIT);
+    free(packet);
+}
+
+// A send on such a socket: `dest` is the host-format address given, or NULL
+// for a connected socket's. The length sent, or an error.
+static ssize_t net_emul_icmp_send(struct fd *sock, const void *data, size_t len, const void *dest) {
+    if (dest == NULL && sock->socket.net_emul_dest_port == 0)
+        return _EDESTADDRREQ;
+    if (!atomic_load(&sock->socket.net_ns->lo_up) || (dest != NULL && !host_sockaddr_is_loopback(dest)))
+        return _ENETUNREACH;
+    if (len < 8)
+        return _EINVAL;
+    if (len > 65507)
+        return _EMSGSIZE;
+    bool v6 = sock->socket.domain == AF_INET6_;
+    uint32_t local = htonl(INADDR_LOOPBACK), remote = local;
+    if (!v6 && dest != NULL)
+        remote = ((const struct sockaddr_in *) dest)->sin_addr.s_addr;
+    uint8_t *msg = malloc(len);
+    if (msg == NULL)
+        return _ENOMEM;
+    memcpy(msg, data, len);
+    // (The kernel fills an ICMPv6 checksum; an IPv4 one is the sender's.)
+    if (v6)
+        net_emul_icmp_set_checksum(msg, len, true);
+    net_emul_icmp_deliver(sock, msg, len, local, remote, true);
+    uint8_t echo = v6 ? 128 : 8, reply = v6 ? 129 : 0;
+    if (msg[0] == echo) {
+        msg[0] = reply;
+        net_emul_icmp_set_checksum(msg, len, v6);
+        net_emul_icmp_deliver(sock, msg, len, remote, local, false);
+    }
+    free(msg);
+    return (ssize_t) len;
 }
 
 struct fd *sock_fd_adopt(int sock_fd, int domain, int type, int protocol) {
@@ -3488,6 +3644,32 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     bool net_emul = current_net_ns() != NULL && (domain == AF_INET_ || domain == AF_INET6_) &&
         ((plain_type == SOCK_STREAM_ && (protocol == 0 || protocol == IPPROTO_TCP)) ||
          (plain_type == SOCK_DGRAM_ && (protocol == 0 || protocol == IPPROTO_UDP)));
+    // An ICMP socket there: answered by the kernel, for the loopback alone
+    // (see "ICMP on a private network namespace's loopback").
+    bool net_icmp = current_net_ns() != NULL &&
+        ((domain == AF_INET_ && protocol == IPPROTO_ICMP) || (domain == AF_INET6_ && protocol == IPPROTO_ICMPV6));
+    if (net_icmp && plain_type == SOCK_DGRAM_)
+        return _EACCES;
+    if (net_icmp && plain_type == SOCK_RAW_) {
+        if (!ns_capable(current_net_ns()->user_ns, CAP_NET_RAW_))
+            return _EPERM;
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
+            return errno_map();
+        int size = 262144;
+        (void) setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+        (void) setsockopt(pair[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+        struct fd *fd = sock_fd_adopt(pair[0], (int) domain, (int) type, (int) protocol);
+        if (fd == NULL) {
+            close(pair[0]);
+            close(pair[1]);
+            return _ENOMEM;
+        }
+        fd->socket.net_emul = true;
+        fd->socket.net_emul_icmp = true;
+        fd->socket.net_emul_icmp_fd = pair[1];
+        return f_install(fd, type & ~SOCKET_TYPE_MASK);
+    }
     int sock;
     if (net_emul) {
         sock = socket(AF_UNIX, plain_type == SOCK_STREAM_ ? SOCK_STREAM : SOCK_DGRAM, 0);
@@ -7008,8 +7190,13 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
             }
             if (!host_sockaddr_is_loopback(dest) || !atomic_load(&sock->socket.net_ns->lo_up))
                 return _ENETUNREACH;
+            if (sock->socket.net_emul_icmp) {
+                // (No port to remember: only that there is a destination.)
+                sock->socket.net_emul_dest_port = 1;
+                return 0;
+            }
             if (!sock->socket.net_emul_bound) {
-                int bind_err = net_emul_bind_port(sock, 0);
+                int bind_err = net_emul_bind_port(sock, 0, true);
                 if (bind_err < 0)
                     return bind_err;
             }
@@ -7250,7 +7437,7 @@ int_t sys_listen(fd_t sock_fd, int_t backlog) {
         if (sock_net_emul_dgram(sock))
             return _EOPNOTSUPP;
         if (!sock->socket.net_emul_bound) {
-            int emul_err = net_emul_bind_port(sock, 0);
+            int emul_err = net_emul_bind_port(sock, 0, true);
             if (emul_err < 0)
                 return emul_err;
         }
@@ -7871,7 +8058,8 @@ static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
         dword_t real_len = 0;
         memcpy(sockaddr, &none, sizeof(none));
         net_emul_from_host(sock, sockaddr, &real_len);
-        ((struct sockaddr_in *) sockaddr)->sin_port = sock->socket.net_emul_dest_port;
+        ((struct sockaddr_in *) sockaddr)->sin_port =
+            sock->socket.net_emul_icmp ? 0 : sock->socket.net_emul_dest_port;
         int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
         if (err < 0)
             return err;
@@ -8077,6 +8265,11 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
             goto error;
         if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul)
             inet_nat_rewrite_dest(sock, &sockaddr);
+    }
+    if (sock->socket.net_emul_icmp) {
+        ssize_t sent = net_emul_icmp_send(sock, buffer, len, sockaddr_addr != 0 ? &sockaddr : NULL);
+        free(buffer);
+        return (int_t) sent;
     }
     if (sock->socket.net_emul) {
         // Loopback in a private network namespace: the destination is a
@@ -8804,6 +8997,30 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         // all) have nothing to set: TCP_NODELAY on a path with no delay,
         // a TTL on packets that are never packets. Accepted, as loopback
         // would accept them, and without effect.
+        // An ICMP socket's own: its filter is kept and applied (ICMP_FILTER
+        // is option 1 of SOL_RAW, 255); the rest of that level, and of
+        // ICMPv6's, has nothing to set either.
+        if (sock->socket.net_emul_icmp && level == 255 && option == 1) {
+            if (value_len < sizeof(dword_t))
+                return _EINVAL;
+            memcpy(&sock->socket.net_emul_icmp_filter, value, sizeof(dword_t));
+            return 0;
+        }
+        if (sock->socket.net_emul_icmp && (level == 255 || level == IPPROTO_ICMPV6))
+            return 0;
+        // Kept: it decides what a wildcard bind takes (net_emul_bind_port).
+        if (sock->socket.net_emul && level == IPPROTO_IPV6 && option == IPV6_V6ONLY_) {
+            if (sock->socket.domain != AF_INET6_)
+                return _ENOPROTOOPT;
+            if (value_len < sizeof(dword_t))
+                return _EINVAL;
+            if (sock->socket.net_emul_bound)
+                return _EINVAL;     // not once it is bound, as on Linux
+            dword_t on;
+            memcpy(&on, value, sizeof(on));
+            sock->socket.net_emul_v6only = on != 0;
+            return 0;
+        }
         if (sock->socket.net_emul && (level == IPPROTO_IP || level == IPPROTO_TCP ||
                     level == IPPROTO_UDP || level == IPPROTO_IPV6))
             return 0;
@@ -9374,6 +9591,10 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         memset(value, 0, user_value_len != 0 ? user_value_len : 1);
         if (!(level == IPPROTO_TCP && option == 11 /* TCP_INFO */) && value_len > sizeof(dword_t))
             value_len = sizeof(dword_t);
+        if (level == IPPROTO_IPV6 && option == IPV6_V6ONLY_ && value_len >= sizeof(dword_t)) {
+            dword_t on = sock->socket.net_emul_v6only;
+            memcpy(value, &on, sizeof(on));
+        }
     } else if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
         dword_t value_p;
         if (option == SO_DOMAIN_)
@@ -10186,7 +10407,7 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     }
     // Loopback in a private network namespace: as in sendto.
     bool net_emul_drop = false;
-    if (sock->socket.net_emul) {
+    if (sock->socket.net_emul && !sock->socket.net_emul_icmp) {
         bool use_addr;
         uint_t name_len = msg.msg_name != NULL ? msg.msg_namelen : 0;
         int emul_err = net_emul_send_dest(sock, msg.msg_name != NULL, &msg_name, &name_len,
@@ -10245,6 +10466,24 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
 
     if (sock->socket.domain == AF_NETLINK_) {
         err = netlink_handle_sendmsg(sock, &msg);
+        goto out_free_iov;
+    }
+    // ICMP in a private network namespace: one message, answered here.
+    if (sock->socket.net_emul_icmp) {
+        size_t total = 0;
+        for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++)
+            total += msg_iov[i].iov_len;
+        uint8_t *whole = malloc(total != 0 ? total : 1);
+        err = _ENOMEM;
+        if (whole == NULL)
+            goto out_free_iov;
+        size_t at = 0;
+        for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
+            memcpy(whole + at, msg_iov[i].iov_base, msg_iov[i].iov_len);
+            at += msg_iov[i].iov_len;
+        }
+        err = (int_t) net_emul_icmp_send(sock, whole, total, msg.msg_name);
+        free(whole);
         goto out_free_iov;
     }
 
@@ -11953,6 +12192,8 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
     struct sockaddr_max_ emul_dest;
     uint_t emul_dest_len = 0;
     bool emul_to = false;
+    if (fd->socket.net_emul_icmp)
+        return net_emul_icmp_send(fd, buf, size, NULL);
     if (fd->socket.net_emul && sock_net_emul_dgram(fd)) {
         bool drop;
         int emul_err = net_emul_send_dest(fd, false, &emul_dest, &emul_dest_len, &emul_to, &drop);
@@ -12327,6 +12568,10 @@ static int sock_close(struct fd *fd) {
     }
     if (fd->socket.net_emul)
         net_emul_release(fd);
+    if (fd->socket.net_emul_icmp) {
+        close(fd->socket.net_emul_icmp_fd);
+        fd->socket.net_emul_icmp = false;
+    }
     net_ns_release(fd->socket.net_ns);
     fd->socket.net_ns = NULL;
     if (fd->real_fd < 0)

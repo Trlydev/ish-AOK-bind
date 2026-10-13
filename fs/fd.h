@@ -120,6 +120,17 @@ struct fd {
             bool net_emul_bound;
             uint16_t net_emul_dest_port;
             uint32_t net_emul_id;
+            // A raw ICMP socket there (also net_emul): nothing is bound or
+            // looked up for it. What it sends to the loopback is answered
+            // by the kernel, into net_emul_icmp_fd -- the other end of the
+            // host socket pair it reads. net_emul_icmp_filter is its
+            // ICMP_FILTER (a set bit is a type not wanted).
+            // (IPV6_V6ONLY, as set: an IPv6 socket bound to the wildcard
+            // without it takes IPv4's traffic for the port as well.)
+            bool net_emul_v6only;
+            bool net_emul_icmp;
+            int net_emul_icmp_fd;
+            uint32_t net_emul_icmp_filter;
             int domain;
             int type;
             int protocol;

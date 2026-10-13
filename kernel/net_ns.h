@@ -28,9 +28,9 @@ struct fd;
 //     another (fs/sock.c, "Loopback in a private network namespace"). So a
 //     server there listens, a client connects to it, datagrams are answered
 //     -- and a destination that is not the namespace's loopback is
-//     ENETUNREACH, because there is nowhere for it to go. Raw and ICMP
-//     sockets are made, and can send nothing: `ping 127.0.0.1` does not
-//     work there.
+//     ENETUNREACH, because there is nowhere for it to go. A raw ICMP
+//     socket's echo requests to the loopback are answered by the kernel,
+//     so `ping 127.0.0.1` works; any other raw socket can send nothing.
 //   - an abstract AF_UNIX name is the namespace's own: it neither finds nor
 //     collides with one bound outside. Pathname sockets are the
 //     filesystem's, as on Linux.

@@ -44,9 +44,9 @@ the namespace's own, and loopback traffic goes from one such socket to
 another. So a server in a sandbox listens on 127.0.0.1 and its client
 connects, datagrams are answered, `accept` and `recvfrom` name the other end
 by address and port — and a destination anywhere else is `ENETUNREACH`,
-because there is nowhere for it to go. One port space serves IPv4 and IPv6,
-raw and ICMP sockets can send nothing (`ping 127.0.0.1` does not work
-there), and there is no second interface to make. Abstract `AF_UNIX` names
+because there is nowhere for it to go. `ping 127.0.0.1` is answered by the
+kernel itself, to the raw socket that sent it, and there is no second
+interface to make. Abstract `AF_UNIX` names
 are the namespace's own; pathname sockets are the filesystem's, as on Linux.
 A socket keeps the namespace it was made in wherever its descriptor goes.
 The native `curl` and `wget`, which fetch through the host rather than
