@@ -9457,7 +9457,18 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
                 const fd_t *fds = (const fd_t *) cmsg_data;
                 for (unsigned i = 0; i < data_len / sizeof(fd_t); i++) {
                     STRACE(" sending fd %d", fds[i]);
-                    scm->fds[fd_i++] = fd_retain(f_get(fds[i]));
+                    // A number that names no open descriptor is EBADF and
+                    // nothing is sent, as Linux's scm_fp_copy has it. (It
+                    // was a NULL handed to fd_retain: the emulator's own
+                    // crash, for any guest that passed a closed descriptor
+                    // or the -1 a failed open had just given it.)
+                    struct fd *passed = f_get_retain(fds[i]);
+                    if (passed == NULL) {
+                        scm->num_fds = fd_i; // only these are held
+                        err = _EBADF;
+                        goto out_free_scm;
+                    }
+                    scm->fds[fd_i++] = passed;
                 }
             }
             if (sock_is_unix_dgram(sock) || sock_is_unix_seqpacket(sock)) {
