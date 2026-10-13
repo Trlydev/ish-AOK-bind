@@ -757,6 +757,15 @@ struct task {
     // clearing TF as it does for the guest's own (x86_signal_handler_flags).
     // Not inherited. At the end for the reason given above native_standin_child.
     bool ptrace_singlestep;
+    // One thread of a native program at a time takes its pending signals
+    // (nlibc_deliver_signals_count). The program's own threads share this
+    // task and every one of them passes a checkpoint on each syscall; two
+    // collecting at once were two sigtimedwaits on one task, which asserts
+    // (signal.c: current->waiting == 0) -- the emulator's abort, found with
+    // two tokio programs running and a child exiting in each. Atomic; not
+    // inherited; cleared where native_helper_threads is. At the end for the
+    // reason given above native_standin_child.
+    int native_delivering;
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {

@@ -19,6 +19,7 @@
 #endif
 #include <time.h>
 
+#include "kernel/native.h"
 #include "kernel/native_kqueue.h"
 #include "kernel/native_libc.h"
 
@@ -56,6 +57,10 @@ void nlibc_kqueue_dup_hook(int oldfd, int newfd) {
     (void) oldfd; (void) newfd;
 }
 
+void nlibc_kqueue_io_hook(int fd, bool write) {
+    (void) fd; (void) write;
+}
+
 #else
 
 // One registration. kqueue is keyed by (ident, filter), so the same descriptor
@@ -88,6 +93,17 @@ struct kq {
     pthread_mutex_t lock;
     int  refs;              // held across the unlocked ppoll
     bool dead;              // closed while someone was polling
+    // The program run that made the queue (nlibc_invocation_token). A
+    // descriptor NUMBER means something only inside one task's table, and
+    // every tokio program's queue is the same small number: looked up by
+    // number alone, two runs at once -- two hx sessions -- found each other's
+    // queues. One registered in, waited on and woke the other's; and when one
+    // of them closed its descriptors the bookkeeping came off whichever queue
+    // was nearer the head of the list, until the survivor asked for a number
+    // that named nothing, got EBADF from kevent(), and tokio panicked. With
+    // the Rust crate panic=abort and abort() the host's, that was the app:
+    // build 558's crash report from an iPad.
+    uint64_t token;
     struct kq *next;
 };
 
@@ -138,9 +154,11 @@ static bool kq_name_add(struct kq *q, int fd) {
     return true;
 }
 
+// The calling program's queue of that number, and nobody else's.
 static struct kq *kq_lookup(int fd) {
+    uint64_t token = nlibc_invocation_token();
     for (struct kq *q = kq_list; q != NULL; q = q->next)
-        if (!q->dead && kq_names(q, fd))
+        if (!q->dead && q->token == token && kq_names(q, fd))
             return q;
     return NULL;
 }
@@ -203,6 +221,7 @@ int nlibc_kqueue(void) {
     }
     q->wake_fd = fds[1];
     q->refs = 1;
+    q->token = nlibc_invocation_token();
     pthread_mutex_init(&q->lock, NULL);
     if (!kq_name_add(q, fds[0])) {
         pthread_mutex_destroy(&q->lock);
@@ -318,9 +337,24 @@ static void kq_remove(struct kq *q, struct kq_reg *r) {
 // read cannot block -- where a second one could, if O_NONBLOCK had not
 // survived. Anything left over is drained by the next call, and the pipe only
 // has to mean "something happened", not "how many times".
+// Set around the reads and writes this file makes of its own wake pipe. They
+// go through the shim's read and write like anyone's, come back short as a
+// matter of course, and would call nlibc_kqueue_io_hook -- from under the
+// very lock it takes.
+static __thread bool kq_own_io;
+
 static void kq_drain_wake(struct kq *q) {
     char buf[256];
+    kq_own_io = true;
     (void) nlibc_read(q->fds[0], buf, sizeof(buf));
+    kq_own_io = false;
+}
+
+static void kq_wake(struct kq *q) {
+    char one = 1;
+    kq_own_io = true;
+    (void) nlibc_write(q->wake_fd, &one, 1);
+    kq_own_io = false;
 }
 
 // ------------------------------------------------------------ the interface
@@ -371,6 +405,15 @@ static int kq_apply(struct kq *q, const struct kevent *ch, bool *woke) {
         r->enabled = true;
     if (ch->flags & EV_DISABLE)
         r->enabled = false;
+    // A descriptor added (or enabled) while another thread is asleep in
+    // kevent() is not in the set that thread is waiting on: it built its
+    // pollfds before this call. A kernel's kqueue has no such set to go stale;
+    // here the sleeper has to be woken to build a new one, or whatever happens
+    // on the new descriptor is never seen. That was a hang about one time in
+    // fifty with two tokio programs running -- a socket registered by a
+    // worker thread just after the reactor went back to sleep.
+    if (ch->filter != EVFILT_USER && (ch->flags & (EV_ADD | EV_ENABLE)))
+        *woke = true;
     // The waker. mio arms an EVFILT_USER registration once and then fires it
     // from any thread with NOTE_TRIGGER.
     if (ch->filter == EVFILT_USER && (ch->fflags & NOTE_TRIGGER)) {
@@ -416,6 +459,78 @@ static short kq_revents_for(const struct pollfd *pfds, unsigned n, int fd) {
     return 0;
 }
 
+// The other half of the edge state (struct kq_reg's `suppressed`).
+//
+// A registration that has been reported is left out of the wait until it is
+// seen not ready, and the only look was at the START of a kevent(). So a
+// waiter that came back round while the consumer had not yet read -- another
+// worker thread of the same runtime, about to -- went to sleep without the
+// descriptor in its set, and nothing told it when the consumer did drain it.
+// The next data, or the peer closing, was never seen: tokio's own TCP round
+// trip in rust-probe hung there, every time, once the two threads' timing
+// settled that way.
+//
+// The consumer says when it has drained: a read or write that comes back
+// short or EAGAIN is exactly the moment an edge-triggered consumer stops
+// trying and waits for the next edge (mio's contract, and tokio's
+// short-read rule on kqueue platforms). The shim's read and write paths call
+// this then. The registration goes back into the set and the waiter is woken
+// to build a new one; if the descriptor is in fact still ready it is simply
+// reported again, which costs a call and loses nothing.
+void nlibc_kqueue_io_hook(int fd, bool write) {
+    if (kq_list == NULL || kq_own_io)   // nobody has a queue (every other
+        return;                         // program), or this is the queue's own
+    int16_t filter = write ? EVFILT_WRITE : EVFILT_READ;
+    uint64_t token = nlibc_invocation_token();
+    pthread_mutex_lock(&kq_list_lock);
+    struct kq *woken = NULL;
+    for (struct kq *q = kq_list; q != NULL && woken == NULL; q = q->next) {
+        if (q->dead || q->token != token)
+            continue;
+        pthread_mutex_lock(&q->lock);
+        for (size_t i = 0; i < q->n; i++) {
+            struct kq_reg *r = &q->regs[i];
+            if (r->ident == (uintptr_t) fd && r->filter == filter && r->suppressed) {
+                r->suppressed = false;
+                woken = q;
+            }
+        }
+        pthread_mutex_unlock(&q->lock);
+        if (woken != NULL)
+            woken->refs++;
+    }
+    pthread_mutex_unlock(&kq_list_lock);
+    if (woken == NULL)
+        return;
+    KQ_TRACE("fd %d %s drained: back in the set, waking the queue", fd, write ? "write" : "read");
+    int saved_errno = errno;    // the caller's result is still to be read
+    kq_wake(woken);
+    errno = saved_errno;
+    kq_release(woken);
+}
+
+// ISH_KQ_TEST_FAIL=<n>, in the emulator's own environment: the next n waits
+// fail with ENOMEM, as a wait can for want of memory for its descriptor list
+// -- and nothing else can be made to on demand. It is how the tokio fork's
+// answer to a failed poll is tested (deps/tokio's runtime/io/driver.rs retries
+// before it panics; tests/manual/native_tokio_poll_error.sh). Read once.
+static bool kq_test_fail_this_wait(void) {
+    static int remaining = -1;
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&lock);
+    if (remaining < 0) {
+        const char *spec = getenv("ISH_KQ_TEST_FAIL");
+        remaining = spec != NULL ? atoi(spec) : 0;
+        if (remaining < 0)
+            remaining = 0;
+    }
+    bool fail = remaining > 0;
+    if (fail)
+        remaining--;
+    pthread_mutex_unlock(&lock);
+    return fail;
+}
+
 int nlibc_kevent(int kq, const void *changelist, int nchanges,
                  void *eventlist, int nevents, const void *timeout) {
     const struct kevent *changes = changelist;
@@ -432,8 +547,8 @@ int nlibc_kevent(int kq, const void *changelist, int nchanges,
         errno = EBADF;
         return -1;
     }
-    KQ_TRACE("kevent(fd=%d) nchanges=%d nevents=%d timeout=%s", kq, nchanges,
-             nevents, ts == NULL ? "block" : "set");
+    KQ_TRACE("kevent(fd=%d, queue %p) nchanges=%d nevents=%d timeout=%s", kq, (void *) q,
+             nchanges, nevents, ts == NULL ? "block" : "set");
 
     int out = 0;
     bool user_ready = false;
@@ -471,13 +586,19 @@ int nlibc_kevent(int kq, const void *changelist, int nchanges,
     // still hung, because the sleeper had no reason to look.
     if (woke) {
         KQ_TRACE("  waking the queue");
-        char one = 1;
-        (void) nlibc_write(q->wake_fd, &one, 1);
+        kq_wake(q);
     }
 
     if (out >= nevents) {           // receipts filled it; do not also block
         kq_release(q);
         return out;
+    }
+
+    if (kq_test_fail_this_wait()) {
+        KQ_TRACE("  ISH_KQ_TEST_FAIL: failing this wait with ENOMEM");
+        kq_release(q);
+        errno = ENOMEM;
+        return -1;
     }
 
     // +1 for the queue's own read end, which is how a waker on another thread
@@ -530,8 +651,16 @@ int nlibc_kevent(int kq, const void *changelist, int nchanges,
              user_ready ? "no wait (user event pending)"
                         : (ts == NULL ? "no timeout"
                                       : (ts->tv_sec == 0 && ts->tv_nsec == 0 ? "0s" : "timed")));
+    if (kq_debug())
+        for (unsigned i = 0; i < n; i++)
+            KQ_TRACE("    waiting on fd %d for %s%s", pfds[i].fd, (pfds[i].events & POLLIN) ? "r" : "",
+                     (pfds[i].events & POLLOUT) ? "w" : "");
     int rc = nlibc_ppoll(pfds, total, user_ready ? &zero : ts);
     KQ_TRACE("  wait returned %d (errno %d)", rc, rc < 0 ? errno : 0);
+    if (kq_debug() && rc > 0)
+        for (unsigned i = 0; i < total; i++)
+            if (pfds[i].revents != 0)
+                KQ_TRACE("    fd %d: revents %#x", pfds[i].fd, pfds[i].revents);
     if (rc < 0 && errno != EINTR) {
         free(pfds);
         kq_release(q);

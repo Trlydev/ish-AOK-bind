@@ -333,18 +333,16 @@ PURE = {
     # Darwin's strmode differs from openbsd's on 4096 of 65536 modes. It is
     # compiled from openbsd-compat now (HAVE_STRMODE undefined) and so is no
     # longer a host symbol at all.
-    # Rust's two pieces of runtime plumbing.
-    #
-    # __assert_rtn is Darwin's assert-failure handler: it prints and aborts, so
-    # it qualifies on the same terms as abort() below -- a crash either way, and
-    # no way to observe or change the host.
+    # Rust's piece of runtime plumbing. (__assert_rtn, Darwin's assert-failure
+    # handler, was here beside abort() as "a crash either way". Both are routed
+    # now: the crash was the app's, and build 558 had one from the field.)
     #
     # rust_eh_personality is the unwinder's personality routine. It is called
     # by the unwind machinery while walking frames and reads only the tables
     # the compiler emitted alongside the code. The crate is built panic=abort,
     # so nothing here should reach it at all; it is referenced because std is
     # compiled once for both panic strategies.
-    "__assert_rtn", "rust_eh_personality",
+    "rust_eh_personality",
     # sysctlbyname, and only as Rust's std_detect uses it.
     #
     # This is the one name in the routed Rust archive that llvm-objcopy cannot
@@ -361,11 +359,6 @@ PURE = {
     # prepared to give it. The split is what makes this entry safe; without it
     # this would be a hole.
     "sysctlbyname",
-    # abort() raises SIGABRT on the calling thread. It ends the app rather than
-    # the task, which is wrong, but it is a crash either way and not a way to
-    # observe or change the host -- routing it would be an improvement, not a
-    # correctness fix.
-    "abort",
 }
 
 # Compiler and runtime plumbing rather than calls the program made.
@@ -502,14 +495,14 @@ def _symbols(path, args):
 # receiver is. Calling it pure would hand back precisely the matched-on-form
 # hole the note below describes, and one entry would exempt every Objective-C
 # call in any future file. So the archive stays out, and what appears here
-# instead is the seven-name interface it presents -- names a reader can follow
+# instead is the eight-name interface it presents -- names a reader can follow
 # to one file and one written justification.
 #
 # The cost, stated so it is not discovered later: nothing checks that file. It
 # is 570 lines and it is on the reviewer.
 SHIM_TO_HOST = {
     "curl_easy_init", "curl_easy_setopt", "curl_easy_perform",
-    "curl_easy_cleanup", "curl_easy_strerror",
+    "curl_easy_cleanup", "curl_easy_strerror", "curl_easy_getinfo",
     "curl_slist_append", "curl_slist_free_all",
 }
 

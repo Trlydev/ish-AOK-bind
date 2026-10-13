@@ -233,6 +233,13 @@ char *nlibc_setlocale(int category, const char *name);
 
 /* The host's exit() would end the whole app; a native program is a task. */
 noreturn void nlibc_exit(int status);
+/* And so would the host's abort(): the program dies of SIGABRT, as on Linux,
+ * and the app goes on. A Rust panic ends here too (deps/rust-native is
+ * panic=abort), and so does a failed assert(), through Darwin's handler. */
+noreturn void nlibc_abort(void);
+#if defined(__APPLE__)
+noreturn void nlibc_assert_rtn(const char *func, const char *file, int line, const char *expr);
+#endif
 
 /* Identity: the GUEST's, not the device's. whoami said "mobile" before this. */
 uid_t nlibc_getuid(void);
@@ -1007,6 +1014,10 @@ char *nlibc_strchrnul(const char *s, int c);
 #define exit                     nlibc_exit
 #define _exit                    nlibc_exit
 #define _Exit                    nlibc_exit
+#define abort                    nlibc_abort
+#if defined(__APPLE__)
+#define __assert_rtn             nlibc_assert_rtn
+#endif
 #define getuid                   nlibc_getuid
 #define geteuid                  nlibc_geteuid
 #define getgid                   nlibc_getgid

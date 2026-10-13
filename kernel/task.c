@@ -1336,6 +1336,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->ptrace_link_capable = false;
     task->ptrace_trap_notify = false;
     task->native_helper_threads = 0;
+    task->native_delivering = 0;
     task->exit_arch = NULL;
     memset(task->ptrace_debugreg, 0, sizeof(task->ptrace_debugreg));
     task->ptrace_singlestep = false;
@@ -1472,6 +1473,17 @@ static void task_free_final(struct task *task) {
     seccomp_filter_release(task->seccomp_filter);
     task->seccomp_filter = NULL;
     sockrestart_task_gone(task);
+    // A native program that ended with threads of its own still running --
+    // it aborted, or exited from one of them -- has left host threads whose
+    // `current` is this struct, and all that stands between them and the rest
+    // of the kernel is native_have_task() reading it (files is NULL from
+    // do_exit on). They are not stopped and cannot be; so the struct they
+    // read is not handed back to malloc. A few kilobytes per program that
+    // ends that way, against a use-after-free in every one of its threads.
+    // (A thread that returned was counted out in nlibc_thread_trampoline; a
+    // program whose threads were all joined frees as before.)
+    if (task != NULL && __atomic_load_n(&task->native_helper_threads, __ATOMIC_ACQUIRE) > 0)
+        return;
     free(task);
 }
 

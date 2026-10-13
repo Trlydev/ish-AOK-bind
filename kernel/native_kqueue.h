@@ -17,6 +17,7 @@
 #ifndef NATIVE_KQUEUE_H
 #define NATIVE_KQUEUE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 // Returns a guest descriptor. Closing it through the shim's close() releases
@@ -39,5 +40,11 @@ bool nlibc_kqueue_close_hook(int fd);
 // one the poller waits on. Without this that call got EBADF, which is what
 // tokio reported as "Runtime::build failed".
 void nlibc_kqueue_dup_hook(int oldfd, int newfd);
+
+// Called when a read (write == false) or a write on a descriptor has come
+// back short or with EAGAIN: the consumer has drained it and will wait for
+// the next edge, so a registration held back as "already reported" has to be
+// watched again. Cheap when the program has no queue. See the .c.
+void nlibc_kqueue_io_hook(int fd, bool write);
 
 #endif

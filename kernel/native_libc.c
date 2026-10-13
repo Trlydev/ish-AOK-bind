@@ -306,12 +306,24 @@ int nlibc_close(int fd_no) {
     return (int) nlibc_ret(native_syscall(NATIVE_SYS_close, fd_no));
 }
 
+// A read or write that came back with less than was asked, or with EAGAIN,
+// has drained the descriptor (or filled it): the program will now wait for
+// the next edge, and a kqueue registration held back as already reported has
+// to be watched again -- kernel/native_kqueue.h's nlibc_kqueue_io_hook, which
+// costs one load when the program has no queue. `res` is the syscall's own
+// result, before translation.
+static void nlibc_note_io(int fd_no, sqword_t res, size_t asked, bool write) {
+    if (res == _EAGAIN || (res > 0 && (size_t) res < asked))
+        nlibc_kqueue_io_hook(fd_no, write);
+}
+
 ssize_t nlibc_read(int fd_no, void *buf, size_t n) {
     NATIVE_FRAME;
     guest_addr_t guest_buf = native_scratch_alloc(n);
     if (guest_buf == 0 && n > 0)
         return nlibc_fail(_ENOMEM);
     sqword_t res = native_syscall(NATIVE_SYS_read, fd_no, guest_buf, n);
+    nlibc_note_io(fd_no, res, n, false);
     if (res > 0 && native_scratch_get(buf, guest_buf, (size_t) res) < 0)
         return nlibc_fail(_EFAULT);
     return nlibc_ret(res);
@@ -322,7 +334,9 @@ ssize_t nlibc_write(int fd_no, const void *buf, size_t n) {
     guest_addr_t guest_buf = native_scratch_put(buf, n);
     if (guest_buf == 0 && n > 0)
         return nlibc_fail(_ENOMEM);
-    return nlibc_ret(native_syscall(NATIVE_SYS_write, fd_no, guest_buf, n));
+    sqword_t res = native_syscall(NATIVE_SYS_write, fd_no, guest_buf, n);
+    nlibc_note_io(fd_no, res, n, true);
+    return nlibc_ret(res);
 }
 
 off_t nlibc_lseek(int fd_no, off_t off, int whence) {
@@ -3683,6 +3697,62 @@ noreturn void nlibc_exit(int status) {
     do_exit_group((status & 0xff) << 8);
 }
 
+// abort(), the program's and not the app's.
+//
+// Left to the host it raises SIGABRT in the one process there is, and every
+// session goes with the program: build 558's Organizer crash on an iPad was a
+// Rust panic in native helix (tokio's reactor met an error it does not
+// expect; deps/rust-native is panic=abort), and the abort it ended in was the
+// app's. "A crash either way" was the reason for leaving it alone, and it is
+// not the same crash.
+//
+// Linux's abort raises SIGABRT for a handler to see -- one that returns
+// changes nothing, and one that never returns (longjmp, exit) is the program's
+// business -- and then the process dies of SIGABRT whatever the handler or
+// the mask said. So: the signal to this thread's task, a checkpoint to run a
+// handler there, and the task group ends with SIGABRT as its wait status,
+// which a shell reports as "Aborted" and 134.
+//
+// A program's own threads (nlibc_pthread_create) are host threads sharing its
+// one task, so whichever of them aborts ends the program, there -- as a fatal
+// signal taken at one of their checkpoints always has. The others are not
+// stopped by that: they run on in the program's code against a task that is
+// gone, every call into the shim fails, and a Rust thread that sees its
+// runtime fail panics in its turn. That second abort is the case below with
+// no task: the thread ends, and only the thread. (Rust's own join() does it
+// at once -- it panics when the thread it waited for left without a result.)
+noreturn void nlibc_abort(void) {
+    if (native_have_task()) {
+        native_syscall(NATIVE_SYS_tgkill, native_syscall(NATIVE_SYS_getpid),
+                native_syscall(NATIVE_SYS_gettid), SIGABRT_);
+        native_checkpoint();
+        // No flush of stdio: abort() makes no promise of one, and the stream
+        // another thread is in the middle of writing is locked.
+        do_exit_group(SIGABRT_);
+    }
+    pthread_exit(NULL);
+}
+
+#if defined(__APPLE__)
+// Darwin's assert() calls this, and the host's version prints to the app's
+// stderr and aborts the app. The message goes to the program's stderr, in
+// Darwin's words, and the program aborts.
+noreturn void nlibc_assert_rtn(const char *func, const char *file, int line, const char *expr) {
+    char message[512];
+    int n;
+    if (func != NULL)
+        n = snprintf(message, sizeof(message), "Assertion failed: (%s), function %s, file %s, line %d.\n",
+                     expr, func, file, line);
+    else
+        n = snprintf(message, sizeof(message), "Assertion failed: (%s), file %s, line %d.\n", expr, file, line);
+    if (n > (int) sizeof(message) - 1)
+        n = (int) sizeof(message) - 1;
+    if (n > 0 && native_have_task())
+        nlibc_write(2, message, (size_t) n);
+    nlibc_abort();
+}
+#endif
+
 // ---------------------------------------------------------------- networking
 //
 // AOK's sockets are real host sockets underneath (fs/sock.c), so what routing
@@ -3952,6 +4022,9 @@ static int nlibc_accept_common(unsigned num, int fd_no, void *addr, socklen_t *l
             return nlibc_fail(_ENOMEM);
     }
     sqword_t res = native_syscall(num, fd_no, guest_sa, guest_salen);
+    // An accept that found nothing waiting has drained the listener.
+    if (num == NATIVE_SYS_accept)
+        nlibc_note_io(fd_no, res, 0, false);
     if (res < 0)
         return nlibc_fail((int) res);
     if (guest_sa != 0) {
@@ -4004,8 +4077,10 @@ ssize_t nlibc_sendto(int fd_no, const void *buf, size_t len, int flags,
         if (guest_sa == 0)
             return nlibc_fail(_ENOMEM);
     }
-    return nlibc_ret(native_syscall(NATIVE_SYS_sendto, fd_no, guest_buf, len,
-            nlibc_msg_to_guest(flags), guest_sa, guest_salen));
+    sqword_t res = native_syscall(NATIVE_SYS_sendto, fd_no, guest_buf, len,
+            nlibc_msg_to_guest(flags), guest_sa, guest_salen);
+    nlibc_note_io(fd_no, res, len, true);
+    return nlibc_ret(res);
 }
 
 ssize_t nlibc_send(int fd_no, const void *buf, size_t len, int flags) {
@@ -4028,6 +4103,7 @@ ssize_t nlibc_recvfrom(int fd_no, void *buf, size_t len, int flags,
     }
     sqword_t res = native_syscall(NATIVE_SYS_recvfrom, fd_no, guest_buf, len,
             nlibc_msg_to_guest(flags), guest_sa, guest_salen);
+    nlibc_note_io(fd_no, res, len, false);
     if (res < 0)
         return nlibc_fail((int) res);
     if (res > 0 && native_scratch_get(buf, guest_buf, (size_t) res) < 0)
@@ -4148,6 +4224,14 @@ static size_t nlibc_put_guest_msghdr(void *raw, bool w64, guest_addr_t name,
     return sizeof(*h);
 }
 
+// (For nlibc_note_io: how much a sendmsg or recvmsg asked for.)
+static size_t nlibc_msg_iov_total(const struct msghdr *msg) {
+    size_t total = 0;
+    for (int i = 0; msg->msg_iov != NULL && i < (int) msg->msg_iovlen; i++)
+        total += msg->msg_iov[i].iov_len;
+    return total;
+}
+
 ssize_t nlibc_sendmsg(int fd_no, const struct msghdr *msg, int flags) {
     NATIVE_FRAME;
     if (msg == NULL)
@@ -4242,8 +4326,10 @@ ssize_t nlibc_sendmsg(int fd_no, const struct msghdr *msg, int flags) {
     guest_addr_t guest_msg = native_scratch_put(hdr_raw, hdr_size);
     if (guest_msg == 0)
         return nlibc_fail(_ENOMEM);
-    return (ssize_t) nlibc_ret(native_syscall(NATIVE_SYS_sendmsg, fd_no, guest_msg,
-            nlibc_msg_to_guest(flags)));
+    sqword_t sent = native_syscall(NATIVE_SYS_sendmsg, fd_no, guest_msg,
+            nlibc_msg_to_guest(flags));
+    nlibc_note_io(fd_no, sent, nlibc_msg_iov_total(msg), true);
+    return (ssize_t) nlibc_ret(sent);
 }
 
 ssize_t nlibc_recvmsg(int fd_no, struct msghdr *msg, int flags) {
@@ -4306,6 +4392,7 @@ ssize_t nlibc_recvmsg(int fd_no, struct msghdr *msg, int flags) {
 
     sqword_t res = native_syscall(NATIVE_SYS_recvmsg, fd_no, guest_msg,
             nlibc_msg_to_guest(flags));
+    nlibc_note_io(fd_no, res, nlibc_msg_iov_total(msg), false);
     if (res < 0)
         return nlibc_fail((int) res);
 
@@ -6268,6 +6355,14 @@ int nlibc_deliver_signals_count(void) {
     if (ours == 0)
         return 0;
 
+    // And one thread of the program at a time (task.h's native_delivering).
+    // A thread that finds another already collecting leaves it to that one:
+    // the handler runs once either way, and which of a program's threads
+    // runs it was never promised.
+    if (current != NULL && __atomic_exchange_n(&current->native_delivering, 1, __ATOMIC_ACQ_REL) != 0)
+        return 0;
+    struct task *delivering_for = current;
+
     nlibc_delivering = true;
     for (;;) {
         struct nlibc_taken_signal taken;
@@ -6344,6 +6439,8 @@ int nlibc_deliver_signals_count(void) {
         }
     }
     nlibc_delivering = false;
+    if (delivering_for != NULL && delivering_for == current)
+        __atomic_store_n(&delivering_for->native_delivering, 0, __ATOMIC_RELEASE);
     return ran;
 }
 
@@ -10131,6 +10228,8 @@ void nlibc_program_state_reset(void) {
     nlibc_stdio_depth = 0;
     nlibc_stdio_deferred = 0;
     nlibc_delivering = false;
+    if (current != NULL)
+        __atomic_store_n(&current->native_delivering, 0, __ATOMIC_RELEASE);
     // getopt as a new thread has it. BSD getopt keeps its scanning pointer in
     // a static only optreset can reach, and optreset set is how a caller asks
     // for exactly this.
