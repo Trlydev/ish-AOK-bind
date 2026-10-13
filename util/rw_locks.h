@@ -115,8 +115,14 @@ static inline void _read_unlock(wrlock_t *lock, const char *file, int line) {
     (void) file;
     (void) line;
 #endif
-    if (old_val - 1 == 0)
-        pthread_cond_broadcast(&lock->c);  // last reader out: wake any writer
+    // Last reader out: wake any writer. And last but one, when a writer is
+    // waiting: it may be a reader upgrading (read_to_write_lock_timed), which
+    // holds a read of its own and waits for the count to reach one, not
+    // zero. Nothing told it, so it slept out its whole timeout -- 20ms for
+    // every split LOCK operation whose sibling was still in guest code when
+    // it began (emu/tlb.c).
+    if (old_val - 1 == 0 || (old_val - 1 == 1 && lock->writers_waiting > 0))
+        pthread_cond_broadcast(&lock->c);
     pthread_mutex_unlock(&lock->m);
 }
 

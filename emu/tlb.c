@@ -297,7 +297,40 @@ int x86_lock_split_begin(struct cpu_state *cpu, struct tlb *tlb,
     // from the JIT, which on its own can be a timer tick away: a poke sends
     // them out at the next block boundary, as the mmap barrier does
     // (kernel/mmap.c). The upgrade then holds them off until it is done.
-    task_poke_shared_mem(current, mem);
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    uint64_t now = (uint64_t) now_ts.tv_sec * 1000000000ull + (uint64_t) now_ts.tv_nsec;
+    // (A sibling that did one of these in the last 50ms is at it too.)
+    const uint64_t recent = 50ull * 1000 * 1000;
+    unsigned others = task_poke_shared_mem_counting(current, mem, now > recent ? now - recent : 1);
+    if (current != NULL) {
+        atomic_store_explicit(&current->split_lock_stamp, now, memory_order_relaxed);
+        // This one is taking the address space from a sibling that was
+        // running guest code and is not at this itself: afterwards this
+        // thread stands aside for a quantum. It pokes itself, which takes it
+        // out of the JIT at the next block boundary as a poke takes anyone,
+        // and kernel/task.c's run loop does the waiting there, holding
+        // nothing. Without it a thread doing these in a loop starves the
+        // rest of its process: each needs the address space to itself, the
+        // siblings are poked out of guest code for it, and the next begins
+        // a few instructions after the last ended -- a sibling got a block
+        // or two between them, and in 1.5 s a second thread had not
+        // finished starting (tests/manual/x86_unaligned_lock.c, "a thread
+        // never ran"). Only for such a sibling: threads that are all doing
+        // split operations hand the lock among themselves as before, where
+        // a quantum each turned seconds into minutes (docs/TODO.md).
+        //
+        // Not after every one: it has 200us of them between quanta. A
+        // compare-and-swap loop (i386's 64-bit atomics are cmpxchg8b in one)
+        // reads, tries, and on failure tries again with the value the
+        // failure handed it; a quantum between the failure and the retry
+        // gives the sibling time to change the value again, every time, and
+        // the loop never gets through.
+        if (others != 0 && now - current->split_lock_stood_aside >= 200000) {
+            current->split_lock_wait = true;
+            cpu_poke(&current->cpu);
+        }
+    }
     if (!read_to_write_lock_timed(&mem->lock, 20 * 1000 * 1000)) {
         unlock(&x86_split_lock);
         return x86_atomic_split_retry(cpu, tlb, addr);

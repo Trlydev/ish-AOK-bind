@@ -62,12 +62,24 @@ struct rseq_cs_ {
 
 // How many CPUs a thread can be on: its affinity mask, 0..N-1
 // (get_cpu_count_allowed). Capped by the slot mask.
+//
+// Asked once. task_current_cpu is called on every return to guest code
+// (kernel/calls.c keeps RDTSCP's CPU number current with it), and for a
+// thread with no rseq area -- every thread of a musl program -- it came
+// here: a sysctl and three getenv()s per system call, for a number that
+// cannot change while the machine runs. Seventy per cent of a thread's time
+// in a host sample of one that leaves the JIT often.
 static int rseq_ncpus(void) {
-    int n = get_cpu_count_allowed();
+    static _Atomic int cached;
+    int n = atomic_load_explicit(&cached, memory_order_relaxed);
+    if (n != 0)
+        return n;
+    n = get_cpu_count_allowed();
     if (n < 1)
         n = 1;
     if (n > 64)
         n = 64;
+    atomic_store_explicit(&cached, n, memory_order_relaxed);
     return n;
 }
 

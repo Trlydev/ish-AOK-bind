@@ -793,6 +793,16 @@ struct task {
     // The network namespace this task is in (kernel/net_ns.h), NULL for the
     // initial one. Owns a reference; handed on by copy_task alone.
     struct net_namespace *net_ns;
+
+    // Split LOCK operations (emu/tlb.c, x86_lock_split_begin): when this
+    // thread last did one, monotonic nanoseconds (0: never), read by its
+    // siblings; that it is to stand aside for a quantum at its next exit
+    // from the JIT, because that one took the address space from a sibling
+    // running guest code that is not doing them itself; and when it last
+    // finished standing aside.
+    _Atomic uint64_t split_lock_stamp;
+    bool split_lock_wait;
+    uint64_t split_lock_stood_aside;
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {
@@ -1264,6 +1274,9 @@ int task_set_pid_max(dword_t value);
 int must_check task_start(struct task *task);
 void task_run_current(void);
 void task_poke_shared_mem(struct task *task, struct mem *mem);
+// The same, counting the siblings found in or near guest code whose last
+// split LOCK operation was before `splitters_since` (or never).
+unsigned task_poke_shared_mem_counting(struct task *task, struct mem *mem, uint64_t splitters_since);
 
 extern void (*exit_hook)(struct task *task, int code);
 // Called when the init process (pid 1) exits, before the brutal halt_system_locked()

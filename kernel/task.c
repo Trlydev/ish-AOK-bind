@@ -1572,6 +1572,9 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->pid_ns = NULL;
     task->pid_ns_for_children = NULL;
     task->net_ns = NULL;
+    atomic_store_explicit(&task->split_lock_stamp, 0, memory_order_relaxed);
+    task->split_lock_wait = false;
+    task->split_lock_stood_aside = 0;
     task->exit_arch = NULL;
     memset(task->ptrace_debugreg, 0, sizeof(task->ptrace_debugreg));
     task->ptrace_singlestep = false;
@@ -2004,6 +2007,11 @@ static bool poke_blocked_task_for_test(const struct task *task) {
 }
 
 void task_poke_shared_mem(struct task *task, struct mem *mem) {
+    task_poke_shared_mem_counting(task, mem, 0);
+}
+
+unsigned task_poke_shared_mem_counting(struct task *task, struct mem *mem, uint64_t splitters_since) {
+    unsigned others = 0;
     // A NULL `task` is a caller with no `current` -- kswapd, and anything else
     // that takes the address-space barrier from a host thread rather than a
     // guest one. It is NOT a reason to do nothing, and returning here made the
@@ -2018,12 +2026,12 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
     // above it excludes -- so a NULL caller correctly means "poke every thread
     // of this mem, there is no self to skip".
     if (mem == NULL)
-        return;
+        return 0;
 
     atomic_fetch_add_explicit(&quiesce_poke_calls, 1, memory_order_relaxed);
     if (trylock(&pids_lock) != 0) {
         atomic_fetch_add_explicit(&quiesce_poke_noop, 1, memory_order_relaxed);
-        return;
+        return 0;
     }
     struct pid *pid_entry;
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
@@ -2056,6 +2064,10 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
             atomic_fetch_add_explicit(&quiesce_pokes_skipped, 1, memory_order_relaxed);
             continue;
         }
+        // (In or near guest code, then: one the caller is taking the address
+        // space from. Not counted when it is at the same thing itself.)
+        if (atomic_load_explicit(&other->split_lock_stamp, memory_order_relaxed) < splitters_since)
+            others++;
         // Already poked and hasn't consumed it: the sticky flag is still up,
         // so the sibling either hasn't reached a block boundary yet (the
         // flag, not the signal, is what evicts a JIT runner) or has already
@@ -2078,6 +2090,7 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
         cpu_poke(&other->cpu);
     }
     unlock(&pids_lock);
+    return others;
 }
 
 static void task_wait_for_mem_quiesce(struct task *task) {
@@ -2146,7 +2159,18 @@ void task_run_current(void) {
 
         read_unlock(&save->mem->lock);
         jit_cleanup_jetsam_after_interrupt(cpu);
- 
+        // A thread that has just done a split LOCK operation at a sibling's
+        // expense stands aside for a moment (emu/tlb.c, x86_lock_split_begin,
+        // which poked it out to here): now, where it holds nothing.
+        if (save->split_lock_wait) {
+            save->split_lock_wait = false;
+            static const struct timespec quantum = {0, 100000};
+            nanosleep(&quantum, NULL);
+            struct timespec stood;
+            clock_gettime(CLOCK_MONOTONIC, &stood);
+            save->split_lock_stood_aside = (uint64_t) stood.tv_sec * 1000000000ull + (uint64_t) stood.tv_nsec;
+        }
+
         handle_interrupt(interrupt);
         task_pthread_canary_check_self("after handle_interrupt");
     }
