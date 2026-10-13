@@ -1440,7 +1440,7 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
         // AT_HWCAP: on aarch64, advertise exactly the ISA features the JIT
         // implements, so libc/OpenSSL take their accelerated paths.
         //   FP(0) ASIMD(1) AES(3) PMULL(4) SHA1(5) SHA2(6) CRC32(7)
-        //   ATOMICS(8) SHA3(17) SHA512(21), matching the ID registers
+        //   ATOMICS(8) CPUID(11) SHA3(17) SHA512(21), matching the ID registers
         // gen.c serves. These hold on EVERY host device: CRC32 and SHA512
         // run as soft fallbacks where the host CPU lacks the instruction
         // (pre-A10 / pre-A13 — see gen.c's arm64_probe_host_caps), the
@@ -1453,9 +1453,13 @@ static intptr_t elf_exec(struct fd *fd, const char *file, struct exec_args argv,
         riscv64_v_ctrl_exec(current);
         qword_t hwcap = 0;
         if (current->abi == GUEST_ABI_ARM64)
+            // CPUID: `mrs` of MIDR, MPIDR, REVIDR and the ID registers works
+            // from EL0 (gen.c answers them). /proc/cpuinfo has said "cpuid"
+            // all along; the bit that libraries actually test was missing,
+            // and MIDR itself was SIGILL.
             hwcap = (1u << 0) | (1u << 1) | (1u << 3) | (1u << 4) |
                     (1u << 5) | (1u << 6) | (1u << 7) | (1u << 8) |
-                    (1u << 17) | (1u << 21);
+                    (1u << 11) | (1u << 17) | (1u << 21);
         // riscv64 COMPAT_HWCAP_ISA_*: one bit per ISA letter (bit = c-'a'):
         // rv64imafdcv. Linux has no bits here for the multi-letter extensions
         // (Zba/Zbb/Zbs/Zicond, Zvbb ...); those are in riscv_hwprobe and

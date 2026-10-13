@@ -571,4 +571,16 @@ static inline const char *reg32_name(enum reg32 reg) {
     }
 }
 
+// The arm64 guest's MIDR_EL1, as `mrs` reads it (jit/gen.c) and as
+// /proc/cpuinfo spells it out (fs/proc/root.c): implementer 0x00 (reserved
+// by Arm for software), variant 0, architecture 0xf (see the ID registers),
+// part 0xa0c, revision 0. Deliberately no CPU that exists.
+#define ARM64_GUEST_MIDR_IMPLEMENTER 0x00
+#define ARM64_GUEST_MIDR_VARIANT 0x0
+#define ARM64_GUEST_MIDR_PART 0xa0c
+#define ARM64_GUEST_MIDR_REVISION 0
+#define ARM64_GUEST_MIDR ((uint64_t) ARM64_GUEST_MIDR_IMPLEMENTER << 24 | ARM64_GUEST_MIDR_VARIANT << 20 | \
+                          0xf << 16 | ARM64_GUEST_MIDR_PART << 4 | ARM64_GUEST_MIDR_REVISION)
+
+
 #endif

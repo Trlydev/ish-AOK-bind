@@ -5055,6 +5055,7 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
         extern void gadget_arm64_vshll(void);
         extern void gadget_arm64_vfcvtn(void), gadget_arm64_vfcvtl(void);
         extern void gadget_arm64_vfcvtxn(void);
+        extern void gadget_arm64_vfcvtn_h(void), gadget_arm64_vfcvtl_h(void);
         extern void gadget_arm64_vfrintn(void), gadget_arm64_vfrintm(void);
         extern void gadget_arm64_vfrintp(void), gadget_arm64_vfrintz(void);
         extern void gadget_arm64_vfrinta(void), gadget_arm64_vfrintx(void);
@@ -5204,8 +5205,18 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
         case V_HB:  if (size >= 2) return gen_arm64_undefined(state); break;
         case V_B:   if (size != 0) return gen_arm64_undefined(state); break;
         case V_FP:  if (sz && !q) return gen_arm64_undefined(state); break;
-        case V_FPN: // FCVTN/FCVTL/FCVTXN: sz=0 is the FP16 form (unsupported)
-            if (!sz) return gen_arm64_undefined(state);
+        case V_FPN: // FCVTN/FCVTL/FCVTXN
+            // sz=0 is single <-> half for FCVTN and FCVTL (base ARMv8; see
+            // simd_misc.S vfcvtn_h), and reserved for FCVTXN and the two
+            // estimates that share this row.
+            if (!sz) {
+                if (gadget == gadget_arm64_vfcvtn)
+                    gadget = gadget_arm64_vfcvtn_h;
+                else if (gadget == gadget_arm64_vfcvtl)
+                    gadget = gadget_arm64_vfcvtl_h;
+                else
+                    return gen_arm64_undefined(state);
+            }
             gen(state, (unsigned long) gadget);
             gen(state, rd | ((uint64_t) rn << 8) | ((uint64_t) q << 18));
             return 1;
@@ -6503,6 +6514,23 @@ int gen_step_arm64(struct gen_state *state, struct tlb *tlb) {
             value = 0;    // ID_AA64MMFR0/1/2_EL1
         else if (op1 == 0 && crn == 0 && crm == 5 && (op2 == 0 || op2 == 1))
             value = 0;    // ID_AA64DFR0/1_EL1
+        else if (op1 == 0 && crn == 0 && crm == 0 && op2 == 0)
+            // MIDR_EL1: who this CPU is. Not the silicon underneath: a
+            // program that takes the answer for an Apple M1 (LLVM's JIT does,
+            // from /proc/cpuinfo's copy of these fields) generates M1
+            // instructions this guest does not have -- llvmpipe died of
+            // SIGILL on a half-precision FADD. Implementer 0 is the code Arm
+            // reserves for software, as QEMU's own CPU uses; ARM64_GUEST_MIDR
+            // (emu/cpu.h) is shared with fs/proc/root.c.
+            value = ARM64_GUEST_MIDR;
+        else if (op1 == 0 && crn == 0 && crm == 0 && op2 == 5)
+            value = 0x80000000; // MPIDR_EL1: Linux's SYS_MPIDR_SAFE_VAL for EL0
+        else if (op1 == 0 && crn == 0 && crm == 0 && op2 == 6)
+            value = 0;          // REVIDR_EL1: implementation defined, 0 to EL0
+        else if (op1 == 0 && crn == 0 && crm >= 4 && crm <= 7)
+            // The rest of the AArch64 ID space reads as zero, as Linux's
+            // emulate_sys_reg gives EL0 for a register it keeps no value for.
+            value = 0;
         else
             known = false;
         if (known) {

@@ -187,11 +187,14 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
             // device: SHA512/CRC32 fall back to soft gadgets pre-A13/A10).
             proc_printf(buf, "Features        : fp asimd cpuid aes pmull sha1 sha2 crc32 atomics sha3 sha512%s\n",
                     arm64_mops_advertised() ? " mops" : "");
-            proc_printf(buf, "CPU implementer : 0x61\n"); // Apple (the silicon underneath)
+            // MIDR_EL1's fields, the same ones `mrs` gives (emu/cpu.h has
+            // why this is not the Apple core underneath, which it used to
+            // name: 0x61, part 0x023, an M1).
+            proc_printf(buf, "CPU implementer : 0x%02x\n", ARM64_GUEST_MIDR_IMPLEMENTER);
             proc_printf(buf, "CPU architecture: 8\n");
-            proc_printf(buf, "CPU variant     : 0x0\n");
-            proc_printf(buf, "CPU part        : 0x023\n");
-            proc_printf(buf, "CPU revision    : 1\n");
+            proc_printf(buf, "CPU variant     : 0x%x\n", ARM64_GUEST_MIDR_VARIANT);
+            proc_printf(buf, "CPU part        : 0x%03x\n", ARM64_GUEST_MIDR_PART);
+            proc_printf(buf, "CPU revision    : %d\n", ARM64_GUEST_MIDR_REVISION);
             proc_printf(buf, "host arch       : %s\n", arm_host_architecture);
             proc_printf(buf, "host machine    : %s\n", arm_host_machine_identifier);
             proc_printf(buf, "host device     : %s\n", arm_host_device_name);

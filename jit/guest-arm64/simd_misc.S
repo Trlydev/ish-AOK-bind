@@ -476,6 +476,48 @@ fcvt_narrow vfcvtxn, fcvtxn
     str q0, [x15]
     gret
 
+// The same two between single and HALF precision (sz=0): FCVTN/FCVTN2
+// .4h/.8h <- .4s, and FCVTL/FCVTL2 .4s <- .4h/.8h. These are base ARMv8, not
+// FEAT_FP16 -- that is arithmetic ON halves, and these only convert -- and
+// they were answered as undefined. A compiler that has halves and no FP16
+// does its half arithmetic in single through exactly this pair: llvmpipe's
+// JIT, once it stopped taking the guest for an Apple M1, died of SIGILL on
+// `fcvtl v3.4s, v3.4h` in its first fragment shader.
+.gadget vfcvtn_h
+    ldr x8, [_ip]
+    add _ip, _ip, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x13, x8, #18, #1
+    add x14, _cpu, #CPU_v0
+    add x15, x14, x9, lsl #4
+    ldr q0, [x15]              // Vd (2-form preserves the low half)
+    add x16, x14, x10, lsl #4
+    ldr q1, [x16]
+    cbz x13, 1f
+    fcvtn2 v0.8h, v1.4s
+    b 2f
+1:  fcvtn v0.4h, v1.4s
+2:  str q0, [x15]
+    gret
+
+.gadget vfcvtl_h
+    ldr x8, [_ip]
+    add _ip, _ip, #8
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x13, x8, #18, #1
+    add x14, _cpu, #CPU_v0
+    add x15, x14, x10, lsl #4
+    ldr q0, [x15]
+    cbz x13, 1f
+    fcvtl2 v0.4s, v0.8h
+    b 2f
+1:  fcvtl v0.4s, v0.4h
+2:  add x15, x14, x9, lsl #4
+    str q0, [x15]
+    gret
+
 // ---- across-lanes reductions ---------------------------------------------
 // Result is a scalar in Vd (upper bits zeroed by the host op).
 // Code stream: [gadget][rd | rn<<8 | size<<16 | q<<18]

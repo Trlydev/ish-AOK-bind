@@ -81,6 +81,19 @@ echo 1 > /proc/ish/arm64_mops   # and show it again
 `ISH_MOPS=0` does the same from the start in the CLI. A process that already
 chose MOPS keeps working either way; the instructions always execute.
 
+The guest is not the Apple chip it runs on, and from build 559 it no longer
+says it is. `/proc/cpuinfo`'s `CPU implementer` is `0x00`, the code Arm
+reserves for software, with a part number (`0xa0c`) no CPU has; `mrs` of
+`MIDR_EL1` reads the same. Before that it gave an Apple M1's numbers, and
+software that goes by them — LLVM's JIT, which is inside Mesa's software
+renderer among other things — generated M1 instructions the guest does not
+implement and crashed with "Illegal instruction". If a root ran such a
+program on an older build, Mesa may still hold the code it compiled then:
+
+```sh
+rm -rf ~/.cache/mesa_shader_cache*     # llvmpipe's compiled-code cache
+```
+
 ## riscv64
 
 As of 558 the riscv64 guest is an **RVA23** machine, the profile Ubuntu's

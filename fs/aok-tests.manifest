@@ -547,6 +547,8 @@ arm64/adc_mul_ospec.c
 arm64/alu_shift_ospec.c
 arm64/hle_loop.c
 arm64/dc_zva.c
+arm64/fcvt_half.c
+arm64/cpu_identity.c
 riscv64/ptrace_regset.c
 riscv64/riscv64_singlestep.c
 riscv64/jalr_retcache.c

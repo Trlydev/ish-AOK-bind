@@ -238,6 +238,8 @@ if [ "$is_arm64_guest" -eq 1 ]; then
     need_file arm64/alu_shift_ospec.c
     need_file arm64/hle_loop.c
     need_file arm64/dc_zva.c
+    need_file arm64/fcvt_half.c
+    need_file arm64/cpu_identity.c
     need_file arm64/arm64_fp_env.c
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
@@ -1142,7 +1144,7 @@ if [ "$is_amd64_guest" -eq 1 ]; then
     all_tests="$all_tests amd64_regress amd64_popcnt amd64_cmpxchg amd64_xadd amd64_muldiv amd64_push_rm amd64_alu_mem amd64_xchg_mem amd64_shift amd64_0f_rm amd64_misc_rm amd64_sse_int amd64_sse_shift amd64_sse_mov amd64_sse_float amd64_sse_ud amd64_sse4_int amd64_sse4_misc amd64_pcmpstr amd64_mxcsr amd64_pushf_popf amd64_ret_pop amd64_moffs_stack16 amd64_loop_addr32 amd64_string_ops avx_regress amd64_incdec amd64_ff_indirect amd64_odd_shapes amd64_addr32 amd64_cmpxchg16b amd64_0fae amd64_iret amd64_x87_cache amd64_singlestep amd64_segment_regs amd64_gs_base amd64_sse_tiny amd64_vex_int amd64_vex_float amd64_vex_imm amd64_vex_move amd64_vex_width amd64_vex_gpr amd64_vex_misc amd64_vex_mask amd64_vex_bmi amd64_vex_fma amd64_vex_f16c amd64_vex_gather amd64_avx512_kmask amd64_avx512_int amd64_avx512_cmp amd64_avx512_misc amd64_avx512_float amd64_avx512_perm amd64_avx512_xform amd64_avx512_ext amd64_avx512_gather amd64_vex_ud amd64_evex_ud"
 fi
 if [ "$is_arm64_guest" -eq 1 ]; then
-    all_tests="$all_tests atomics64 arm64_lse_gadgets arm64_vldst_gadgets arm64_sha512_crc32 arm64_regress vector_smoke simd_elem_moves simd_three_same alu_ospec ldst_lspec vldst_lspec smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep singlestep_fused ands_bcond_fusion cbz_tbz pair_fusion adc_mul_ospec alu_shift_ospec hle_loop dc_zva arm64_fp_env"
+    all_tests="$all_tests atomics64 arm64_lse_gadgets arm64_vldst_gadgets arm64_sha512_crc32 arm64_regress vector_smoke simd_elem_moves simd_three_same alu_ospec ldst_lspec vldst_lspec smc_stale_block ret_retcache stlr_ldar_publish ptrace_singlestep singlestep_fused ands_bcond_fusion cbz_tbz pair_fusion adc_mul_ospec alu_shift_ospec hle_loop dc_zva fcvt_half cpu_identity arm64_fp_env"
 fi
 if [ "$is_riscv64_guest" -eq 1 ]; then
     all_tests="$all_tests ptrace_regset jalr_retcache alu_pair branch_pair riscv64_pair_fusion rcache_run riscv64_singlestep singlestep_fused riscv64_fp_env riscv64_rva23_scalar riscv64_rva23_fp riscv64_rvv riscv64_rvv_signal riscv64_rvv_ptrace riscv64_rvv_gadgets riscv64_rvv_ctrl riscv64_fp_rules riscv64_amo_align"
