@@ -571,15 +571,32 @@ if [ "$AOK_WL_DISPLAY" = 1 ] && [ "${WLR_RENDERER:-}" != pixman ]; then
     AOK_WL_OWN_RENDERER=1
 fi
 # X programs draw through Xwayland, and beside a GL compositor Xwayland draws
-# with GL itself (glamor). On virgl that came out wrong: dillo's window was
-# there and every glyph in it a filled black box (UTM's GL device, 2026-10-12).
-# Without glamor Xwayland draws in software into shared memory, which the
-# compositor shows like any other window; an X program gains nothing from
-# glamor here that it would notice. XWAYLAND_NO_GLAMOR from the caller wins.
-if [ "$AOK_WL_OWN_RENDERER" = 1 ] && [ "$(aok_wl_virtio_gpu)" = 3d ]; then
-    export XWAYLAND_NO_GLAMOR="${XWAYLAND_NO_GLAMOR-1}"
-    [ -n "$XWAYLAND_NO_GLAMOR" ] || unset XWAYLAND_NO_GLAMOR
+# with GL itself (glamor). That is also what gives an X program the GPU: with
+# no glamor there is no DRI3, an X11 game is drawn by llvmpipe, and vkcube
+# says "No DRI3 support detected" and takes the CPU device. On virgl glamor's
+# desktop-GL half draws every glyph as a filled black box (dillo, xterm: UTM's
+# GL device, in the simulator and on an M4 iPad, 2026-10-12/13); its GLES half
+# draws them right and still gives DRI3 (on the M4: xterm's core and Xft text
+# readable, glxinfo "direct rendering: Yes", renderer virgl, vkcube --wsi xcb
+# on the venus device). So Xwayland is started through a wrapper that adds
+# "-glamor es"; WLR_XWAYLAND names the program wlroots runs. An Xwayland with
+# no such option runs without glamor, as every one here did at first.
+# WLR_XWAYLAND or XWAYLAND_NO_GLAMOR (empty: glamor as Xwayland chooses it)
+# from the caller wins.
+if [ "$AOK_WL_OWN_RENDERER" = 1 ] && [ "$(aok_wl_virtio_gpu)" = 3d ] &&
+   [ -z "${WLR_XWAYLAND:-}" ] && [ -z "${XWAYLAND_NO_GLAMOR+set}" ]; then
+    if Xwayland -help 2>&1 | grep -q -- '-glamor \[gl|es|off\]'; then
+        mkdir -p "$HOME/.config/labwc"
+        printf '%s\n' '#!/bin/sh' \
+            '# Written by start-wayland.sh: glamor on GLES (see there for why).' \
+            'exec Xwayland "$@" -glamor es' > "$HOME/.config/labwc/xwayland-es"
+        chmod +x "$HOME/.config/labwc/xwayland-es"
+        export WLR_XWAYLAND="$HOME/.config/labwc/xwayland-es"
+    else
+        export XWAYLAND_NO_GLAMOR=1
+    fi
 fi
+[ -n "${XWAYLAND_NO_GLAMOR-unset}" ] || unset XWAYLAND_NO_GLAMOR
 # Two things Wayfire cannot do, where the session is the plain labwc desktop
 # instead, and says why. It draws everything with OpenGL ES, so it cannot run
 # in software here: wlroots' GLES renderer needs a GPU device, and pixman has
