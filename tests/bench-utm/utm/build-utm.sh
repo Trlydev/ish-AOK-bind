@@ -14,8 +14,14 @@
 #
 # UTM at that commit needs the released Xcode 27: Xcode 26 lacks iOS 27 APIs it uses, and Xcode 27 beta 3
 # cannot compile the SwiftTerm it depends on. CodeSigning.xcconfig (written here if absent) gives the app a
-# bundle id of our own, so that it installs beside a UTM SE from the App Store, and asks for none of the
-# entitlements UTM's paid-account configuration adds.
+# bundle id of our own, so that it installs beside a UTM SE from the App Store, and UTM's paid-account
+# entitlements (Platform/iOS/iOS.entitlements): the App Group group.<prefix>.UTM, the increased memory limit
+# and extended virtual addressing. Automatic signing registers them on the team at the first build. The
+# App Group is not optional for Vulkan: on a device a sandboxed app may shm_open() only names inside a
+# group it is entitled to, UTM's virglrenderer makes the shared memory of a venus context that way
+# (APP_SANDBOX_GROUP_ID, which the front end sets from Info.plist whether or not the app is entitled), and
+# built without the group every guest's vkCreateInstance failed with "proxy: failed to pre-initialize
+# context" in the VM's log -- on an iPad only: the simulator does not enforce it.
 #
 # The front end is UTM's with utm-frontend.patch (beside this script; copy it to ~/aok-utm) applied when
 # it is there and not applied yet. What it changes, all in Platform/iOS:
@@ -27,6 +33,9 @@
 #   - every ancestor view controller is told which child decides on the lock, not only the parent
 #   - the keyboard's power key (HID usage 0x66) is not passed to the guest: an iPad keyboard's key arrived
 #     as one and the guest shut down under its user
+#   - GCMouse is listened to only while the pointer is locked. Unlocked, an M4 iPad delivered every
+#     movement and button twice, as GCMouse's and as the system pointer's; one asked for the guest's mouse
+#     and the other for its tablet, and UTM switched between them up to 150 times a second.
 #   - a tap whose touch made UTM switch the guest between its mouse and its tablet is clicked when the
 #     switch is through, where the finger landed. UTM sent it at once: pressed on the old device, wherever
 #     its cursor was, and released on the new one (the guest's mouse kept its button down and the desktop
@@ -41,7 +50,7 @@ fi
 [ -f CodeSigning.xcconfig ] || cat > CodeSigning.xcconfig <<'XC'
 DEVELOPMENT_TEAM = UYU5FM4LQ4
 PRODUCT_BUNDLE_PREFIX = app.ish.aok
-DEVELOPER_ACCOUNT_PAID = NO
+DEVELOPER_ACCOUNT_PAID = YES
 DEVELOPER_ACCOUNT_VM_ACCESS = NO
 CODE_SIGN_IDENTITY_IOS = Apple Development
 CODE_SIGN_STYLE_IOS = Automatic

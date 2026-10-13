@@ -36,10 +36,48 @@ index 1755428b..331f1223 100644
  @end
  
 diff --git a/Platform/iOS/Display/VMDisplayMetalViewController+Pointer.m b/Platform/iOS/Display/VMDisplayMetalViewController+Pointer.m
-index 73371d26..3591275d 100644
+index 73371d26..70cbc91b 100644
 --- a/Platform/iOS/Display/VMDisplayMetalViewController+Pointer.m
 +++ b/Platform/iOS/Display/VMDisplayMetalViewController+Pointer.m
-@@ -102,6 +102,72 @@
+@@ -61,20 +61,37 @@
+         UTMLog(@"invalid mouse object!");
+         return;
+     }
++    // GCMouse speaks for the device only while the pointer is locked. Unlocked, the same movement and the
++    // same buttons also arrive as the system's pointer (regionForRequest, the indirect touches), which
++    // positions the guest's cursor; GCMouse reported them as well on an M4 iPad, each movement then asked
++    // for the relative mouse and the pointer for the tablet, and the guest's pointer device was switched
++    // up to 150 times a second, with every button sent twice (debug.log, 2026-10-13).
+     mouse.mouseInput.mouseMovedHandler = ^(GCMouseInput * _Nonnull mouse, float deltaX, float deltaY) {
++        if (!self.isPointerLocked) {
++            return;
++        }
+         [self switchMouseType:VMMouseTypeRelative];
+         [self.vmInput sendMouseMotion:self.mouseButtonDown relativePoint:CGPointMake(deltaX, -deltaY)];
+     };
+     mouse.mouseInput.leftButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
++        if (!self.isPointerLocked) {
++            return;
++        }
+         self.mouseLeftDown = pressed;
+         [self.vmInput sendMouseButton:kCSInputButtonLeft mask:self.mouseButtonDown pressed:pressed];
+     };
+     mouse.mouseInput.rightButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
++        if (!self.isPointerLocked) {
++            return;
++        }
+         self.mouseRightDown = pressed;
+         [self.vmInput sendMouseButton:kCSInputButtonRight mask:self.mouseButtonDown pressed:pressed];
+ 
+     };
+     mouse.mouseInput.middleButton.pressedChangedHandler = ^(GCControllerButtonInput * _Nonnull button, float value, BOOL pressed) {
++        if (!self.isPointerLocked) {
++            return;
++        }
+         self.mouseMiddleDown = pressed;
+         [self.vmInput sendMouseButton:kCSInputButtonMiddle mask:self.mouseButtonDown pressed:pressed];
+     };
+@@ -102,6 +119,73 @@
      }
  }
  
@@ -48,9 +86,10 @@ index 73371d26..3591275d 100644
 +// A mouse or trackpad reaches the VM in one of two ways. With the pointer locked the system hides its own
 +// pointer and GCMouse reports movement, which goes to the guest as a relative mouse. The system grants the
 +// lock only to a scene that is full screen and frontmost, and says nothing when it does not: GCMouse then
-+// reports no movement at all, and with indirect touches ignored (as they must be under the lock) the device
-+// did nothing. So what counts is the lock the system reports, not the one asked for: without it the
-+// pointer is the system's own and drives the guest's cursor by position, the way visionOS always has.
++// reported no movement at all (it can: see mouseDidBecomeCurrent), and with indirect touches ignored (as
++// they must be under the lock) the device did nothing. So what counts is the lock the system reports, not
++// the one asked for: without it the pointer is the system's own and drives the guest's cursor by position,
++// the way visionOS always has, and GCMouse is not listened to.
 +//
 +// And that is the default here. UTM asks for the lock whenever a VM runs; on an M4 iPad with a keyboard's
 +// trackpad that left the trackpad dead (2026-10-12: GCMouse devices came and went in the log and not one
@@ -112,7 +151,7 @@ index 73371d26..3591275d 100644
  #pragma mark - UIPointerInteractionDelegate
  
  // Add pointer interaction to VM view
-@@ -151,7 +217,14 @@
+@@ -151,7 +235,14 @@
  
  - (UIPointerRegion *)pointerInteraction:(UIPointerInteraction *)interaction regionForRequest:(UIPointerRegionRequest *)request defaultRegion:(UIPointerRegion *)defaultRegion {
  #if !TARGET_OS_VISION

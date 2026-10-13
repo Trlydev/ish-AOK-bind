@@ -700,7 +700,18 @@ before. No swapchain can be made there, by vkcube or by vkmark's headless
 mode: the host side gives a guest's window-system images linear tiling, and
 MoltenVK does not render to linear images in the simulator (`MVK_OS_SIMULATOR`
 sets `renderLinearTextures` false; every Apple GPU family has it otherwise).
-So a cube on a screen is for an iPad to show. Direct3D (`neptune`) does rest
+So a cube on a screen is for an iPad to show.
+
+The iPad's first answer was no device at all: `vkCreateInstance` failed
+again, and the VM's log, pulled off the M4, said `proxy: failed to
+pre-initialize context`. That is the host side failing to make the shared
+memory of a venus context. UTM's virglrenderer makes it with `shm_open()`
+under a name inside the app's App Group, because a sandboxed app on a device
+may open no other; I had built the app with UTM's free-account settings,
+which sign it with no App Group, and the simulator does not enforce the
+rule. The app is now signed with UTM's own entitlements (the group, the
+increased memory limit, extended virtual addressing; the user's yes was
+asked for, since it registers them on the team). Direct3D (`neptune`) does rest
 on the fork and is still switched off, as are the fork's own refinements of
 the blob and fence code (an unmap that does not hold the queue, fences
 retired off the poll timer).
@@ -808,6 +819,12 @@ none of which a test of mine had, each in a different layer:
   switch is through, where the finger landed (before, it went to wherever the
   old cursor was, or nowhere). The root desktop "worked" only because a
   compositor that starts later does not learn of a button already down.
+  Why a tap straddled a switch so readily came out a day later, from the
+  same machine's log: 2783 switches in seven minutes, up to 153 in a
+  second. My trackpad patch let the system's pointer position the cursor
+  (the tablet) and left UTM's GCMouse handler asking for the relative mouse
+  on every movement; on this iPad both report an unlocked pointer. GCMouse
+  is now listened to only under the pointer lock.
 - **Two faults of the desktop itself**, found on the way. Under a GL
   compositor Xwayland draws with GL too (glamor), and on virgl every glyph of
   an X program came out as a filled black box: `start-wayland.sh` now sets
