@@ -2090,6 +2090,33 @@ static void ProvisionGuestHostFiles(void) {
             "    esac\n"
             "fi\n",
             0644);
+        // An Arch root, which cannot install a package until
+        // /AOK/fixes/arch/fix-pacman.sh has been run (pacman's Landlock
+        // sandbox, a dangling resolv.conf, an empty keyring: fs/aok.c has the
+        // README). The script shipped in the very build a tester reported
+        // "pacman fails, tried DisableSandbox, didn't help" from -- nothing
+        // told them it was there. An interactive login says so, for as long
+        // as any of the three is still true, and then never again.
+        struct statbuf pacmanConf;
+        if (generic_statat(AT_PWD, "/etc/pacman.conf", &pacmanConf, 0) >= 0) {
+            EnsureRegularFileNonEmpty("/etc/profile.d/20-aok-arch-pacman.sh",
+                "# Written by iSH-AOK: tells an interactive login that pacman needs a\n"
+                "# one-time setup in this root, until /AOK/fixes/arch/fix-pacman.sh has\n"
+                "# done it. Rewritten only when missing or empty; to turn it off,\n"
+                "# replace this with a comment.\n"
+                "case $- in\n"
+                "    *i*)\n"
+                "        if [ -f /etc/pacman.conf ] && [ -r /AOK/fixes/arch/fix-pacman.sh ] && {\n"
+                "                ! grep -q '^DisableSandbox' /etc/pacman.conf ||\n"
+                "                [ ! -e /etc/resolv.conf ] ||\n"
+                "                [ ! -s /etc/pacman.d/gnupg/trustdb.gpg ]; }; then\n"
+                "            echo 'iSH-AOK: pacman needs a one-time setup before it can install anything here.'\n"
+                "            echo '         As root:  sh /AOK/fixes/arch/fix-pacman.sh'\n"
+                "            echo '         Why:      /AOK/fixes/arch/README.txt'\n"
+                "        fi ;;\n"
+                "esac\n",
+                0644);
+        }
     }
 
     // The clock's zone, which a root ships as UTC or not at all.

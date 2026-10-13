@@ -418,6 +418,12 @@ sh /AOK/fixes/arch/fix-pacman.sh
 Safe to re-run; each step checks whether it is already done. The keyring step
 takes a few minutes and needs no network.
 
+From build 559 an Arch root says so itself: until the script has been run, an
+interactive login prints three lines naming it. The reminder is
+`/etc/profile.d/20-aok-arch-pacman.sh`, written at boot into any root that has
+an `/etc/pacman.conf`; it goes quiet once the three things above are dealt
+with, and replacing its contents with a comment turns it off for good.
+
 `/AOK/fixes/codex` is for OpenAI's Codex CLI, which works until it runs a shell
 command: it runs each one inside bubblewrap, which needs user and mount
 namespaces AOK does not have, and it has no fallback. The script tells Codex to
