@@ -1136,14 +1136,17 @@ minute and `desktop` brings up labwc, waybar and foot on the GL display
 have the app and the two machines; on a device the machines have not been
 started yet, which takes a tap.
 
-On that desktop the main loop still enters QEMU's code a third as often as
+On that desktop the main loop still entered QEMU's code a third as often as
 streams (6.4 million times in a boot and three minutes of desktop), almost
-all of it for `ld1`/`st1`, which the check programs hardly use.
+all of it for `ld1`/`st1`, which the check programs hardly use. Those, the
+other structure loads and stores and `ldpsw` were added the same day
+(qemu-aok 734639c): in a boot and the check,
+FP and memory programs QEMU's code is now entered about a hundred times. The
+M4 passes the gates with that engine too, and both iPads' UTM SE have it.
 
 ### Not done
 
-- `ld1`/`st1` and the other structure loads and stores: the one class a
-  desktop still hands to QEMU in numbers. Then the LSE atomics.
+- The LSE atomics (not on a cortex-a72).
 - Fused pairs (AOK's arm64 pair list, `jit/guest-arm64/pairs.h`).
 - A CPU newer than the base: with `-cpu max` the guest is correct but
   hardly faster, because pointer authentication, BTI's indirect branches,
