@@ -664,6 +664,13 @@ CURLcode curl_easy_perform(CURL *handle) {
         return CURLE_FAILED_INIT;
     if (!h->url || !h->url[0])
         return CURLE_URL_MALFORMAT;
+    // This transfer is the host's, not a guest socket's, so the rule a
+    // guest socket is held to has to be asked here by name: a task in a
+    // private network namespace has no network (kernel/net_ns.h), and a
+    // sandbox that could fetch through the native curl would have one.
+    extern bool current_net_is_host(void);
+    if (!current_net_is_host())
+        return CURLE_COULDNT_CONNECT;
 
     @autoreleasepool {
         CURLcode err = CURLE_OK;

@@ -1,8 +1,8 @@
 // What clone() and unshare() answer, as root, for each namespace flag.
 //
 // On Linux as root both succeed, and so they do here for the namespaces AOK
-// has (UTS, IPC, mount, user, PID). For a type it does not have (network,
-// cgroup) each entry point must fail with the errno its consumers read as
+// has (UTS, IPC, mount, user, PID, network). For a type it does not have
+// (cgroup) each entry point must fail with the errno its consumers read as
 // "no sandbox here, carry on", and those differ:
 //
 //   clone:   EINVAL (Linux's answer for a namespace type it was built
@@ -21,7 +21,8 @@
 // systemd's ns_type_supported() reads that file, and when it existed while
 // unshare(CLONE_NEWNET) failed, every PrivateNetwork=yes unit (hostnamed,
 // localed, shadow) failed at step NETWORK. A kernel built without network
-// namespaces has no ns/net, which is what AOK presents.
+// namespaces has no ns/net, which is what AOK presented until it had them
+// (kernel/net_ns.h); now it has both.
 //
 // Each probe runs in its own child, so a namespace that does get created (on
 // Linux) never touches the test itself.

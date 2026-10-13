@@ -317,9 +317,10 @@ can calibrate.
 **There is one machine.** There is exactly one Linux underneath everything,
 so `/proc`, `/sys` and `/dev` show the same true state no matter which root
 you booted or which chroot you are standing in. A process can ask for a
-mount table, a user namespace and a pid namespace of its own (all three
-arrived in 559, for sandboxes), but there is one network and no cgroup
-namespaces, and nothing container-shaped works. This is
+mount table, a user namespace, a pid namespace and a network of its own (all
+four arrived in 559, and a sandbox like bubblewrap is built from them), but
+that network is a loopback interface with nothing behind it, there are no
+cgroup namespaces, and nothing container-shaped works. This is
 architectural, not a missing feature; Chapter 21 shows the one place it is an
 advantage, and Chapter 41 is honest about the rest.
 

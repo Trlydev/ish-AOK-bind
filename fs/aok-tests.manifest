@@ -134,6 +134,7 @@ mntns_basic.c
 mount_cover_setattr.c
 userns_basic.c
 pidns_basic.c
+netns_basic.c
 exec_link_by_fd.c
 exec_fd_pathless.c
 tmpfs_nlink.c

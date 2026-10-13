@@ -2932,6 +2932,12 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
                     "saved session does not carry", task->pid);
         w->err = _EBUSY;
     }
+    // Nor a network namespace: restored, its sockets would be the machine's.
+    if (task->net_ns != NULL && w->err == 0) {
+        ckpt_refuse("pid %d is in a network namespace of its own (a sandbox), which a "
+                    "saved session does not carry", task->pid);
+        w->err = _EBUSY;
+    }
     if (task->mnt_ns != NULL && w->err == 0) {
         ckpt_refuse("pid %d is in a mount namespace of its own (a sandbox, or a "
                     "service with private mounts), which a saved session does not carry", task->pid);

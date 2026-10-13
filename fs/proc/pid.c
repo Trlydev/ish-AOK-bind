@@ -5,6 +5,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#include "kernel/net_ns.h"
 #include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "emu/memory.h"
@@ -1965,18 +1966,17 @@ struct proc_ns_type {
     unsigned nstype;
 };
 
-// No "net": AOK has one network, the host's, and cannot make another --
-// unshare(CLONE_NEWNET) is ENOSYS. A Linux kernel built without
-// CONFIG_NET_NS has no ns/net either, and that absence is how systemd's
-// ns_type_supported() tells: with ns/net listed, every unit with
-// PrivateNetwork=yes (systemd-hostnamed, -localed, shadow, coredump...) went
-// on to unshare, got ENOSYS, and failed at step NETWORK, so hostnamectl and
-// localectl could not activate their daemons. Without it systemd logs
-// "proceeding without" and runs them, as on such a kernel.
+// "net" is here because a network namespace can be made (kernel/net_ns.h),
+// and only because of that: systemd's ns_type_supported() reads this file
+// to decide whether to unshare for a PrivateNetwork=yes unit. While it was
+// listed and unshare(CLONE_NEWNET) was ENOSYS, systemd-hostnamed, -localed,
+// shadow and coredump all failed at step NETWORK. The two change together;
+// tests/manual/namespace_errno.c holds them to it.
 static const struct proc_ns_type proc_ns_types[] = {
     {"cgroup", 4026531835, CLONE_NEWCGROUP_},
     {"ipc", 4026531839, CLONE_NEWIPC_},
     {"mnt", 4026531840, CLONE_NEWNS_},
+    {"net", 4026531992, CLONE_NEWNET_},
     {"pid", 4026531836, CLONE_NEWPID_},
     {"pid_for_children", 4026531836, CLONE_NEWPID_},
     {"time", 4026531834, CLONE_NEWTIME_},
@@ -2018,7 +2018,7 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
     if (ns_out != NULL)
         *ns_out = NULL;
     if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_ && nstype != CLONE_NEWNS_ &&
-            nstype != CLONE_NEWUSER_ && nstype != CLONE_NEWPID_)
+            nstype != CLONE_NEWUSER_ && nstype != CLONE_NEWPID_ && nstype != CLONE_NEWNET_)
         return inode;
     // Not a plain lock: see task_lock_unless_exiting.
     if (!task_lock_unless_exiting(task))
@@ -2042,6 +2042,14 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
             inode = pid_ns->inode;
         if (ns_out != NULL)
             *ns_out = pid_ns_retain(pid_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    if (nstype == CLONE_NEWNET_) {
+        if (task->net_ns != NULL)
+            inode = task->net_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = net_ns_retain(task->net_ns);
         unlock(&task->general_lock);
         return inode;
     }
@@ -2086,6 +2094,8 @@ static void proc_ns_release(unsigned index, void *ns) {
         user_ns_release(ns);
     else if (proc_ns_types[index].nstype == CLONE_NEWPID_)
         pid_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWNET_)
+        net_ns_release(ns);
 }
 
 static int proc_pid_ns_readlink(struct proc_entry *entry, char *buf) {
@@ -2256,7 +2266,7 @@ bool proc_ns_fd_is_initial(struct fd *fd) {
         return ns == NULL || ns == &init_ipc_ns;
     if (nstype == CLONE_NEWNS_)
         return ns == NULL || ns == &init_mnt_ns;
-    if (nstype == CLONE_NEWUSER_ || nstype == CLONE_NEWPID_)
+    if (nstype == CLONE_NEWUSER_ || nstype == CLONE_NEWPID_ || nstype == CLONE_NEWNET_)
         return ns == NULL;
     return true;
 }

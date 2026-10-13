@@ -106,6 +106,10 @@ struct fd {
             struct fd *target;
         } opath_held;
         struct {
+            // The network namespace the socket was made in (kernel/net_ns.h),
+            // NULL for the initial one. Owns a reference, for the life of
+            // the socket: set where the socket is made and nowhere else.
+            struct net_namespace *net_ns;
             int domain;
             int type;
             int protocol;

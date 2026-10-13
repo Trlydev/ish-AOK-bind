@@ -1,4 +1,5 @@
 #include "debug.h"
+#include "kernel/net_ns.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
@@ -52,7 +53,8 @@
 // stress-ng's clone stressor outright, not just noisy logging.
 #define IMPLEMENTED_FLAGS (CLONE_VM_|CLONE_FILES_|CLONE_FS_|CLONE_SIGHAND_|CLONE_SYSVSEM_|CLONE_VFORK_|CLONE_THREAD_|\
         CLONE_SETTLS_|CLONE_CHILD_SETTID_|CLONE_PARENT_SETTID_|CLONE_CHILD_CLEARTID_|CLONE_DETACHED_|CLONE_PARENT_|\
-        CLONE_PIDFD_|CLONE_IO_|CLONE_NEWUTS_|CLONE_NEWIPC_|CLONE_NEWNS_|CLONE_NEWUSER_|CLONE_NEWPID_)
+        CLONE_PIDFD_|CLONE_IO_|CLONE_NEWUTS_|CLONE_NEWIPC_|CLONE_NEWNS_|CLONE_NEWUSER_|CLONE_NEWPID_|\
+        CLONE_NEWNET_)
 // The remaining namespace flags are recognized but never implemented (no
 // mount/user/pid/cgroup/net namespaces; UTS and IPC are real, see kernel/uts.h
 // and kernel/ipc_ns.h).
@@ -61,7 +63,7 @@
 // CAP_SYS_ADMIN/CAP_SYS_USER_NS) instead of the generic "unrecognized flag"
 // EINVAL -- callers that already fall back when they lack namespace privilege
 // need to see that, not a malformed-argument error.
-#define CLONE_NEW_FLAGS_ (CLONE_NEWCGROUP_|CLONE_NEWNET_)
+#define CLONE_NEW_FLAGS_ (CLONE_NEWCGROUP_)
 
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
@@ -239,6 +241,17 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
             if (into != NULL)
                 atomic_compare_exchange_strong(&into->init_pid, &nobody, task->pid);
         }
+    }
+
+    // The parent's network namespace, or with CLONE_NEWNET one of the child's
+    // own: a loopback interface that is down, and nothing else
+    // (kernel/net_ns.h).
+    if (flags & CLONE_NEWNET_) {
+        task->net_ns = net_ns_new(task->user_ns);
+        if (task->net_ns == NULL)
+            goto fail_free_fs;
+    } else {
+        task->net_ns = net_ns_retain(current->net_ns);
     }
 
     // The parent's mount namespace, or with CLONE_NEWNS a copy of its tree
@@ -462,7 +475,10 @@ fail_free_fs:
     task->user_ns = NULL;
     struct pid_namespace *dead_pid_early = task->pid_ns;
     task->pid_ns = NULL;
+    struct net_namespace *dead_net_early = task->net_ns;
+    task->net_ns = NULL;
     unlock(&task->general_lock);
+    net_ns_release(dead_net_early);
     fs_info_release(dead_fs);
     mnt_ns_release(dead_mnt_early);
     user_ns_release(dead_user_early);
@@ -527,6 +543,8 @@ void task_never_ran_destroy(struct task *task) {
     task->user_ns = NULL;
     struct pid_namespace *dead_pid = task->pid_ns;
     task->pid_ns = NULL;
+    struct net_namespace *dead_net = task->net_ns;
+    task->net_ns = NULL;
     struct fdtable *dead_files = task->files;
     task->files = NULL;
     struct mm *dead_mm = task->mm;
@@ -563,6 +581,7 @@ void task_never_ran_destroy(struct task *task) {
     user_ns_release(dead_user);
     pid_ns_forget_init(dead_pid, task->pid);
     pid_ns_release(dead_pid);
+    net_ns_release(dead_net);
     if (dead_files != NULL)
         fdtable_release(dead_files);
     if (dead_mm != NULL)
@@ -653,8 +672,8 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
     // Creating any namespace but a user namespace needs CAP_SYS_ADMIN in
     // the caller's own user namespace -- or comes with a new user namespace,
     // in which the child holds it.
-    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ | CLONE_NEWPID_)) && !(flags & CLONE_NEWUSER_) &&
-            !ns_capable(current_user_ns(), CAP_SYS_ADMIN_))
+    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ | CLONE_NEWPID_ | CLONE_NEWNET_)) &&
+            !(flags & CLONE_NEWUSER_) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN_))
         return _EPERM;
     // A user namespace is a credential of the whole process and of nobody
     // else's view of the filesystem (copy_process).
@@ -1178,7 +1197,7 @@ dword_t sys_unshare(dword_t flags) {
         flags |= CLONE_THREAD_ | CLONE_FS_;
     const dword_t supported = CLONE_THREAD_ | CLONE_SIGHAND_ | CLONE_VM_ |
         CLONE_FILES_ | CLONE_FS_ | CLONE_SYSVSEM_ | CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ |
-        CLONE_NEWUSER_ | CLONE_NEWPID_;
+        CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_;
     // Recognized, and not provided. The distinction from the ~known case
     // below is the whole point: a flag listed here is a real thing this
     // kernel does not have (ENOSYS), while one that is not listed at all is a
@@ -1196,7 +1215,7 @@ dword_t sys_unshare(dword_t flags) {
     // unshare(CLONE_NEWNS) treats ENOSYS as "not supported here" and EINVAL as
     // a failure (see sys_clone_common_). (CLONE_IO is not a namespace, and Linux's unshare
     // refuses it as malformed, so it is not listed here.)
-    const dword_t known_unsupported = CLONE_NEWCGROUP_ | CLONE_NEWTIME_ | CLONE_NEWNET_;
+    const dword_t known_unsupported = CLONE_NEWCGROUP_ | CLONE_NEWTIME_;
     const dword_t known = supported | known_unsupported;
 
     if (flags & ~known)
@@ -1206,8 +1225,8 @@ dword_t sys_unshare(dword_t flags) {
         return err;
     if (flags & known_unsupported)
         return _ENOSYS;
-    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ | CLONE_NEWPID_)) && !(flags & CLONE_NEWUSER_) &&
-            !ns_capable(current_user_ns(), CAP_SYS_ADMIN_))
+    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ | CLONE_NEWPID_ | CLONE_NEWNET_)) &&
+            !(flags & CLONE_NEWUSER_) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN_))
         return _EPERM;
 
     // Everything that can fail to allocate is allocated before anything
@@ -1328,6 +1347,18 @@ dword_t sys_unshare(dword_t flags) {
         user_ns_release(old_user);
     }
 
+    // A network namespace: allocated here, where nothing after it can fail.
+    // The caller's sockets stay in the one they were made in.
+    if (flags & CLONE_NEWNET_) {
+        struct net_namespace *new_net = net_ns_new(owner);
+        if (new_net != NULL) {
+            lock(&current->general_lock, 0);
+            struct net_namespace *old_net = current->net_ns;
+            current->net_ns = new_net;
+            unlock(&current->general_lock);
+            net_ns_release(old_net);
+        }
+    }
     if (new_pid != NULL) {
         lock(&current->general_lock, 0);
         struct pid_namespace *old_for_children = current->pid_ns_for_children;
@@ -1508,6 +1539,12 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
         if (flags != 0 && flags != nstype)
             return _EINVAL;
         flags = nstype;
+        // A pid or network namespace that is not the initial one cannot be
+        // joined (the initial one is the no-op it always was): saying it had
+        // been would leave the caller outside a sandbox it believes it is in.
+        // proc_ns_fd_info handed over no reference for these.
+        if ((nstype == CLONE_NEWPID_ || nstype == CLONE_NEWNET_) && ns != NULL)
+            return _EINVAL;
         if (nstype == CLONE_NEWUTS_ && ns != NULL)
             uts = uts_ns_retain(ns);
         if (nstype == CLONE_NEWIPC_ && ns != NULL)

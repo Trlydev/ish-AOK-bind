@@ -1488,6 +1488,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->user_ns = NULL; // likewise
     task->pid_ns = NULL;
     task->pid_ns_for_children = NULL;
+    task->net_ns = NULL;
     task->exit_arch = NULL;
     memset(task->ptrace_debugreg, 0, sizeof(task->ptrace_debugreg));
     task->ptrace_singlestep = false;

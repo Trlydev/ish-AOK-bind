@@ -14,21 +14,41 @@ inventory:
 - **Structural ceilings** — bounded by physics or arithmetic rather than by
   effort.
 
-## 41.1 Architectural: five namespaces out of seven
+## 41.1 Architectural: one machine, and the namespaces a sandbox needs
 
-No network or cgroup namespaces (nor time). UTS, IPC, mount, user and pid
-are the five there are: a UTS namespace is a hostname in a refcounted struct,
+No cgroup or time namespaces. UTS, IPC, mount, user, pid and network are the
+six there are, the last four added in 559 for one purpose — bubblewrap, and
+through it Codex CLI's command sandbox — and each shaped by the fact that
+underneath there is still one mount table, one pid table and the host's one
+network: a UTS namespace is a hostname in a refcounted struct,
 an IPC namespace is System V shared memory, semaphores and message queues kept
 per namespace instead of global, a mount namespace (559) is a mount table
 of the process's own — a copy of its parent's tree that it can mount in,
 unmount from and `pivot_root` on without anyone else seeing — and a user
 namespace (559) is a process being root, with every capability, over a world
 of its own and nobody new over the machine; and a pid namespace (559) is a
-set of processes that see only each other, the first of them as pid 1.
-`setns(2)` can join a UTS, IPC or mount namespace — or one nothing is in any more — through its
-`/proc/<pid>/ns` file; it cannot join a user or a pid namespace. Every other kind is
-`ENOSYS` to `unshare`, and `setns` into one is the no-op of joining the only
-one there is.
+set of processes that see only each other, the first of them as pid 1; and a
+network namespace (559) is a loopback interface with nothing behind it.
+`setns(2)` can join a UTS, IPC or mount namespace — or one nothing is in any
+more — through its `/proc/<pid>/ns` file; it cannot join a user, pid or
+network namespace. Every other kind is `ENOSYS` to `unshare`, and `setns`
+into one is the no-op of joining the only one there is.
+
+A network namespace here is the network a sandbox is given so that it has
+none. AOK's sockets are the host's and the host has one network, so a
+private namespace cannot be a second network; it is "lo", which comes up
+and takes 127.0.0.1 when told to over rtnetlink, and sockets that never
+touch the host: `bind` is recorded and reported back with nothing bound on
+the host, a destination outside is `ENETUNREACH`, a loopback connect is
+`ECONNREFUSED` — and that is the truth, because `listen` on an inet socket
+there is refused (`EOPNOTSUPP`). There is no loopback traffic between a
+namespace's sockets yet, and a server that could never be reached is told so
+where it asks rather than left waiting. Abstract `AF_UNIX` names are the
+namespace's own; pathname sockets are the filesystem's, as on Linux. A socket
+keeps the namespace it was made in wherever its descriptor goes. The native
+`curl` and `wget`, which fetch through the host rather than through a guest
+socket, ask the same question by name. `/proc/net/dev` and `/sys/class/net`
+still describe the machine's interfaces to whoever reads them.
 
 A user namespace here is narrower than Linux's, always on the refusing side.
 Its capabilities reach the namespaces made inside it, the ids its maps cover
@@ -70,7 +90,7 @@ with `PrivateNetwork=yes` went on to call `unshare(CLONE_NEWNET)`, got
 `localectl` could not start their daemons. With the file absent systemd says
 "proceeding without" and runs them.
 
-`clone` refuses the missing kinds (`CLONE_NEWNET`, `CLONE_NEWCGROUP`) too, but with `EINVAL`, the answer of a
+`clone` refuses the missing kind (`CLONE_NEWCGROUP`) too, but with `EINVAL`, the answer of a
 Linux kernel built without that namespace type. The two calls give different
 errnos on purpose: each is the one its callers read as "no sandbox here, carry
 on". systemd forks its generator sandbox with `clone` and runs the generators
@@ -88,12 +108,12 @@ with `PrivateTmp=`, `ProtectSystem=`, `ProtectHome=`, `ProtectProc=` or
 under them, and `/proc/sys/kernel/domainname` to get right, and all of
 logind, resolved, networkd, udevd and userdbd run inside one on Arch.
 
-So nothing container-shaped runs. No Docker, no `unshare -n`, no rootless
-podman. `unshare -m`, `-U`, `-r` and `-p` work, for an ordinary user too, and
-so does `bwrap` when it is asked for user, mount and pid namespaces
-(`--unshare-user --unshare-pid --ro-bind / / --dev /dev --proc /proc --tmpfs
-/tmp`); what Codex asks of it, `--unshare-net` as well, does not yet. There
-is one network, the same from every root, chroot and sandbox.
+So sandboxes run, and containers do not. `unshare -m`, `-U`, `-r`, `-p` and
+`-n` work, for an ordinary user too; so does `bwrap` with everything Codex
+asks of it, and `codex sandbox -- /bin/echo x` prints `x`. No Docker and no
+rootless podman: those want a network namespace that is a network (veth
+pairs, bridges, NAT), control groups of their own, and overlay mounts, and
+none of that is here.
 
 This is not a missing feature with a ticket. The absence runs through the design
 — Chapter 10's task model, Chapter 16's global mount table, Chapter 21's

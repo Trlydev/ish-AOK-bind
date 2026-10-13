@@ -855,8 +855,9 @@ reader can take to a different project:
 ## Chapter 41. The honest gaps
 
 - No `PROT_EXEC` enforcement — no NX for guest pages.
-- No network or cgroup namespaces (mount, user and pid namespaces arrived in
-  559, for sandboxes), so nothing container-shaped works; this is architectural, not a missing feature.
+- No cgroup namespaces, and a network namespace that is only a loopback
+  (mount, user, pid and network namespaces arrived in 559, for sandboxes), so
+  nothing container-shaped works; this is architectural, not a missing feature.
 - The interpreters are legacy and being retired.
 - Known native-program gaps: the applet argv ownership class, unrouted host
   symbols, process substitution where the rootfs lacks `/dev/fd`.

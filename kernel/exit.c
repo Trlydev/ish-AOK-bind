@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <string.h>
 #include "emu/cpu.h"
+#include "kernel/net_ns.h"
 #include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/rseq.h"
@@ -919,6 +920,9 @@ noreturn void do_exit(struct task *task, int status) {
     struct user_namespace *dead_user = task->user_ns;
     task->user_ns = NULL;
     user_ns_release(dead_user);
+    struct net_namespace *dead_net = task->net_ns;
+    task->net_ns = NULL;
+    net_ns_release(dead_net);
     struct pid_namespace *dead_pid_for_children = task->pid_ns_for_children;
     task->pid_ns_for_children = NULL;
     pid_ns_release(dead_pid_for_children);

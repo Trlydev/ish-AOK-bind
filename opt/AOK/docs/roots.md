@@ -435,15 +435,17 @@ interactive login prints three lines naming it. The reminder is
 an `/etc/pacman.conf`; it goes quiet once the three things above are dealt
 with, and replacing its contents with a comment turns it off for good.
 
-`/AOK/fixes/codex` is for OpenAI's Codex CLI, which works until it runs a shell
-command: it runs each one inside bubblewrap, which needs a network
-namespace AOK does not have (it has mount, user and pid namespaces, since
-559, and `bwrap --unshare-user --unshare-pid` with binds works, for an
-ordinary user too), and it has no fallback. The script tells Codex to
-run commands without that sandbox, by putting
-`sandbox_mode = "danger-full-access"` at the top of `~/.codex/config.toml`;
-Codex's approval policy is unchanged, so it still asks before what it would
-have asked about. `README.txt` beside it says the same at more length.
+`/AOK/fixes/codex` is about OpenAI's Codex CLI, which runs every shell command
+it issues inside bubblewrap. That needs user, mount, pid and network
+namespaces, and from build 559 AOK has them: `codex sandbox -- /bin/echo x`
+prints `x`, for root and for an ordinary user, and there is nothing to fix.
+Before 559 the sandbox could not start, and the script here turned it off by
+putting `sandbox_mode = "danger-full-access"` at the top of
+`~/.codex/config.toml`. The script now does the opposite: it takes that line
+out again (only the one it added), so that a root set up on an older build
+goes back to running Codex's commands confined. `README.txt` beside it says
+what the sandbox is here, including the one thing narrower than on Linux — a
+sandboxed command with network access off cannot listen on a TCP port.
 
 ```sh
 sh /AOK/fixes/codex/fix-codex.sh         # or, for one session: codex --sandbox danger-full-access

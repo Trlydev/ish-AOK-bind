@@ -84,9 +84,10 @@ quietest of the three lives.
 `/AOK/fixes` is a small directory with a specific philosophy behind it. When a
 distribution ships something that does not work under AOK — Devuan's
 `pkcsslotd` init script, an Arch packaging assumption, a Debian symlink, and
-since 557 Codex CLI, which runs every command inside a bubblewrap sandbox that
-needs namespaces AOK does not have (Chapter 41) — the fix has to live
-somewhere.
+for two builds Codex CLI, which runs every command inside a bubblewrap sandbox
+that needed namespaces AOK did not have until 559 (Chapter 41) — the fix has
+to live somewhere. (That one is also the example of a fix retiring: the
+script that used to turn Codex's sandbox off now removes what it added.)
 
 The obvious place is the root filesystem image, patched before it ships. That
 means the fix is frozen at image-build time, applies only to roots created

@@ -21,6 +21,8 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include "kernel/ipc_ns.h"
+#include "kernel/net_ns.h"
 #include "kernel/pid_ns.h"
 #include "util/wait_spin.h"
 #include "kernel/user_ns.h"
@@ -119,6 +121,7 @@ struct audit_features_ {
 #define SIOCGIFNAME_ 0x8910
 #define SIOCGIFCONF_ 0x8912
 #define SIOCGIFFLAGS_ 0x8913
+#define SIOCSIFFLAGS_ 0x8914
 #define SIOCGIFADDR_ 0x8915
 #define SIOCGIFDSTADDR_ 0x8917
 #define SIOCGIFBRDADDR_ 0x8919
@@ -1403,8 +1406,187 @@ static int netlink_append_route_routes(struct fd *sock, const struct nlmsghdr_ *
     return err;
 }
 
+// ---- rtnetlink in a private network namespace (kernel/net_ns.h) -------------
+//
+// One interface, "lo", index 1: down and without an address until it is told
+// otherwise, which is the whole of what a sandbox does to its network before
+// it runs anything (bubblewrap: RTM_NEWADDR 127.0.0.1/8, then RTM_NEWLINK
+// IFF_UP; systemd for a PrivateNetwork= service: RTM_SETLINK up, and reads it
+// back).
+
+#define NET_NS_LO_INDEX 1
+#define RTM_SETLINK_NET_NS_ 19
+
+static unsigned net_ns_lo_flags(struct net_namespace *ns) {
+    unsigned flags = IFF_LOOPBACK_LINUX_;
+    if (atomic_load(&ns->lo_up))
+        flags |= IFF_UP_LINUX_ | IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
+    return flags;
+}
+
+static int net_ns_append_lo_link(struct fd *sock, struct net_namespace *ns, uint32_t seq, uint16_t msg_flags) {
+    char payload[256];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifinfomsg_);
+    struct ifinfomsg_ *msg = (struct ifinfomsg_ *) payload;
+    msg->ifi_family = AF_UNSPEC;
+    msg->ifi_type = ARPHRD_LOOPBACK_;
+    msg->ifi_index = NET_NS_LO_INDEX;
+    msg->ifi_flags = net_ns_lo_flags(ns);
+    msg->ifi_change = 0xffffffffu;
+    uint32_t mtu = 65536, txqlen = 1000;
+    uint8_t operstate = atomic_load(&ns->lo_up) ? IF_OPER_UNKNOWN_ : 2 /* IF_OPER_DOWN */;
+    uint8_t carrier = atomic_load(&ns->lo_up) ? 1 : 0;
+    uint8_t hw[6] = {0};
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_IFNAME_, "lo", 3);
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_MTU_, &mtu, sizeof(mtu));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_ADDRESS_, hw, sizeof(hw));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_BROADCAST_, hw, sizeof(hw));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_TXQLEN_, &txqlen, sizeof(txqlen));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_OPERSTATE_, &operstate, sizeof(operstate));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_CARRIER_, &carrier, sizeof(carrier));
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWLINK_, msg_flags, seq, payload, len);
+}
+
+static int net_ns_append_lo_addr(struct fd *sock, uint32_t seq, bool v6) {
+    char payload[128];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifaddrmsg_);
+    struct ifaddrmsg_ *msg = (struct ifaddrmsg_ *) payload;
+    msg->ifa_family = v6 ? AF_INET6_ : AF_INET_;
+    msg->ifa_prefixlen = v6 ? 128 : 8;
+    msg->ifa_flags = 0x80; // IFA_F_PERMANENT
+    msg->ifa_scope = RT_SCOPE_HOST_;
+    msg->ifa_index = NET_NS_LO_INDEX;
+    int err;
+    if (v6) {
+        struct in6_addr addr = IN6ADDR_LOOPBACK_INIT;
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, &addr, sizeof(addr));
+    } else {
+        struct in_addr addr = {.s_addr = htonl(INADDR_LOOPBACK)};
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LOCAL_, &addr, sizeof(addr));
+        if (err >= 0)
+            err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, &addr, sizeof(addr));
+        if (err >= 0)
+            err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LABEL_, "lo", 3);
+    }
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWADDR_, NLM_F_MULTI_, seq, payload, len);
+}
+
+// A reply to a request that changes something: only when it asked for one.
+static int net_ns_ack(struct fd *sock, const struct nlmsghdr_ *hdr, int err_code) {
+    if (err_code != 0 || (hdr->nlmsg_flags & NLM_F_ACK_))
+        return netlink_append_error(sock, hdr->nlmsg_seq, hdr, err_code);
+    return 0;
+}
+
+// true when the request was one of this namespace's own to answer (*result
+// is then what netlink_handle_route_request returns).
+static bool net_ns_route_request(struct fd *sock, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len, int *result) {
+    struct net_namespace *ns = sock->socket.net_ns;
+    uint8_t family = payload_len >= 1 ? *(const uint8_t *) payload : AF_UNSPEC;
+    switch (hdr->nlmsg_type) {
+        case RTM_GETLINK_: {
+            if (hdr->nlmsg_flags & NLM_F_DUMP_) {
+                int err = family == AF_BRIDGE_ ? 0 : net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, NLM_F_MULTI_);
+                *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
+                return true;
+            }
+            // One link, by index or by name.
+            const struct ifinfomsg_ *req = payload_len >= sizeof(*req) ? payload : NULL;
+            bool is_lo = req != NULL && req->ifi_index == NET_NS_LO_INDEX;
+            if (req != NULL && req->ifi_index == 0) {
+                const struct nlattr_ *name = netlink_attr_find((const char *) payload + sizeof(*req),
+                        payload_len - sizeof(*req), IFLA_IFNAME_);
+                is_lo = name != NULL && netlink_attr_streq(name, "lo");
+            }
+            *result = is_lo ? net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, 0)
+                            : netlink_append_error(sock, hdr->nlmsg_seq, hdr, _ENODEV);
+            return true;
+        }
+        case RTM_GETADDR_: {
+            int err = 0;
+            if (atomic_load(&ns->lo_addr4) && (family == AF_UNSPEC || family == AF_INET_))
+                err = net_ns_append_lo_addr(sock, hdr->nlmsg_seq, false);
+            if (err >= 0 && atomic_load(&ns->lo_addr6) && (family == AF_UNSPEC || family == AF_INET6_))
+                err = net_ns_append_lo_addr(sock, hdr->nlmsg_seq, true);
+            *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
+            return true;
+        }
+        case RTM_GETROUTE_:
+            // No routes: the loopback's own are not listed here either.
+            *result = netlink_append_done(sock, hdr->nlmsg_seq);
+            return true;
+        case RTM_NEWADDR_:
+        case RTM_DELADDR_: {
+            const struct ifaddrmsg_ *req = payload_len >= sizeof(*req) ? payload : NULL;
+            int err = 0;
+            if (req == NULL)
+                err = _EINVAL;
+            else if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+                err = _EPERM;
+            else if (req->ifa_index != NET_NS_LO_INDEX)
+                err = _ENODEV;
+            else if (req->ifa_family == AF_INET_)
+                atomic_store(&ns->lo_addr4, hdr->nlmsg_type == RTM_NEWADDR_);
+            else if (req->ifa_family == AF_INET6_)
+                atomic_store(&ns->lo_addr6, hdr->nlmsg_type == RTM_NEWADDR_);
+            else
+                err = _EAFNOSUPPORT;
+            *result = net_ns_ack(sock, hdr, err);
+            return true;
+        }
+        case RTM_NEWLINK_:
+        case RTM_SETLINK_NET_NS_: {
+            const struct ifinfomsg_ *req = payload_len >= sizeof(*req) ? payload : NULL;
+            int err = 0;
+            bool is_lo = req != NULL && req->ifi_index == NET_NS_LO_INDEX;
+            if (req != NULL && req->ifi_index == 0) {
+                const struct nlattr_ *name = netlink_attr_find((const char *) payload + sizeof(*req),
+                        payload_len - sizeof(*req), IFLA_IFNAME_);
+                is_lo = name != NULL && netlink_attr_streq(name, "lo");
+            }
+            if (req == NULL)
+                err = _EINVAL;
+            else if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+                err = _EPERM;
+            else if (!is_lo)
+                // Nothing but "lo" is here, and no other kind can be made.
+                err = req->ifi_index != 0 ? _ENODEV : _EOPNOTSUPP;
+            else if (req->ifi_change == 0 || (req->ifi_change & IFF_UP_LINUX_)) {
+                bool up = (req->ifi_flags & IFF_UP_LINUX_) != 0;
+                atomic_store(&ns->lo_up, up);
+                // Up, the loopback has its addresses, as Linux gives them.
+                if (up) {
+                    atomic_store(&ns->lo_addr4, true);
+                    atomic_store(&ns->lo_addr6, true);
+                }
+            }
+            *result = net_ns_ack(sock, hdr, err);
+            return true;
+        }
+    }
+    return false;
+}
+
 static int netlink_handle_route_request(struct fd *sock, const struct nlmsghdr_ *hdr,
         const void *payload, size_t payload_len) {
+    if (sock->socket.net_ns != NULL) {
+        int result;
+        if (net_ns_route_request(sock, hdr, payload, payload_len, &result))
+            return result;
+    }
     switch (hdr->nlmsg_type) {
         case RTM_GETLINK_:
             // Either bit of NLM_F_DUMP makes it a dump, as rtnetlink_rcv_msg
@@ -2685,10 +2867,118 @@ static int unix_socket_finish_peer(struct fd *sock);
 // rather than at the next free number in the current one.
 static void unix_seqpacket_host_init(struct fd *sock);
 
+// ---- Network namespaces (kernel/net_ns.h) ----------------------------------
+
+struct net_namespace *net_ns_retain(struct net_namespace *ns) {
+    if (ns != NULL)
+        atomic_fetch_add(&ns->refcount, 1);
+    return ns;
+}
+
+void net_ns_release(struct net_namespace *ns) {
+    if (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
+        user_ns_release(ns->user_ns);
+        free(ns);
+    }
+}
+
+struct net_namespace *net_ns_new(struct user_namespace *owner) {
+    struct net_namespace *ns = calloc(1, sizeof(*ns));
+    if (ns == NULL)
+        return NULL;
+    atomic_init(&ns->refcount, 1);
+    ns->inode = ns_alloc_inum();
+    ns->user_ns = user_ns_retain(owner);
+    return ns;
+}
+
+struct net_namespace *current_net_ns(void) {
+    return current != NULL ? current->net_ns : NULL;
+}
+
+bool current_net_is_host(void) {
+    return current_net_ns() == NULL;
+}
+
+// Is this an inet socket of a private network namespace: one that must never
+// reach the host's network?
+static bool sock_net_private_inet(const struct fd *sock) {
+    return sock->socket.net_ns != NULL &&
+        (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_);
+}
+
+// A host-format address: loopback (127/8, ::1, or 127/8 mapped into IPv6)?
+static bool host_sockaddr_is_loopback(const void *addr) {
+    const struct sockaddr *sa = addr;
+    if (sa->sa_family == AF_INET)
+        return (ntohl(((const struct sockaddr_in *) sa)->sin_addr.s_addr) >> 24) == 127;
+    if (sa->sa_family == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *) sa)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(a6))
+            return true;
+        return IN6_IS_ADDR_V4MAPPED(a6) && a6->s6_addr[12] == 127;
+    }
+    return false;
+}
+
+// What a destination gets from a socket of a private network namespace, where
+// nothing is carried anywhere: ECONNREFUSED on loopback -- nothing can be
+// listening, since listen() is refused there -- and ENETUNREACH beyond it.
+// 0 for a socket this does not concern, and for AF_UNSPEC (a disconnect).
+static int sock_net_dest_gate(const struct fd *sock, const void *addr) {
+    if (!sock_net_private_inet(sock))
+        return 0;
+    const struct sockaddr *sa = addr;
+    if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
+        return 0;
+    // (Loopback too, until "lo" is up: there is no route to it.)
+    return host_sockaddr_is_loopback(addr) && atomic_load(&sock->socket.net_ns->lo_up)
+        ? _ECONNREFUSED : _ENETUNREACH;
+}
+
+// bind() for an inet socket of a private network namespace: recorded, and
+// reported back by getsockname, with nothing bound on the host -- a host bind
+// would be a door onto the machine's network (a UDP socket bound there
+// receives whatever the LAN sends it). To the wildcard address, or to a
+// loopback address the namespace's "lo" has been given.
+static _Atomic unsigned net_ns_next_port = 0;
+static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
+    struct net_namespace *ns = sock->socket.net_ns;
+    struct sockaddr *sa = addr;
+    if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
+        return _EAFNOSUPPORT;
+    if (sock->socket.bind_deferred)
+        return _EINVAL;     // bound already
+    bool wildcard = sa->sa_family == AF_INET
+        ? ((struct sockaddr_in *) sa)->sin_addr.s_addr == htonl(INADDR_ANY)
+        : IN6_IS_ADDR_UNSPECIFIED(&((struct sockaddr_in6 *) sa)->sin6_addr);
+    if (!wildcard) {
+        if (!host_sockaddr_is_loopback(addr))
+            return _EADDRNOTAVAIL;
+        bool assigned = sa->sa_family == AF_INET ? atomic_load(&ns->lo_addr4) : atomic_load(&ns->lo_addr6);
+        if (!assigned)
+            return _EADDRNOTAVAIL;
+    }
+    in_port_t *port = sa->sa_family == AF_INET ? &((struct sockaddr_in *) sa)->sin_port
+                                               : &((struct sockaddr_in6 *) sa)->sin6_port;
+    if (*port != 0 && ntohs(*port) < 1024 && !ns_capable(ns->user_ns, CAP_NET_BIND_SERVICE_))
+        return _EACCES;
+    // A port of the socket's own when it asked for any.
+    if (*port == 0)
+        *port = htons((uint16_t) (32768 + atomic_fetch_add(&net_ns_next_port, 1) % 28000));
+    memcpy(sock->socket.deferred_addr, addr,
+           addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
+    sock->socket.deferred_addr_len = (socklen_t) addr_len;
+    sock->socket.bind_deferred = true;
+    return 0;
+}
+
 struct fd *sock_fd_adopt(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
     if (fd == NULL)
         return NULL;
+    // The namespace of whoever is making it (kernel/net_ns.h).
+    fd->socket.net_ns = net_ns_retain(current_net_ns());
     fd->stat.mode = S_IFSOCK | 0666;
     // A socket's inode belongs to whoever created it. adhoc_fd_create zeroes
     // the whole statbuf, so this was uid 0 -- every socket in the system
@@ -2846,7 +3136,11 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         fd->socket.protocol = protocol;
         sock_init_emulation_defaults(fd);
         fd->socket.netlink_port_id = netlink_next_port_id();
-        netlink_notify_register(fd);
+        fd->socket.net_ns = net_ns_retain(current_net_ns());
+        // What the host's interfaces do is no news in a private network
+        // namespace, which has none of them.
+        if (fd->socket.net_ns == NULL)
+            netlink_notify_register(fd);
         return f_install(fd, type & ~SOCKET_TYPE_MASK);
     }
     // Three different failures were all reported as EINVAL, and a program
@@ -3245,6 +3539,10 @@ int sock_snapshot_collect(struct sock_snapshot *out, int domain, int type) {
                 continue;
             if (fd->socket.domain != domain)
                 continue;
+            // The sockets of the reader's own network namespace
+            // (kernel/net_ns.h): /proc/net and socket-diag list no others.
+            if (fd->socket.net_ns != current_net_ns())
+                continue;
             if (type >= 0 && fd->socket.type != type)
                 continue;
             if (domain != AF_LOCAL_ && fd->real_fd < 0)
@@ -3636,6 +3934,10 @@ static int netlink_handle_diag_request(struct fd *sock, const struct nlmsghdr_ *
         const void *payload, size_t payload_len) {
     if (hdr->nlmsg_type != SOCK_DIAG_BY_FAMILY_)
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
+    // A private network namespace is shown none of the machine's sockets
+    // (kernel/net_ns.h), and its own are not listed yet.
+    if (sock->socket.net_ns != NULL)
+        return netlink_append_done(sock, hdr->nlmsg_seq);
 
     if (payload_len < 1)
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EINVAL);
@@ -4827,6 +5129,10 @@ struct unix_abstract {
     char *name;
     uint32_t socket_id;
     int socket_type; // of the socket bound here; see inode_data.socket_type
+    // The network namespace the name is in (kernel/net_ns.h): an abstract
+    // name is found only from the namespace it was bound in. Compared, never
+    // followed -- the socket bound here is what holds the namespace.
+    const struct net_namespace *net_ns;
     struct list links;
 };
 #define ABSTRACT_HASH_SIZE 1024
@@ -4837,6 +5143,7 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
                              int *bound_type) {
     uint32_t hash = str_hash(name);
     size_t name_len = strlen(name);
+    const struct net_namespace *net_ns = bind_fd != NULL ? bind_fd->socket.net_ns : current_net_ns();
     lock(&unix_abstract_lock, 0);
     struct unix_abstract *sock_tmp;
     struct unix_abstract *sock = NULL;
@@ -4844,7 +5151,7 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
     if (list_null(bucket))
         list_init(bucket);
     list_for_each_entry(bucket, sock_tmp, links) {
-        if (sock_tmp->hash == hash &&
+        if (sock_tmp->hash == hash && sock_tmp->net_ns == net_ns &&
                 sock_tmp->name_len == name_len &&
                 memcmp(sock_tmp->name, name, name_len) == 0) {
             sock = sock_tmp;
@@ -4880,6 +5187,7 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
         sock->name_len = name_len;
         sock->socket_id = unix_socket_next_id();
         sock->socket_type = 0;
+        sock->net_ns = net_ns;
         list_add(bucket, &sock->links);
     }
 
@@ -5666,6 +5974,9 @@ static bool sock_bind_probe_ok(struct fd *sock, const void *addr, uint_t addr_le
 static int sock_bind_materialize(struct fd *sock) {
     if (!sock->socket.bind_deferred)
         return 0;
+    // Never, in a private network namespace: see sock_net_private_bind.
+    if (sock_net_private_inet(sock))
+        return 0;
     sock->socket.bind_deferred = false;
     if (bind(sock->real_fd, (struct sockaddr *) sock->socket.deferred_addr,
                 sock->socket.deferred_addr_len) < 0)
@@ -5709,6 +6020,9 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
             sock->socket.netlink_port_id = addr->nl_pid;
         return 0;
     }
+
+    if (sock_net_private_inet(sock))
+        return sock_net_private_bind(sock, &sockaddr, sockaddr_len);
 
     // CAP_NET_BIND_SERVICE: ports below 1024 are privileged on Linux. We had no
     // check at all, so uid 1000 could bind 127.0.0.1:80 or :53 and serve
@@ -6350,6 +6664,12 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
     if (sock->socket.domain == AF_LOCAL_ && peer_type != 0 && peer_type != sock->socket.type)
         return _EPROTOTYPE;
 
+    // A private network namespace: before anything can turn the address into
+    // one on the host (the loopback NAT below would).
+    int net_gate = sock_net_dest_gate(sock, &sockaddr);
+    if (net_gate < 0)
+        return net_gate;
+
     if (sock->socket.domain == AF_INET_) {
         struct sockaddr_in guest_dest = *(struct sockaddr_in *) &sockaddr;
         if (inet_nat_rewrite_dest(sock, &sockaddr)) {
@@ -6536,6 +6856,12 @@ int_t sys_listen(fd_t sock_fd, int_t backlog) {
     struct fd *sock = sock_getfd(sock_fd, &sock_err);
     if (sock == NULL)
         return sock_err;
+    // A private network namespace carries nothing between its sockets yet
+    // (kernel/net_ns.h), and a listener nobody could ever reach is refused
+    // here rather than left waiting -- which is also what makes ECONNREFUSED
+    // the truth for a loopback connect there.
+    if (sock_net_private_inet(sock))
+        return _EOPNOTSUPP;
     // The bind was deferred so the port would not sit on the host in a state
     // where Darwin swallows connections; this is the moment it must be real.
     int bind_err = sock_bind_materialize(sock);
@@ -6836,6 +7162,12 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
     // well under its limit, so the window, not EMFILE, is the likelier cause.
     struct fd *client_fd = sock_fd_adopt(client,
             sock->socket.domain, sock->socket.type | flags, sock->socket.protocol);
+    // An accepted socket is in its listener's network namespace, whoever
+    // called accept.
+    if (client_fd != NULL && client_fd->socket.net_ns != sock->socket.net_ns) {
+        net_ns_release(client_fd->socket.net_ns);
+        client_fd->socket.net_ns = net_ns_retain(sock->socket.net_ns);
+    }
     if (client_fd == NULL) {
         close(client);
         return _ENOMEM;
@@ -7274,6 +7606,9 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
             }
             goto error;
         }
+        err = sock_net_dest_gate(sock, &sockaddr);
+        if (err < 0)
+            goto error;
         if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_dest(sock, &sockaddr);
     }
@@ -7957,6 +8292,25 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
     // INDEX, so the name is resolved here. The guest sees the host's own
     // interface names (lo0, en0, ...), so no translation is needed beyond
     // that. An empty name unbinds, which is how Linux clears it.
+    // A socket of a private network namespace (kernel/net_ns.h) has "lo" to
+    // be bound to and no group to join: none of this reaches the host's
+    // interfaces.
+    if (sock_net_private_inet(sock)) {
+        if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
+            char name[IFNAMSIZ_ + 1] = "";
+            memcpy(name, value, value_len < IFNAMSIZ_ ? value_len : IFNAMSIZ_);
+            return name[0] == '\0' || strcmp(name, "lo") == 0 ? 0 : _ENODEV;
+        }
+        if (level == SOL_SOCKET_ && option == SO_BINDTOIFINDEX_) {
+            int32_t index = 0;
+            if (value_len >= sizeof(index))
+                memcpy(&index, value, sizeof(index));
+            return index == 0 || index == NET_NS_LO_INDEX ? 0 : _ENODEV;
+        }
+        if ((level == IPPROTO_IP && (option == IP_ADD_MEMBERSHIP_ || option == IP_DROP_MEMBERSHIP_)) ||
+                (level == IPPROTO_IPV6 && (option == IPV6_ADD_MEMBERSHIP_ || option == IPV6_DROP_MEMBERSHIP_)))
+            return _ENODEV;
+    }
     if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
         char name[sizeof(sock->socket.so_bindtodevice)];
         size_t copy = value_len < sizeof(name) - 1 ? value_len : sizeof(name) - 1;
@@ -9314,6 +9668,9 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     struct sockaddr_max_ msg_name;
     if (msg_fake.msg_name != 0 && !sock_is_unix_seqpacket(sock)) {
         int err = sockaddr_read(msg_fake.msg_name, &msg_name, &msg_fake.msg_namelen);
+        if (err < 0)
+            return err;
+        err = sock_net_dest_gate(sock, &msg_name);
         if (err < 0)
             return err;
         if (sock->socket.domain == AF_INET_)
@@ -11151,6 +11508,85 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
     return res;
 }
 
+// The interface ioctls for a socket of a private network namespace
+// (kernel/net_ns.h): "lo", index 1, and nothing else. *handled is false for
+// a command that is not one of them.
+static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *handled) {
+    *handled = true;
+    struct ifreq_ *ifreq = arg;
+    if (cmd == SIOCGIFCONF_) {
+        bool is_64bit = task_is_64bit(current);
+        struct guest_ifconf32_ *ifconf32 = arg;
+        struct guest_ifconf64_ *ifconf64 = arg;
+        int32_t guest_len = is_64bit ? ifconf64->guest_len : ifconf32->guest_len;
+        guest_addr_t guest_buf = is_64bit ? ifconf64->guest_buf : ifconf32->guest_buf;
+        size_t entry_size = is_64bit ? sizeof(struct guest_ifreq_addr64_) : sizeof(struct guest_ifreq_addr32_);
+        size_t total = atomic_load(&ns->lo_addr4) ? entry_size : 0, used = 0;
+        if (total != 0 && guest_buf != 0 && guest_len > 0 && (size_t) guest_len >= entry_size) {
+            struct guest_ifreq_addr64_ entry = {};
+            strcpy(entry.ifr_name, "lo");
+            entry.guest_addr.sin_family = AF_INET_;
+            entry.guest_addr.sin_addr = htonl(INADDR_LOOPBACK);
+            if (user_write(guest_buf, &entry, entry_size))
+                return _EFAULT;
+            used = entry_size;
+        }
+        int32_t result_len = guest_buf == 0 ? (int32_t) total : (int32_t) used;
+        if (is_64bit)
+            ifconf64->guest_len = result_len;
+        else
+            ifconf32->guest_len = result_len;
+        return 0;
+    }
+    if (cmd == SIOCGIFNAME_) {
+        if (ifreq->ifr_ifru.ifindex != NET_NS_LO_INDEX)
+            return _ENODEV;
+        memset(ifreq->ifr_name, 0, sizeof(ifreq->ifr_name));
+        strcpy(ifreq->ifr_name, "lo");
+        return 0;
+    }
+    if (cmd != SIOCGIFINDEX_ && cmd != SIOCGIFFLAGS_ && cmd != SIOCSIFFLAGS_ && cmd != SIOCGIFTXQLEN_ && cmd != SIOCGIFMTU_ &&
+            cmd != SIOCGIFMETRIC_ && cmd != SIOCGIFHWADDR_ && cmd != SIOCGIFADDR_ &&
+            cmd != SIOCGIFDSTADDR_ && cmd != SIOCGIFBRDADDR_ && cmd != SIOCGIFNETMASK_) {
+        *handled = false;
+        return 0;
+    }
+    if (strncmp(ifreq->ifr_name, "lo", sizeof(ifreq->ifr_name)) != 0)
+        return _ENODEV;
+    switch (cmd) {
+        case SIOCGIFINDEX_: ifreq->ifr_ifru.ifindex = NET_NS_LO_INDEX; return 0;
+        case SIOCGIFFLAGS_: ifreq->ifr_ifru.flags = (int16_t) net_ns_lo_flags(ns); return 0;
+        case SIOCSIFFLAGS_: {
+            // `ip link set lo up` the old way (busybox, ifconfig): the same
+            // as RTM_NEWLINK above, addresses included.
+            if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+                return _EPERM;
+            bool up = (ifreq->ifr_ifru.flags & IFF_UP_LINUX_) != 0;
+            atomic_store(&ns->lo_up, up);
+            if (up) {
+                atomic_store(&ns->lo_addr4, true);
+                atomic_store(&ns->lo_addr6, true);
+            }
+            return 0;
+        }
+        case SIOCGIFTXQLEN_: ifreq->ifr_ifru.qlen = 1000; return 0;
+        case SIOCGIFMTU_: ifreq->ifr_ifru.mtu = 65536; return 0;
+        case SIOCGIFMETRIC_: ifreq->ifr_ifru.metric = 0; return 0;
+        case SIOCGIFHWADDR_:
+            memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+            ifreq->ifr_ifru.addr.family = ARPHRD_LOOPBACK_;
+            return 0;
+    }
+    // An address of "lo": the one it has, once it has it.
+    if (!atomic_load(&ns->lo_addr4))
+        return _EADDRNOTAVAIL;
+    struct sockaddr_in_ *in = (struct sockaddr_in_ *) &ifreq->ifr_ifru.addr;
+    memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+    in->sin_family = AF_INET_;
+    in->sin_addr = cmd == SIOCGIFNETMASK_ ? htonl(0xff000000u) : htonl(INADDR_LOOPBACK);
+    return 0;
+}
+
 static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
     if (cmd == SIOCGSKNS_) {
         // Which network namespace this socket lives in. AOK presents no
@@ -11167,6 +11603,16 @@ static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
             return PTR_ERR(ns);
         return f_install(ns, O_CLOEXEC_);
     }
+    if (fd->socket.net_ns != NULL) {
+        bool handled;
+        int err = net_ns_if_ioctl(fd->socket.net_ns, cmd, arg, &handled);
+        if (handled)
+            return err;
+    }
+    // The machine's interfaces are the host's, and not a guest's to set:
+    // what this ioctl has always answered here.
+    if (cmd == SIOCSIFFLAGS_)
+        return _ENOTTY;
     if (cmd == SIOCGIFNAME_)
         return sock_ifreq_name_from_index(arg);
     if (cmd == SIOCGIFCONF_)
@@ -11253,6 +11699,7 @@ static ssize_t sock_ioctl_size(int cmd) {
         case SIOCGIFCONF_:
         case SIOCGIFINDEX_:
         case SIOCGIFFLAGS_:
+        case SIOCSIFFLAGS_:
         case SIOCGIFTXQLEN_:
         case SIOCGIFMTU_:
         case SIOCGIFMETRIC_:
@@ -11333,6 +11780,8 @@ static int sock_close(struct fd *fd) {
         close(fd->socket.ipv6_recverr_fd);
         fd->socket.ipv6_recverr_fd = -1;
     }
+    net_ns_release(fd->socket.net_ns);
+    fd->socket.net_ns = NULL;
     if (fd->real_fd < 0)
         return 0;
     if (sock_is_unix_seqpacket(fd))

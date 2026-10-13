@@ -96,6 +96,7 @@ struct native_program;   // kernel/native.h
 struct mnt_namespace;
 struct user_namespace;
 struct pid_namespace;
+struct net_namespace;
 struct task {
     enum guest_abi abi;
     // Ticks since boot when this task was created -- /proc/<pid>/stat field 22
@@ -788,6 +789,10 @@ struct task {
     // reference. Like the two above, handed on by copy_task alone.
     struct pid_namespace *pid_ns;
     struct pid_namespace *pid_ns_for_children;
+
+    // The network namespace this task is in (kernel/net_ns.h), NULL for the
+    // initial one. Owns a reference; handed on by copy_task alone.
+    struct net_namespace *net_ns;
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {
@@ -1268,6 +1273,7 @@ extern void (*halt_hook)(int status);
 // the capabilities ns_capable() finds (kernel/user_ns.h), and nothing else.
 #define superuser() (current != NULL && current->euid == 0 && current->user_ns == NULL)
 
+#define CAP_NET_ADMIN_ 12
 #define CAP_DAC_OVERRIDE_ 1
 #define CAP_KILL_ 5
 // Linux capability numbers, for the gates below. Only the ones something
