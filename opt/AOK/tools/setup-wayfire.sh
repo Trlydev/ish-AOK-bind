@@ -48,9 +48,10 @@
 #   sudo sh /AOK/tools/select-desktop.sh labwc        back to the default desktop
 #
 # Devuan 6 (Wayfire 0.9) runs it, on any architecture (arm64 Wayfire through
-# multiarch where the root is not arm64). Arch Linux ARM packages it (0.11) but its
-# Mesa is too new for OpenGL ES on iSH-AOK's GPU (see below), and Alpine does
-# not package it; setup-xfce.sh works on both.
+# multiarch where the root is not arm64). Arch Linux ARM packages it (0.11),
+# and from build 559 its Mesa can use the GPU for OpenGL ES (see below), but
+# nobody has run a Wayfire session there yet. Alpine does not package it;
+# setup-xfce.sh works on both.
 # ---------------------------------------------------------------------------
 set -u
 
@@ -109,18 +110,18 @@ elif ! sh /AOK/tools/setup-gpu.sh --check >/dev/null 2>&1; then
     sh /AOK/tools/setup-gpu.sh || die "setup-gpu.sh failed, and Wayfire cannot run without the GPU -- see above"
 fi
 
-# Wayfire composites with OpenGL ES, which reaches the GPU only through zink,
-# and Mesa 25.2 and later refuse to start zink without robustness2's
-# nullDescriptor -- which iSH-AOK's GPU (Venus on MoltenVK) does not offer
-# yet. Such a root would install Wayfire and then only ever start labwc, so
-# find out first. Devuan 6 (Mesa 25.0) works; Arch and Alpine 3.24 ship newer.
-# (In arm64 mode the arm64 Mesa's version is checked after it is installed.)
+# Wayfire composites with OpenGL ES, which reaches the GPU only through zink.
+# A root where zink does not start would install Wayfire and then only ever
+# start labwc, so find out first. (Mesa 25.2 and later will not start zink
+# without robustness2's nullDescriptor, which iSH-AOK's GPU -- Venus on
+# MoltenVK -- has offered since build 559; Devuan 6's Mesa 25.0 never needed
+# it.)
 gles_renderer=zink
 [ "$ARM64_MODE" = 1 ] || gles_renderer=$(LIBGL_ALWAYS_SOFTWARE=0 MESA_LOADER_DRIVER_OVERRIDE=zink \
     eglinfo -B -p surfaceless 2>/dev/null | sed -n 's/^OpenGL ES profile renderer: //p' | head -1)
 case "$gles_renderer" in
     *zink*) : ;;
-    *) die "Wayfire needs OpenGL ES on the GPU, and this root's Mesa cannot provide it (renderer: ${gles_renderer:-none}). Mesa 25.2 and later need a Vulkan feature iSH-AOK's GPU does not offer yet; Devuan 6 (Mesa 25.0) runs Wayfire. setup-xfce.sh works here." ;;
+    *) die "Wayfire needs OpenGL ES on the GPU, and this root's Mesa does not provide it (renderer: ${gles_renderer:-none}). 'sh /AOK/tools/setup-gpu.sh --check' says what is missing; setup-xfce.sh works without it." ;;
 esac
 
 PKGS="wayfire wf-shell wcm kclock"
@@ -161,12 +162,10 @@ if command -v apt-get >/dev/null 2>&1; then
         -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold $PKGS \
         || die "apt-get install failed -- see output above"
     if [ "$ARM64_MODE" = 1 ]; then
-        # The zink rule (above), for the Mesa Wayfire will load.
+        # The Mesa Wayfire will load. (Any version's zink starts on the GPU
+        # since build 559; this used to refuse 25.2 and later.)
         mesa_arm64=$(dpkg-query -W -f '${Version}' libegl-mesa0:arm64 2>/dev/null)
-        case "$mesa_arm64" in
-            2[0-4].*|25.[01].*|25.[01]) note "arm64 Mesa $mesa_arm64: OpenGL ES on the GPU" ;;
-            *) die "arm64 Mesa ${mesa_arm64:-(none)} is 25.2 or later, whose zink needs a Vulkan feature iSH-AOK's GPU does not offer yet; Wayfire cannot composite on it" ;;
-        esac
+        note "arm64 Mesa ${mesa_arm64:-(none)}: OpenGL ES on the GPU"
     fi
 elif command -v pacman >/dev/null 2>&1; then
     PKGS="$PKGS $CLOCK_ARCH"

@@ -151,14 +151,15 @@ check() {
                 ok "OpenGL through zink: ${gl%;}" ;;
             *)
                 if printf '%s\n' "$egl_out" | grep -q 'nullDescriptor'; then
-                    # Not something this script can install: Mesa 25.2 and
-                    # later refuse to start zink without robustness2's
-                    # nullDescriptor, which the GPU path (Venus on MoltenVK,
-                    # on Metal) does not offer yet. Vulkan is unaffected.
-                    info "OpenGL cannot use the GPU with this Mesa ($(mesa_version)): its zink requires a"
-                    info "  Vulkan feature (nullDescriptor) iSH-AOK's GPU does not offer yet. OpenGL"
-                    info "  programs run in software; Vulkan programs use the GPU. Devuan 6's Mesa 25.0"
-                    info "  still runs OpenGL on the GPU."
+                    # Mesa 25.2 and later refuse to start zink without
+                    # robustness2's nullDescriptor. iSH-AOK's GPU (Venus on
+                    # MoltenVK) offers it from build 559, so this is an older
+                    # app build under a newer copy of this script, or a
+                    # regression. Vulkan is unaffected either way.
+                    info "OpenGL cannot use the GPU with this Mesa ($(mesa_version)): its zink requires the"
+                    info "  Vulkan feature nullDescriptor, which the GPU here is not offering (iSH-AOK"
+                    info "  has it from build 559). OpenGL programs run in software; Vulkan programs"
+                    info "  use the GPU."
                 else
                     bad "zink gave no OpenGL context on the GPU (renderer: ${renderer:-none})"
                 fi ;;
