@@ -32,7 +32,15 @@ put() {     # put FILE DEST: replace DEST if FILE differs
     fi
 }
 for f in $tools; do put "$t/$f" "/AOK/tools/$f"; done
+newer=; cmp -s "$t/vm-update.sh" /usr/local/bin/aok-update || newer=1
 put "$t/vm-update.sh" /usr/local/bin/aok-update
+# Run as the installed command and replaced by a newer one: the rest is the newer one's to do, or what it
+# added would wait for a second run.
+if [ -n "$newer" ] && [ "${0##*/}" = aok-update ] && [ -z "$AOK_UPDATE_AGAIN" ]; then
+    echo "  (aok-update itself was updated: going on with the new one)"
+    rm -rf "${t:?}"; trap - EXIT
+    AOK_UPDATE_AGAIN=1 exec sh /usr/local/bin/aok-update
+fi
 # An iPad keyboard's power key reaches the guest as one, and elogind's default is to power off.
 k=/etc/elogind/logind.conf.d/50-aok-vm-keys.conf
 if [ -d /etc/elogind ] && ! [ -f "$k" ]; then
