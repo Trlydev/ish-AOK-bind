@@ -27,7 +27,7 @@
 -QEMU_PLATFORM_BUILD_FLAGS="$QEMU_PLATFORM_BUILD_FLAGS --disable-fdt"
 -QEMU_PLATFORM_BUILD_FLAGS="$QEMU_PLATFORM_BUILD_FLAGS --enable-virtfs --target-list=x86_64-softmmu"
 +QEMU_PLATFORM_BUILD_FLAGS="$QEMU_PLATFORM_BUILD_FLAGS --enable-fdt=internal"
-+QEMU_PLATFORM_BUILD_FLAGS="$QEMU_PLATFORM_BUILD_FLAGS --target-list=riscv64-softmmu"
++QEMU_PLATFORM_BUILD_FLAGS="$QEMU_PLATFORM_BUILD_FLAGS --target-list=riscv64-softmmu,aarch64-softmmu"
  # prepare_qemu_source() has already fetched every subproject this needs.
 -QEMU_PLATFORM_BUILD_FLAGS="$QEMU_PLATFORM_BUILD_FLAGS --disable-download"
  # Both of TCG's AArch64 backends in one library: TCTI, the threaded interpreter that needs no JIT,

@@ -1,7 +1,8 @@
 // AOK QEMU Bench -- the race of tests/bench-utm, on a device.
 //
 // Boots the same RISC-V guest (kernel, initramfs and OpenSBI in the bundle) on the QEMU in
-// Frameworks/qemu-riscv64-softmmu.framework, which is the tctiSH fork built with --enable-aok-gadgets, and
+// Frameworks/qemu-riscv64-softmmu.framework -- or, for a label that begins "aarch64", the arm64 guest on
+// qemu-aarch64-softmmu.framework -- which is the tctiSH fork built with --enable-aok-gadgets, and
 // measures each workload the way cycwrap.c does on a Mac: this process's cycle and instruction counters
 // read at the guest's WL-START and RESULT lines. Results are appended to Documents/results.txt, one WL line
 // per workload in cycwrap's format, then "DONE label".
@@ -101,18 +102,26 @@ static void *reader(void *arg) {
 
 static void *run_qemu(void *arg) {
     NSString *bundle = NSBundle.mainBundle.resourcePath;
+    // The label's first part is the guest: riscv64-..., or aarch64-... for the arm64 guest of the Mac race.
+    BOOL arm = strncmp(env_or("AOKQ_LABEL", "riscv64-aokq-1"), "aarch64", 7) == 0;
+    NSString *name = arm ? @"qemu-aarch64-softmmu" : @"qemu-riscv64-softmmu";
     NSString *framework = [NSBundle.mainBundle.privateFrameworksPath
-        stringByAppendingPathComponent:@"qemu-riscv64-softmmu.framework/qemu-riscv64-softmmu"];
+        stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.framework/%@", name, name]];
     NSString *serial = [documents stringByAppendingPathComponent:@"serial.log"];
-    NSString *append = [NSString stringWithFormat:@"console=ttyS0 rdinit=/init quiet bench=%s",
+    NSString *append = [NSString stringWithFormat:@"console=%@ rdinit=/init quiet bench=%s",
+                        arm ? @"ttyAMA0" : @"ttyS0",
                         env_or("AOKQ_WORKLOADS", "coremark,nbody,python,xz,sha256,awk")];
     NSArray<NSString *> *args = @[
-        @"qemu-system-riscv64", @"-M", @"virt", @"-cpu", @"rv64", @"-smp", @(env_or("AOKQ_SMP", "1")),
+        arm ? @"qemu-system-aarch64" : @"qemu-system-riscv64", @"-M", @"virt",
+        @"-cpu", @(env_or("AOKQ_CPU", arm ? "cortex-a72" : "rv64")), @"-smp", @(env_or("AOKQ_SMP", "1")),
         @"-m", @"1024", @"-accel", @"tcg,tb-size=256", @"-display", @"none", @"-monitor", @"none",
         @"-serial", [@"file:" stringByAppendingString:serial], @"-no-reboot", @"-L", bundle,
-        @"-kernel", [bundle stringByAppendingPathComponent:@"Image-lts-riscv64"],
-        @"-initrd", [bundle stringByAppendingPathComponent:@"initramfs-riscv64.cpio"],
+        @"-kernel", [bundle stringByAppendingPathComponent:arm ? @"vmlinuz-virt-aarch64" : @"Image-lts-riscv64"],
+        @"-initrd", [bundle stringByAppendingPathComponent:arm ? @"initramfs-aarch64.cpio"
+                                                               : @"initramfs-riscv64.cpio"],
         @"-append", append,
+        // (the arm64 machine's default network card wants an option ROM the bundle does not carry)
+        @"-nic", @"none",
     ];
     int argc = (int) args.count;
     char **argv = calloc(argc + 1, sizeof *argv);

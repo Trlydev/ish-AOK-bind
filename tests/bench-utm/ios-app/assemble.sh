@@ -11,6 +11,10 @@ mkdir -p Frameworks Resources
 rsync -a --delete "$W/ios/sysroot-iOS-arm64/Frameworks/" Frameworks/
 cp "$W/kernel/Image-lts-riscv64" "$W/initramfs-riscv64.cpio" \
    "$W/src-aok/pc-bios/opensbi-riscv64-generic-fw_dynamic.bin" Resources/
+# The arm64 guest, when this QEMU was built with its target (labels that begin "aarch64").
+if [ -d Frameworks/qemu-aarch64-softmmu.framework ]; then
+    cp "$W/kernel/vmlinuz-virt-aarch64" "$W/initramfs-aarch64.cpio" Resources/
+fi
 
 # Every framework is embedded and signed; none is linked, since the app dlopen()s QEMU and QEMU finds the
 # rest through the app's rpath.
