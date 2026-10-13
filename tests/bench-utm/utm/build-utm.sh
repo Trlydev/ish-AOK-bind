@@ -40,6 +40,7 @@
 #     switch is through, where the finger landed. UTM sent it at once: pressed on the old device, wherever
 #     its cursor was, and released on the new one (the guest's mouse kept its button down and the desktop
 #     ignored every later click), or, if the switch was already through, not at all.
+#   - a scheme "AOK VM" for Xcode, and the settings page's patch at every build (both below)
 #   - the app is "AOK VM" on the home screen and on its welcome page, which says what it is based on. A
 #     fork is not UTM's to be named for (its licence grants the code, not the name), and UTM SE is on the
 #     App Store under that name.
@@ -72,10 +73,15 @@ esac
 # bundle" build phase removes the ones that are not this target's. Its declared input is the bundle's
 # directory, so after an edit to Root.plist an incremental build copied the file again and did not patch
 # it: the SE app then showed JitStreamer and other entries of the JIT editions, and took its defaults from
-# whichever platform's entry came last. Make both steps run, and check below that they did.
-touch Platform/iOS/Settings.bundle
-rm -rf "$U/dd/Build/Products/$products/UTM SE.app/Settings.bundle"
-xcodebuild -scheme iOS-SE -destination "$dest" -configuration Release ARCHS=arm64 -derivedDataPath "$U/dd" \
+# whichever platform's entry came last. The patch makes that phase run at every build (it changes nothing
+# the second time); the check below stays.
+#
+# From Xcode, with no script: once this has run (the patch, the icon and CodeSigning.xcconfig are then in
+# the checkout), open ~/aok-utm/UTM/UTM.xcodeproj, choose the scheme "AOK VM" (the patch adds it: the
+# iOS-SE target, with Run building the Release configuration, which is the one on the devices) and a
+# device, and press Run. What Xcode does not build is the engines: they are in the sysroot, from
+# build-qemu-utm.sh and install-qemu-utm.sh.
+xcodebuild -scheme "AOK VM" -destination "$dest" -configuration Release ARCHS=arm64 -derivedDataPath "$U/dd" \
     -skipPackagePluginValidation -skipMacroValidation $extra build > "$U/build-${1:-device}.log" 2>&1 ||
     { grep "error:" "$U/build-${1:-device}.log" | sort -u | head -20; exit 1; }
 if plutil -p "$U/dd/Build/Products/$products/UTM SE.app/Settings.bundle/Root.plist" | grep -q 'ExcludeTargets\|"Platform"'; then
