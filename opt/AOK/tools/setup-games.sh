@@ -24,10 +24,15 @@
 # games are installed; sound is the machine's ALSA card (give the VM one). The
 # GPU there is two things: the display device's own GL driver (virgl on a
 # virtio-gpu), which runs what draws with GLES or SDL's renderer (Doom,
-# ScummVM), and its Vulkan device (venus), which Warzone 2100 uses directly
-# and the fixed-pipeline OpenGL games through zink -- virgl on UTM's GLES host
-# drops every draw of theirs (black windows). With no Vulkan device those
-# games draw in software.
+# ScummVM), and its Vulkan device (venus), which Warzone 2100 uses directly.
+# The games that draw with OpenGL's fixed pipeline (Neverball, Armagetron,
+# Chromium B.S.U., Blobby Volley, Trigger Rally) have no GPU path under UTM
+# yet and draw in software: virgl on UTM's GLES host drops every draw of
+# theirs (black windows), and zink on its Vulkan device fails at the first
+# pipeline with UTM's MoltenVK (an M4 iPad, 2026-10-13: the Metal shader made
+# for zink's uniform buffer does not compile, the game hangs or aborts).
+# --zink sends them through zink all the same, to try another Vulkan driver
+# (UTM's settings: Vulkan Driver).
 #
 # The GPU is used where it works: an arm64 or amd64 root, the GPU device, and
 # a GPU zink can draw on (A9 and newer; the A10X needs MoltenVK 67d3f726).
@@ -40,6 +45,8 @@
 #   sudo sh /AOK/tools/setup-games.sh --minimal    Freedoom and Beneath a Steel Sky only
 #   sudo sh /AOK/tools/setup-games.sh --gpu        Doom on the GPU regardless
 #   sudo sh /AOK/tools/setup-games.sh --software   everything in software
+#   sudo sh /AOK/tools/setup-games.sh --zink       (a VM) the fixed-pipeline OpenGL
+#                                                  games through zink on Vulkan
 #   sudo sh /AOK/tools/setup-games.sh --debs DIR   use the .deb files in DIR
 #                                                  before downloading any
 #   sh /AOK/tools/setup-games.sh --check           report only (no root needed)
@@ -76,6 +83,7 @@ CHECK_ONLY=0
 MINIMAL=0
 GL_CHOICE=auto
 GL_FORCED=0
+USE_ZINK=0
 DEBS=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -83,6 +91,7 @@ while [ $# -gt 0 ]; do
         --minimal) MINIMAL=1 ;;
         --gpu) GL_CHOICE=gpu; GL_FORCED=1 ;;
         --software) GL_CHOICE=software; GL_FORCED=1 ;;
+        --zink) USE_ZINK=1 ;;
         --debs) [ $# -ge 2 ] || { usage >&2; exit 2; }; DEBS=$2; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; exit 2 ;;
@@ -335,13 +344,19 @@ elif [ "$IN_AOK" = 1 ]; then
     gpu_list="$GPU_GAMES $MORE_GPU"
 elif venus_device; then
     # (Warzone 2100 too: its own Vulkan, and not Mesa's software device)
-    gpu_list="$GPU_GAMES $MORE_GPU warzone2100"
-    zink_list="$MORE_GPU"
-    note "the fixed-pipeline OpenGL games go through zink on the Vulkan device"
+    gpu_list="$GPU_GAMES warzone2100"
+    if [ "$USE_ZINK" = 1 ]; then
+        gpu_list="$gpu_list $MORE_GPU"
+        zink_list="$MORE_GPU"
+        note "--zink: the fixed-pipeline OpenGL games go through zink on the Vulkan device"
+    else
+        note "Doom, ScummVM and Warzone 2100 on the GPU; the fixed-pipeline OpenGL games"
+        note "in software (no GPU path for them here yet; --zink tries zink on Vulkan)"
+    fi
 else
     gpu_list="$GPU_GAMES"
-    note "no Vulkan device (venus): Doom and ScummVM on the GPU, the OpenGL games in"
-    note "software. In UTM: the app's settings, Vulkan Driver, anything but Disabled."
+    note "no Vulkan device (venus): Doom and ScummVM on the GPU, the rest in software."
+    note "In UTM: the app's settings, Vulkan Driver, anything but Disabled."
 fi
 {
     echo "# Written by /AOK/tools/setup-games.sh; /usr/local/bin/aok-sdl-game reads it."
