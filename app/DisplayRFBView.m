@@ -164,6 +164,21 @@ static const struct virtgpu_present_ops display_direct_ops = {
     CGSize _cursorImageSize;
     CGPoint _cursorHotspot;
     CGPoint _lastPointerViewPoint; // last touch location, in this view's own coordinate space
+    BOOL _havePointerPoint;        // ...once there has been one
+
+    // Touchpad mode (UserPreferences displayTouchpadMode, GH #628): fingers
+    // move the pointer from where it is instead of putting it under them.
+    // One gesture runs from the first finger down to the last one up.
+    NSMutableArray<UITouch *> *_Nullable _tpTouches; // fingers down now
+    CGPoint _tpLastCentroid;         // where their centre was at the last event
+    NSTimeInterval _tpLastEventTime; // ...and when
+    NSTimeInterval _tpBeganAt;       // the first finger's touch-down
+    CGFloat _tpTravel;               // how far the centre has moved, in points
+    NSUInteger _tpMaxFingers;        // the most fingers down at once
+    BOOL _tpDragArmed;               // began right after a tap: moving it drags
+    BOOL _tpDragging;                // the left button is held for that drag
+    NSTimeInterval _tpLastTapAt;     // when the last one-finger tap ended
+    CGFloat _tpScrollX, _tpScrollY;  // two-finger travel not yet sent as wheel steps
 
     // Accessory key strip shown above/instead of the soft keyboard (the Display
     // surface is its own first responder, so TerminalViewController's bar never
@@ -196,6 +211,13 @@ static const struct virtgpu_present_ops display_direct_ops = {
         self.layer.cornerRadius = 10.0;
         self.layer.masksToBounds = YES;
         self.multipleTouchEnabled = NO;
+        // ...unless fingers are a touchpad, whose scroll and right-click take
+        // two. The menu's toggle writes the preference; this follows it.
+        [self applyTouchInputPreference];
+        [NSNotificationCenter.defaultCenter addObserver:self
+                                               selector:@selector(touchInputPreferenceDidChange:)
+                                                   name:NSUserDefaultsDidChangeNotification
+                                                 object:nil];
         // Without this, iOS reserves space above the accessory bar for its own
         // (never-shown, since we have no text field) predictive-text strip
         // whenever a hardware keyboard is attached, leaving a visible gap
@@ -463,19 +485,245 @@ static BOOL DisplayHardwareKeyboardAttached(void) {
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *_Nullable)event {
     [self takeKeyboardFocusFromTouch];
-    [self sendPointerEventFromTouches:touches down:YES];
+    NSSet<UITouch *> *fingers = [self touchpadFingersIn:touches];
+    if (fingers.count != 0)
+        [self touchpadFingersDown:fingers];
+    if (fingers.count != touches.count)
+        [self sendPointerEventFromTouches:[self touches:touches without:fingers] down:YES];
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *_Nullable)event {
-    [self sendPointerEventFromTouches:touches down:YES];
+    NSSet<UITouch *> *fingers = [self touchpadFingersIn:touches];
+    if (fingers.count != 0)
+        [self touchpadFingersMoved];
+    if (fingers.count != touches.count)
+        [self sendPointerEventFromTouches:[self touches:touches without:fingers] down:YES];
 }
 
 - (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *_Nullable)event {
-    [self sendPointerEventFromTouches:touches down:NO];
+    NSSet<UITouch *> *fingers = [self touchpadFingersIn:touches];
+    if (fingers.count != 0)
+        [self touchpadFingersUp:fingers cancelled:NO];
+    if (fingers.count != touches.count)
+        [self sendPointerEventFromTouches:[self touches:touches without:fingers] down:NO];
 }
 
 - (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *_Nullable)event {
-    [self sendPointerEventFromTouches:touches down:NO];
+    NSSet<UITouch *> *fingers = [self touchpadFingersIn:touches];
+    if (fingers.count != 0)
+        [self touchpadFingersUp:fingers cancelled:YES];
+    if (fingers.count != touches.count)
+        [self sendPointerEventFromTouches:[self touches:touches without:fingers] down:NO];
+}
+
+#pragma mark - Touchpad mode
+
+// RFB's button mask: bits 0-2 are the left, middle and right buttons; 3 and 4
+// are one step of the wheel up and down, 5 and 6 left and right.
+enum {
+    DisplayButtonLeft = 0x01,
+    DisplayButtonMiddle = 0x02,
+    DisplayButtonRight = 0x04,
+    DisplayWheelUp = 0x08,
+    DisplayWheelDown = 0x10,
+    DisplayWheelLeft = 0x20,
+    DisplayWheelRight = 0x40,
+};
+
+// How a gesture is read. Points are this view's.
+static const CGFloat DisplayTouchpadTapSlop = 8.0;         // a tap moves less than this...
+static const NSTimeInterval DisplayTouchpadTapTime = 0.35; // ...and is over within this
+static const NSTimeInterval DisplayTouchpadDragWindow = 0.30; // a touch this soon after a tap drags
+static const CGFloat DisplayTouchpadWheelStep = 14.0;      // two-finger travel per wheel step
+
+// The pointer's travel for a finger's: one for one when slow, so a target can
+// be approached exactly, and up to three times as far when fast, so the
+// screen can be crossed in a stroke.
+static CGFloat DisplayTouchpadGain(CGFloat pointsPerSecond) {
+    const CGFloat slow = 120.0, fast = 1400.0;
+    if (pointsPerSecond <= slow)
+        return 1.0;
+    if (pointsPerSecond >= fast)
+        return 3.0;
+    return 1.0 + 2.0 * (pointsPerSecond - slow) / (fast - slow);
+}
+
+// Fingers are touchpad input while the preference is on. A mouse or a
+// trackpad's pointer already is one, and a pencil points at what it touches:
+// both stay as they were.
+- (NSSet<UITouch *> *)touchpadFingersIn:(NSSet<UITouch *> *)touches {
+    if (!UserPreferences.shared.displayTouchpadMode && _tpTouches.count == 0)
+        return [NSSet set];
+    NSMutableSet<UITouch *> *fingers = [NSMutableSet set];
+    for (UITouch *touch in touches) {
+        if (touch.type == UITouchTypeDirect || [_tpTouches containsObject:touch])
+            [fingers addObject:touch];
+    }
+    return fingers;
+}
+
+- (NSSet<UITouch *> *)touches:(NSSet<UITouch *> *)touches without:(NSSet<UITouch *> *)fingers {
+    NSMutableSet<UITouch *> *rest = [touches mutableCopy];
+    [rest minusSet:fingers];
+    return rest;
+}
+
+// (Posted on whichever thread wrote the default.)
+- (void)touchInputPreferenceDidChange:(NSNotification *)note {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self applyTouchInputPreference];
+    });
+}
+
+// Two-finger gestures need the second finger delivered; the direct mode's
+// one-touch stream is what it has always been.
+- (void)applyTouchInputPreference {
+    BOOL touchpad = UserPreferences.shared.displayTouchpadMode;
+    if (self.multipleTouchEnabled != touchpad)
+        self.multipleTouchEnabled = touchpad;
+}
+
+- (CGPoint)touchpadCentroid {
+    CGPoint sum = CGPointZero;
+    for (UITouch *touch in _tpTouches) {
+        CGPoint p = [touch locationInView:self];
+        sum.x += p.x;
+        sum.y += p.y;
+    }
+    NSUInteger n = MAX((NSUInteger) 1, _tpTouches.count);
+    return CGPointMake(sum.x / n, sum.y / n);
+}
+
+// Where the pointer is, for a gesture that moves it from there: where the
+// last event of any kind left it, or the middle of the desktop before any.
+- (CGPoint)touchpadPointer {
+    if (!_havePointerPoint)
+        return CGPointMake(CGRectGetMidX(self.bounds), CGRectGetMidY(self.bounds));
+    return _lastPointerViewPoint;
+}
+
+- (void)touchpadSendButtons:(uint8_t)buttons {
+    [self sendPointerEventAtViewPoint:[self touchpadPointer] buttonMask:buttons];
+}
+
+- (void)touchpadClick:(uint8_t)button {
+    uint8_t held = _tpDragging ? DisplayButtonLeft : 0;
+    [self touchpadSendButtons:held | button];
+    [self touchpadSendButtons:held];
+}
+
+- (void)touchpadFingersDown:(NSSet<UITouch *> *)fingers {
+    if (_tpTouches == nil)
+        _tpTouches = [NSMutableArray array];
+    NSTimeInterval now = fingers.anyObject.timestamp;
+    BOOL first = _tpTouches.count == 0;
+    for (UITouch *touch in fingers) {
+        if (![_tpTouches containsObject:touch])
+            [_tpTouches addObject:touch];
+    }
+    if (first) {
+        _tpBeganAt = now;
+        _tpTravel = 0;
+        _tpMaxFingers = 0;
+        _tpScrollX = _tpScrollY = 0;
+        _tpDragging = NO;
+        // Tap, then touch again at once and move: the second touch drags
+        // with the button held, as a laptop's touchpad has it.
+        _tpDragArmed = _tpLastTapAt != 0 && now - _tpLastTapAt < DisplayTouchpadDragWindow;
+    }
+    _tpMaxFingers = MAX(_tpMaxFingers, _tpTouches.count);
+    // A finger joining moves the centre without anything having moved.
+    _tpLastCentroid = [self touchpadCentroid];
+    _tpLastEventTime = now;
+}
+
+- (void)touchpadFingersMoved {
+    if (_tpTouches.count == 0)
+        return;
+    CGPoint centroid = [self touchpadCentroid];
+    NSTimeInterval now = _tpTouches.lastObject.timestamp;
+    for (UITouch *touch in _tpTouches)
+        now = MAX(now, touch.timestamp);
+    CGFloat dx = centroid.x - _tpLastCentroid.x;
+    CGFloat dy = centroid.y - _tpLastCentroid.y;
+    CGFloat distance = hypot(dx, dy);
+    if (distance == 0)
+        return;
+    NSTimeInterval elapsed = now - _tpLastEventTime;
+    _tpLastCentroid = centroid;
+    _tpLastEventTime = now;
+    BOOL wasStill = _tpTravel < DisplayTouchpadTapSlop;
+    _tpTravel += distance;
+
+    if (_tpMaxFingers >= 2) {
+        // Two fingers scroll, and the content follows them: down the screen
+        // is toward the top of the document, which is the wheel turned up.
+        _tpScrollX += dx;
+        _tpScrollY += dy;
+        while (fabs(_tpScrollY) >= DisplayTouchpadWheelStep) {
+            BOOL down = _tpScrollY > 0;
+            [self touchpadClick:down ? DisplayWheelUp : DisplayWheelDown];
+            _tpScrollY -= down ? DisplayTouchpadWheelStep : -DisplayTouchpadWheelStep;
+        }
+        while (fabs(_tpScrollX) >= DisplayTouchpadWheelStep) {
+            BOOL right = _tpScrollX > 0;
+            [self touchpadClick:right ? DisplayWheelLeft : DisplayWheelRight];
+            _tpScrollX -= right ? DisplayTouchpadWheelStep : -DisplayTouchpadWheelStep;
+        }
+        return;
+    }
+
+    // Within a tap's slop nothing moves, so that a tap lands where the
+    // pointer was and not a few pixels off it.
+    if (_tpTravel < DisplayTouchpadTapSlop)
+        return;
+    if (wasStill) {
+        if (_tpDragArmed && !_tpDragging) {
+            _tpDragging = YES;
+            [self touchpadSendButtons:DisplayButtonLeft];
+        }
+        // The slop itself is not travel: start from here.
+        return;
+    }
+    CGFloat gain = DisplayTouchpadGain(elapsed > 0 ? distance / elapsed : 0);
+    CGPoint pointer = [self touchpadPointer];
+    pointer.x = MAX(0.0, MIN(CGRectGetWidth(self.bounds) - 1, pointer.x + dx * gain));
+    pointer.y = MAX(0.0, MIN(CGRectGetHeight(self.bounds) - 1, pointer.y + dy * gain));
+    [self sendPointerEventAtViewPoint:pointer buttonMask:_tpDragging ? DisplayButtonLeft : 0];
+}
+
+- (void)touchpadFingersUp:(NSSet<UITouch *> *)fingers cancelled:(BOOL)cancelled {
+    NSTimeInterval now = fingers.anyObject.timestamp;
+    for (UITouch *touch in fingers)
+        [_tpTouches removeObject:touch];
+    if (_tpTouches.count != 0) {
+        _tpLastCentroid = [self touchpadCentroid];
+        return;
+    }
+    // The last finger is up: the gesture is over.
+    if (_tpDragging) {
+        _tpDragging = NO;
+        [self touchpadSendButtons:0];
+        _tpLastTapAt = 0;
+        return;
+    }
+    BOOL tap = !cancelled && _tpTravel < DisplayTouchpadTapSlop && now - _tpBeganAt < DisplayTouchpadTapTime;
+    if (!tap) {
+        _tpLastTapAt = 0;
+        return;
+    }
+    if (_tpMaxFingers >= 3) {
+        [self touchpadClick:DisplayButtonMiddle];
+        _tpLastTapAt = 0;
+    } else if (_tpMaxFingers == 2) {
+        [self touchpadClick:DisplayButtonRight];
+        _tpLastTapAt = 0;
+    } else {
+        // One finger: a click where the pointer is. A second tap right after
+        // it is a second click (a double click); a touch that moves is a drag.
+        [self touchpadClick:DisplayButtonLeft];
+        _tpLastTapAt = now;
+    }
 }
 
 - (void)sendPointerEventFromTouches:(NSSet<UITouch *> *)touches down:(BOOL)down {
@@ -506,6 +754,7 @@ static BOOL DisplayHardwareKeyboardAttached(void) {
     uint16_t y = (uint16_t) MAX(0.0, MIN((CGFloat) (fbHeight - 1), point.y * scaleY));
     [_rfbClient sendPointerEventAtX:x y:y buttonMask:buttonMask];
     _lastPointerViewPoint = point;
+    _havePointerPoint = YES;
     [self repositionCursor];
 }
 

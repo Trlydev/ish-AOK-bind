@@ -62,6 +62,10 @@ extern NSString *const kThemeBackgroundColor;
 @property BOOL hideStatusBar;
 @property BOOL showTerminalQuickButtons;
 @property BOOL autoShowKeyboard;
+// The Wayland display takes a finger as a touchpad (drag moves the pointer
+// from where it is, tap clicks, two fingers scroll or right-click) rather
+// than as the pointer itself. Off by default. GH #628.
+@property BOOL displayTouchpadMode;
 @property NSInteger workspaceLaunchCount;
 @property (nonatomic) Theme *theme;
 @property (nonatomic) Palette *palette;

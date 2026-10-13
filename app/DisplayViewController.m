@@ -1280,6 +1280,18 @@ static NSString *DisplayScaleChoiceTitle(NSString *name, NSInteger value, NSInte
             [weakSelf menuPipTapped:sender];
         });
     }];
+    // A finger as a touchpad instead of as the pointer (GH #628): on a phone
+    // the desktop's targets are smaller than a fingertip. DisplayRFBView reads
+    // the preference; nothing here needs telling.
+    BOOL touchpadMode = UserPreferences.shared.displayTouchpadMode;
+    [sheet addActionWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Touchpad Mode: %@", @"Wayland display menu toggle; %@ is On or Off"), touchpadMode ? NSLocalizedString(@"On", @"Toggle state") : NSLocalizedString(@"Off", @"Toggle state")]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        UserPreferences.shared.displayTouchpadMode = !touchpadMode;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf menuPipTapped:sender];
+        });
+    }];
     // GH #529: no way to dismiss the on-screen keyboard in standalone Wayland
     // mode short of leaving the session (Terminal has hideKeyboardButton for
     // exactly this; Display had nothing). resignFirstResponder is a no-op if

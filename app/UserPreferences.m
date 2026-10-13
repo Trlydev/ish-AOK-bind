@@ -21,6 +21,7 @@ static NSString *const kPreferenceHideExtraKeysWithExternalKeyboardKey = @"Hide 
 static NSString *const kPreferenceMaximizeScreenSpaceKey = @"Maximize Screen Space";
 static NSString *const kPreferenceShowTerminalQuickButtonsKey = @"Show Terminal Quick Buttons";
 static NSString *const kPreferenceAutoShowKeyboardKey = @"Auto Show Keyboard";
+static NSString *const kPreferenceDisplayTouchpadModeKey = @"Display Touchpad Mode";
 static NSString *const kPreferenceWorkspaceLaunchCountKey = @"Workspaces At Launch";
 static NSString *const kPreferenceOverrideControlSpaceKey = @"Override Control Space";
 static NSString *const kPreferenceFontFamilyKey = @"Font Family";
@@ -328,6 +329,7 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceWorkspaceStyleKey: @(WorkspaceStyleModern),
             kPreferenceShowTerminalQuickButtonsKey: @(YES),
             kPreferenceAutoShowKeyboardKey: @(YES),
+            kPreferenceDisplayTouchpadModeKey: @(NO),
             kPreferenceWorkspaceLaunchCountKey: @(1),
             kPreferenceThemeKey: @"Solarized",
             kPreferenceLoginAsDefaultUserKey: @(NO),
@@ -371,6 +373,7 @@ void amd64_jit_preference_set(bool enabled) {
             @"maximize_screen_space": kPreferenceMaximizeScreenSpaceKey,
             @"show_terminal_quick_buttons": kPreferenceShowTerminalQuickButtonsKey,
             @"auto_show_keyboard": kPreferenceAutoShowKeyboardKey,
+            @"display_touchpad_mode": kPreferenceDisplayTouchpadModeKey,
             @"workspace_launch_count": kPreferenceWorkspaceLaunchCountKey,
             @"override_control_space": kPreferenceOverrideControlSpaceKey,
             @"font_family": kPreferenceFontFamilyKey,
@@ -434,6 +437,7 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceMaximizeScreenSpaceKey: property(maximizeScreenSpace),
             kPreferenceShowTerminalQuickButtonsKey: property(showTerminalQuickButtons),
             kPreferenceAutoShowKeyboardKey: property(autoShowKeyboard),
+            kPreferenceDisplayTouchpadModeKey: property(displayTouchpadMode),
             kPreferenceWorkspaceLaunchCountKey: property(workspaceLaunchCount),
             kPreferenceOverrideControlSpaceKey: property(overrideControlSpace),
             kPreferenceFontFamilyKey: property(fontFamily),
@@ -569,6 +573,15 @@ void amd64_jit_preference_set(bool enabled) {
 
 - (void)setAutoShowKeyboard:(BOOL)autoShowKeyboard {
     [_defaults setBool:autoShowKeyboard forKey:kPreferenceAutoShowKeyboardKey];
+}
+
+// MARK: displayTouchpadMode
+- (BOOL)displayTouchpadMode {
+    return [_defaults boolForKey:kPreferenceDisplayTouchpadModeKey];
+}
+
+- (void)setDisplayTouchpadMode:(BOOL)displayTouchpadMode {
+    [_defaults setBool:displayTouchpadMode forKey:kPreferenceDisplayTouchpadModeKey];
 }
 
 // MARK: workspaceLaunchCount

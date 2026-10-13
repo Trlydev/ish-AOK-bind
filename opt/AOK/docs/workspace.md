@@ -150,6 +150,23 @@ over, and **Wayland Full Screen** in the Workspace corner menu does the reverse.
 If you change **Open Everything as Default User**, the view offers to restart the session
 as the right user.
 
+A finger on the desktop is the pointer: where you touch is where it goes, and
+the touch is the left button. On a phone the targets are smaller than a
+fingertip, so the view's menu (**···**) has **Touchpad Mode** (build 559),
+which treats the whole view as a laptop's touchpad instead:
+
+| Gesture | What it does |
+|---|---|
+| Drag one finger | Moves the pointer from where it is: one for one when slow, further when fast |
+| Tap | Left click where the pointer is |
+| Tap twice | Double click |
+| Tap, then touch again at once and drag | Drags with the left button held |
+| Drag two fingers | Scrolls, the content following the fingers |
+| Tap with two fingers | Right click |
+| Tap with three fingers | Middle click |
+
+A mouse, a trackpad and a pencil are unaffected: they already point.
+
 It needs those programs installed in the guest first, and two scripts do that:
 
 ```sh
