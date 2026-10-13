@@ -20,6 +20,7 @@ cat /proc/ish/applets        # the Workspace applets that are open
 cat /proc/ish/arch           # every process's guest architecture, one line each
 cat /proc/ish/host_ports     # Mach port usage -- a leak diagnostic
 cat /proc/ish/host_fds       # the host descriptors behind the guest's open files, and the host's limit
+cat /proc/ish/fault_reports  # which program faults dmesg reports: unhandled (default), all, none
 cat /proc/ish/host_vm        # where the app's own memory is -- GPU included
 cat /proc/ish/hle            # 1 when libc calls are run as host code
 ```
@@ -82,6 +83,23 @@ launched the process with. AOK raises the soft limit as far as the host allows
 when it mounts the root -- to 10240 on an iPad that starts an app at 4864 --
 so "Too many open files" with a count near `soft_limit` here is the host's
 limit, and one near 1024 is the guest's own.
+
+`fault_reports` chooses which faults of guest programs reach the kernel log
+(`dmesg`). A report is long -- the fault line, the registers, the bytes around
+the instruction, the stack -- and it is written only for a fault that kills
+its program: no handler for the signal, or the signal blocked. Those are
+limited to ten in any five seconds, with a line saying how many were dropped.
+A fault the program catches itself (a Java or Go runtime does this routinely)
+is not reported, as on Linux. When you are chasing a crash inside a program
+that has its own crash handler, and want the registers at the fault:
+
+```sh
+echo all > /proc/ish/fault_reports        # every fault, unlimited
+echo unhandled > /proc/ish/fault_reports  # back to the default
+```
+
+`none` silences them all. The second line of the file counts the reports the
+limit has dropped. For the CLI, `ISH_FAULT_REPORTS=all` sets it from the start.
 
 ## Battery, heat and the time zone
 

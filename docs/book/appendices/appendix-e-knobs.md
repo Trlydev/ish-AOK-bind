@@ -52,6 +52,7 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_FAKEFS_LOCKSTATS` | `main.c`, `util/lockstats.c` |
 | `ISH_FAKEFS_PARALLEL_READS` | `fs/fake-conn.c` |
 | `ISH_FAKE_MNT2` | `main.c` |
+| `ISH_FAULT_REPORTS` | `kernel/calls.c` |
 | `ISH_FORCE_MAC_SHEETS` | `app/UIViewController+Extras.m` |
 | `ISH_FORCE_SEQPACKET_EPERM` | `fs/sock.c` |
 | `ISH_FORCE_WRITE_REVALIDATE` | `emu/memory.c` |

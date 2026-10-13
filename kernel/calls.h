@@ -18,6 +18,14 @@
 // See kernel/calls.c: cancels a pending _ERESTART_NOHAND rewind.
 void cancel_syscall_restart(void);
 void handle_interrupt(int interrupt);
+
+// Which guest faults get a report in the kernel log (kernel/calls.c, above
+// handle_page_fault_interrupt): 0 none, 1 those that will kill the program
+// (the default), 2 all. /proc/ish/fault_reports.
+int guest_fault_reports_get(unsigned long *suppressed);
+void guest_fault_reports_set(int mode);
+int guest_fault_reports_parse(const char *text, size_t len);
+const char *guest_fault_reports_name(int mode);
 // One syscall on behalf of a natively-compiled program (kernel/native.h),
 // reached from host code instead of from a guest trap. Numbering is
 // asm-generic; see the definition in kernel/calls.c.

@@ -141,6 +141,7 @@ unix_bind_dir_perms.c
 scm_rights_stress.c
 scm_rights_bad_fd.c
 host_fd_limit.c
+fault_report_policy.c
 ambient_caps.c
 fs_conformance.c
 process_conformance.c

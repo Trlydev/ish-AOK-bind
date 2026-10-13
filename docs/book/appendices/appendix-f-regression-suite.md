@@ -4,7 +4,7 @@
 
 # Appendix F. The regression suite, annotated
 
-602 C programs in `tests/manual/`, of which **555 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
+603 C programs in `tests/manual/`, of which **556 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
 
 A row with a directory prefix is a per-architecture or accelerator test, kept
 in a subdirectory of `tests/manual/` and registered under that same prefix.
@@ -119,6 +119,7 @@ does not say what it is for.
 | `fakefs_inode_alias.c` | yes | Regression test for fakefs inode aliasing, and for the unremovable entry it used to leave behind. |
 | `fakefs_type_race.c` | yes | Regression test for a fakefs metadata/host-filesystem entry-type race. |
 | `fallocate_modes.c` | yes | What fallocate's mode argument means. |
+| `fault_report_policy.c` | yes | The kernel log reports a guest fault only when the fault kills its program. |
 | `fcntl_getfl_flags.c` | yes | fcntl(F_GETFL) reports the status flags Linux reports. |
 | `fcntl_lock.c` | yes | fcntl POSIX-lock (F_SETLK/F_SETLKW/F_GETLK) marshalling + release test. |
 | `fcntl_lock_validation.c` | yes | POSIX byte-range locks: what the range means, who holds it, and what happens when two holders want each other's. |

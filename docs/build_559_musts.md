@@ -692,7 +692,7 @@ skipped, and it fails on the Mac on 558 too once another guest process is busy.
 
 Not musts. Each is in docs/TODO.md's queue: nullDescriptor in the MoltenVK fork
 (GL on the GPU for Mesa 25.2+, and Wayfire on Alpine 3.24); guest fault reports
-flooding the kernel log; GH #631, ssh sessions dropping when the device idles;
+flooding the kernel log (done 2026-10-13, /proc/ish/fault_reports); GH #631, ssh sessions dropping when the device idles;
 a CLOCK_PROCESS_CPUTIME_ID timer running on the whole emulator's CPU (found
 with §6).
 

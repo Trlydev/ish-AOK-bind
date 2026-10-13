@@ -1540,6 +1540,28 @@ static int proc_ish_update_jit_cache(struct proc_entry *UNUSED(e), struct proc_d
     return 0;
 }
 
+// /proc/ish/fault_reports: which guest faults are written to the kernel log
+// (kernel/calls.c guest_fault_reported). Reads as the mode and the number of
+// reports the rate limit has dropped; write "unhandled" (the default: only a
+// fault that kills its program, ten in five seconds at most), "all" (every
+// fault, as it used to be -- for working on the emulator) or "none".
+static int proc_ish_show_fault_reports(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    unsigned long suppressed = 0;
+    int mode = guest_fault_reports_get(&suppressed);
+    proc_printf(buf, "%s\nsuppressed %lu\n", guest_fault_reports_name(mode), suppressed);
+    return 0;
+}
+static int proc_ish_update_fault_reports(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    int mode = guest_fault_reports_parse(d->data, n);
+    if (mode < 0)
+        return _EINVAL;
+    guest_fault_reports_set(mode);
+    return 0;
+}
+
 // /proc/ish/jit_timing: time spent translating guest code into gadget blocks.
 // Write 1 to zero the counters and start counting, 0 to stop; read for the
 // totals so far, across every process. Counting costs two clock reads per
@@ -2401,6 +2423,7 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"foreign_exec", S_IFREG | 0644, .show = proc_ish_show_foreign_exec, .update = proc_ish_update_foreign_exec},
     {"hle", S_IFREG | 0644, .show = proc_ish_show_hle, .update = proc_ish_update_hle},
     {"jit_inherit", S_IFREG | 0644, .show = proc_ish_show_jit_inherit, .update = proc_ish_update_jit_inherit},
+    {"fault_reports", S_IFREG | 0644, .show = proc_ish_show_fault_reports, .update = proc_ish_update_fault_reports},
     {"jit_cache", S_IFREG | 0644, .show = proc_ish_show_jit_cache, .update = proc_ish_update_jit_cache},
     {"jit_timing", S_IFREG | 0644, .show = proc_ish_show_jit_timing, .update = proc_ish_update_jit_timing},
     {"i386_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_i386_jit_fuse, .update = proc_ish_update_i386_jit_fuse},

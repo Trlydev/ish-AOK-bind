@@ -5873,6 +5873,106 @@ void x86_umip_warn(struct cpu_state *cpu, unsigned inst, qword_t ip, qword_t sp)
                current->comm, current->pid, (unsigned long long) ip, (unsigned long long) sp);
 }
 
+// ---- which guest faults are reported to the kernel log ---------------------
+//
+// A fault report is a screenful: the line, the registers, an opcode window,
+// page-table state, the stack. Every fault used to get one, including the
+// ones a program takes on purpose and catches -- a JVM's null checks, a
+// test that raises 61,440 #UDs to see what each reports -- and a distro's
+// syslog daemon then wrote all of it to disk twice. Three suite runs left
+// 1.3 GB in /var/log and filled a phone.
+//
+// Linux prints for a fault only when nobody will handle it
+// (show_unhandled_signals, unhandled_signal()) and ratelimits that. So:
+//
+//   unhandled (the default)  a report when the signal will kill the program
+//                            -- no handler, or blocked, and no tracer to
+//                            hand it to -- at most 10 in any 5 seconds
+//   all                      every fault, unlimited: what it was, for
+//                            working on the emulator
+//   none                     nothing
+//
+// /proc/ish/fault_reports reads and sets it; ISH_FAULT_REPORTS sets it for a
+// CLI run from the start.
+enum { FAULT_REPORTS_NONE, FAULT_REPORTS_UNHANDLED, FAULT_REPORTS_ALL };
+static _Atomic int fault_reports_mode = -1; // -1: not decided yet
+static _Atomic unsigned long fault_reports_suppressed_total;
+
+static const char *const fault_reports_names[] = {"none", "unhandled", "all"};
+
+int guest_fault_reports_parse(const char *text, size_t len) {
+    for (int i = 0; i < 3; i++)
+        if (strlen(fault_reports_names[i]) == len && memcmp(text, fault_reports_names[i], len) == 0)
+            return i;
+    return -1;
+}
+
+int guest_fault_reports_get(unsigned long *suppressed) {
+    int mode = atomic_load(&fault_reports_mode);
+    if (mode < 0) {
+        const char *env = getenv("ISH_FAULT_REPORTS");
+        mode = env != NULL ? guest_fault_reports_parse(env, strlen(env)) : -1;
+        if (mode < 0)
+            mode = FAULT_REPORTS_UNHANDLED;
+        atomic_store(&fault_reports_mode, mode);
+    }
+    if (suppressed != NULL)
+        *suppressed = atomic_load(&fault_reports_suppressed_total);
+    return mode;
+}
+
+const char *guest_fault_reports_name(int mode) {
+    return mode >= 0 && mode < 3 ? fault_reports_names[mode] : "?";
+}
+
+void guest_fault_reports_set(int mode) {
+    if (mode >= FAULT_REPORTS_NONE && mode <= FAULT_REPORTS_ALL)
+        atomic_store(&fault_reports_mode, mode);
+}
+
+// Whether the fault about to be delivered to `current` as `sig` gets a report.
+// Ask once per fault, before printing any of it.
+static bool guest_fault_reported(int sig) {
+    int mode = guest_fault_reports_get(NULL);
+    if (mode == FAULT_REPORTS_ALL)
+        return true;
+    if (mode == FAULT_REPORTS_NONE)
+        return false;
+    // Linux's unhandled_signal(), and one more: a handler that cannot run
+    // because the signal is blocked is no handler -- the fault kills.
+    struct sighand *sighand = current->sighand;
+    lock(&sighand->lock, 0);
+    addr_t handler = sighand->action[sig].handler;
+    unlock(&sighand->lock);
+    bool handled = handler != SIG_DFL_ && handler != SIG_IGN_ && !sigset_has(current->blocked, sig);
+    if (handled || current->ptrace.traced)
+        return false;
+
+    static lock_t rl_lock = LOCK_INITIALIZER;
+    static struct timespec begin;
+    static int printed, missed;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    lock(&rl_lock, 0);
+    long long since_ms = (now.tv_sec - begin.tv_sec) * 1000LL + (now.tv_nsec - begin.tv_nsec) / 1000000;
+    if ((begin.tv_sec == 0 && begin.tv_nsec == 0) || since_ms > 5000) {
+        if (missed != 0)
+            printk("guest faults: %d reports suppressed\n", missed);
+        missed = 0;
+        begin = now;
+        printed = 0;
+    }
+    bool ok = printed < 10;
+    if (ok) {
+        printed++;
+    } else {
+        missed++;
+        atomic_fetch_add(&fault_reports_suppressed_total, 1);
+    }
+    unlock(&rl_lock);
+    return ok;
+}
+
 void handle_page_fault_interrupt(struct cpu_state *cpu) {
     // A UMIP-spoofed store's fault (emu/cpu.h umip_report): consumed here,
     // whatever happens next.
@@ -5897,12 +5997,14 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
         // for a copy-on-write break. Linux answers that with SIGBUS/BUS_ADRERR,
         // the same as a truncated file mapping (handle_bus_interrupt below), not
         // with SIGSEGV -- the address is valid, the hardware could not deliver it.
-        printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (page contents unreadable)\n",
-               current->pid, current->comm, guest_abi_desc(current->abi).name,
-               (unsigned long long) cpu->segfault_addr,
-               (unsigned long long) current_fault_ip(cpu));
-        record_guest_fault_event("swap-io-error", cpu, cpu->segfault_addr,
-                                 cpu->segfault_was_write);
+        if (guest_fault_reported(SIGBUS_)) {
+            printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (page contents unreadable)\n",
+                   current->pid, current->comm, guest_abi_desc(current->abi).name,
+                   (unsigned long long) cpu->segfault_addr,
+                   (unsigned long long) current_fault_ip(cpu));
+            record_guest_fault_event("swap-io-error", cpu, cpu->segfault_addr,
+                                     cpu->segfault_was_write);
+        }
         struct siginfo_ bus_info = {
             .code = BUS_ADRERR_,
             .fault.addr = cpu->segfault_addr,
@@ -5912,47 +6014,50 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
     }
 
     if (ptr == NULL) {
-        printk("ERROR: %d(%s) [%s] page fault on %#llx at %#llx%s\n",
-               current->pid, current->comm, guest_abi_desc(current->abi).name,
-               (unsigned long long) cpu->segfault_addr,
-               (unsigned long long) current_fault_ip(cpu),
-               cpu->segfault_was_write ? " (write)" : " (read)");
-        if (current->abi == GUEST_ABI_ARM64) {
-            for (int i = 0; i < 31; i += 4)
-                printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
-                       i, (unsigned long long) cpu->arm64_regs[i],
-                       i + 1, i + 1 < 31 ? (unsigned long long) cpu->arm64_regs[i + 1] : 0,
-                       i + 2, i + 2 < 31 ? (unsigned long long) cpu->arm64_regs[i + 2] : 0,
-                       i + 3, i + 3 < 31 ? (unsigned long long) cpu->arm64_regs[i + 3] : 0);
-            printk("  sp=%#llx pc=%#llx tpidr=%#llx\n",
-                   (unsigned long long) cpu->arm64_sp,
-                   (unsigned long long) cpu->arm64_pc,
-                   (unsigned long long) cpu->arm64_tpidr);
-            dump_addr_backing("  pc-backing", current_fault_ip(cpu));
-            dump_arm64_fault_memdump(cpu);
-            arm64_watch_dump();
-        }
-        if (current->abi == GUEST_ABI_RISCV64) {
-            for (int i = 0; i < 32; i += 4)
-                printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
-                       i, (unsigned long long) cpu->riscv64_regs[i],
-                       i + 1, (unsigned long long) cpu->riscv64_regs[i + 1],
-                       i + 2, (unsigned long long) cpu->riscv64_regs[i + 2],
-                       i + 3, (unsigned long long) cpu->riscv64_regs[i + 3]);
-            printk("  pc=%#llx\n", (unsigned long long) cpu->riscv64_pc);
-        }
-        dump_opcode_window(current_fault_ip(cpu));
-        if (current->abi == GUEST_ABI_AMD64) {
-            dump_amd64_regs(cpu);
-            dump_fault_pt_state(cpu->segfault_addr);
-            dump_amd64_cc1_trace(cpu);
-            dump_amd64_cc1_jit_trace(cpu);
-            if (amd64_verbose_fault_trace_enabled()) {
-                dump_amd64_loader_state(cpu);
-                dump_amd64_store_trace(cpu);
+        bool report = guest_fault_reported(SIGSEGV_);
+        if (report) {
+            printk("ERROR: %d(%s) [%s] page fault on %#llx at %#llx%s\n",
+                   current->pid, current->comm, guest_abi_desc(current->abi).name,
+                   (unsigned long long) cpu->segfault_addr,
+                   (unsigned long long) current_fault_ip(cpu),
+                   cpu->segfault_was_write ? " (write)" : " (read)");
+            if (current->abi == GUEST_ABI_ARM64) {
+                for (int i = 0; i < 31; i += 4)
+                    printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
+                           i, (unsigned long long) cpu->arm64_regs[i],
+                           i + 1, i + 1 < 31 ? (unsigned long long) cpu->arm64_regs[i + 1] : 0,
+                           i + 2, i + 2 < 31 ? (unsigned long long) cpu->arm64_regs[i + 2] : 0,
+                           i + 3, i + 3 < 31 ? (unsigned long long) cpu->arm64_regs[i + 3] : 0);
+                printk("  sp=%#llx pc=%#llx tpidr=%#llx\n",
+                       (unsigned long long) cpu->arm64_sp,
+                       (unsigned long long) cpu->arm64_pc,
+                       (unsigned long long) cpu->arm64_tpidr);
+                dump_addr_backing("  pc-backing", current_fault_ip(cpu));
+                dump_arm64_fault_memdump(cpu);
+                arm64_watch_dump();
             }
+            if (current->abi == GUEST_ABI_RISCV64) {
+                for (int i = 0; i < 32; i += 4)
+                    printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
+                           i, (unsigned long long) cpu->riscv64_regs[i],
+                           i + 1, (unsigned long long) cpu->riscv64_regs[i + 1],
+                           i + 2, (unsigned long long) cpu->riscv64_regs[i + 2],
+                           i + 3, (unsigned long long) cpu->riscv64_regs[i + 3]);
+                printk("  pc=%#llx\n", (unsigned long long) cpu->riscv64_pc);
+            }
+            dump_opcode_window(current_fault_ip(cpu));
+            if (current->abi == GUEST_ABI_AMD64) {
+                dump_amd64_regs(cpu);
+                dump_fault_pt_state(cpu->segfault_addr);
+                dump_amd64_cc1_trace(cpu);
+                dump_amd64_cc1_jit_trace(cpu);
+                if (amd64_verbose_fault_trace_enabled()) {
+                    dump_amd64_loader_state(cpu);
+                    dump_amd64_store_trace(cpu);
+                }
+            }
+            record_guest_fault_event("page-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
         }
-        record_guest_fault_event("page-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
         struct siginfo_ info = {
             .code = mem_segv_reason(current->mem, cpu->segfault_addr),
             .fault.addr = cpu->segfault_addr,
@@ -5965,7 +6070,8 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
             cpu->segfault_addr = cpu->umip_report_addr;
             cpu->segfault_was_write = true;
         }
-        dump_stack(8);
+        if (report)
+            dump_stack(8);
         deliver_signal(current, SIGSEGV_, info);
     }
 }
@@ -6029,33 +6135,35 @@ static void handle_general_protection_interrupt(struct cpu_state *cpu, word_t er
     guest_addr_t ip = current_fault_ip(cpu);
     uint8_t first_opcode = 0;
     bool have_first_opcode = user_get(ip, first_opcode) == 0;
-    printk("ERROR: %d(%s) [%s] general protection fault(%#x) at %#llx: ",
-           current->pid, current->comm, guest_abi_desc(current->abi).name, error_code,
-           (unsigned long long) ip);
-    for (int i = 0; i < 8; i++) {
-        uint8_t b;
-        if (user_get(ip + i, b))
-            break;
-        printk("%02x ", b);
-    }
-    printk("\n");
-    dump_opcode_window(ip);
-    if (current->abi == GUEST_ABI_AMD64) {
-        dump_amd64_regs(cpu);
-        dump_amd64_cc1_trace(cpu);
-        dump_amd64_cc1_jit_trace(cpu);
-        if (have_first_opcode && first_opcode == 0xf4) {
-            dump_amd64_hlt_tls_state(cpu);
-            if (amd64_hlt_is_zero_sentinel_trap(ip))
-                dump_amd64_hlt_zero_sentinel_state(cpu);
+    if (guest_fault_reported(SIGSEGV_)) {
+        printk("ERROR: %d(%s) [%s] general protection fault(%#x) at %#llx: ",
+               current->pid, current->comm, guest_abi_desc(current->abi).name, error_code,
+               (unsigned long long) ip);
+        for (int i = 0; i < 8; i++) {
+            uint8_t b;
+            if (user_get(ip + i, b))
+                break;
+            printk("%02x ", b);
         }
-        if (amd64_verbose_fault_trace_enabled()) {
-            dump_amd64_loader_state(cpu);
-            dump_amd64_store_trace(cpu);
+        printk("\n");
+        dump_opcode_window(ip);
+        if (current->abi == GUEST_ABI_AMD64) {
+            dump_amd64_regs(cpu);
+            dump_amd64_cc1_trace(cpu);
+            dump_amd64_cc1_jit_trace(cpu);
+            if (have_first_opcode && first_opcode == 0xf4) {
+                dump_amd64_hlt_tls_state(cpu);
+                if (amd64_hlt_is_zero_sentinel_trap(ip))
+                    dump_amd64_hlt_zero_sentinel_state(cpu);
+            }
+            if (amd64_verbose_fault_trace_enabled()) {
+                dump_amd64_loader_state(cpu);
+                dump_amd64_store_trace(cpu);
+            }
         }
+        record_guest_fault_event("general-protection-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+        dump_stack(8);
     }
-    record_guest_fault_event("general-protection-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
-    dump_stack(8);
     cpu->trapno = INT_GPF;
     cpu->gp_error_code = error_code;
     cpu->segfault_addr = 0;
@@ -7164,27 +7272,29 @@ void handle_illegal_instruction_interrupt(struct cpu_state *cpu) {
             return;
     }
 
-    printk("ERROR: %d(%s) [%s] illegal instruction at %#llx: ",
-           current->pid, current->comm, guest_abi_desc(current->abi).name, (unsigned long long) ip);
-    for (int i = 0; i < 8; i++) {
-        uint8_t b;
-        if (user_get(ip + i, b))
-            break;
-        printk("%02x ", b);
-    }
-    printk("\n");
-    dump_opcode_window(ip);
-    if (current->abi == GUEST_ABI_AMD64) {
-        dump_amd64_regs(cpu);
-        dump_amd64_cc1_trace(cpu);
-        dump_amd64_cc1_jit_trace(cpu);
-        if (amd64_verbose_fault_trace_enabled()) {
-            dump_amd64_loader_state(cpu);
-            dump_amd64_store_trace(cpu);
+    if (guest_fault_reported(SIGILL_)) {
+        printk("ERROR: %d(%s) [%s] illegal instruction at %#llx: ",
+               current->pid, current->comm, guest_abi_desc(current->abi).name, (unsigned long long) ip);
+        for (int i = 0; i < 8; i++) {
+            uint8_t b;
+            if (user_get(ip + i, b))
+                break;
+            printk("%02x ", b);
         }
+        printk("\n");
+        dump_opcode_window(ip);
+        if (current->abi == GUEST_ABI_AMD64) {
+            dump_amd64_regs(cpu);
+            dump_amd64_cc1_trace(cpu);
+            dump_amd64_cc1_jit_trace(cpu);
+            if (amd64_verbose_fault_trace_enabled()) {
+                dump_amd64_loader_state(cpu);
+                dump_amd64_store_trace(cpu);
+            }
+        }
+        record_guest_fault_event("illegal-instruction", cpu, current_fault_ip(cpu), false);
+        dump_stack(8);
     }
-    record_guest_fault_event("illegal-instruction", cpu, current_fault_ip(cpu), false);
-    dump_stack(8);
     // x86 Linux reports #UD as ILL_ILLOPN (handle_invalid_op), for 32- and
     // 64-bit tasks alike; arm64 and riscv64 report an undefined instruction as
     // ILL_ILLOPC.
@@ -7203,11 +7313,13 @@ static void handle_bus_interrupt(struct cpu_state *cpu) {
     // guest page is validly mapped in iSH's page table, so there is nothing for
     // mem_ptr_fault to resolve -- deliver a guest SIGBUS directly, matching
     // Linux (accessing a truncated page of a file mapping => SIGBUS/BUS_ADRERR).
-    printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (file-backed mmap truncated)\n",
-           current->pid, current->comm, guest_abi_desc(current->abi).name,
-           (unsigned long long) cpu->segfault_addr,
-           (unsigned long long) current_fault_ip(cpu));
-    record_guest_fault_event("bus-error", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    if (guest_fault_reported(SIGBUS_)) {
+        printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (file-backed mmap truncated)\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name,
+               (unsigned long long) cpu->segfault_addr,
+               (unsigned long long) current_fault_ip(cpu));
+        record_guest_fault_event("bus-error", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    }
     struct siginfo_ info = {
         .code = BUS_ADRERR_,
         .fault.addr = cpu->segfault_addr,
@@ -7218,11 +7330,13 @@ static void handle_bus_interrupt(struct cpu_state *cpu) {
 // A misaligned atomic (INT_ALIGN): Linux's alignment fault, SIGBUS with
 // BUS_ADRALN at the address.
 static void handle_alignment_interrupt(struct cpu_state *cpu) {
-    printk("ERROR: %d(%s) [%s] alignment fault on %#llx at %#llx\n",
-           current->pid, current->comm, guest_abi_desc(current->abi).name,
-           (unsigned long long) cpu->segfault_addr,
-           (unsigned long long) current_fault_ip(cpu));
-    record_guest_fault_event("alignment", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    if (guest_fault_reported(SIGBUS_)) {
+        printk("ERROR: %d(%s) [%s] alignment fault on %#llx at %#llx\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name,
+               (unsigned long long) cpu->segfault_addr,
+               (unsigned long long) current_fault_ip(cpu));
+        record_guest_fault_event("alignment", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    }
     struct siginfo_ info = {
         .code = BUS_ADRALN_,
         .fault.addr = cpu->segfault_addr,
@@ -7231,9 +7345,11 @@ static void handle_alignment_interrupt(struct cpu_state *cpu) {
 }
 
 static void handle_arithmetic_interrupt(struct cpu_state *cpu) {
-    printk("ERROR: %d(%s) [%s] arithmetic fault at 0x%x\n",
-           current->pid, current->comm, guest_abi_desc(current->abi).name, cpu->eip);
-    dump_stack(8);
+    if (guest_fault_reported(SIGFPE_)) {
+        printk("ERROR: %d(%s) [%s] arithmetic fault at 0x%x\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name, cpu->eip);
+        dump_stack(8);
+    }
     // #DE is vector 0: the frame's REG_TRAPNO, which was whatever trap came
     // before it.
     cpu->trapno = INT_DIV;
