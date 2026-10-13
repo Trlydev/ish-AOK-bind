@@ -9219,6 +9219,11 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
     button.clipsToBounds = NO;
     [button.heightAnchor constraintGreaterThanOrEqualToConstant:68].active = YES;
     button.accessibilityIdentifier = identifier;
+    // A custom button has no title for VoiceOver to read, and the labels drawn
+    // inside it are not its own: without this the row was announced as
+    // "button" and nothing else. -refreshThemeSelectionButtons gives it the
+    // row's second line as its value.
+    button.accessibilityLabel = title;
     [button addTarget:self action:@selector(selectThemeFromButton:) forControlEvents:UIControlEventTouchUpInside];
 
     UIStackView *contentRow = [UIStackView new];
@@ -9413,6 +9418,13 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
         detailLabel.text = [identifier isEqualToString:currentIdentifier]
             ? [NSString stringWithFormat:NSLocalizedString(@"Applied • %@", @"theme library row detail for the applied theme; %@ is Built-in theme or Saved custom theme"), detail]
             : detail;
+        // What the row shows, said: the kind of theme, and whether it is the
+        // one applied (as the selected trait, which VoiceOver announces).
+        button.accessibilityValue = detail;
+        if ([identifier isEqualToString:currentIdentifier])
+            button.accessibilityTraits |= UIAccessibilityTraitSelected;
+        else
+            button.accessibilityTraits &= ~UIAccessibilityTraitSelected;
         [_themeListStack addArrangedSubview:button];
     }
     [self workspaceApplyTheme];
