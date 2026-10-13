@@ -636,7 +636,18 @@ static int futex_wait_masked(guest_addr_t uaddr, dword_t op, dword_t val, struct
                 err = 0;
                 break;
             }
-            if (err != _ETIMEDOUT)
+            // Still queued, so nobody has woken it: every wake takes the
+            // waiter off its queue before it signals. A slice that timed out
+            // goes round again, and so does one that came back for no reason
+            // of the futex's (0): a wake of the host thread meant for
+            // something else -- a sibling's munmap or mprotect pokes every
+            // thread of the process -- or one that arrived before the sleep
+            // began and ended it at once. That used to leave the loop, and
+            // the guest was told it had been woken: a 200ms wait nobody woke
+            // returned 0, at once or part way through
+            // (tests/manual/futex_timeout_duration.c). The top of the loop
+            // is what decides the deadline has passed.
+            if (err != _ETIMEDOUT && err != 0)
                 break;
         }
         futex = w->futex;

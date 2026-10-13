@@ -23,6 +23,17 @@
 //
 // Hence: assert DURATION, and use a sub-second one. A test that only ever asks
 // for whole seconds passes on the broken kernel.
+//
+// And the other way round: a wait nobody woke must not say it was woken. A
+// timed FUTEX_WAIT here is a loop of sleeps on a host condition, and a sleep
+// that came back for a reason that was not the futex's -- a sibling thread's
+// munmap or mprotect pokes every thread of the process -- left the loop with
+// 0. So the guest was told "woken", at once or part way through: a 200ms wait
+// returned 0 after 158ms, which is how a suite run met it (and callers that
+// do not loop, as a test of the timeout does not, saw a wake that never
+// was). The last case below waits beside two threads that churn mappings:
+// before the fix one wait in a few hundred came back 0 on amd64, and two of
+// forty 200ms ones.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
@@ -32,6 +43,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/futex.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 
 #include "test_common.h"
@@ -135,6 +147,42 @@ static double cond_timedwait(clockid_t clock, long ms) {
     return elapsed_ms(t0, t1);
 }
 
+static volatile int churn_stop;
+
+// Mappings made, re-protected and dropped: each change reaches the other
+// threads of the process wherever they are, a waiter in its sleep included.
+static void *churn(void *arg) {
+    (void) arg;
+    while (!churn_stop) {
+        char *p = mmap(NULL, 1 << 16, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED)
+            continue;
+        p[0] = 1;
+        mprotect(p, 1 << 16, PROT_READ);
+        mprotect(p, 1 << 16, PROT_READ | PROT_WRITE | PROT_EXEC);
+        munmap(p, 1 << 16);
+    }
+    return NULL;
+}
+
+// `rounds` waits of `ms` each on a word nobody wakes, beside the churn. How
+// many said they were woken, and how many ended early.
+static void unwoken_waits(int rounds, long ms, int *woken, int *early) {
+    *woken = *early = 0;
+    for (int i = 0; i < rounds; i++) {
+        struct timespec t0, t1, rel = {0, 0};
+        add_ms(&rel, ms);
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        errno = 0;
+        long rc = futex_call(&futex_word, FUTEX_WAIT | FUTEX_PRIVATE_FLAG, 0, &rel, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (rc == 0)
+            (*woken)++;
+        if (elapsed_ms(t0, t1) < ms * 0.9)
+            (*early)++;
+    }
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     // Backstop only: every wait here is bounded, so the alarm firing means one
@@ -213,6 +261,27 @@ int main(int argc, char **argv) {
         test_logf("  %-52s %s (%.0fms, %s)\n",
                   "expired deadline returns ETIMEDOUT at once", ok ? "ok" : "FAIL",
                   ms, strerror(err));
+    }
+
+    // ---- a wait nobody woke does not say it was woken ---------------------
+    {
+        pthread_t churners[2];
+        int started = 0;
+        for (int i = 0; i < 2; i++)
+            started += pthread_create(&churners[i], NULL, churn, NULL) == 0;
+        int woken = 0, early = 0, woken_long = 0, early_long = 0;
+        unwoken_waits(300, 20, &woken, &early);
+        unwoken_waits(12, 200, &woken_long, &early_long);
+        churn_stop = 1;
+        for (int i = 0; i < started; i++)
+            pthread_join(churners[i], NULL);
+        int ok = started == 2 && woken == 0 && early == 0 && woken_long == 0 && early_long == 0;
+        if (!ok)
+            failf("an unwoken wait beside a churning thread times out",
+                  (uint64_t) woken, (uint64_t) early, (uint64_t) (woken_long * 100 + early_long), 0, 0, 0);
+        test_logf("  %-52s %s (20ms: %d woken, %d early of 300; 200ms: %d woken, %d early of 12)\n",
+                  "an unwoken wait beside a churning thread times out", ok ? "ok" : "FAIL",
+                  woken, early, woken_long, early_long);
     }
 
     return finish_suite("futex_timeout_duration");
