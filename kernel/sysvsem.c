@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "util/timer.h"
 #include "kernel/errno.h"
@@ -431,7 +433,7 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
         }
         struct sem_entry *sem = &set->sems[semnum];
         int_t result = cmd_base == GETVAL_ ? sem->val :
-                       cmd_base == GETPID_ ? sem->last_pid :
+                       cmd_base == GETPID_ ? current_pid_shown(sem->last_pid) :
                        cmd_base == GETNCNT_ ? (int_t) sem->ncnt : (int_t) sem->zcnt;
         unlock(&ns->sem_lock);
         return result;
@@ -514,6 +516,13 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             }
             uid = perm.uid; gid = perm.gid; mode = (mode_t_) perm.mode;
         }
+        // The caller's user namespace's ids; one with no mapping is EINVAL.
+        uid = current_make_kuid(uid);
+        gid = current_make_kgid(gid);
+        if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID) {
+            unlock(&ns->sem_lock);
+            return _EINVAL;
+        }
         set->uid = uid;
         set->gid = gid;
         set->mode = mode & 0777;
@@ -528,8 +537,8 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             struct semid64_ds_amd64_ info = {
                 .sem_perm = {
                     .key = set->key,
-                    .uid = set->uid, .gid = set->gid,
-                    .cuid = set->cuid, .cgid = set->cgid,
+                    .uid = current_uid_shown(set->uid), .gid = current_gid_shown(set->gid),
+                    .cuid = current_uid_shown(set->cuid), .cgid = current_gid_shown(set->cgid),
                     .mode = (word_t) set->mode,
                 },
                 .sem_otime = set->otime,
@@ -542,8 +551,8 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             struct semid64_ds_generic_ info = {
                 .sem_perm = {
                     .key = set->key,
-                    .uid = set->uid, .gid = set->gid,
-                    .cuid = set->cuid, .cgid = set->cgid,
+                    .uid = current_uid_shown(set->uid), .gid = current_gid_shown(set->gid),
+                    .cuid = current_uid_shown(set->cuid), .cgid = current_gid_shown(set->cgid),
                     .mode = (word_t) set->mode,
                 },
                 .sem_otime = set->otime,
@@ -556,8 +565,8 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             struct semid64_ds_i386_ info = {
                 .sem_perm = {
                     .key = set->key,
-                    .uid = set->uid, .gid = set->gid,
-                    .cuid = set->cuid, .cgid = set->cgid,
+                    .uid = current_uid_shown(set->uid), .gid = current_gid_shown(set->gid),
+                    .cuid = current_uid_shown(set->cuid), .cgid = current_gid_shown(set->cgid),
                     .mode = set->mode,
                 },
                 .sem_otime = (dword_t) set->otime,
@@ -638,7 +647,8 @@ void proc_sysvipc_show_sem(struct proc_data *buf) {
             continue;
         proc_printf(buf, "%10d %10d %-10o %10u %5u %5u %5u %5u %10lld %10lld\n",
                     (int) set->key, set->id, set->mode & 0777, set->nsems,
-                    set->uid, set->gid, set->cuid, set->cgid,
+                    current_uid_shown(set->uid), current_gid_shown(set->gid),
+                    current_uid_shown(set->cuid), current_gid_shown(set->cgid),
                     (long long) set->otime, (long long) set->ctime);
     }
     unlock(&ns->sem_lock);

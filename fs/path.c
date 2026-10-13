@@ -3,6 +3,22 @@
 #include "kernel/calls.h"
 #include "fs/path.h"
 
+// The mount the first `len` bytes of `path` -- a normalized global path, ""
+// for the root -- are on: its id, or -1 for none.
+static int path_prefix_mount_id(const char *path, size_t len) {
+    char prefix[MAX_PATH];
+    if (len >= sizeof(prefix))
+        return -1;
+    memcpy(prefix, path, len);
+    prefix[len] = '\0';
+    struct mount *mount = mount_find(prefix);
+    if (mount == NULL)
+        return -1;
+    int id = mount_id(mount);
+    mount_release(mount);
+    return id;
+}
+
 static int __path_normalize(const char *root_path, const char *at_path, const char *path, char *out, int flags, int levels) {
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
@@ -64,11 +80,19 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 size_t staging = mount_staging_point_len(out, (size_t) (o - out));
                 if (staging != 0 && staging == (size_t) (o - out))
                     at_root = true;
+                // N_BENEATH: above the starting directory is out of bounds,
+                // not the starting directory again.
+                if ((flags & N_BENEATH) && (at_root || o == out))
+                    return _EXDEV;
                 if (o != out && !at_root) {
+                    int below = (flags & N_NO_XDEV) ? path_prefix_mount_id(out, (size_t) (o - out)) : 0;
                     do {
                         o--;
                         n++;
                     } while (*o != '/');
+                    // N_NO_XDEV: out of the root of a mount.
+                    if ((flags & N_NO_XDEV) && path_prefix_mount_id(out, (size_t) (o - out)) != below)
+                        return _EXDEV;
                 }
                 p += 2;
                 while (*p == '/')
@@ -109,6 +133,12 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
             if (!(flags & N_DETACHED_OK))
                 return _ENOENT;
         }
+
+        // N_NO_XDEV: a name that is a mount point is the root of another
+        // mount, the last name of the path included.
+        if ((flags & N_NO_XDEV) && path_prefix_mount_id(out, (size_t) (o - out)) !=
+                path_prefix_mount_id(out, (size_t) (c - 1 - out)))
+            return _EXDEV;
 
         // N_SLASH_EISDIR: open(O_CREAT) on a name spelled with a trailing
         // slash. Linux answers EISDIR from open_last_lookups() --
@@ -182,7 +212,9 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                         possible_symlink[1] >= '0' && possible_symlink[1] <= '9') {
                     if (flags & N_NO_MAGICLINKS)
                         return _ELOOP;
-                    if (flags & N_IN_ROOT)
+                    // (For N_NO_XDEV Linux asks whether the file is on the
+                    // mount the walk is on; refusing them all asks less.)
+                    if (flags & (N_IN_ROOT | N_BENEATH | N_NO_XDEV))
                         return _EXDEV;
                 }
                 // Linux's MAXSYMLINKS. Five was low enough that ordinary
@@ -223,6 +255,17 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 // /i386root/bin/busybox, causing execve() to fail with ENOENT (no
                 // such absolute path in the real root) or resolve the wrong file.
                 bool absolute_target = *c == '/';
+                // An absolute target starts over at the root: outside an
+                // N_BENEATH walk by definition, and outside an N_NO_XDEV one
+                // unless the link is on the root's own mount.
+                if (absolute_target && !jump_real_root) {
+                    if (flags & N_BENEATH)
+                        return _EXDEV;
+                    if ((flags & N_NO_XDEV) && path_prefix_mount_id(out, parent_len) !=
+                            path_prefix_mount_id(root_path != NULL ? root_path : "",
+                                root_path != NULL && strcmp(root_path, "/") != 0 ? strlen(root_path) : 0))
+                        return _EXDEV;
+                }
                 if (absolute_target)
                     memmove(out, c, strlen(c) + 1);
                 char *expanded_path = possible_symlink;
@@ -261,6 +304,16 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                     expanded_path[out_len + 1] = '\0';
                 }
                 const char *next_at_path = absolute_target && !jump_real_root ? root_path : NULL;
+                // N_NO_XDEV, a relative target: walked from the link's own
+                // directory instead of again from the top, which would count
+                // every mount the way here crossed as crossed by this walk.
+                // That directory is the first `parent_len` bytes of the
+                // expanded path, and has no link left in it.
+                if ((flags & N_NO_XDEV) && !absolute_target) {
+                    expanded_path[parent_len] = '\0';
+                    next_at_path = expanded_path;
+                    expanded_path += parent_len + 1;
+                }
                 // The target is walked again from the top, through
                 // MOUNT_STAGING_DIR when it is in a detached mount (see the
                 // entry rule above). A relative target in one is: `..` cannot
@@ -419,7 +472,13 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     bool absolute = path[0] == '/';
     // N_IN_ROOT: the starting directory is the root of this walk, for an
     // absolute path too.
-    bool in_root = (flags & N_IN_ROOT) != 0;
+    // N_BENEATH: the same starting point and the same bound, with nothing
+    // above it to be had; an absolute path asks for the root, which is.
+    if ((flags & N_BENEATH) && absolute) {
+        unlock(&current->fs->lock);
+        return _EXDEV;
+    }
+    bool in_root = (flags & (N_IN_ROOT | N_BENEATH)) != 0;
     if (in_root) {
         if (at == AT_PWD)
             at = current->fs->pwd;

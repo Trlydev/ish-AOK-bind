@@ -28,6 +28,16 @@
 //                tmpfs, files there are its own, and a mount it inherited
 //                cannot be unmounted to see beneath it (EINVAL)
 //   nested       a user namespace inside the user namespace
+//   chroot       the namespace's root may chroot, and a chrooted process
+//                can make no user namespace (EPERM)
+//   file caps    the namespace's root may give a file of its own
+//                capabilities; they are stored for that root (a v3 naming
+//                it, which reads back inside as the v2 written), an exec by
+//                a user below that root gets them, and an exec outside the
+//                namespace gets nothing
+//   SysV IPC     in an IPC namespace of its own, an object's ids read as the
+//                namespace's (0), IPC_SET takes them the same way and an id
+//                with no mapping is EINVAL
 //   refused      CLONE_NEWUSER|CLONE_FS is EINVAL; so is unshare from a
 //                process with more than one thread
 //
@@ -54,10 +64,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 #define NAME "userns_basic"
@@ -300,6 +313,132 @@ static void case_nested(void) {
     MUST(getuid() == 0 && getgid() == 0, "the inner namespace's ids are %u/%u", (unsigned) getuid(), (unsigned) getgid());
 }
 
+static void case_chroot(void) {
+    char path[160];
+    enter(0);
+    snprintf(path, sizeof(path), "%s/inside-root", scratch);
+    int fd = open(path, O_WRONLY | O_CREAT, 0644);
+    MUST(fd >= 0, "cannot create a file in the scratch directory");
+    close(fd);
+    MUST(chroot(scratch) == 0, "chroot by the root of a user namespace failed");
+    MUST(chdir("/") == 0, "chdir to the new root failed");
+    struct stat st;
+    MUST(stat("/inside-root", &st) == 0, "the new root is not the directory asked for");
+    errno = 0;
+    MUST(unshare(CLONE_NEWUSER) == -1 && errno == EPERM, "a chrooted process made a user namespace");
+}
+
+static char self_exe[256];
+
+// What `program --capeff` prints: the effective capabilities it was started
+// with, or -1.
+static long long run_capeff(const char *program) {
+    int fds[2];
+    if (pipe(fds) != 0)
+        return -1;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+        dup2(fds[1], 1);
+        close(fds[0]);
+        close(fds[1]);
+        execl(program, program, "--capeff", (char *) NULL);
+        _exit(127);
+    }
+    close(fds[1]);
+    char text[64] = "";
+    ssize_t n = read(fds[0], text, sizeof(text) - 1);
+    close(fds[0]);
+    int status = -1;
+    waitpid(pid, &status, 0);
+    if (n <= 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        return -1;
+    return strtoll(text, NULL, 16);
+}
+
+static int copy_file(const char *from, const char *to) {
+    char buf[65536];
+    int in = open(from, O_RDONLY), out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (in < 0 || out < 0)
+        return -1;
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0)
+        if (write(out, buf, (size_t) n) != n)
+            return -1;
+    close(in);
+    return close(out) == 0 && n == 0 ? 0 : -1;
+}
+
+struct caps_v3 {
+    uint32_t magic_etc;
+    struct { uint32_t permitted, inheritable; } data[2];
+    uint32_t rootid;
+};
+#define CAPS_V2_EFFECTIVE 0x02000001u
+#define CAPS_V3_EFFECTIVE 0x03000001u
+#define CAP_NET_RAW_BIT (1u << 13)
+
+static void case_file_caps(void) {
+    char with[160], without[160];
+    snprintf(with, sizeof(with), "%s/with-caps", scratch);
+    snprintf(without, sizeof(without), "%s/without-caps", scratch);
+    MUST(copy_file(self_exe, with) == 0 && copy_file(self_exe, without) == 0, "cannot copy the test program to %s", scratch);
+    MUST(run_capeff(without) == 0, "an ordinary user's exec starts with capabilities %llx", run_capeff(without));
+
+    fflush(stdout);
+    pid_t inside = fork();
+    if (inside == 0) {
+        enter(0);
+        struct caps_v3 caps = {.magic_etc = CAPS_V2_EFFECTIVE, .data = {{CAP_NET_RAW_BIT, 0}, {0, 0}}};
+        MUST(setxattr(with, "security.capability", &caps, 20, 0) == 0, "the namespace's root cannot give its own file capabilities");
+        struct caps_v3 back = {0};
+        ssize_t n = getxattr(with, "security.capability", &back, sizeof(back));
+        MUST(n == 20 && back.magic_etc == CAPS_V2_EFFECTIVE && back.data[0].permitted == CAP_NET_RAW_BIT,
+             "inside, the attribute reads back as %zd bytes, magic %#x, permitted %#x", n, back.magic_etc, back.data[0].permitted);
+        // A user who is not root, in a namespace below: uid 1000 there is
+        // this namespace's root.
+        MUST(unshare(CLONE_NEWUSER) == 0, "a user namespace inside the user namespace failed");
+        MUST(write_file("/proc/self/uid_map", "1000 0 1") == 0, "the inner uid map failed");
+        MUST(write_file("/proc/self/gid_map", "1000 0 1") == 0, "the inner gid map failed");
+        MUST(getuid() == 1000, "the inner namespace's uid is %u", (unsigned) getuid());
+        MUST(run_capeff(without) == 0, "an exec by a user who is not root, of a file with no capabilities, starts with %llx", run_capeff(without));
+        MUST(run_capeff(with) == CAP_NET_RAW_BIT, "an exec of the file with capabilities starts with %llx, wanted %x", run_capeff(with), CAP_NET_RAW_BIT);
+        _exit(0);
+    }
+    int status = -1;
+    MUST(waitpid(inside, &status, 0) == inside && WIFEXITED(status) && WEXITSTATUS(status) == 0, "inside the namespace: status %#x", status);
+
+    // Outside: stored for the namespace's root, and worth nothing here.
+    struct caps_v3 stored = {0};
+    ssize_t n = getxattr(with, "security.capability", &stored, sizeof(stored));
+    MUST(n == 24 && stored.magic_etc == CAPS_V3_EFFECTIVE && stored.rootid == outer_uid && stored.data[0].permitted == CAP_NET_RAW_BIT,
+         "outside, the attribute reads back as %zd bytes, magic %#x, root %u", n, stored.magic_etc, (unsigned) stored.rootid);
+    MUST(run_capeff(with) == 0, "an exec outside the namespace took %llx from capabilities written inside it", run_capeff(with));
+    unlink(with);
+    unlink(without);
+}
+
+static void case_sysv(void) {
+    enter(CLONE_NEWIPC);
+    int id = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+    MUST(id >= 0, "shmget in its own IPC namespace failed");
+    struct shmid_ds ds;
+    memset(&ds, 0xff, sizeof(ds));
+    MUST(shmctl(id, IPC_STAT, &ds) == 0, "IPC_STAT failed");
+    MUST(ds.shm_perm.uid == 0 && ds.shm_perm.gid == 0 && ds.shm_perm.cuid == 0 && ds.shm_perm.cgid == 0,
+         "the segment's ids read %u/%u (creator %u/%u), wanted the namespace's 0",
+         (unsigned) ds.shm_perm.uid, (unsigned) ds.shm_perm.gid, (unsigned) ds.shm_perm.cuid, (unsigned) ds.shm_perm.cgid);
+    MUST(ds.shm_cpid == getpid(), "the segment's creator pid reads %d", (int) ds.shm_cpid);
+    ds.shm_perm.mode = 0640;
+    MUST(shmctl(id, IPC_SET, &ds) == 0, "IPC_SET with the namespace's own ids failed");
+    ds.shm_perm.uid = 1;
+    errno = 0;
+    MUST(shmctl(id, IPC_SET, &ds) == -1 && errno == EINVAL, "IPC_SET to an id with no mapping did not fail with EINVAL");
+    MUST(shmctl(id, IPC_STAT, &ds) == 0 && ds.shm_perm.uid == 0 && (ds.shm_perm.mode & 0777) == 0640,
+         "after IPC_SET the segment is uid %u mode %o", (unsigned) ds.shm_perm.uid, (unsigned) ds.shm_perm.mode & 0777);
+    MUST(shmctl(id, IPC_RMID, NULL) == 0, "IPC_RMID failed");
+}
+
 static void case_machine_root(void) {
     MUST(unshare(CLONE_NEWUSER) == 0, "unshare(CLONE_NEWUSER) as root failed");
     MUST(write_file("/proc/self/setgroups", "deny") == 0, "setgroups deny failed");
@@ -316,8 +455,6 @@ static void case_machine_root(void) {
     MUST(mknod(node, S_IFCHR | 0600, makedev(1, 3)) == -1 && errno == EPERM, "...made a device node");
     int e = write_file("/proc/sys/kernel/hostname", "userns-test");
     MUST(e == EPERM || e == EACCES, "...wrote /proc/sys/kernel/hostname (errno %d)", e);
-    errno = 0;
-    MUST(chroot("/") == -1 && errno == EPERM, "...called chroot");
     errno = 0;
     MUST(setgroups(0, NULL) == -1 && errno == EPERM, "...called setgroups where it had denied it");
 }
@@ -350,8 +487,18 @@ static void parent_hostname_unchanged(void) {
     CHECK(strcmp(name, "userns-test") != 0, "the hostname set inside a namespace is the machine's now");
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--capeff") == 0) {
+        printf("%llx\n", cap_effective());
+        return 0;
+    }
     setvbuf(stdout, NULL, _IOLBF, 0);
+    ssize_t exe_len = readlink("/proc/self/exe", self_exe, sizeof(self_exe) - 1);
+    if (exe_len <= 0) {
+        printf(NAME ": FAIL setup: readlink /proc/self/exe: %s\n", strerror(errno));
+        return 1;
+    }
+    self_exe[exe_len] = '\0';
     bool was_root = geteuid() == 0;
     if (was_root) {
         snprintf(scratch, sizeof(scratch), "/tmp/userns_root.XXXXXX");
@@ -395,6 +542,9 @@ int main(void) {
     parent_hostname_unchanged();
     run("its own mount namespace", case_own_mounts);
     run("nested", case_nested);
+    run("chroot", case_chroot);
+    run("SysV IPC", case_sysv);
+    run("file capabilities", case_file_caps);
     run("refused", case_refused);
 
     char path[128];

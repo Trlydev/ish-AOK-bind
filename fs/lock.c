@@ -1,5 +1,6 @@
 #include <limits.h>
 #include "kernel/calls.h"
+#include "kernel/pid_ns.h"
 #include "kernel/fs.h"
 #include "fs/inode.h"
 #include "kernel/signal.h"
@@ -305,7 +306,9 @@ static int flock_from_file_lock(struct file_lock *lock, struct flock_ *flock) {
         flock->len = lock->end - lock->start + 1;
     else
         flock->len = 0;
-    flock->pid = lock->pid;
+    // The holder, as the caller's pid namespace knows it: 0 for one it has
+    // no number for (-1, an open file description's lock, is left alone).
+    flock->pid = current_pid_shown(lock->pid);
     strncpy(flock->comm, lock->comm, sizeof(flock->comm));
     return 0;
 }

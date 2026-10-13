@@ -150,8 +150,16 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
 // A task that was to be a pid namespace's init and never ran: the namespace
 // has no init again, and the next process forked into it is.
 static void pid_ns_forget_init(struct pid_namespace *ns, pid_t_ pid) {
-    if (ns != NULL)
-        atomic_compare_exchange_strong(&ns->init_pid, &pid, 0);
+    if (ns == NULL)
+        return;
+    // Its numbers go back too, and the namespace counts from 1 again: the
+    // next process forked into it is its init, and an init is pid 1.
+    complex_lockt(&pids_lock, 0);
+    pid_ns_unnumber((dword_t) pid);
+    pid_t_ was = pid;
+    if (atomic_compare_exchange_strong(&ns->init_pid, &was, 0))
+        ns->last_nr = 0;
+    unlock(&pids_lock);
 }
 
 static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest_addr_t ptid_addr,
@@ -241,6 +249,16 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
             if (into != NULL)
                 atomic_compare_exchange_strong(&into->init_pid, &nobody, task->pid);
         }
+        // Its number in that namespace and in each one above it: 1 for an
+        // init, the next one free for anything else.
+        if (task->pid_ns != NULL) {
+            complex_lockt(&pids_lock, 0);
+            err = pid_ns_number_task(task);
+            unlock(&pids_lock);
+            if (err < 0)
+                goto fail_free_fs;
+            err = _ENOMEM;
+        }
     }
 
     // The parent's network namespace, or with CLONE_NEWNET one of the child's
@@ -285,7 +303,7 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
     // A new IPC namespace starts empty; otherwise the child sees its parent's
     // objects.
     if (flags & CLONE_NEWIPC_) {
-        task->ipc_ns = ipc_ns_new();
+        task->ipc_ns = ipc_ns_new(task->user_ns);
         if (task->ipc_ns == NULL)
             goto fail_free_uts;
     } else {
@@ -913,7 +931,7 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         struct siginfo_ info = {
             .sig = SIGTRAP_,
             .code = SI_KERNEL_,
-            .kill.pid = current->pid,
+            .kill.pid = current_pid_shown(current->pid),
             .kill.uid = current->uid,
         };
         ptrace_event_stop(SIGTRAP_, &info, ptrace_event, pid);
@@ -997,14 +1015,15 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
             struct siginfo_ info = {
                 .sig = SIGTRAP_,
                 .code = SI_KERNEL_,
-                .kill.pid = current->pid,
+                .kill.pid = current_pid_shown(current->pid),
                 .kill.uid = current->uid,
             };
             ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_VFORK_DONE_, pid);
         }
     }
 
-    return pid;
+    // The child's number where the caller is (kernel/pid_ns.h).
+    return current_pid_shown(pid);
 }
 
 // A child of `current` with fork semantics, for a caller that will exec into
@@ -1276,7 +1295,7 @@ dword_t sys_unshare(dword_t flags) {
     }
     struct ipc_namespace *new_ipc = NULL;
     if (flags & CLONE_NEWIPC_) {
-        new_ipc = ipc_ns_new();
+        new_ipc = ipc_ns_new(owner);
         if (new_ipc == NULL) {
             if (new_uts != NULL)
                 uts_ns_release(new_uts);
@@ -1505,33 +1524,42 @@ void vfork_notify(struct task *task) {
 // namespaces of every kind `flags` lists are joined together -- all of them
 // or, if any check fails, none.
 //
-// UTS and IPC namespaces are real, and are switched. Every other kind has
-// only its initial namespace, which the caller is already in, so joining it
-// changes nothing except where Linux's does: a mount namespace resets the
-// root and cwd to its root (a way out of a chroot, which is why it also needs
-// CAP_SYS_CHROOT), and the user namespace one is already in may not be
-// entered again (EINVAL), or it would hand its owner's capabilities back.
+// Mount, UTS, IPC, user, pid and network namespaces are real, and are
+// switched; cgroup and time have only their initial one, which the caller is
+// already in. What joining each does, as on Linux:
 //
-// The checks run in Linux's order (kernel/nsproxy.c and each kind's
-// install): the descriptor, the flags, the target process, and then per kind
-// -- user, mnt, uts, ipc, pid, cgroup, net, time. atop joins pid 1's UTS
-// namespace to read the host name, and got ENOSYS from a stub here.
+//   mount    the root and working directory become its root (a way out of a
+//            chroot, which is why it also needs CAP_SYS_CHROOT)
+//   user     the caller holds every capability in it, and keeps its ids. One
+//            cannot enter the namespace one is in (EINVAL) -- it would hand
+//            its owner's capabilities back -- so the way is only ever down.
+//   pid      the caller stays what it is; its children are made there
+//            (pid_ns_for_children). Its own namespace or one below it only.
+//   network  sockets made from here on are in it; the ones it has stay
+//
+// Each kind takes CAP_SYS_ADMIN over the user namespace that owns the target,
+// and in the user namespace the caller will be in afterwards -- the one being
+// joined, when one is. The checks run in Linux's order (kernel/nsproxy.c and
+// each kind's install): the descriptor, the flags, the target process, and
+// then per kind -- user, mnt, uts, ipc, pid, cgroup, net, time. atop joins
+// pid 1's UTS namespace to read the host name, and got ENOSYS from a stub
+// here; nsenter into a sandbox joins all of them.
 dword_t sys_setns(fd_t fd_no, dword_t flags) {
     STRACE("setns(%d, %#x)", fd_no, flags);
-    // No CLONE_NEWNET: there is no network namespace to join, not even a
-    // descriptor for the one network (fs/proc/pid.c), and a kernel built
-    // without CONFIG_NET_NS refuses the flag with EINVAL.
     const dword_t all_kinds = CLONE_NEWNS_ | CLONE_NEWCGROUP_ | CLONE_NEWUTS_ | CLONE_NEWIPC_ |
-        CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWTIME_;
+        CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_ | CLONE_NEWTIME_;
     struct fd *fd = f_get(fd_no);
     if (fd == NULL)
         return _EBADF;
 
     struct uts_namespace *uts = NULL;
     struct ipc_namespace *ipc = NULL;
-    // The mount namespace to join: NULL is the initial one, which needs no
-    // reference; any other is held from here.
+    // The mount, user, pid and network namespaces to join: NULL is the
+    // initial one, which needs no reference; any other is held from here.
     struct mnt_namespace *mnt = NULL;
+    struct user_namespace *user = NULL;
+    struct pid_namespace *pid = NULL;
+    struct net_namespace *net = NULL;
     unsigned nstype;
     void *ns;
     int err = 0;
@@ -1539,18 +1567,18 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
         if (flags != 0 && flags != nstype)
             return _EINVAL;
         flags = nstype;
-        // A pid or network namespace that is not the initial one cannot be
-        // joined (the initial one is the no-op it always was): saying it had
-        // been would leave the caller outside a sandbox it believes it is in.
-        // proc_ns_fd_info handed over no reference for these.
-        if ((nstype == CLONE_NEWPID_ || nstype == CLONE_NEWNET_) && ns != NULL)
-            return _EINVAL;
         if (nstype == CLONE_NEWUTS_ && ns != NULL)
             uts = uts_ns_retain(ns);
         if (nstype == CLONE_NEWIPC_ && ns != NULL)
             ipc = ipc_ns_retain(ns);
         if (nstype == CLONE_NEWNS_ && ns != NULL)
             mnt = mnt_ns_retain(ns);
+        if (nstype == CLONE_NEWUSER_)
+            user = user_ns_retain(ns);
+        if (nstype == CLONE_NEWPID_)
+            pid = pid_ns_retain(ns);
+        if (nstype == CLONE_NEWNET_)
+            net = net_ns_retain(ns);
     } else {
         // Anything that is neither a namespace fd nor a pidfd is EINVAL too.
         if (flags == 0 || (flags & ~all_kinds))
@@ -1575,6 +1603,13 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
                     ipc = ipc_ns_retain(task->ipc_ns);
                 if (flags & CLONE_NEWNS_)
                     mnt = mnt_ns_retain(task->mnt_ns);
+                if (flags & CLONE_NEWUSER_)
+                    user = user_ns_retain(task->user_ns);
+                // (The one it is in, not the one its children are made in.)
+                if (flags & CLONE_NEWPID_)
+                    pid = pid_ns_retain(task->pid_ns);
+                if (flags & CLONE_NEWNET_)
+                    net = net_ns_retain(task->net_ns);
             }
             unlock(&task->general_lock);
         }
@@ -1583,21 +1618,56 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
             return _ESRCH;
     }
 
-    bool admin = current_capable(CAP_SYS_ADMIN_);
-    if (flags & CLONE_NEWUSER_)
-        err = _EINVAL;
-    else if ((flags & CLONE_NEWNS_) && (!admin || !current_capable(CAP_SYS_CHROOT_)))
+    // The user namespace the caller will be in once this is done, and whether
+    // it will hold CAP_SYS_ADMIN and CAP_SYS_CHROOT there: asked of what it
+    // holds now, which over a namespace it may join is everything.
+    struct user_namespace *cred_ns = current_user_ns();
+    if (flags & CLONE_NEWUSER_) {
+        if (user == cred_ns)
+            err = _EINVAL;
+        else if (!current_is_only_thread() || current->fs->refcount != 1)
+            err = _EINVAL;
+        else if (!ns_capable(user, CAP_SYS_ADMIN_))
+            err = _EPERM;
+        else
+            cred_ns = user;
+    }
+    bool admin = ns_capable(cred_ns, CAP_SYS_ADMIN_);
+    if (err == 0 && (flags & CLONE_NEWNS_)) {
+        if (!ns_capable(mnt != NULL ? mnt->user_ns : NULL, CAP_SYS_ADMIN_) || !admin ||
+                !ns_capable(cred_ns, CAP_SYS_CHROOT_))
+            err = _EPERM;
+        // Only for a mount namespace alone: given other kinds as well, Linux
+        // works on a private copy of the fs_struct, which nobody shares.
+        else if (flags == CLONE_NEWNS_ && current->fs->refcount != 1)
+            err = _EINVAL;
+    }
+    if (err == 0 && (flags & CLONE_NEWUTS_) &&
+            (!ns_capable(uts != NULL ? uts->user_ns : NULL, CAP_SYS_ADMIN_) || !admin))
         err = _EPERM;
-    // Only for a mount namespace alone: given other kinds as well, Linux
-    // works on a private copy of the fs_struct, which nobody shares.
-    else if (flags == CLONE_NEWNS_ && current->fs->refcount != 1)
-        err = _EINVAL;
-    else if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWPID_ | CLONE_NEWCGROUP_ | CLONE_NEWNET_)) && !admin)
+    if (err == 0 && (flags & CLONE_NEWIPC_) &&
+            (!ns_capable(ipc != NULL ? ipc->user_ns : NULL, CAP_SYS_ADMIN_) || !admin))
         err = _EPERM;
-    else if ((flags & CLONE_NEWTIME_) && !current_is_only_thread())
-        err = _EUSERS;
-    else if ((flags & CLONE_NEWTIME_) && !admin)
+    if (err == 0 && (flags & CLONE_NEWPID_)) {
+        if (!ns_capable(pid != NULL ? pid->user_ns : NULL, CAP_SYS_ADMIN_) || !admin)
+            err = _EPERM;
+        // The one the caller is in, or one below it: there is no way up, and
+        // none across.
+        else if (!pid_ns_in(pid, current->pid_ns))
+            err = _EINVAL;
+    }
+    // (The one cgroup namespace is the machine's.)
+    if (err == 0 && (flags & CLONE_NEWCGROUP_) && (!current_capable(CAP_SYS_ADMIN_) || !admin))
         err = _EPERM;
+    if (err == 0 && (flags & CLONE_NEWNET_) &&
+            (!ns_capable(net != NULL ? net->user_ns : NULL, CAP_SYS_ADMIN_) || !admin))
+        err = _EPERM;
+    if (err == 0 && (flags & CLONE_NEWTIME_)) {
+        if (!current_is_only_thread())
+            err = _EUSERS;
+        else if (!current_capable(CAP_SYS_ADMIN_) || !admin)
+            err = _EPERM;
+    }
 
     // Into the mount namespace first, the one step here that can fail: the
     // root and working directory both become its root (mntns_install).
@@ -1609,7 +1679,17 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
         if (ipc != NULL)
             ipc_ns_release(ipc);
         mnt_ns_release(mnt);
+        user_ns_release(user);
+        pid_ns_release(pid);
+        net_ns_release(net);
         return err;
+    }
+    if (flags & CLONE_NEWUSER_) {
+        lock(&current->general_lock, 0);
+        struct user_namespace *old_user = current->user_ns;
+        user_ns_enter(current, user); // the reference taken above
+        unlock(&current->general_lock);
+        user_ns_release(old_user);
     }
     if (flags & CLONE_NEWNS_) {
         lock(&current->general_lock, 0);
@@ -1617,6 +1697,27 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
         current->mnt_ns = mnt; // the reference taken above, or NULL
         unlock(&current->general_lock);
         mnt_ns_release(old_mnt);
+    }
+    if (flags & CLONE_NEWPID_) {
+        // Its own namespace is where its children are made when nothing is
+        // set aside, which is how that is written down.
+        lock(&current->general_lock, 0);
+        struct pid_namespace *old_for_children = current->pid_ns_for_children;
+        if (pid == current->pid_ns) {
+            current->pid_ns_for_children = NULL;
+            pid_ns_release(pid);
+        } else {
+            current->pid_ns_for_children = pid; // the reference taken above
+        }
+        unlock(&current->general_lock);
+        pid_ns_release(old_for_children);
+    }
+    if (flags & CLONE_NEWNET_) {
+        lock(&current->general_lock, 0);
+        struct net_namespace *old_net = current->net_ns;
+        current->net_ns = net; // the reference taken above, or NULL
+        unlock(&current->general_lock);
+        net_ns_release(old_net);
     }
     // Linux leaves the SEM_UNDO list on any IPC setns, even into the
     // namespace the caller is already in.

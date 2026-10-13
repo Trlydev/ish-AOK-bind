@@ -26,6 +26,8 @@
 //                while the directory it is a bind of still takes them
 //   pivot_root   onto a tmpfs: its files are at /, the old root is under the
 //                directory named for it, and is gone after a lazy unmount
+//   move         MS_MOVE takes what is mounted in a mount along with it, and
+//                a mount cannot be moved into its own tree (ELOOP)
 //
 // Needs root. On Linux, run by an ordinary user, it first enters a user
 // namespace (where it is root over its own mounts): that is how it is run
@@ -309,6 +311,41 @@ static void case_readonly_bind(void) {
     wait_ok(pid, "read-only bind");
 }
 
+static void case_move(void) {
+    char from[128], to[128], sub[160], inner[200], moved_inner[200], left[200], into[200];
+    path_in(from, sizeof(from), "move-from");
+    path_in(to, sizeof(to), "move-to");
+    snprintf(sub, sizeof(sub), "%s/sub", from);
+    snprintf(inner, sizeof(inner), "%s/sub/inner", from);
+    snprintf(moved_inner, sizeof(moved_inner), "%s/sub/inner", to);
+    snprintf(left, sizeof(left), "%s/sub", from);
+    snprintf(into, sizeof(into), "%s/sub", to);
+    mkdir(from, 0755);
+    mkdir(to, 0755);
+    pid_t pid = fork();
+    if (pid == 0) {
+        CHILD_CHECK(unshare(CLONE_NEWNS) == 0, "unshare(CLONE_NEWNS) failed");
+        private_tree();
+        CHILD_CHECK(mount("outer", from, "tmpfs", 0, NULL) == 0, "mount tmpfs on %s failed", from);
+        CHILD_CHECK(mkdir(sub, 0755) == 0, "mkdir %s failed", sub);
+        CHILD_CHECK(mount("inner", sub, "tmpfs", 0, NULL) == 0, "mount tmpfs on %s failed", sub);
+        CHILD_CHECK(touch(inner) == 0, "cannot create a file in the inner tmpfs");
+        CHILD_CHECK(mount(from, to, NULL, MS_MOVE, NULL) == 0, "MS_MOVE of %s to %s failed", from, to);
+        CHILD_CHECK(exists(moved_inner), "the mount inside the moved one did not come with it: no %s", moved_inner);
+        CHILD_CHECK(!exists(left), "something is still at %s after the move", left);
+        CHILD_CHECK(mountinfo_has(into) == 1 && mountinfo_has(to) == 1, "mountinfo does not list the moved mounts at %s and %s", to, into);
+        CHILD_CHECK(mountinfo_has(sub) == 0 && mountinfo_has(from) == 0, "mountinfo still lists a mount at %s or %s", from, sub);
+        errno = 0;
+        CHILD_CHECK(mount(to, into, NULL, MS_MOVE, NULL) == -1 && errno == ELOOP, "moving a mount into its own tree did not fail with ELOOP");
+        // The inner one is still a mount of its own: it goes, and its file
+        // with it, leaving the directory it was on.
+        CHILD_CHECK(umount(into) == 0, "unmounting the inner mount at its new place failed");
+        CHILD_CHECK(!exists(moved_inner) && exists(into), "after unmounting the inner mount, %s is %s", into, exists(into) ? "there with its file" : "gone");
+        _exit(0);
+    }
+    wait_ok(pid, "move");
+}
+
 static void case_pivot_root(void) {
     char newroot[128];
     path_in(newroot, sizeof(newroot), "newroot");
@@ -397,6 +434,7 @@ int main(void) {
     case_setns();
     case_readonly_bind();
     case_pivot_root();
+    case_move();
 
     umount2(base, MNT_DETACH);
     rmdir(base);

@@ -750,6 +750,10 @@ static int proc_show_loadavg(struct proc_entry *UNUSED(entry), struct proc_data 
     get_guest_loadavg(loads);
     struct pid *last_pid = pid_get_last_allocated();
     int last_pid_id = last_pid ? last_pid->id : 0;
+    // (The last one its own pid namespace handed out, for a reader in one.)
+    struct pid_namespace *reader_ns = current_pid_ns();
+    if (reader_ns != NULL)
+        last_pid_id = reader_ns->last_nr;
     double load_1m = loads[0] / 65536.0;
     double load_5m = loads[1] / 65536.0;
     double load_15m = loads[2] / 65536.0;

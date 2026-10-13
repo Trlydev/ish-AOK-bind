@@ -6,15 +6,14 @@
 //   practice: it is how a program opens a path it does not control without a
 //   symlink somewhere in it redirecting the open elsewhere.
 //
-//   AOK implements NO_SYMLINKS, NO_MAGICLINKS and IN_ROOT inside path
-//   resolution, and answers CACHED with EAGAIN. IN_ROOT is "as if the caller
-//   had chroot()ed to dirfd", and is the walk that confines a chrooted task
-//   with dirfd as its root (bubblewrap opens every bind source this way, from
-//   the old root it has pivoted away from). RESOLVE_BENEATH and
-//   RESOLVE_NO_XDEV stay refused with EINVAL, which is what a kernel without
-//   them says and what every caller already handles -- openat2 is Linux 5.6+,
-//   so nothing may assume it. This test accepts EITHER a working
-//   implementation or EINVAL for those two, and pins the rest.
+//   AOK implements NO_SYMLINKS, NO_MAGICLINKS, IN_ROOT, BENEATH and NO_XDEV
+//   inside path resolution, and answers CACHED with EAGAIN. IN_ROOT is "as if
+//   the caller had chroot()ed to dirfd", and is the walk that confines a
+//   chrooted task with dirfd as its root (bubblewrap opens every bind source
+//   this way, from the old root it has pivoted away from). BENEATH has the
+//   same bound and refuses (EXDEV) what IN_ROOT turns back: an absolute path,
+//   an absolute link, a `..` above dirfd. NO_XDEV keeps the walk on the mount
+//   it starts on. The last two were refused with EINVAL until 559.
 //
 // Measured against x86_64 glibc on Linux 6.12.
 #define _GNU_SOURCE
@@ -235,30 +234,79 @@ int main(int argc, char **argv) {
         close(rootfd);
     }
 
-    // ---- the sandbox flags: implemented, or honestly refused ---------------
+    // ---- RESOLVE_BENEATH ---------------------------------------------------
     {
-        struct { const char *name; unsigned long long bit; } sandbox[] = {
-            { "BENEATH", RESOLVE_BENEATH_ },
-            { "IN_ROOT", RESOLVE_IN_ROOT_ },
-            { "NO_XDEV", RESOLVE_NO_XDEV_ },
-            { "NO_MAGICLINKS", RESOLVE_NO_MAGICLINKS_ },
-        };
-        for (unsigned i = 0; i < sizeof sandbox / sizeof sandbox[0]; i++) {
-            long r = open2(dfd, "sub/f", sandbox[i].bit);
-            char label[96];
-            snprintf(label, sizeof label, "%s works or is EINVAL", sandbox[i].name);
-            ck(label, r >= 0 || r == -EINVAL, 1);
-            // What must not happen is succeeding without enforcing: if it
-            // opened, escaping must be refused.
-            if (r >= 0 && sandbox[i].bit == RESOLVE_BENEATH_) {
-                close((int) r);
-                long esc = open2(dfd, "../", RESOLVE_BENEATH_);
-                ck("  ...and if BENEATH works, escaping is refused", esc < 0, 1);
-                close_if_fd(esc);
-            } else {
-                close_if_fd(r);
-            }
+        char rel[160], relup[160], back[200];
+        snprintf(rel, sizeof rel, "%s/rel", base);
+        snprintf(relup, sizeof relup, "%s/relup", base);
+        snprintf(back, sizeof back, "%s/sub/back", base);
+        ck("a relative symlink to the file", symlink("sub/f", rel), 0);
+        ck("a relative symlink that climbs out", symlink("../../etc/passwd", relup), 0);
+        ck("a relative symlink that climbs and comes back", symlink("../sub/f", back), 0);
+
+        long r = open2(dfd, "sub/f", RESOLVE_BENEATH_);
+        ck("BENEATH on a path below dirfd opens", r >= 0, 1);
+        close_if_fd(r);
+        r = open2(dfd, "sub/..", RESOLVE_BENEATH_);
+        ck("BENEATH: `..` back to dirfd itself opens", r >= 0, 1);
+        close_if_fd(r);
+        r = open2(dfd, "rel", RESOLVE_BENEATH_);
+        ck("BENEATH follows a relative symlink that stays below", r >= 0, 1);
+        close_if_fd(r);
+        r = open2(dfd, "sub/back", RESOLVE_BENEATH_);
+        ck("BENEATH follows one that climbs no higher than dirfd", r >= 0, 1);
+        close_if_fd(r);
+        ck("BENEATH: `..` above dirfd is EXDEV", open2(dfd, "..", RESOLVE_BENEATH_), -EXDEV);
+        ck("BENEATH: `sub/../..` is EXDEV", open2(dfd, "sub/../..", RESOLVE_BENEATH_), -EXDEV);
+        ck("BENEATH: an absolute path is EXDEV", open2(dfd, "/etc/passwd", RESOLVE_BENEATH_), -EXDEV);
+        ck("BENEATH: an absolute symlink is EXDEV", open2(dfd, "link", RESOLVE_BENEATH_), -EXDEV);
+        ck("BENEATH: through an absolute symlink is EXDEV", open2(dfd, "dirlink/f", RESOLVE_BENEATH_), -EXDEV);
+        ck("BENEATH: a relative symlink that climbs out is EXDEV", open2(dfd, "relup", RESOLVE_BENEATH_), -EXDEV);
+        ck("BENEATH with IN_ROOT is EINVAL",
+           open2(dfd, "sub/f", RESOLVE_BENEATH_ | RESOLVE_IN_ROOT_), -EINVAL);
+        // ...and IN_ROOT turns the same climbs back instead.
+        r = open2(dfd, "sub/../../sub/f", RESOLVE_IN_ROOT_);
+        ck("IN_ROOT: the same climb stays at dirfd", r >= 0, 1);
+        close_if_fd(r);
+    }
+
+    // ---- RESOLVE_NO_XDEV ---------------------------------------------------
+    {
+        long r = open2(dfd, "sub/f", RESOLVE_NO_XDEV_);
+        ck("NO_XDEV on a path within one mount opens", r >= 0, 1);
+        close_if_fd(r);
+        r = open2(dfd, "sub/../sub/f", RESOLVE_NO_XDEV_);
+        ck("NO_XDEV: `..` within the mount opens", r >= 0, 1);
+        close_if_fd(r);
+        r = open2(dfd, "rel", RESOLVE_NO_XDEV_);
+        ck("NO_XDEV follows a relative symlink within the mount", r >= 0, 1);
+        close_if_fd(r);
+        int rootfd = open("/", O_RDONLY | O_DIRECTORY);
+        int procfd = open("/proc", O_RDONLY | O_DIRECTORY);
+        ck("open / and /proc", rootfd >= 0 && procfd >= 0, 1);
+        if (rootfd >= 0 && procfd >= 0) {
+            ck("NO_XDEV: a mount point as the last name is EXDEV",
+               open2(rootfd, "proc", RESOLVE_NO_XDEV_), -EXDEV);
+            ck("NO_XDEV: a path into another mount is EXDEV",
+               open2(rootfd, "proc/self/status", RESOLVE_NO_XDEV_), -EXDEV);
+            ck("NO_XDEV: an absolute path into another mount is EXDEV",
+               open2(AT_FDCWD, "/proc/self/status", RESOLVE_NO_XDEV_), -EXDEV);
+            r = open2(procfd, "self/status", RESOLVE_NO_XDEV_);
+            ck("NO_XDEV from a dirfd on /proc stays on /proc", r >= 0, 1);
+            close_if_fd(r);
+            ck("NO_XDEV: `..` out of a mount's root is EXDEV",
+               open2(procfd, "../etc/passwd", RESOLVE_NO_XDEV_), -EXDEV);
+            char viafd[64];
+            snprintf(viafd, sizeof viafd, "self/fd/%d", dfd);
+            ck("NO_XDEV: a /proc/self/fd/N link to another mount is EXDEV",
+               open2(procfd, viafd, RESOLVE_NO_XDEV_), -EXDEV);
+            ck("BENEATH: a /proc/self/fd/N link is EXDEV",
+               open2(procfd, viafd, RESOLVE_BENEATH_), -EXDEV);
         }
+        if (rootfd >= 0)
+            close(rootfd);
+        if (procfd >= 0)
+            close(procfd);
     }
 
     // ---- an unknown resolve bit is EINVAL ---------------------------------

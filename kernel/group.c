@@ -81,6 +81,7 @@ dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
     pid_t_ machine_pgid = current_pid_global(pgid);
     if (tgroup->pgid != machine_pgid) {
         list_remove(&tgroup->pgroup);
+        pid_ns_unnumber_if_empty((dword_t) tgroup->pgid);
         tgroup->pgid = machine_pgid;
         list_add(&group_pid->pgroup, &tgroup->pgroup);
     }
@@ -124,6 +125,9 @@ void task_leave_session(struct task *task) {
     struct pid *sid_pid = pid_get_global(group->sid);
     bool last_session_group = sid_pid == NULL || list_size(&sid_pid->session) <= 1;
     list_remove_safe(&group->session);
+    // (The last of a session whose leader is long reaped: the number was
+    // kept for the session, and now names nothing.)
+    pid_ns_unnumber_if_empty((dword_t) group->sid);
     if (group->tty) {
         lock(&ttys_lock, 0);
         if (last_session_group) {
@@ -199,6 +203,7 @@ pid_t_ task_setsid(struct task *task) {
     group->sid = new_sid;
 
     list_remove_safe(&group->pgroup);
+    pid_ns_unnumber_if_empty((dword_t) group->pgid);
     list_add(&pid->pgroup, &group->pgroup);
     group->pgid = new_sid;
 

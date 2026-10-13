@@ -18,12 +18,17 @@
 // queues lose their names and its System V objects are removed. `holds` only
 // keeps the struct itself allocated for what still points at it afterwards: a
 // queue that is open outlives its name, and the namespace it was counted in.
+struct user_namespace;
 struct ipc_namespace {
     atomic_uint refcount;
     atomic_uint holds;
     // Its identity in /proc/<pid>/ns/ipc, which is how a program tells two
     // namespaces apart.
     unsigned long inode;
+    // The user namespace it was made in (kernel/user_ns.h), NULL for the
+    // initial one: CAP_SYS_ADMIN there is what joining this one takes. Owns
+    // a reference. Immutable.
+    struct user_namespace *user_ns;
 
     // POSIX message queues by name, and how many; the rest of mqueue's state
     // lives on the queues. The limits are the namespace's own sysctls.
@@ -56,8 +61,9 @@ extern struct ipc_namespace init_ipc_ns;
 struct ipc_namespace *ipc_ns_current(void);
 struct ipc_namespace *ipc_ns_retain(struct ipc_namespace *ns);
 void ipc_ns_release(struct ipc_namespace *ns);
-// A new, empty namespace with Linux's default limits, one reference held.
-struct ipc_namespace *ipc_ns_new(void);
+// A new, empty namespace with Linux's default limits, one reference held,
+// owned by the user namespace `owner`.
+struct ipc_namespace *ipc_ns_new(struct user_namespace *owner);
 // Keep the struct (not the namespace) allocated; see `holds` above.
 void ipc_ns_hold(struct ipc_namespace *ns);
 void ipc_ns_unhold(struct ipc_namespace *ns);

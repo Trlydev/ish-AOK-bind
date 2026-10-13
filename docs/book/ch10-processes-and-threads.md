@@ -139,14 +139,16 @@ things a namespace's root *is* given — the mount, UTS and user namespaces it
 makes, the ids its maps cover, the files those ids own — are asked for by
 name with `ns_capable()`. `CLONE_NEWPID`, the third of 559's, is the one that
 shows how far "one machine" bends. There is still one pid table and a task
-still has one number in it; a pid namespace is a *filter* on what a number
-may name — from inside, only the tasks in the namespace or below it — plus a
-single exchange: the namespace's first process is `1` to those inside
-(`kernel/pid_ns.h`). The lookups by number apply both for whoever is asking,
-so a number a guest hands the kernel is confined without the call site's
-knowing, and what holds a machine number asks the `_global` forms. `ps` in
-one shows pid 1 and then numbers that are not small, which is the visible
-difference from Linux. When that pid 1 exits, everything left inside is
+still has one slot in it, its machine pid, which is what the kernel holds and
+compares everywhere; a pid namespace gives each task in it a second number,
+counted from 1 as Linux counts them, and a task three namespaces deep has
+four (`kernel/pid_ns.h`). The lookups by number read a number as the
+caller's namespace's and find only tasks that have one there, so a number a
+guest hands the kernel is confined without the call site's knowing, and what
+holds a machine number asks the `_global` forms; a number handed back is
+translated for whoever is being told, and reads 0 for a task they have no
+number for. `ps` in one shows 1, 2, 3, and `/proc/<pid>/status` lists the
+whole column in `NSpid`. When that pid 1 exits, everything left inside is
 killed. `CLONE_NEWNET` completes what a sandbox asks for, and is the plainest
 case of all: guest sockets are host sockets and the host has one network, so
 a private network namespace is a loopback interface with nothing behind it,

@@ -9,37 +9,36 @@ struct task;
 struct user_namespace;
 
 // A pid namespace (CLONE_NEWPID): a set of processes that can see only each
-// other, whose first one is pid 1.
+// other, numbered from 1.
 //
-// Pid NUMBERS stay the machine's. AOK keeps one pid table, and a task has one
-// number in it; Linux gives a task a number at every level and this does not.
-// A namespace here is two things, both asked of the task that is looking
-// (`current`):
+// AOK keeps one pid table, and a task has one slot in it: its MACHINE pid,
+// which is what the kernel holds and compares everywhere. A namespace gives
+// the tasks in it -- its own and those of namespaces made inside it -- a
+// second number each, handed out from 1 as Linux hands them out, so its first
+// process is pid 1, the next 2. A task three namespaces deep has four
+// numbers: the machine's and one in each namespace above it. Two things
+// follow, both asked of the task that is looking (`current`):
 //
-//   - a filter. From inside a namespace, a number names a task only if that
-//     task is in the namespace or in one made inside it. Every other pid is
-//     simply not there: ESRCH to kill, absent from /proc, 0 as a parent.
-//   - one exchange of numbers. The namespace's first process (its init), seen
-//     from inside, is 1; its machine number names nothing there. Seen from
-//     its parent's namespace it is the number it has always had.
+//   - a number names a task only in the namespace it was given in. From
+//     inside, the lookups by number (pid_get, pid_get_task, ... in
+//     kernel/task.h) read a number as the caller's namespace's and find only
+//     tasks in that namespace or below it. Every other pid is not there:
+//     ESRCH to kill, absent from /proc, 0 as a parent.
+//   - a number given back to a guest is the one its namespace has for the
+//     task (current_pid_shown), and 0 for a task it has no number for; one a
+//     guest gives that is kept for later -- a process group, a terminal's
+//     foreground group -- is kept as the machine's (current_pid_global).
 //
-// So `ps` in a namespace shows pid 1 and then numbers that are not small,
-// which is the one place this differs to the eye from Linux; nothing may
-// rely on which numbers its children get.
-//
-// The lookups by number (pid_get, pid_get_task, ... in kernel/task.h) apply
-// both, so a number a guest hands the kernel is confined without the call
-// site's knowing: what holds a machine number instead -- a stored tgid, a
-// timer's target, the app -- asks pid_get_*_global. A number given back to a
-// guest goes through current_pid_shown(), and one a guest gives that is kept
-// for later (a process group, a terminal's foreground group) through
-// current_pid_global().
+// So a number a guest hands the kernel is confined without the call site's
+// knowing, and what holds a machine number instead -- a stored tgid, a
+// timer's target, the app -- asks pid_get_*_global.
 //
 // The init is the namespace: when it exits every process left inside is
 // killed, and nothing more can be forked into it. Orphans inside go to it. A
 // signal sent to it from inside does only what it has a handler for.
 //
-// The initial namespace is `task->pid_ns == NULL`.
+// The initial namespace is `task->pid_ns == NULL`, and its numbers are the
+// machine's.
 struct pid_namespace {
     atomic_uint refcount;
     unsigned long inode;            // its identity in /proc/<pid>/ns/pid
@@ -51,6 +50,12 @@ struct pid_namespace {
     _Atomic pid_t_ init_pid;
     // Its init has exited.
     atomic_bool dead;
+    // Its numbers, both ways, each MAX_PID + 1 long and indexed by a pid:
+    // nr_of[machine pid] is that task's number here (0: it has none), and
+    // by_nr[number] the machine pid it is. Written under pids_lock; read
+    // without it, an int at a time, by whoever holds the namespace.
+    pid_t_ *nr_of, *by_nr;
+    pid_t_ last_nr;                 // the last one handed out; guarded by pids_lock
 };
 
 #define PID_NS_MAX_LEVEL 32
@@ -68,9 +73,9 @@ bool pid_ns_in(const struct pid_namespace *ns, const struct pid_namespace *ances
 
 // The calling task's namespace, NULL for the initial one (and off a task).
 struct pid_namespace *current_pid_ns(void);
-// A machine number as tasks in `viewer` know it, and the reverse
-// (PID_NS_NO_PID for a number that names nothing there). 0 and negative
-// numbers are left alone: they are not pids.
+// A machine number as tasks in `viewer` know it -- 0 for a task that has no
+// number there -- and the reverse (PID_NS_NO_PID for a number that names
+// nothing there). 0 and negative numbers are left alone: they are not pids.
 pid_t_ pid_ns_shown(struct pid_namespace *viewer, pid_t_ pid);
 pid_t_ pid_ns_global(struct pid_namespace *viewer, pid_t_ pid);
 pid_t_ current_pid_shown(pid_t_ pid);

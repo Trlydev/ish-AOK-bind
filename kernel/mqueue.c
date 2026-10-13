@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "debug.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "kernel/ipc_ns.h"
@@ -485,6 +486,8 @@ static void mq_note_fire(struct mq_note *note) {
             owner = NULL;
         unlock(&pids_lock);
         if (owner != NULL) {
+            // The sender, as the one told knows it (kernel/pid_ns.h).
+            info.rt.pid = task_pid_shown(owner, info.rt.pid);
             send_signal_to_process(owner, note->signo, info);
             task_ref_cnt_mod(owner, -1);
         }

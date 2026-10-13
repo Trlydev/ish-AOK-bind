@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/signal.h"
@@ -480,7 +481,7 @@ enum seccomp_verdict seccomp_syscall_enter(enum guest_abi abi, qword_t nr64,
                 struct siginfo_ info = {
                     .sig = SIGTRAP_,
                     .code = SI_USER_,
-                    .kill.pid = current->pid,
+                    .kill.pid = current_pid_shown(current->pid),
                     .kill.uid = current->uid,
                 };
                 ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_SECCOMP_, rdata);

@@ -1,4 +1,5 @@
 #include "ptrace.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/abi/amd64.h"
@@ -58,7 +59,7 @@ static void ptrace_resume_child_locked(struct task *child, int resume_sig,
         } else {
             struct task *tracer = ptrace_tracer(child);
             resume_info.code = SI_USER_;
-            resume_info.kill.pid = tracer != NULL ? tracer->pid : current->pid;
+            resume_info.kill.pid = task_pid_shown(child, tracer != NULL ? tracer->pid : current->pid);
             resume_info.kill.uid = tracer != NULL ? tracer->uid : current->uid;
         }
     }
@@ -1445,7 +1446,7 @@ void ptrace_trap_stop_if_pending(void) {
     struct siginfo_ info = {
         .sig = SIGTRAP_,
         .code = (PTRACE_EVENT_STOP_ << 8) | SIGTRAP_,
-        .kill.pid = current->pid,
+        .kill.pid = current_pid_shown(current->pid),
         .kill.uid = current->uid,
     };
     ptrace_stop_common(SIGTRAP_, &info, false, false, PTRACE_EVENT_STOP_, 0, true);
@@ -1458,7 +1459,7 @@ void ptrace_syscall_stop(struct cpu_state *cpu) {
     struct siginfo_ info = {
         .sig = SIGTRAP_,
         .code = current->ptrace.sysgood ? (SIGTRAP_ | 0x80) : SIGTRAP_,
-        .kill.pid = current->pid,
+        .kill.pid = current_pid_shown(current->pid),
         .kill.uid = current->uid,
     };
 
@@ -1530,7 +1531,7 @@ void ptrace_group_stop(void) {
         struct siginfo_ info = {
             .sig = stop_sig,
             .code = (PTRACE_EVENT_STOP_ << 8) | stop_sig,
-            .kill.pid = current->pid,
+            .kill.pid = current_pid_shown(current->pid),
             .kill.uid = current->uid,
         };
         ptrace_stop_common(stop_sig, &info, false, false, PTRACE_EVENT_STOP_, 0, false);
@@ -1558,7 +1559,7 @@ void ptrace_listen_cont_stop(void) {
     struct siginfo_ info = {
         .sig = SIGTRAP_,
         .code = (PTRACE_EVENT_STOP_ << 8) | SIGTRAP_,
-        .kill.pid = current->pid,
+        .kill.pid = current_pid_shown(current->pid),
         .kill.uid = current->uid,
     };
     ptrace_stop_common(SIGTRAP_, &info, false, false, PTRACE_EVENT_STOP_, 0, false);
@@ -2298,6 +2299,14 @@ dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_
             if (!child) return _ESRCH;
 
             qword_t eventmsg = child->ptrace.eventmsg;
+            // A new child's pid, or the tid an exec gave up: as the tracer
+            // knows it (kernel/pid_ns.h).
+            switch (child->ptrace.trap_event) {
+                case PTRACE_EVENT_FORK_: case PTRACE_EVENT_VFORK_: case PTRACE_EVENT_CLONE_:
+                case PTRACE_EVENT_VFORK_DONE_: case PTRACE_EVENT_EXEC_:
+                    eventmsg = (qword_t) current_pid_shown((pid_t_) eventmsg);
+                    break;
+            }
             if (data && ptrace_put_eventmsg(current, data, eventmsg)) {
                 unlock(&child->ptrace.lock);
                 return _EFAULT;

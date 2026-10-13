@@ -50,7 +50,7 @@ struct proc_data;
 #define USER_NS_INVALID_ID ((uid_t_) -1)
 #define USER_NS_MAX_LEVEL 32
 // Linux takes 340 lines in a map. Nothing writes more than a handful.
-#define USER_NS_MAP_EXTENTS 16
+#define USER_NS_MAP_EXTENTS 340
 
 struct id_extent {
     uid_t_ first;   // in the namespace

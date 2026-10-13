@@ -1110,7 +1110,7 @@ struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, i
     // they jump straight to the file a /proc/<pid>/{fd/N,ns/*} link names,
     // which is the thing such a walk is asked not to do. The ordinary walk
     // meets the link and answers for it (fs/path.c).
-    bool scoped = (extra_norm & (N_NO_SYMLINKS | N_NO_MAGICLINKS | N_IN_ROOT)) != 0;
+    bool scoped = (extra_norm & (N_NO_SYMLINKS | N_NO_MAGICLINKS | N_IN_ROOT | N_BENEATH | N_NO_XDEV)) != 0;
     if (flags & O_TMPFILE_) {
         if (scoped) {
             char path[MAX_PATH];

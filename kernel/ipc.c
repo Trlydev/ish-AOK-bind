@@ -5,6 +5,8 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/resource.h"
 #include "kernel/personality.h"
@@ -49,7 +51,9 @@ bool ipc_access_ok(uid_t_ uid, uid_t_ gid, uid_t_ cuid, uid_t_ cgid,
                    mode_t_ mode, int want) {
     if (current == NULL)
         return false;
-    if (current_capable(CAP_SYS_ADMIN_))
+    // Over the user namespace the caller's IPC namespace was made in: root
+    // of a sandbox has it for the sandbox's own objects, and for no others.
+    if (ns_capable(ipc_ns_current()->user_ns, CAP_SYS_ADMIN_))
         return true;
     // Owner bits if we own it, else group bits if we are in its group, else
     // other bits -- and the chosen class is final, exactly as on Linux. A
@@ -69,7 +73,7 @@ bool ipc_access_ok(uid_t_ uid, uid_t_ gid, uid_t_ cuid, uid_t_ cgid,
 bool ipc_owner_ok(uid_t_ uid, uid_t_ cuid) {
     if (current == NULL)
         return false;
-    return current_capable(CAP_SYS_ADMIN_) ||
+    return ns_capable(ipc_ns_current()->user_ns, CAP_SYS_ADMIN_) ||
            current->euid == uid || current->euid == cuid;
 }
 
@@ -254,8 +258,8 @@ static int shmget_internal(dword_t key, size_t size, int flags) {
         .gid = current->egid,
         .cuid = current->euid,
         .cgid = current->egid,
-        .cpid = current->pid,
-        .lpid = current->pid,
+        .cpid = current->tgid,
+        .lpid = current->tgid,
         .ctime = ipc_now(),
     };
     list_init(&segment->shm_segments);
@@ -364,7 +368,7 @@ static guest_addr_t shm_region_attach(struct mm *mm, struct shm_segment *segment
 
     lock(&segment->ns->shm_lock, 0);
     segment->nattch++;
-    segment->lpid = current->pid;
+    segment->lpid = current->tgid;
     segment->atime = ipc_now();
     unlock(&segment->ns->shm_lock);
 
@@ -447,6 +451,12 @@ static int shmdt_internal(struct mm *mm, guest_addr_t addr, pid_t_ lpid, bool fr
 }
 
 static int shmctl_ipc_set(struct shm_segment *segment, uid_t_ uid, uid_t_ gid, mode_t_ mode) {
+    // The ids are the caller's user namespace's (kernel/user_ns.h), and one
+    // it has no mapping for is EINVAL.
+    uid = current_make_kuid(uid);
+    gid = current_make_kgid(gid);
+    if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID)
+        return _EINVAL;
     segment->uid = uid;
     segment->gid = gid;
     segment->mode = mode & 0777;
@@ -460,10 +470,10 @@ static int shmctl_ipc_set(struct shm_segment *segment, uid_t_ uid, uid_t_ gid, m
 static void shmctl_fill_ipc_perm_i386(struct ipc_perm_i386_ *perm, struct shm_segment *segment) {
     *perm = (struct ipc_perm_i386_) {
         .key = segment->removed ? IPC_PRIVATE_ : segment->key,
-        .uid = segment->uid,
-        .gid = segment->gid,
-        .cuid = segment->cuid,
-        .cgid = segment->cgid,
+        .uid = current_uid_shown(segment->uid),
+        .gid = current_gid_shown(segment->gid),
+        .cuid = current_uid_shown(segment->cuid),
+        .cgid = current_gid_shown(segment->cgid),
         .mode = segment->mode | (segment->removed ? SHM_DEST_ : 0),
         .seq = 0,
     };
@@ -472,10 +482,10 @@ static void shmctl_fill_ipc_perm_i386(struct ipc_perm_i386_ *perm, struct shm_se
 static void shmctl_fill_ipc_perm_amd64(struct ipc_perm_amd64_ *perm, struct shm_segment *segment) {
     *perm = (struct ipc_perm_amd64_) {
         .key = segment->removed ? IPC_PRIVATE_ : segment->key,
-        .uid = segment->uid,
-        .gid = segment->gid,
-        .cuid = segment->cuid,
-        .cgid = segment->cgid,
+        .uid = current_uid_shown(segment->uid),
+        .gid = current_gid_shown(segment->gid),
+        .cuid = current_uid_shown(segment->cuid),
+        .cgid = current_gid_shown(segment->cgid),
         .mode = segment->mode | (segment->removed ? SHM_DEST_ : 0),
         .seq = 0,
     };
@@ -521,9 +531,9 @@ static int shmctl_internal_i386(int id, int cmd, addr_t ptr) {
             unlock(&ns->shm_lock);
             return _EINVAL;
         }
-        shmctl_ipc_set(segment, info.shm_perm.uid, info.shm_perm.gid, (mode_t_) info.shm_perm.mode);
+        int set_err = shmctl_ipc_set(segment, info.shm_perm.uid, info.shm_perm.gid, (mode_t_) info.shm_perm.mode);
         unlock(&ns->shm_lock);
-        return 0;
+        return set_err;
     }
 
     if (cmd_base == IPC_STAT_) {
@@ -532,8 +542,8 @@ static int shmctl_internal_i386(int id, int cmd, addr_t ptr) {
             .shm_atime = segment->atime,
             .shm_dtime = segment->dtime,
             .shm_ctime = segment->ctime,
-            .shm_cpid = segment->cpid,
-            .shm_lpid = segment->lpid,
+            .shm_cpid = current_pid_shown(segment->cpid),
+            .shm_lpid = current_pid_shown(segment->lpid),
             .shm_nattch = segment->nattch,
         };
         shmctl_fill_ipc_perm_i386(&info.shm_perm, segment);
@@ -589,9 +599,9 @@ static int shmctl_internal_amd64(int id, int cmd, guest_addr_t ptr) {
             unlock(&ns->shm_lock);
             return _EINVAL;
         }
-        shmctl_ipc_set(segment, info.shm_perm.uid, info.shm_perm.gid, info.shm_perm.mode);
+        int set_err = shmctl_ipc_set(segment, info.shm_perm.uid, info.shm_perm.gid, info.shm_perm.mode);
         unlock(&ns->shm_lock);
-        return 0;
+        return set_err;
     }
 
     if (cmd_base == IPC_STAT_) {
@@ -600,8 +610,8 @@ static int shmctl_internal_amd64(int id, int cmd, guest_addr_t ptr) {
             .shm_atime = segment->atime,
             .shm_dtime = segment->dtime,
             .shm_ctime = segment->ctime,
-            .shm_cpid = segment->cpid,
-            .shm_lpid = segment->lpid,
+            .shm_cpid = current_pid_shown(segment->cpid),
+            .shm_lpid = current_pid_shown(segment->lpid),
             .shm_nattch = segment->nattch,
         };
         shmctl_fill_ipc_perm_amd64(&info.shm_perm, segment);
@@ -658,7 +668,7 @@ void ipc_mm_release(struct mm *mm) {
     struct shm_region *region, *tmp;
     list_for_each_entry_safe(&mm->shm_regions, region, tmp, mm_regions) {
         guest_addr_t addr = region->addr;
-        shmdt_internal(mm, addr, current ? current->pid : 0, true);
+        shmdt_internal(mm, addr, current ? current->tgid : 0, true);
     }
 }
 
@@ -736,7 +746,7 @@ static int_t sys_ipc_common(uint_t call, int_t first, int_t second, guest_addr_t
             return 0;
         }
         case IPCOP_SHMDT_:
-            return shmdt_internal(current->mm, ptr, current->pid, false);
+            return shmdt_internal(current->mm, ptr, current->tgid, false);
         case IPCOP_SHMCTL_:
             if (current->abi == GUEST_ABI_AMD64)
                 return shmctl_internal_amd64(first, second, ptr);
@@ -781,11 +791,11 @@ guest_addr_t sys_shmat_guest(int_t shmid, guest_addr_t shmaddr, int_t shmflg) {
 }
 
 int_t sys_shmdt(addr_t shmaddr) {
-    return shmdt_internal(current->mm, shmaddr, current->pid, false);
+    return shmdt_internal(current->mm, shmaddr, current->tgid, false);
 }
 
 int_t sys_shmdt_guest(guest_addr_t shmaddr) {
-    return shmdt_internal(current->mm, shmaddr, current->pid, false);
+    return shmdt_internal(current->mm, shmaddr, current->tgid, false);
 }
 
 int_t sys_shmctl(int_t shmid, int_t cmd, addr_t buf) {

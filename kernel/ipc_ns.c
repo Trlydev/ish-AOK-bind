@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include "kernel/ipc_ns.h"
 #include "kernel/task.h"
+#include "kernel/user_ns.h"
 
 struct ipc_namespace init_ipc_ns = {
     .refcount = 1,
@@ -51,8 +52,10 @@ void ipc_ns_hold(struct ipc_namespace *ns) {
 }
 
 void ipc_ns_unhold(struct ipc_namespace *ns) {
-    if (atomic_fetch_sub(&ns->holds, 1) == 1 && ns != &init_ipc_ns)
+    if (atomic_fetch_sub(&ns->holds, 1) == 1 && ns != &init_ipc_ns) {
+        user_ns_release(ns->user_ns);
         free(ns);
+    }
 }
 
 void ipc_ns_release(struct ipc_namespace *ns) {
@@ -72,12 +75,13 @@ void ipc_ns_release(struct ipc_namespace *ns) {
     ipc_ns_unhold(ns);
 }
 
-struct ipc_namespace *ipc_ns_new(void) {
+struct ipc_namespace *ipc_ns_new(struct user_namespace *owner) {
     struct ipc_namespace *ns = malloc(sizeof(*ns));
     if (ns == NULL)
         return NULL;
     *ns = (struct ipc_namespace) {
         .inode = ns_alloc_inum(),
+        .user_ns = user_ns_retain(owner),
         .mq_queues_max = 256,
         .mq_msg_max = 10,
         .mq_msgsize_max = 8192,

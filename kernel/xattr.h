@@ -25,8 +25,9 @@ struct file_caps {
 
 // The capabilities an exec of the open file `fd` takes from it: Linux's
 // get_vfs_caps_from_disk. 0 with *caps filled for a well-formed attribute of
-// revision 1, 2 or 3 whose root id is this namespace's root; _ENODATA for none
-// that apply (no attribute, or one written for another root); _EINVAL for an
+// revision 1, 2 or 3 written for the root of the caller's user namespace or of
+// one above it; _ENODATA for none that apply (no attribute, or one written
+// for another root -- a sandbox's, read from outside it); _EINVAL for an
 // attribute that is no valid revision at all, which fails the exec.
 int xattr_exec_file_caps(struct fd *fd, struct file_caps *caps);
 

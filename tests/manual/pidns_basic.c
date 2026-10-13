@@ -3,10 +3,9 @@
 //
 // AOK had one pid space: clone(CLONE_NEWPID) was EINVAL and unshare ENOSYS.
 // bubblewrap --unshare-pid (and so Codex CLI's command sandbox) asks for one.
-// kernel/pid_ns.h has the model -- pid numbers stay the machine's, and a
-// namespace is a filter on what a number may name plus "its init is 1" -- so
-// the numbers of a namespace's OTHER processes are not small here as they are
-// on Linux, and nothing below asks what they are.
+// kernel/pid_ns.h has the model: a task keeps its machine pid, and each
+// namespace it is in gives it a second number, counted from 1 as Linux
+// counts them.
 //
 // As an ordinary user in a user namespace, which is how it runs on Linux as
 // the oracle (6.12, camd); as root the test becomes uid 1000 first.
@@ -29,11 +28,23 @@
 //   the end      when the init exits, every other process in the namespace
 //                is killed, and a fork into the namespace is ENOMEM
 //   refused      CLONE_NEWPID with CLONE_THREAD is EINVAL
+//   numbers      the init's children are 2, then 3 (the numbers go round,
+//                they do not go back to one that was freed), a thread's tid
+//                is the next; a group and session from outside read 0, and
+//                kill(0) still reaches the caller's own group
+//   reported     the same number wherever a pid is given back: waitid and
+//                SIGCHLD's si_pid, F_GETLK's l_pid, F_GETOWN, SO_PEERCRED
+//                (0 for a peer from outside), /proc/<pid>/stat and status
+//   NSpid        /proc/<pid>/status lists a task's number in the reader's
+//                namespace and in each one below, so the parent outside
+//                reads "<pid> 1" for an init, and three numbers for the
+//                init of a namespace made inside that one
 #define _GNU_SOURCE
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <grp.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -42,6 +53,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -347,6 +359,241 @@ static void case_the_end(void) {
     MUST(late == -1 && errno == ENOMEM, "a fork into a namespace whose init is gone did not fail with ENOMEM (%d)", (int) late);
 }
 
+static void *thread_tid(void *arg) {
+    *(pid_t *) arg = (pid_t) syscall(SYS_gettid);
+    return NULL;
+}
+
+static void init_numbers(void) {
+    // The group and session it was born into are outside.
+    MUST(getpgid(0) == 0, "a process group from outside reads %d", (int) getpgid(0));
+    MUST(getsid(0) == 0, "a session from outside reads %d", (int) getsid(0));
+    MUST(kill(0, 0) == 0, "kill(0, 0) did not reach the caller's own group");
+
+    pid_t first = fork();
+    if (first == 0)
+        _exit(getpid() == 2 && getppid() == 1 ? 0 : 9);
+    MUST(first == 2, "the init's first child is pid %d", (int) first);
+    MUST(wait_status(first) == 0, "the first child did not call itself 2");
+
+    // The next number, not the one just freed.
+    int fds[2];
+    MUST(pipe(fds) == 0, "pipe");
+    pid_t second = fork();
+    if (second == 0) {
+        pid_t group = setpgid(0, 0) == 0 ? getpgid(0) : -1;
+        _exit(getpid() == 3 && write(fds[1], &group, sizeof(group)) == sizeof(group) ? 0 : 9);
+    }
+    MUST(second == 3, "the init's second child is pid %d", (int) second);
+    close(fds[1]);
+    pid_t group = -1;
+    MUST(read(fds[0], &group, sizeof(group)) == sizeof(group) && group == 3, "a group made inside reads %d to its leader", (int) group);
+    siginfo_t exited;
+    memset(&exited, 0, sizeof(exited));
+    MUST(waitid(P_PID, 3, &exited, WEXITED) == 0 && exited.si_pid == 3 && exited.si_status == 0,
+            "waitid for pid 3 says pid %d, status %d", (int) exited.si_pid, exited.si_status);
+
+    pthread_t thread;
+    pid_t tid = -1;
+    MUST(pthread_create(&thread, NULL, thread_tid, &tid) == 0, "pthread_create");
+    pthread_join(thread, NULL);
+    MUST(tid == 4, "a thread of the init has tid %d", (int) tid);
+}
+
+static void case_numbers(void) {
+    enter(CLONE_NEWPID);
+    in_new_pidns(init_numbers, "numbers");
+}
+
+static volatile sig_atomic_t chld_pid = -1;
+static void on_chld(int sig, siginfo_t *info, void *context) {
+    (void) sig, (void) context;
+    chld_pid = info->si_pid;
+}
+
+static int outside_socket = -1;     // one end of a socketpair made outside the namespace
+
+// Field `want` (1-based) of /proc/<pid>/stat, counted from after the name.
+static long stat_field(pid_t pid, int want) {
+    char path[64], buf[1024];
+    snprintf(path, sizeof(path), "/proc/%d/stat", (int) pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return -2;
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return -2;
+    buf[n] = '\0';
+    if (want == 1)
+        return atol(buf);
+    char *at = strrchr(buf, ')');
+    for (int field = 2; at != NULL && field < want; field++)
+        at = strchr(at + 1, ' ');
+    return at != NULL ? atol(at + 1) : -2;
+}
+
+// The line of /proc/<pid>/status that starts with `key`, less the key.
+static const char *status_line(pid_t pid, const char *key) {
+    static char buf[8192];
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/status", (int) pid);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return "(unreadable)";
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return "(unreadable)";
+    buf[n] = '\0';
+    char *at = buf;
+    while (at != NULL && strncmp(at, key, strlen(key)) != 0) {
+        at = strchr(at, '\n');
+        if (at != NULL)
+            at++;
+    }
+    if (at == NULL)
+        return "(absent)";
+    char *end = strchr(at, '\n');
+    if (end != NULL)
+        *end = '\0';
+    return at + strlen(key);
+}
+
+static void init_reported(void) {
+    MUST(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) == 0, "making the tree private failed");
+    MUST(mount("proc", "/proc", "proc", 0, NULL) == 0, "mounting /proc in the namespace failed");
+    struct sigaction action;
+    memset(&action, 0, sizeof(action));
+    action.sa_sigaction = on_chld;
+    action.sa_flags = SA_SIGINFO;
+    MUST(sigaction(SIGCHLD, &action, NULL) == 0, "sigaction");
+
+    char path[] = "/tmp/pidns_basic.XXXXXX";
+    int file = mkstemp(path);
+    MUST(file >= 0, "mkstemp");
+    unlink(path);
+    int locked[2], done[2];
+    MUST(pipe(locked) == 0 && pipe(done) == 0, "pipe");
+    pid_t child = fork();
+    if (child == 0) {
+        close(done[1]);
+        struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+        char c = 0;
+        if (fcntl(file, F_SETLK, &lock) != 0 || write(locked[1], &c, 1) != 1)
+            _exit(9);
+        (void) !read(done[0], &c, 1);
+        _exit(0);
+    }
+    MUST(child == 2, "the child is pid %d", (int) child);
+    close(done[0]);
+    char c;
+    MUST(read(locked[0], &c, 1) == 1, "the child did not take its lock");
+
+    struct flock lock = {.l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0, .l_len = 1};
+    MUST(fcntl(file, F_GETLK, &lock) == 0 && lock.l_type == F_WRLCK && lock.l_pid == 2,
+            "F_GETLK names pid %d (type %d) for the child's lock", (int) lock.l_pid, (int) lock.l_type);
+    MUST(fcntl(locked[0], F_SETOWN, child) == 0 && fcntl(locked[0], F_GETOWN) == 2,
+            "F_GETOWN reads %d after F_SETOWN to the child", fcntl(locked[0], F_GETOWN));
+
+    int pair[2];
+    MUST(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "socketpair");
+    struct ucred cred = {.pid = -1};
+    socklen_t len = sizeof(cred);
+    MUST(getsockopt(pair[0], SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 && cred.pid == 1,
+            "SO_PEERCRED on the init's own socketpair says pid %d", (int) cred.pid);
+    cred.pid = -1;
+    len = sizeof(cred);
+    MUST(getsockopt(outside_socket, SOL_SOCKET, SO_PEERCRED, &cred, &len) == 0 && cred.pid == 0,
+            "SO_PEERCRED for a peer outside the namespace says pid %d", (int) cred.pid);
+
+    MUST(stat_field(1, 1) == 1 && stat_field(1, 4) == 0, "/proc/1/stat: pid %ld, parent %ld", stat_field(1, 1), stat_field(1, 4));
+    MUST(stat_field(1, 5) == 0 && stat_field(1, 6) == 0, "/proc/1/stat: group %ld, session %ld; both are outside", stat_field(1, 5), stat_field(1, 6));
+    MUST(stat_field(2, 1) == 2 && stat_field(2, 4) == 1, "/proc/2/stat: pid %ld, parent %ld", stat_field(2, 1), stat_field(2, 4));
+    MUST(strcmp(status_line(2, "Pid:"), "\t2") == 0, "/proc/2/status Pid:%s", status_line(2, "Pid:"));
+    MUST(strcmp(status_line(2, "PPid:"), "\t1") == 0, "/proc/2/status PPid:%s", status_line(2, "PPid:"));
+    MUST(strcmp(status_line(2, "NSpid:"), "\t2") == 0, "/proc/2/status NSpid:%s", status_line(2, "NSpid:"));
+    MUST(strcmp(status_line(1, "NStgid:"), "\t1") == 0, "/proc/1/status NStgid:%s", status_line(1, "NStgid:"));
+    MUST(strcmp(status_line(1, "NSpgid:"), "\t0") == 0, "/proc/1/status NSpgid:%s", status_line(1, "NSpgid:"));
+    MUST(strcmp(status_line(1, "NSsid:"), "\t0") == 0, "/proc/1/status NSsid:%s", status_line(1, "NSsid:"));
+    struct stat st;
+    MUST(stat("/proc/2/task/2", &st) == 0, "no /proc/2/task/2");
+
+    close(done[1]);
+    for (int i = 0; i < 500 && chld_pid == -1; i++)
+        usleep(10000);
+    MUST(chld_pid == 2, "SIGCHLD for the child says si_pid %d", (int) chld_pid);
+    MUST(wait_status(child) == 0, "the child failed");
+}
+
+static void case_reported(void) {
+    int pair[2];
+    MUST(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "socketpair");
+    outside_socket = pair[0];
+    enter(CLONE_NEWPID | CLONE_NEWNS);
+    in_new_pidns(init_reported, "reported");
+}
+
+// What the parent outside is told of the namespaces below it.
+static void case_nspid(void) {
+    enter(CLONE_NEWPID);
+    int up[2], hold[2];
+    MUST(pipe(up) == 0 && pipe(hold) == 0, "pipe");
+    fflush(stdout);
+    pid_t init = fork();
+    MUST(init >= 0, "fork");
+    if (init == 0) {
+        close(up[0]);
+        close(hold[1]);
+        // A namespace inside this one, and its init.
+        MUST(unshare(CLONE_NEWPID) == 0, "unshare(CLONE_NEWPID) inside a pid namespace failed");
+        pid_t inner = fork();
+        if (inner == 0) {
+            pid_t me = getpid();
+            char c;
+            if (write(up[1], &me, sizeof(me)) != sizeof(me))
+                _exit(9);
+            (void) !read(hold[0], &c, 1);
+            _exit(0);
+        }
+        MUST(write(up[1], &inner, sizeof(inner)) == sizeof(inner), "write");
+        close(up[1]);
+        close(hold[0]);
+        _exit(wait_status(inner) == 0 ? 0 : 9);
+    }
+    close(up[1]);
+    close(hold[0]);
+    pid_t first = -1, second = -1;
+    MUST(read(up[0], &first, sizeof(first)) == sizeof(first) && read(up[0], &second, sizeof(second)) == sizeof(second),
+            "the two inits did not report");
+    // In either order: one is the inner init's own pid, the other what its
+    // parent calls it.
+    MUST((first == 1 && second == 2) || (first == 2 && second == 1),
+            "the inner init is %d to itself and %d to its parent, or the reverse; wanted 1 and 2", (int) first, (int) second);
+
+    char want[64];
+    snprintf(want, sizeof(want), "\t%d\t1", (int) init);
+    MUST(strcmp(status_line(init, "NSpid:"), want) == 0, "/proc/%d/status NSpid:%s for the init of a child namespace", (int) init, status_line(init, "NSpid:"));
+    // The inner init: the one process whose NSpid has three numbers.
+    int found = 0;
+    DIR *dir = opendir("/proc");
+    MUST(dir != NULL, "opendir /proc");
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] < '0' || entry->d_name[0] > '9')
+            continue;
+        pid_t pid = atoi(entry->d_name);
+        snprintf(want, sizeof(want), "\t%d\t2\t1", (int) pid);
+        if (strcmp(status_line(pid, "NSpid:"), want) == 0 && stat_field(pid, 4) == init)
+            found++;
+    }
+    closedir(dir);
+    MUST(found == 1, "%d processes under the init read NSpid \"<pid> 2 1\"; wanted the inner init", found);
+    close(hold[1]);
+    int status = wait_status(init);
+    MUST(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the init: status %#x", status);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (geteuid() == 0) {
@@ -376,6 +623,9 @@ int main(void) {
     run("orphans", case_orphans);
     run("/proc", case_proc);
     run("the end of a namespace", case_the_end);
+    run("numbers", case_numbers);
+    run("the numbers reported", case_reported);
+    run("NSpid", case_nspid);
 
     if (failures != 0) {
         printf(NAME ": FAIL failures=%d\n", failures);

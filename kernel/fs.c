@@ -741,8 +741,12 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
 #define RESOLVE_IN_ROOT_       0x10
 #define RESOLVE_CACHED_        0x20
     static const qword_t resolve_implemented =
-        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_ | RESOLVE_NO_MAGICLINKS_ | RESOLVE_IN_ROOT_;
+        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_ | RESOLVE_NO_MAGICLINKS_ | RESOLVE_IN_ROOT_ |
+        RESOLVE_BENEATH_ | RESOLVE_NO_XDEV_;
     if (how.resolve & ~resolve_implemented)
+        return _EINVAL;
+    // One or the other: they are two answers to the same question.
+    if ((how.resolve & RESOLVE_BENEATH_) && (how.resolve & RESOLVE_IN_ROOT_))
         return _EINVAL;
     if (how.resolve & RESOLVE_CACHED_)
         return _EAGAIN;
@@ -753,6 +757,10 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
         extra_norm |= N_NO_MAGICLINKS;
     if (how.resolve & RESOLVE_IN_ROOT_)
         extra_norm |= N_IN_ROOT;
+    if (how.resolve & RESOLVE_BENEATH_)
+        extra_norm |= N_BENEATH;
+    if (how.resolve & RESOLVE_NO_XDEV_)
+        extra_norm |= N_NO_XDEV;
 
     dword_t flags = (dword_t) how.flags;
     // The struct is read here rather than at the dispatch site, so plain
@@ -2334,8 +2342,12 @@ dword_t sys_fchdir(fd_t f) {
 static dword_t sys_chroot_common(guest_addr_t path_addr) {
     // Linux requires CAP_SYS_CHROOT. Without this an unprivileged process could
     // chroot itself, which is both unlike Linux and a way to escape a directory
-    // restriction rather than enter one.
-    if (!current_capable(CAP_SYS_CHROOT_))
+    // restriction rather than enter one. In the caller's own user namespace,
+    // as Linux asks it: root of a sandbox may (nix's build sandbox does), and
+    // gains nothing over the machine by it -- a set-id program whose owner
+    // the namespace does not map runs as nobody special (kernel/exec.c), and
+    // a chrooted process can make no further user namespace.
+    if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT_))
         return _EPERM;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));

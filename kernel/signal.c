@@ -1584,6 +1584,8 @@ void notify_parent_cldstop(struct task *parent, struct siginfo_ info) {
     struct sighand *sighand = parent->sighand;
     if (sighand == NULL)
         return;
+    // The child, as the one told knows it (kernel/pid_ns.h).
+    info.child.pid = task_pid_shown(parent, info.child.pid);
     lock(&sighand->lock, 0);
     struct sigaction_ *action = &sighand->action[SIGCHLD_];
     bool wanted = action->handler != SIG_IGN_ && !(action->flags & SA_NOCLDSTOP_);
@@ -4874,12 +4876,15 @@ struct kill_target {
     struct task *task;
 };
 
-static int kill_group(pid_t_ pgid, dword_t sig, int si_code) {
+// `pgid` is the caller's pid namespace's number for the group, or with
+// `machine` the machine's: a process's own group need not have a number where
+// the process is (kernel/pid_ns.h).
+static int kill_group(pid_t_ pgid, bool machine, dword_t sig, int si_code) {
     struct kill_target stack_targets[32];
     struct kill_target *targets = stack_targets;
     size_t target_cap = sizeof(stack_targets) / sizeof(stack_targets[0]);
     size_t target_count = 0;
-    struct pid *pid = pid_get(pgid);
+    struct pid *pid = (machine ? pid_get_global(pgid) : pid_get(pgid));
     if (pid == NULL) {
         unlock(&pids_lock);
         return _ESRCH;
@@ -4900,7 +4905,7 @@ retry:
         target_cap = needed;
 
         complex_lockt(&pids_lock, 0);
-        pid = pid_get(pgid);
+        pid = (machine ? pid_get_global(pgid) : pid_get(pgid));
         if (pid == NULL) {
             unlock(&pids_lock);
             free(targets);
@@ -4939,11 +4944,18 @@ retry:
         return _ESRCH;
     }
 
-    int err = skipped > 0 ? 0 : _EPERM;
+    // Done if any member took it, as Linux's __kill_pgrp_info has it. A
+    // member the caller's pid namespace has no number for is not signalled
+    // (signal_send_checked) and does not make the group one that is not
+    // there: a process's own group can be one from outside, with it the
+    // only member inside.
+    int err = skipped > 0 ? 0 : _ESRCH;
     for (size_t i = 0; i < target_count; i++) {
         int kill_err = signal_kill_process(targets[i].task, sig, si_code);
         task_ref_cnt_mod(targets[i].task, -1);
-        if (err == _EPERM)
+        if (kill_err == 0)
+            err = 0;
+        else if (err != 0 && kill_err != _ESRCH)
             err = kill_err;
     }
     if (targets != stack_targets)
@@ -5034,13 +5046,13 @@ static int do_kill_common(pid_t_ pid, dword_t sig, pid_t_ tgid, int si_code,
         pid_t_ pgid = current->group->pgid;
         unlock(&current->group->lock);
         complex_lockt(&pids_lock, 0);
-        err = kill_group(current_pid_shown(pgid), sig, si_code);
+        err = kill_group(pgid, true, sig, si_code);
     } else if (pid == -1) {
         complex_lockt(&pids_lock, 0);
         err = kill_everything(sig, si_code);
     } else if (pid < 0) {
         complex_lockt(&pids_lock, 0);
-        err = kill_group(-pid, sig, si_code);
+        err = kill_group(-pid, false, sig, si_code);
     } else {
         err = signal_send_to_pid(pid, tgid, sig, kill_siginfo(si_code), !thread_directed);
     }

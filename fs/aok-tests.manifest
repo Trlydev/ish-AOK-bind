@@ -134,6 +134,7 @@ mntns_basic.c
 mount_cover_setattr.c
 userns_basic.c
 pidns_basic.c
+setns_sandbox.c
 netns_basic.c
 connect_refused_adjacent.c
 exec_link_by_fd.c

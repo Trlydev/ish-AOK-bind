@@ -153,9 +153,17 @@ rather than pretended:
   between the two passes fails the open rather than redirecting it. On a
   host directory mounted in (realfs) the host follows it, for this as for a
   chroot.
-- **`RESOLVE_BENEATH` and `RESOLVE_NO_XDEV`** are refused with `EINVAL`, which
-  is what a kernel without them says; `openat2` is Linux 5.6+, so nothing may
-  assume it is there.
+- **`RESOLVE_BENEATH`** has `RESOLVE_IN_ROOT`'s bound and the other answer:
+  what would leave the directory — an absolute path, an absolute link, a `..`
+  at the top, a magic link — is `EXDEV` rather than turned back.
+- **`RESOLVE_NO_XDEV`** keeps the walk on the mount it starts on. The walker
+  has no notion of "the mount I am on", only of paths, so it asks at each
+  step whether the name it just added is on the same mount as its parent,
+  and the same of a `..`; a relative link is followed from its own directory
+  rather than from the top, so the mounts crossed on the way to the starting
+  directory are not counted against the walk. Every magic link is `EXDEV`
+  here, which is more than Linux refuses (it allows one whose file is on the
+  same mount).
 
 A sandbox that reports success without holding is worse than one that says it is
 not available — Chapter 40's capability-honesty rule applied to a security

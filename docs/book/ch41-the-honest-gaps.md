@@ -29,10 +29,10 @@ namespace (559) is a process being root, with every capability, over a world
 of its own and nobody new over the machine; and a pid namespace (559) is a
 set of processes that see only each other, the first of them as pid 1; and a
 network namespace (559) is a loopback interface with nothing behind it.
-`setns(2)` can join a UTS, IPC or mount namespace — or one nothing is in any
-more — through its `/proc/<pid>/ns` file; it cannot join a user, pid or
-network namespace. Every other kind is `ENOSYS` to `unshare`, and `setns`
-into one is the no-op of joining the only one there is.
+`setns(2)` joins any of those six — or one nothing is in any more — through
+its `/proc/<pid>/ns` file or a pidfd, which is `nsenter` into a sandbox.
+Cgroup and time namespaces are `ENOSYS` to `unshare`, and `setns` into one
+is the no-op of joining the only one there is.
 
 A network namespace here is the network a sandbox is given so that it has
 none. AOK's sockets are the host's and the host has one network, so a
@@ -54,27 +54,30 @@ through a guest socket, ask the same question by name. `/proc/net`,
 `/sys/class/net` and the interface ioctls show the reader's own namespace.
 
 A user namespace here is narrower than Linux's, always on the refusing side.
-Its capabilities reach the namespaces made inside it, the ids its maps cover
-and the files those ids own; everything else a capability would do inside a
-namespace on Linux — System V IPC ownership, `chroot`, joining namespaces
-with `setns`, file capabilities on exec — is refused. Ids are translated
-where a program most often looks (the `get*id` and `set*id` calls, `stat`,
-`chown`, signal senders, `/proc/<pid>/status`, socket peer credentials) and
-not yet in System V `ipc_perm`, process accounting or FUSE requests, which
-show the machine's ids. A mount namespace made in one has its inherited
-mounts locked, and takes only tmpfs, proc, sysfs and devpts as new
-filesystems. A session with a process in one is refused a save.
+Its capabilities reach the namespaces made inside it (mount, UTS, IPC, pid,
+network, and user namespaces below), the ids its maps cover and the files
+those ids own: its root may `chroot`, join those namespaces with `setns`,
+own the System V objects of its IPC namespace, and give its own files
+capabilities — which are stored for that root, as Linux stores them, and
+are worth nothing to an exec outside. Ids are translated where a program
+looks (the `get*id` and `set*id` calls, `stat`, `chown`, signal senders,
+`/proc/<pid>/status`, socket peer credentials, System V `ipc_perm`) and not
+yet in process accounting or FUSE requests, which show the machine's ids. A
+mount namespace made in one has its inherited mounts locked, and takes only
+tmpfs, proc, sysfs and devpts as new filesystems. A session with a process
+in one is refused a save.
 
-A pid namespace here keeps the machine's pid numbers: it is a filter on what
-a number names, and "the namespace's init is 1". So the other processes in
-one do not have the small numbers they would on Linux, `/proc` shows what
-the *reader's* namespace holds whichever mount it is read through (Linux
-ties that to the mount), and `/proc/<pid>/status` has no `NSpid` lines. The
-parts that confine are as Linux's: a pid outside the namespace is `ESRCH`
-and absent from `/proc`, a parent outside is 0, a signal's sender outside is
-0, `kill(-1)` reaches only the namespace, the init takes from inside only
-signals it handles, orphans go to it, and when it exits everything left
-inside is killed and nothing more can be forked in.
+A pid namespace here numbers its processes from 1 as Linux does, and differs
+in two places. `/proc` shows what the *reader's* namespace holds whichever
+mount it is read through (Linux ties that to the mount). And a process
+group signalled from inside reaches only the members the caller has a
+number for, where Linux would also signal members outside that the caller's
+credentials allow. The rest is as Linux's: a pid outside the namespace is
+`ESRCH` and absent from `/proc`, a parent, group or signal sender outside
+reads 0, `kill(-1)` reaches only the namespace, the init takes from inside
+only signals it handles, orphans go to it, and when it exits everything
+left inside is killed and nothing more can be forked in. `RLIMIT_NPROC` and
+the load average still count the machine.
 
 A mount namespace here is not everything Linux's is. Nothing propagates:
 every mount is private, so `--make-shared` is accepted and not done. A mount
@@ -82,7 +85,7 @@ that is covered when the namespace is copied is not in the copy. A session
 with a process in a mount namespace of its own cannot be saved (the save is
 refused, and says which process). And on its own it confines nothing — a
 process in one is still root over the one machine, which is why a sandbox
-also asks for the user and PID namespaces that are not here.
+asks for a user namespace as well.
 
 Network is the one kind with no `/proc/<pid>/ns` file at all, as on a Linux
 kernel built without network namespaces. systemd decides whether a kind

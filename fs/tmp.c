@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
@@ -1843,12 +1844,16 @@ static void cgroup2_render(const char *cg, const char *name, struct cgroup2_text
         if (procs || threads) {
             if (strcmp(path, cg) != 0)
                 continue;
+            // By the reader's pid namespace's numbers, and only what it
+            // has a number for (Linux lists the rest as 0).
             if (procs) {
-                cgroup2_text_add(t, "%d\n", task->pid);
+                if (current_pid_shown(task->pid) != 0)
+                    cgroup2_text_add(t, "%d\n", current_pid_shown(task->pid));
             } else {
                 struct task *thread;
                 list_for_each_entry(&group->threads, thread, group_links)
-                    cgroup2_text_add(t, "%d\n", thread->pid);
+                    if (current_pid_shown(thread->pid) != 0)
+                        cgroup2_text_add(t, "%d\n", current_pid_shown(thread->pid));
             }
         } else if (cgroup2_path_within(path, cg)) {
             populated = true;

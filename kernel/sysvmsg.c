@@ -11,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/sysvipc.h"
@@ -236,7 +238,7 @@ int_t sys_msgsnd_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz, int_t msgf
     list_add_tail(&queue->messages, &msg->mlist);
     queue->cbytes += msgsz;
     queue->qnum++;
-    queue->lspid = current->pid;
+    queue->lspid = current->tgid;
     queue->stime = msg_now();
     notify(&queue->rcv_cond);
     unlock(&ns->msg_lock);
@@ -313,7 +315,7 @@ int_t sys_msgrcv_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz,
     list_remove(&msg->mlist);
     queue->cbytes -= msg->size;
     queue->qnum--;
-    queue->lrpid = current->pid;
+    queue->lrpid = current->tgid;
     queue->rtime = msg_now();
     notify(&queue->snd_cond);
     unlock(&ns->msg_lock);
@@ -428,6 +430,13 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
             mode = (mode_t_) info.msg_perm.mode;
             qbytes = info.msg_qbytes;
         }
+        // The caller's user namespace's ids; one with no mapping is EINVAL.
+        uid = current_make_kuid(uid);
+        gid = current_make_kgid(gid);
+        if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID) {
+            unlock(&ns->msg_lock);
+            return _EINVAL;
+        }
         queue->uid = uid;
         queue->gid = gid;
         queue->mode = mode & 0777;
@@ -444,10 +453,10 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
             struct msqid64_ds_64_ info = {
                 .msg_perm = {
                     .key = queue->key,
-                    .uid = queue->uid,
-                    .gid = queue->gid,
-                    .cuid = queue->cuid,
-                    .cgid = queue->cgid,
+                    .uid = current_uid_shown(queue->uid),
+                    .gid = current_gid_shown(queue->gid),
+                    .cuid = current_uid_shown(queue->cuid),
+                    .cgid = current_gid_shown(queue->cgid),
                     .mode = (word_t) queue->mode,
                 },
                 .msg_stime = queue->stime,
@@ -456,8 +465,8 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
                 .msg_cbytes = queue->cbytes,
                 .msg_qnum = queue->qnum,
                 .msg_qbytes = queue->qbytes,
-                .msg_lspid = queue->lspid,
-                .msg_lrpid = queue->lrpid,
+                .msg_lspid = current_pid_shown(queue->lspid),
+                .msg_lrpid = current_pid_shown(queue->lrpid),
             };
             if (user_write(buf, &info, sizeof(info)))
                 err = _EFAULT;
@@ -465,10 +474,10 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
             struct msqid64_ds_i386_ info = {
                 .msg_perm = {
                     .key = queue->key,
-                    .uid = queue->uid,
-                    .gid = queue->gid,
-                    .cuid = queue->cuid,
-                    .cgid = queue->cgid,
+                    .uid = current_uid_shown(queue->uid),
+                    .gid = current_gid_shown(queue->gid),
+                    .cuid = current_uid_shown(queue->cuid),
+                    .cgid = current_gid_shown(queue->cgid),
                     .mode = queue->mode,
                 },
                 .msg_stime = (dword_t) queue->stime,
@@ -477,8 +486,8 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
                 .msg_cbytes = (dword_t) queue->cbytes,
                 .msg_qnum = (dword_t) queue->qnum,
                 .msg_qbytes = (dword_t) queue->qbytes,
-                .msg_lspid = queue->lspid,
-                .msg_lrpid = queue->lrpid,
+                .msg_lspid = current_pid_shown(queue->lspid),
+                .msg_lrpid = current_pid_shown(queue->lrpid),
             };
             if (user_write(buf, &info, sizeof(info)))
                 err = _EFAULT;
@@ -519,8 +528,9 @@ void proc_sysvipc_show_msg(struct proc_data *buf) {
             continue;
         proc_printf(buf, "%10d %10d %-10o %10zu %10zu %5d %5d %5u %5u %5u %5u %10lld %10lld %10lld\n",
                     (int) q->key, q->id, q->mode & 0777, q->cbytes, q->qnum,
-                    (int) q->lspid, (int) q->lrpid,
-                    q->uid, q->gid, q->cuid, q->cgid,
+                    (int) current_pid_shown(q->lspid), (int) current_pid_shown(q->lrpid),
+                    current_uid_shown(q->uid), current_gid_shown(q->gid),
+                    current_uid_shown(q->cuid), current_gid_shown(q->cgid),
                     (long long) q->stime, (long long) q->rtime, (long long) q->ctime);
     }
     unlock(&ns->msg_lock);

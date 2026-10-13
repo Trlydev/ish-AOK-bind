@@ -210,6 +210,8 @@ void pid_ns_release(struct pid_namespace *ns) {
     while (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
         struct pid_namespace *parent = ns->parent;
         user_ns_release(ns->user_ns);
+        free(ns->nr_of);
+        free(ns->by_nr);
         free(ns);
         ns = parent;
     }
@@ -225,12 +227,90 @@ struct pid_namespace *pid_ns_new(struct pid_namespace *parent, struct user_names
         *err = _ENOMEM;
         return NULL;
     }
+    ns->nr_of = calloc(MAX_PID + 1, sizeof(*ns->nr_of));
+    ns->by_nr = calloc(MAX_PID + 1, sizeof(*ns->by_nr));
+    if (ns->nr_of == NULL || ns->by_nr == NULL) {
+        free(ns->nr_of);
+        free(ns->by_nr);
+        free(ns);
+        *err = _ENOMEM;
+        return NULL;
+    }
     atomic_init(&ns->refcount, 1);
     ns->inode = ns_alloc_inum();
     ns->parent = pid_ns_retain(parent);
     ns->level = parent != NULL ? parent->level + 1 : 1;
     ns->user_ns = user_ns_retain(owner);
     return ns;
+}
+
+// Take back every number machine pid `id` has: in the namespace that
+// numbered it and in each one above. Caller holds pids_lock.
+void pid_ns_unnumber(dword_t id) {
+    if (id > MAX_PID)
+        return;
+    struct pid *slot = &pids[id];
+    struct pid_namespace *innermost = slot->numbered_ns;
+    if (innermost == NULL)
+        return;
+    slot->numbered_ns = NULL;
+    for (struct pid_namespace *ns = innermost; ns != NULL; ns = ns->parent) {
+        pid_t_ nr = ns->nr_of[id];
+        if (nr > 0 && nr <= MAX_PID && ns->by_nr[nr] == (pid_t_) id)
+            ns->by_nr[nr] = 0;
+        ns->nr_of[id] = 0;
+    }
+    pid_ns_release(innermost);
+}
+
+void pid_ns_unnumber_if_empty(dword_t id) {
+    if (id <= MAX_PID && pid_empty(&pids[id]))
+        pid_ns_unnumber(id);
+}
+
+// The next free number in `ns`, from the one after the last handed out and
+// round again at the machine's limit, as Linux allocates them. 0 when the
+// namespace is full. Caller holds pids_lock.
+static pid_t_ pid_ns_next_nr(struct pid_namespace *ns) {
+    pid_t_ limit = (pid_t_) task_pid_wrap();
+    for (pid_t_ tries = 1; tries < limit; tries++) {
+        pid_t_ nr = ns->last_nr + 1;
+        if (nr >= limit)
+            nr = 1;
+        ns->last_nr = nr;
+        pid_t_ holder = ns->by_nr[nr];
+        // Free, or left behind by a slot that has since been given away.
+        if (holder == 0 || ns->nr_of[holder] != nr || pid_empty(&pids[holder]))
+            return nr;
+    }
+    return 0;
+}
+
+int pid_ns_number_task(struct task *task) {
+    dword_t id = (dword_t) task->pid;
+    if (id > MAX_PID)
+        return _EINVAL;
+    pid_ns_unnumber(id);
+    if (task->pid_ns == NULL)
+        return 0;
+    for (struct pid_namespace *ns = task->pid_ns; ns != NULL; ns = ns->parent) {
+        pid_t_ nr = pid_ns_next_nr(ns);
+        if (nr == 0) {
+            // Undo what this call numbered: the namespaces from the task's
+            // down to this one.
+            for (struct pid_namespace *done = task->pid_ns; done != ns; done = done->parent) {
+                pid_t_ was = done->nr_of[id];
+                if (was > 0 && done->by_nr[was] == (pid_t_) id)
+                    done->by_nr[was] = 0;
+                done->nr_of[id] = 0;
+            }
+            return _EAGAIN;
+        }
+        ns->nr_of[id] = nr;
+        ns->by_nr[nr] = (pid_t_) id;
+    }
+    pids[id].numbered_ns = pid_ns_retain(task->pid_ns);
+    return 0;
 }
 
 bool pid_ns_in(const struct pid_namespace *ns, const struct pid_namespace *ancestor) {
@@ -250,16 +330,19 @@ struct pid_namespace *current_pid_ns(void) {
 pid_t_ pid_ns_shown(struct pid_namespace *viewer, pid_t_ pid) {
     if (viewer == NULL || pid <= 0)
         return pid;
-    return pid == atomic_load(&viewer->init_pid) ? 1 : pid;
+    return pid <= MAX_PID ? viewer->nr_of[pid] : 0;
 }
 
 pid_t_ pid_ns_global(struct pid_namespace *viewer, pid_t_ pid) {
     if (viewer == NULL || pid <= 0)
         return pid;
-    pid_t_ init = atomic_load(&viewer->init_pid);
-    if (pid == 1)
-        return init != 0 ? init : PID_NS_NO_PID;
-    return pid == init ? PID_NS_NO_PID : pid;
+    if (pid > MAX_PID)
+        return PID_NS_NO_PID;
+    pid_t_ machine = viewer->by_nr[pid];
+    // (An entry a slot left behind names nothing: see pid_ns_next_nr.)
+    if (machine <= 0 || machine > MAX_PID || viewer->nr_of[machine] != pid)
+        return PID_NS_NO_PID;
+    return machine;
 }
 
 pid_t_ current_pid_shown(pid_t_ pid) { return pid_ns_shown(current_pid_ns(), pid); }
@@ -1524,6 +1607,9 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
                  pid_is_kthread(last_allocated_pid, NULL));
     }
     struct pid *pid = &pids[last_allocated_pid];
+    // (Numbers the slot's last holder had in a pid namespace, if nothing
+    // took them back when it emptied.)
+    pid_ns_unnumber((dword_t) last_allocated_pid);
     pid->id = last_allocated_pid;
     list_init(&pid->alive);
     list_init(&pid->session);
@@ -1592,6 +1678,9 @@ void task_unlink_locked(struct task *task) {
     // pid_empty tests task/session/pgroup and never `alive`.
     list_remove(&pid->alive);
     list_init(&pid->alive);
+    // The number names nothing more, unless a process group or session
+    // still goes by it: its numbers in a pid namespace are free again.
+    pid_ns_unnumber_if_empty((dword_t) task->pid);
 }
 
 static void task_free_final(struct task *task) {

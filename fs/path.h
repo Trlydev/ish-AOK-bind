@@ -113,6 +113,16 @@ struct statbuf;
 // Linux does for any scoped walk: where they land is outside the scope by
 // construction.
 #define N_NO_MAGICLINKS 8192
+// N_BENEATH: openat2's RESOLVE_BENEATH. Like N_IN_ROOT the walk may not leave
+// the directory it starts from, but leaving is refused (EXDEV) where N_IN_ROOT
+// turns it back: an absolute path, an absolute symlink target, a `..` at the
+// starting directory, and a link that names a file rather than a path.
+#define N_BENEATH 16384
+// N_NO_XDEV: openat2's RESOLVE_NO_XDEV. The walk stays on the mount it starts
+// on: stepping onto a mount point, a `..` out of a mount's root, an absolute
+// symlink followed from a mount that is not the root's, and any link that
+// names a file are all EXDEV. A bind mount is a mount like any other.
+#define N_NO_XDEV 32768
 
 // Normalizes the path specified and writes the result into the out buffer.
 //

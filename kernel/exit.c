@@ -337,6 +337,8 @@ static void exit_notes_signal(struct exit_notes *notes, struct task *to, int sig
         struct siginfo_ info) {
     if (to == NULL || sig == 0)
         return;
+    // The child, as the one told knows it (kernel/pid_ns.h).
+    info.child.pid = task_pid_shown(to, info.child.pid);
     if (notes->nsignals == notes->cap) {
         // Only a tracer dying with many zombies outstanding gets here. The
         // child_exit notify has gone out already, so a signal lost to a failed
@@ -412,6 +414,9 @@ static void release_process_locked(struct task *leader, struct exit_notes *notes
     lock(&leader->group->lock, 0);
     task_leave_session(leader);
     list_remove(&leader->group->pgroup);
+    // (A group whose leader was reaped before its last member: the number
+    // was kept for the group, and now names nothing.)
+    pid_ns_unnumber_if_empty((dword_t) leader->group->pgid);
     unlock(&leader->group->lock);
     task_unlink_locked(leader);
     list_add(&notes->dead, &leader->ptrace_siblings);
@@ -707,7 +712,11 @@ static void pdeath_notes_send(struct pdeath_notes *pd, struct siginfo_ info) {
             thread = NULL;
         unlock(&pids_lock);
         if (thread != NULL) {
-            send_signal_to_process(thread, note->sig, info);
+            // The parent, as its child's pid namespace knows it: 0 for one
+            // that was outside it.
+            struct siginfo_ told = info;
+            told.kill.pid = task_pid_shown(thread, info.kill.pid);
+            send_signal_to_process(thread, note->sig, told);
             task_ref_cnt_mod(thread, -1);
         }
     }
@@ -832,7 +841,7 @@ noreturn void do_exit(struct task *task, int status) {
         struct siginfo_ info = {
             .sig = SIGTRAP_,
             .code = SI_USER_,
-            .kill.pid = task->pid,
+            .kill.pid = current_pid_shown(task->pid),
             .kill.uid = task->uid,
         };
         ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXIT_, (qword_t) (dword_t) status);
@@ -2042,6 +2051,10 @@ dword_t sys_waitid_guest(int_t idtype, pid_t_ id, guest_addr_t info_addr, int_t 
         int_t pid = pidfd_get_pid(id);
         if (pid < 0)
             return pid;
+        // (The wait below takes the caller's pid namespace's number.)
+        pid = current_pid_shown(pid);
+        if (pid == 0)
+            return _ECHILD;
         idtype = P_PID_;
         id = pid;
     }

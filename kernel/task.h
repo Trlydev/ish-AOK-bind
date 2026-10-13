@@ -1062,6 +1062,11 @@ struct pid {
     struct list alive; // list of alive pids
     struct list session;
     struct list pgroup;
+    // The innermost pid namespace this number has a number of its own in
+    // (kernel/pid_ns.h): it has one in that namespace and in each one above
+    // it. NULL for a pid of the initial namespace. Owns a reference, for as
+    // long as the slot holds anything; guarded by pids_lock.
+    struct pid_namespace *numbered_ns;
 };
 
 // @alive_pids_list is used as a head of all active pids.
@@ -1101,6 +1106,13 @@ struct task *pid_get_task_global(dword_t pid);
 struct task *pid_get_task_global_ref(dword_t pid);
 struct task *pid_get_task_zombie_global(dword_t id);
 struct task *pid_get_task_zombie_global_ref(dword_t id);
+// Give `task`'s pid its numbers in the task's pid namespace and those above
+// it, and take them back: when a fork that had them fails, and when the
+// number stops naming anything (the task reaped, and no process group or
+// session left under it). Caller holds pids_lock.
+int pid_ns_number_task(struct task *task);
+void pid_ns_unnumber(dword_t id);
+void pid_ns_unnumber_if_empty(dword_t id);
 int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only);
 int task_snapshot_collect_all(struct task_snapshot *snapshot);
 void task_snapshot_release(struct task_snapshot *snapshot);

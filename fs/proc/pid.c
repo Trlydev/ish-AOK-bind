@@ -38,6 +38,22 @@ static char proc_task_state_char_from_snapshot(pid_t_ pid, bool zombie, bool io_
             'R');
 }
 
+// A line of /proc/<pid>/status that gives one of a task's ids in each pid
+// namespace the task has a number in, from the reader's down to its own
+// (NStgid, NSpid, NSpgid, NSsid): one number for a task in the reader's
+// namespace, "<pid> 1" for the init of one made below it.
+static void proc_status_ns_ids(struct proc_data *buf, const char *key, struct task *task, pid_t_ id) {
+    struct pid_namespace *below[PID_NS_MAX_LEVEL + 1];
+    unsigned depth = 0;
+    struct pid_namespace *reader = current_pid_ns();
+    for (struct pid_namespace *ns = task->pid_ns; ns != NULL && ns != reader && depth <= PID_NS_MAX_LEVEL; ns = ns->parent)
+        below[depth++] = ns;
+    proc_printf(buf, "%s:\t%d", key, pid_ns_shown(reader, id));
+    while (depth > 0)
+        proc_printf(buf, "\t%d", pid_ns_shown(below[--depth], id));
+    proc_printf(buf, "\n");
+}
+
 static struct task *proc_get_task(struct proc_entry *entry) {
     // Zombies included. An exited-but-unreaped process still has a /proc entry
     // on Linux -- that is where ps gets the "Z" it shows and where a monitor
@@ -870,6 +886,10 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     for (unsigned i = 0; i < task->ngroups; i++)
         proc_printf(buf, "%s%u", i == 0 ? "" : " ", current_gid_shown(task->groups[i]));
     proc_printf(buf, "\n");
+    proc_status_ns_ids(buf, "NStgid", task, task->tgid);
+    proc_status_ns_ids(buf, "NSpid", task, task->pid);
+    proc_status_ns_ids(buf, "NSpgid", task, task->group->pgid);
+    proc_status_ns_ids(buf, "NSsid", task, task->group->sid);
     proc_printf(buf, "VmPeak:\t%lu kB\n", (unsigned long) usage.vm_peak * page_kb);
     proc_printf(buf, "VmSize:\t%lu kB\n", (unsigned long) usage.vm * page_kb);
     proc_printf(buf, "VmLck:\t%lu kB\n", (unsigned long) usage.locked * page_kb);
@@ -1852,7 +1872,7 @@ static int proc_pid_fdinfo_show(struct proc_entry *entry, struct proc_data *buf)
     // missing line as "not a pidfd" (-ENOTTY). See fd_pidfd_pid's comment.
     pid_t_ pidfd_pid = fd_pidfd_pid(fd);
     if (pidfd_pid != -1)
-        proc_printf(buf, "Pid:\t%d\n", pidfd_pid);
+        proc_printf(buf, "Pid:\t%d\n", current_pid_shown(pidfd_pid));
     fd_close(fd);
     proc_put_task(task);
     return 0;
@@ -2157,6 +2177,15 @@ static ssize_t proc_ns_ioctl_size(int cmd) {
 
 static struct fd *proc_ns_fd_for_index(unsigned index, unsigned long inode, void *ns);
 
+// The first entry of a kind in the table: the one that carries its plain name.
+static unsigned proc_ns_index_of(unsigned nstype) {
+    unsigned index;
+    for (index = 0; index < PROC_NS_TYPES_LEN; index++)
+        if (proc_ns_types[index].nstype == nstype)
+            break;
+    return index;
+}
+
 static int proc_ns_ioctl(struct fd *fd, int cmd, void *arg) {
     unsigned index = fd->nsfs.type_index;
     if (index >= PROC_NS_TYPES_LEN)
@@ -2168,33 +2197,80 @@ static int proc_ns_ioctl(struct fd *fd, int cmd, void *arg) {
 
         case NS_GET_OWNER_UID_:
             // A user namespace is owned by the uid that created it, and the
-            // initial one is root's. Asking any other kind is EINVAL -- the
-            // question only means something about a user namespace.
+            // initial one is root's: as the caller's user namespace names
+            // that uid. Asking any other kind is EINVAL -- the question only
+            // means something about a user namespace.
             if (nstype != CLONE_NEWUSER_)
                 return _EINVAL;
-            *(uid_t_ *) arg = 0;
+            *(uid_t_ *) arg = current_uid_shown(fd->nsfs.ns != NULL ?
+                    ((struct user_namespace *) fd->nsfs.ns)->owner : 0);
             return 0;
 
-        case NS_GET_PARENT_:
-            // Only user and pid namespaces nest. For the rest the question is
-            // malformed; for these two the parent of the initial namespace is
-            // itself, which the caller is not permitted to be handed.
+        case NS_GET_PARENT_: {
+            // Only user and pid namespaces nest; for the rest the question is
+            // malformed. The parent is handed over only when it is the
+            // caller's own namespace or one inside it: the parent of the
+            // caller's own, and of the initial one, is EPERM.
             if (nstype != CLONE_NEWUSER_ && nstype != CLONE_NEWPID_)
                 return _EINVAL;
-            return _EPERM;
+            if (fd->nsfs.ns == NULL)
+                return _EPERM;
+            unsigned parent_index = proc_ns_index_of(nstype);
+            if (parent_index == PROC_NS_TYPES_LEN)
+                return _EINVAL;
+            unsigned long inode = proc_ns_types[parent_index].inode;
+            void *parent;
+            if (nstype == CLONE_NEWUSER_) {
+                struct user_namespace *up = ((struct user_namespace *) fd->nsfs.ns)->parent;
+                if (!user_ns_in(up, current_user_ns()))
+                    return _EPERM;
+                if (up != NULL)
+                    inode = up->inode;
+                parent = user_ns_retain(up);
+            } else {
+                struct pid_namespace *up = ((struct pid_namespace *) fd->nsfs.ns)->parent;
+                if (!pid_ns_in(up, current_pid_ns()))
+                    return _EPERM;
+                if (up != NULL)
+                    inode = up->inode;
+                parent = pid_ns_retain(up);
+            }
+            struct fd *parent_fd = proc_ns_fd_for_index(parent_index, inode, parent);
+            if (IS_ERR(parent_fd))
+                return PTR_ERR(parent_fd);
+            return f_install(parent_fd, O_CLOEXEC_);
+        }
 
         case NS_GET_USERNS_: {
-            // Everything here is owned by the one user namespace. Asking that
-            // namespace who owns IT walks off the top, which Linux refuses.
-            if (nstype == CLONE_NEWUSER_)
+            // The user namespace that owns this one: the one it was made in,
+            // and for a user namespace its parent. Handed over only when it
+            // is the caller's own user namespace or one inside it; asking
+            // the initial user namespace who owns IT walks off the top.
+            struct user_namespace *owner = NULL;
+            void *ns = fd->nsfs.ns;
+            if (nstype == CLONE_NEWUSER_) {
+                if (ns == NULL)
+                    return _EPERM;
+                owner = ((struct user_namespace *) ns)->parent;
+            } else if (ns != NULL) {
+                if (nstype == CLONE_NEWNS_)
+                    owner = ((struct mnt_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWUTS_)
+                    owner = ((struct uts_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWIPC_)
+                    owner = ((struct ipc_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWPID_)
+                    owner = ((struct pid_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWNET_)
+                    owner = ((struct net_namespace *) ns)->user_ns;
+            }
+            if (!user_ns_in(owner, current_user_ns()))
                 return _EPERM;
-            unsigned user_index;
-            for (user_index = 0; user_index < PROC_NS_TYPES_LEN; user_index++)
-                if (proc_ns_types[user_index].nstype == CLONE_NEWUSER_)
-                    break;
+            unsigned user_index = proc_ns_index_of(CLONE_NEWUSER_);
             if (user_index == PROC_NS_TYPES_LEN)
                 return _EINVAL;
-            struct fd *userns = proc_ns_fd_for_index(user_index, proc_ns_types[user_index].inode, NULL);
+            struct fd *userns = proc_ns_fd_for_index(user_index,
+                    owner != NULL ? owner->inode : proc_ns_types[user_index].inode, user_ns_retain(owner));
             if (IS_ERR(userns))
                 return PTR_ERR(userns);
             // A namespace fd handed out by an ioctl is close-on-exec on

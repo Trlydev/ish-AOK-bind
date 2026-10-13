@@ -33,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "debug.h"
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "kernel/inotify.h"
@@ -192,31 +193,58 @@ static bool caps_valid_header(const void *value, size_t size) {
                                     : revision == VFS_CAP_REVISION_3_;
 }
 
-// cap_convert_nscap: a v2 or v3 value of exactly its size, then CAP_SETFCAP.
-// There is one user namespace here, so a v3 naming its root (0) is the v2 it
-// would read back as, and is stored as one; a v3 naming any other root keeps
-// it, reads back as that v3, and gives nothing at exec.
-static int caps_convert(void *value, size_t *size) {
+// Linux's rootid_owns_currentns: is kernel uid `kroot` root in the caller's
+// user namespace, or in one above it? The machine's root (0) is, for
+// everyone; a namespace's root is for the tasks in that namespace and below.
+static bool rootid_owns_current(uid_t_ kroot) {
+    for (struct user_namespace *ns = current_user_ns();; ns = ns->parent) {
+        if (ns == NULL)
+            return kroot == 0;
+        if (user_ns_from_kuid(ns, kroot) == 0)
+            return true;
+    }
+}
+
+// cap_convert_nscap: a v2 or v3 value of exactly its size, then CAP_SETFCAP
+// over the file. What is stored names the root the capabilities are for, as
+// a kernel uid: the machine's (a v2, which is all a v3 for root 0 is) or, for
+// a writer in a user namespace, that namespace's root -- a v3, whatever the
+// writer handed over. So a sandbox's root may give its own files
+// capabilities, and they are capabilities for that sandbox alone: an exec
+// outside it reads the attribute as written for another root, and takes
+// nothing from it (read_file_caps). `value` must have room for a v3.
+static int caps_convert(const struct xattr_target *t, void *value, size_t *size) {
     if (!caps_valid_header(value, *size))
         return _EINVAL;
-    if (!current_capable(CAP_SETFCAP_))
+    if (!capable_wrt_inode(&t->stat, CAP_SETFCAP_))
         return _EPERM;
-    if (*size == XATTR_CAPS_SZ_3_) {
-        struct vfs_ns_cap_data_ caps;
-        memcpy(&caps, value, sizeof(caps));
-        if (caps.rootid == 0) {
-            caps.magic_etc = VFS_CAP_REVISION_2_ | (caps.magic_etc & VFS_CAP_FLAGS_EFFECTIVE_);
-            memcpy(value, &caps, XATTR_CAPS_SZ_2_);
-            *size = XATTR_CAPS_SZ_2_;
-        }
+    struct vfs_ns_cap_data_ caps = {};
+    memcpy(&caps, value, *size);
+    // The root it is for: the writer's namespace's, or the id a v3 names
+    // there.
+    uid_t_ kroot = current_make_kuid(*size == XATTR_CAPS_SZ_3_ ? caps.rootid : 0);
+    if (kroot == USER_NS_INVALID_ID)
+        return _EINVAL;
+    dword_t effective = caps.magic_etc & VFS_CAP_FLAGS_EFFECTIVE_;
+    if (kroot == 0) {
+        caps.magic_etc = VFS_CAP_REVISION_2_ | effective;
+        memcpy(value, &caps, XATTR_CAPS_SZ_2_);
+        *size = XATTR_CAPS_SZ_2_;
+    } else {
+        caps.magic_etc = VFS_CAP_REVISION_3_ | effective;
+        caps.rootid = kroot;
+        memcpy(value, &caps, XATTR_CAPS_SZ_3_);
+        *size = XATTR_CAPS_SZ_3_;
     }
     return 0;
 }
 
 // cap_inode_getsecurity: what getxattr hands back for security.capability.
-// Only a v2, or a v3 for a root other than ours, was ever valid to store; a
-// value that is neither (an empty one, which Linux lets anyone write) reads as
-// EINVAL. A v3 for our own root reads back as the v2 it is.
+// Only a v2, or a v3 for a root other than the machine's, was ever valid to
+// store; a value that is neither (an empty one, which Linux lets anyone
+// write) reads as EINVAL. A v3 reads back naming its root as the reader's
+// user namespace knows it; as the v2 it is to a reader whose own root (or one
+// above) it is for; and as EOVERFLOW to one for whom that root has no name.
 static ssize_t caps_get(const struct xattr_target *t, const struct xattr_ops *ops,
         void *value, size_t size) {
     unsigned char raw[64];
@@ -231,10 +259,16 @@ static ssize_t caps_get(const struct xattr_target *t, const struct xattr_ops *op
     if (len == XATTR_CAPS_SZ_3_) {
         struct vfs_ns_cap_data_ caps;
         memcpy(&caps, raw, sizeof(caps));
-        if (caps.rootid == 0) {
+        uid_t_ shown = user_ns_from_kuid(current_user_ns(), caps.rootid);
+        if (shown != USER_NS_INVALID_ID && shown != 0) {
+            caps.rootid = shown;
+            memcpy(raw, &caps, XATTR_CAPS_SZ_3_);
+        } else if (rootid_owns_current(caps.rootid)) {
             caps.magic_etc = VFS_CAP_REVISION_2_ | (caps.magic_etc & VFS_CAP_FLAGS_EFFECTIVE_);
             memcpy(raw, &caps, XATTR_CAPS_SZ_2_);
             len = XATTR_CAPS_SZ_2_;
+        } else {
+            return _EOVERFLOW;
         }
     }
     if (size == 0)
@@ -280,11 +314,28 @@ static int do_setxattr(struct xattr_target *t, const char *name, void *value, si
             // which lets anyone put an empty security.capability on a file
             // they may write. It then reads back EINVAL and makes the file
             // unexecutable (EINVAL); measured on 6.12, as uid 1000.
+            unsigned char converted[XATTR_CAPS_SZ_3_];
             if (size != 0) {
-                err = caps_convert(value, &size);
+                // (A v2 may leave as a v3, which is longer.)
+                if (size <= sizeof(converted)) {
+                    memcpy(converted, value, size);
+                    value = converted;
+                }
+                err = caps_convert(t, value, &size);
                 if (err < 0)
                     return err;
             }
+            // Stored inside this block, where the converted value lives.
+            const struct xattr_ops *caps_ops = xattr_ops_for_mount(target_mount(t));
+            if (caps_ops == NULL)
+                return _EOPNOTSUPP;
+            err = xattr_resolve(name);
+            if (err < 0)
+                return err;
+            err = caps_ops->set(target_mount(t), target_path(t), t->fd, name, value, size, flags);
+            if (err >= 0)
+                xattr_changed(t);
+            return err;
         } else if (!current_capable(CAP_SYS_ADMIN_)) {
             return _EPERM;
         }
@@ -360,7 +411,10 @@ static int do_removexattr(struct xattr_target *t, const char *name) {
     if (err < 0)
         return err;
     if (has_prefix(name, "security.")) {
-        if (!current_capable(strcmp(name, XATTR_NAME_CAPS_) == 0 ? CAP_SETFCAP_ : CAP_SYS_ADMIN_))
+        // A file's capabilities are its owner's namespace's root's to take
+        // away, as they are to give (caps_convert).
+        if (strcmp(name, XATTR_NAME_CAPS_) == 0 ? !capable_wrt_inode(&t->stat, CAP_SETFCAP_)
+                                                 : !current_capable(CAP_SYS_ADMIN_))
             return _EPERM;
     }
     const struct xattr_ops *ops = xattr_ops_for_mount(target_mount(t));
@@ -720,8 +774,9 @@ static int read_file_caps(struct fd *fd, struct file_caps *caps) {
         case VFS_CAP_REVISION_3_:
             if (len != XATTR_CAPS_SZ_3_)
                 return _EINVAL;
-            // rootid_owns_currentns: only this namespace's root owns it.
-            if (data.rootid != 0)
+            // Written for a root that is not the caller's, nor one above
+            // it: not capabilities for this exec.
+            if (!rootid_owns_current(data.rootid))
                 return _ENODATA;
             break;
         default:

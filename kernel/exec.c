@@ -1,3 +1,4 @@
+#include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/signal.h"
 #include "task.h"
@@ -904,6 +905,9 @@ static void exec_de_thread(void) {
         // sites walk alive_pids_list with it.
         list_remove(&own->alive);
         list_init(&own->alive);
+        // (And its numbers in a pid namespace, as task_unlink_locked gives
+        // them back: the process is known by the leader's from here.)
+        pid_ns_unnumber_if_empty((dword_t) current->pid);
     }
     // ...and take the leader's, which is this process's pid. Session and
     // process-group membership hang off struct pid, so they travel with it.
@@ -2467,14 +2471,15 @@ static bool exec_gain_unsafe(void) {
 // malformed attribute), which this plan then carries.
 static void exec_setid_plan(struct exec_setid *plan, bool setuid, uid_t_ owner,
         bool setgid, uid_t_ group, const struct file_caps *caps, int caps_error) {
-    // In a user namespace: "root" is the id that is 0 there; the set-id bits
-    // count only when the namespace maps the file's owner and group both
+    // In a user namespace: "root" is the id that is 0 there; and the set-id
+    // bits count only when the namespace maps the file's owner and group both
     // (bprm_fill_uid), so a setuid-root program run in a sandbox is an
-    // ordinary one; and a file's capabilities are not granted at all.
+    // ordinary one. A file's capabilities are granted there as anywhere --
+    // they are capabilities in the namespace, like every other the task
+    // holds -- when they were written for its root or one above it
+    // (kernel/xattr.c, read_file_caps).
     const uid_t_ root = task_root_kuid(current);
     if (current->user_ns != NULL) {
-        caps = NULL;
-        caps_error = 0;
         if (user_ns_from_kuid(current->user_ns, owner) == USER_NS_INVALID_ID ||
                 user_ns_from_kgid(current->user_ns, group) == USER_NS_INVALID_ID)
             setuid = setgid = false;
@@ -2779,7 +2784,7 @@ static void exec_report_to_tracer(pid_t_ old_pid) {
     struct siginfo_ info = {
         .sig = SIGTRAP_,
         .code = SI_USER_,
-        .kill.pid = current->pid,
+        .kill.pid = current_pid_shown(current->pid),
         .kill.uid = current->uid,
     };
     if (current->ptrace.options & PTRACE_O_TRACEEXEC_)

@@ -648,6 +648,126 @@ static void mount_uncover_locked(const struct mount *top) {
     }
 }
 
+// ---- Moving a mount with what is mounted in it -----------------------------
+//
+// MS_MOVE and move_mount move a tree: the mount and every mount in view below
+// its point, which are mounted IN it and go where it goes. They used to move
+// the one mount, and left its submounts behind at paths that no longer led
+// anywhere.
+//
+// In three steps, because the mount itself uncovers what it was over and
+// covers what it lands on in between, and neither of those is its submounts'
+// business: collect (which takes them out of view), then the caller moves
+// the top, then place. Caller holds mounts_lock for the first two.
+struct mount_subtree {
+    size_t n;
+    struct mount **subs;
+    char **points;      // where each goes; then, for the notice, where it was
+};
+
+static void mount_subtree_free(struct mount_subtree *tree) {
+    for (size_t i = 0; tree->points != NULL && i < tree->n; i++)
+        free(tree->points[i]);
+    free(tree->points);
+    free(tree->subs);
+    *tree = (struct mount_subtree) {};
+}
+
+static bool mount_point_below(const char *point, const char *top, size_t top_len) {
+    return strncmp(point, top, top_len) == 0 && point[top_len] == '/';
+}
+
+static int mount_subtree_collect_locked(const struct mount *top, const char *old_point,
+        const char *new_point, struct mount_subtree *tree) {
+    *tree = (struct mount_subtree) {};
+    size_t old_len = strlen(old_point), new_len = strlen(new_point);
+    struct mount *mount;
+    size_t n = 0;
+    list_for_each_entry(&mounts, mount, mounts)
+        if (mount != top && !mount->detached && !mount->lazy_umount &&
+                mount_point_below(mount->point, old_point, old_len))
+            n++;
+    if (n == 0)
+        return 0;
+    tree->subs = calloc(n, sizeof(*tree->subs));
+    tree->points = calloc(n, sizeof(*tree->points));
+    if (tree->subs == NULL || tree->points == NULL) {
+        mount_subtree_free(tree);
+        return _ENOMEM;
+    }
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount == top || mount->detached || mount->lazy_umount ||
+                !mount_point_below(mount->point, old_point, old_len))
+            continue;
+        const char *rest = mount->point + old_len;
+        size_t len = new_len + strlen(rest);
+        char *point = len < MAX_PATH ? malloc(len + 1) : NULL;
+        if (point == NULL) {
+            tree->n++;  // (so the free below reaches every point made so far)
+            mount_subtree_free(tree);
+            return len < MAX_PATH ? _ENOMEM : _ENAMETOOLONG;
+        }
+        snprintf(point, len + 1, "%s%s", new_point, rest);
+        tree->subs[tree->n] = mount;
+        tree->points[tree->n] = point;
+        tree->n++;
+    }
+    // Out of view while the top moves: what it covers where it lands is what
+    // was there, not these.
+    for (size_t i = 0; i < tree->n; i++)
+        tree->subs[i]->detached = true;
+    return 0;
+}
+
+static void mount_subtree_place_locked(struct mount_subtree *tree, const char *old_point,
+        const char *new_point) {
+    size_t old_len = strlen(old_point), new_len = strlen(new_point);
+    // A mount one of them covers comes back, when it does, below the tree's
+    // new point. (Best effort, as in pivot_root: one whose point cannot be
+    // had stays parked.)
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount->covered_by == 0 || mount->covered_point == NULL ||
+                !mount_point_below(mount->covered_point, old_point, old_len))
+            continue;
+        bool ours = false;
+        for (size_t i = 0; i < tree->n && !ours; i++)
+            ours = tree->subs[i]->id == mount->covered_by;
+        if (!ours)
+            continue;
+        const char *rest = mount->covered_point + old_len;
+        size_t len = new_len + strlen(rest);
+        char *point = len < MAX_PATH ? malloc(len + 1) : NULL;
+        if (point != NULL)
+            snprintf(point, len + 1, "%s%s", new_point, rest);
+        free((void *) mount->covered_point);
+        mount->covered_point = point;
+    }
+    for (size_t i = 0; i < tree->n; i++) {
+        struct mount *sub = tree->subs[i];
+        char *was = (char *) sub->point;
+        sub->point = tree->points[i];
+        sub->point_len = strlen(sub->point);
+        tree->points[i] = was;
+        sub->detached = false;
+        list_remove(&sub->mounts);
+        mount_list_insert(sub);
+        sub->refcount++;  // for mount_notify_relocated
+    }
+}
+
+// After the unlock: each filesystem hears where it went.
+static void mount_subtree_notify(struct mount_subtree *tree) {
+    for (size_t i = 0; i < tree->n; i++) {
+        char now[MAX_PATH];
+        lock(&mounts_lock, 0);
+        snprintf(now, sizeof(now), "%s", tree->subs[i]->point);
+        unlock(&mounts_lock);
+        mount_notify_relocated(tree->subs[i], tree->points[i], now);
+    }
+    mount_subtree_free(tree);
+}
+
 // Take one mount out of the tree for umount -l, as the last step of
 // mount_remove_lazy. Caller holds mounts_lock.
 static void mount_detach_one(struct mount *mount) {
@@ -1802,10 +1922,25 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
             unlock(&mounts_lock);
             return _EINVAL;
         }
+        // Not onto itself, nor into its own tree.
+        size_t source_len = strlen(op_source);
+        if (strncmp(point, op_source, source_len) == 0 &&
+                (point[source_len] == '/' || point[source_len] == '\0')) {
+            unlock(&mounts_lock);
+            return _ELOOP;
+        }
         const char *new_point = strdup(point);
         if (new_point == NULL) {
             unlock(&mounts_lock);
             return _ENOMEM;
+        }
+        // With what is mounted in it (mount_subtree_collect_locked).
+        struct mount_subtree tree;
+        int tree_err = mount_subtree_collect_locked(found, op_source, point, &tree);
+        if (tree_err < 0) {
+            free((void *) new_point);
+            unlock(&mounts_lock);
+            return tree_err;
         }
         // It uncovers what it was over, and covers what it lands on.
         mount_uncover_locked(found);
@@ -1821,9 +1956,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         }
         list_add_before(&after->mounts, &found->mounts);
         mount_cover_below_locked(found, MOUNT_COVER_ALL);
+        mount_subtree_place_locked(&tree, op_source, point);
         found->refcount++;  // for mount_notify_relocated
         unlock(&mounts_lock);
         mount_notify_relocated(found, op_source, point);
+        mount_subtree_notify(&tree);
         proc_mountinfo_notify_changed();
         return 0;
     }
@@ -2685,10 +2822,25 @@ static int mount_relocate(const char *from_point, const char *to_point) {
         unlock(&mounts_lock);
         return _EINVAL;
     }
+    // Not onto itself, nor into its own tree.
+    size_t from_len = strlen(from_point);
+    if (strncmp(to_point, from_point, from_len) == 0 &&
+            (to_point[from_len] == '/' || to_point[from_len] == '\0')) {
+        unlock(&mounts_lock);
+        return _ELOOP;
+    }
     const char *new_point = strdup(to_point);
     if (new_point == NULL) {
         unlock(&mounts_lock);
         return _ENOMEM;
+    }
+    // With what is mounted in it (mount_subtree_collect_locked).
+    struct mount_subtree tree;
+    int tree_err = mount_subtree_collect_locked(found, from_point, to_point, &tree);
+    if (tree_err < 0) {
+        free((void *) new_point);
+        unlock(&mounts_lock);
+        return tree_err;
     }
     // A covered mount, moved by a descriptor inside it, is covered no more;
     // and wherever it comes from, it covers what it lands on.
@@ -2712,9 +2864,11 @@ static int mount_relocate(const char *from_point, const char *to_point) {
     found->detached = false;
     mount_cover_below_locked(found, MOUNT_COVER_ALL);
     found->detached = was_detached;
+    mount_subtree_place_locked(&tree, from_point, to_point);
     found->refcount++;  // for mount_notify_relocated
     unlock(&mounts_lock);
     mount_notify_relocated(found, from_point, to_point);
+    mount_subtree_notify(&tree);
     return 0;
 }
 
