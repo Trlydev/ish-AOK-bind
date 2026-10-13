@@ -32,7 +32,11 @@
 #include "fs/proc/ish.h"
 #include "kernel/checkpoint.h"
 #include "kernel/errno.h"
+#include "kernel/swap.h"
+#import "AppGroup.h"
 #include <arpa/inet.h>
+#include <fts.h>
+#include <sys/stat.h>
 #include <ifaddrs.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -1091,8 +1095,9 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
         // All four cards; at 238 the Live terminals card was entirely hidden.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
             return CGSizeMake(332, 372);
+        // A list to read down: room for the summary and six rows.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
-            return CGSizeMake(336, 268);
+            return CGSizeMake(336, 420);
         // All five rows of actions; at 184 three of them were below the edge.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
             return CGSizeMake(312, 364);
@@ -1149,7 +1154,7 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
         return CGSizeMake(460, 384);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
-        return CGSizeMake(500, 320);
+        return CGSizeMake(520, 500);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
         return CGSizeMake(400, 396);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier])
@@ -1778,69 +1783,6 @@ static NSString *ISHWorkspacePrimaryNetworkLine(void) {
 static NSString *ISHWorkspaceByteCountString(uint64_t bytes) {
     return [NSByteCountFormatter stringFromByteCount:(long long) bytes
                                           countStyle:NSByteCountFormatterCountStyleFile];
-}
-
-static NSDictionary<NSString *, NSNumber *> *ISHWorkspaceDirectoryUsage(NSURL *directoryURL) {
-    if (directoryURL == nil)
-        return @{@"bytes": @0, @"files": @0, @"directories": @0};
-
-    uint64_t totalBytes = 0;
-    NSUInteger fileCount = 0;
-    NSUInteger directoryCount = 0;
-    NSArray<NSURLResourceKey> *keys = @[
-        NSURLIsDirectoryKey,
-        NSURLFileAllocatedSizeKey,
-        NSURLTotalFileAllocatedSizeKey,
-        NSURLFileSizeKey,
-    ];
-    NSDirectoryEnumerator<NSURL *> *enumerator =
-        [NSFileManager.defaultManager enumeratorAtURL:directoryURL
-                           includingPropertiesForKeys:keys
-                                              options:0
-                                         errorHandler:^BOOL(__unused NSURL *url, __unused NSError *error) {
-        return YES;
-    }];
-    for (NSURL *itemURL in enumerator) {
-        NSNumber *isDirectory = nil;
-        [itemURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
-        if (isDirectory.boolValue) {
-            directoryCount += 1;
-            continue;
-        }
-        NSNumber *size = nil;
-        [itemURL getResourceValue:&size forKey:NSURLTotalFileAllocatedSizeKey error:nil];
-        if (size == nil)
-            [itemURL getResourceValue:&size forKey:NSURLFileAllocatedSizeKey error:nil];
-        if (size == nil)
-            [itemURL getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
-        totalBytes += size.unsignedLongLongValue;
-        fileCount += 1;
-    }
-    return @{
-        @"bytes": @(totalBytes),
-        @"files": @(fileCount),
-        @"directories": @(directoryCount),
-    };
-}
-
-static NSArray<NSDictionary<NSString *, id> *> *ISHWorkspaceRootUsageRecords(void) {
-    NSMutableArray<NSDictionary<NSString *, id> *> *records = [NSMutableArray array];
-    NSString *defaultRoot = Roots.instance.defaultRoot;
-    for (NSString *rootName in Roots.instance.roots) {
-        NSURL *rootURL = [Roots.instance rootUrl:rootName];
-        NSDictionary<NSString *, NSNumber *> *usage = ISHWorkspaceDirectoryUsage(rootURL);
-        NSString *guestABI = [Roots.instance guestABIForRootNamed:rootName] ?: NSLocalizedString(@"Unknown ABI", @"root filesystem ABI when unknown");
-        [records addObject:@{
-            @"name": rootName,
-            @"isDefault": @([rootName isEqualToString:defaultRoot]),
-            @"abi": guestABI,
-            @"path": rootURL.path ?: @"",
-            @"bytes": usage[@"bytes"] ?: @0,
-            @"files": usage[@"files"] ?: @0,
-            @"directories": usage[@"directories"] ?: @0,
-        }];
-    }
-    return records;
 }
 
 static NSString *ISHWorkspaceUsageBarString(double ratio, NSUInteger width) {
@@ -10408,21 +10350,287 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
 
 @end
 
-// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable). What a person reads here scales: the per-root
-// lines (a -workspaceThemeTextView, which the base class re-fonts) and the summary above them.
-// The ROOT STORAGE heading and the Rescan row stay: a card title, and a button with its caption,
-// in a horizontal row where larger text would only squeeze the caption against the button.
-@interface WorkspaceStorageToolViewController () <WorkspaceTextScalable>
+// ---- Storage (GH #640) -----------------------------------------------------
+//
+// Where the app's disk has gone, ncdu-style: every place the app keeps data,
+// largest first, and inside each the directories and files that make it up.
+// The tool used to print one total per filesystem and stop there, which says
+// that 5 GB is gone and not where.
+//
+// A place is scanned once, on a background queue, into a table of what every
+// directory under it holds; going into a directory after that only lists it.
+// Sizes are what the files occupy on the device (allocated blocks, a hard
+// link counted once), which is what "storage used" means, and can differ from
+// the lengths `ls -l` shows in the guest.
+
+typedef struct {
+    uint64_t bytes;
+    uint64_t files;
+} ISHStorageUsage;
+
+@interface ISHStorageEntry : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy, nullable) NSString *detail;
+// Where it is on the device; nil for something with no files to list (swap).
+@property (nonatomic, copy, nullable) NSString *hostPath;
+@property (nonatomic) uint64_t bytes;
+@property (nonatomic) uint64_t files;
+@property (nonatomic) BOOL isDirectory;
+@property (nonatomic) BOOL scanning;
+// A filesystem: its files are under data/, and are shown by their guest paths.
+@property (nonatomic) BOOL isRoot;
+// Relative directory path ("" for the place itself) -> ISHStorageUsage, once scanned.
+@property (nonatomic, strong, nullable) NSDictionary<NSString *, NSValue *> *tree;
+@end
+
+@implementation ISHStorageEntry
+@end
+
+static NSValue *ISHStorageUsageValue(ISHStorageUsage usage) {
+    return [NSValue valueWithBytes:&usage objCType:@encode(ISHStorageUsage)];
+}
+
+static ISHStorageUsage ISHStorageUsageFromValue(NSValue *_Nullable value) {
+    ISHStorageUsage usage = {0, 0};
+    if (value != nil)
+        [value getValue:&usage size:sizeof(usage)];
+    return usage;
+}
+
+// Walks everything under `path` and returns what each directory holds, keyed
+// by its path relative to `path`. `*total` is the whole of it, and is all
+// there is when `path` is a file.
+static NSDictionary<NSString *, NSValue *> *ISHStorageScan(NSString *path, ISHStorageUsage *total, BOOL (^cancelled)(void)) {
+    NSMutableDictionary<NSString *, NSValue *> *tree = [NSMutableDictionary dictionary];
+    *total = (ISHStorageUsage) {0, 0};
+    char *const roots[] = {(char *) path.fileSystemRepresentation, NULL};
+    FTS *fts = fts_open(roots, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, NULL);
+    if (fts == NULL)
+        return tree;
+    size_t rootLength = strlen(roots[0]);
+    size_t depthCapacity = 64;
+    ISHStorageUsage *stack = calloc(depthCapacity, sizeof(*stack));
+    // A file with several names is one file's worth of disk.
+    NSMutableSet<NSNumber *> *linked = [NSMutableSet set];
+    FTSENT *entry;
+    unsigned sinceCheck = 0;
+    while (stack != NULL && (entry = fts_read(fts)) != NULL) {
+        if (++sinceCheck >= 512) {
+            sinceCheck = 0;
+            if (cancelled != nil && cancelled())
+                break;
+        }
+        size_t level = entry->fts_level < 0 ? 0 : (size_t) entry->fts_level;
+        if (level + 1 >= depthCapacity) {
+            size_t newCapacity = depthCapacity * 2;
+            ISHStorageUsage *grown = realloc(stack, newCapacity * sizeof(*stack));
+            if (grown == NULL)
+                break;
+            memset(grown + depthCapacity, 0, (newCapacity - depthCapacity) * sizeof(*stack));
+            stack = grown;
+            depthCapacity = newCapacity;
+        }
+        const struct stat *st = entry->fts_statp;
+        switch (entry->fts_info) {
+            case FTS_D:
+                stack[level] = (ISHStorageUsage) {st != NULL ? (uint64_t) st->st_blocks * 512 : 0, 0};
+                break;
+            case FTS_DP: {
+                ISHStorageUsage usage = stack[level];
+                const char *relative = entry->fts_path + rootLength;
+                while (*relative == '/')
+                    relative++;
+                NSString *key = [NSFileManager.defaultManager stringWithFileSystemRepresentation:relative length:strlen(relative)];
+                if (key != nil)
+                    tree[key] = ISHStorageUsageValue(usage);
+                if (level > 0) {
+                    stack[level - 1].bytes += usage.bytes;
+                    stack[level - 1].files += usage.files;
+                } else {
+                    *total = usage;
+                }
+                break;
+            }
+            case FTS_F:
+            case FTS_SL:
+            case FTS_SLNONE:
+            case FTS_DEFAULT: {
+                uint64_t bytes = st != NULL ? (uint64_t) st->st_blocks * 512 : 0;
+                if (st != NULL && st->st_nlink > 1) {
+                    NSNumber *inode = @((unsigned long long) st->st_ino);
+                    if ([linked containsObject:inode])
+                        bytes = 0;
+                    else
+                        [linked addObject:inode];
+                }
+                if (level > 0) {
+                    stack[level - 1].bytes += bytes;
+                    stack[level - 1].files += 1;
+                } else {
+                    *total = (ISHStorageUsage) {bytes, 1};
+                }
+                break;
+            }
+            default:
+                break; // unreadable, or a directory that could not be entered: counted as nothing
+        }
+    }
+    free(stack);
+    fts_close(fts);
+    return tree;
+}
+
+// The rows of one directory of a scanned place, largest first.
+static NSArray<ISHStorageEntry *> *ISHStorageChildren(NSString *hostDirectory, NSString *relativePath,
+                                                      NSDictionary<NSString *, NSValue *> *tree) {
+    NSMutableArray<ISHStorageEntry *> *children = [NSMutableArray array];
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:hostDirectory error:nil];
+    for (NSString *name in names) {
+        NSString *childPath = [hostDirectory stringByAppendingPathComponent:name];
+        struct stat st;
+        if (lstat(childPath.fileSystemRepresentation, &st) != 0)
+            continue;
+        ISHStorageEntry *child = [ISHStorageEntry new];
+        child.name = name;
+        child.hostPath = childPath;
+        if (S_ISDIR(st.st_mode)) {
+            NSString *key = relativePath.length > 0 ? [relativePath stringByAppendingPathComponent:name] : name;
+            ISHStorageUsage usage = ISHStorageUsageFromValue(tree[key]);
+            child.isDirectory = YES;
+            child.bytes = usage.bytes;
+            child.files = usage.files;
+        } else {
+            child.bytes = (uint64_t) st.st_blocks * 512;
+            child.files = 1;
+        }
+        [children addObject:child];
+    }
+    [children sortUsingComparator:^NSComparisonResult(ISHStorageEntry *a, ISHStorageEntry *b) {
+        if (a.bytes != b.bytes)
+            return a.bytes > b.bytes ? NSOrderedAscending : NSOrderedDescending;
+        return [a.name localizedStandardCompare:b.name];
+    }];
+    return children;
+}
+
+// Every place the app keeps data. Built on the main thread (Roots is), with
+// nothing measured yet.
+static NSArray<ISHStorageEntry *> *ISHStoragePlaces(void) {
+    NSMutableArray<ISHStorageEntry *> *places = [NSMutableArray array];
+    NSFileManager *files = NSFileManager.defaultManager;
+    ISHStorageEntry *(^place)(NSString *, NSString *_Nullable, NSString *_Nullable) =
+            ^ISHStorageEntry *(NSString *name, NSString *detail, NSString *hostPath) {
+        ISHStorageEntry *entry = [ISHStorageEntry new];
+        entry.name = name;
+        entry.detail = detail;
+        entry.hostPath = hostPath;
+        BOOL isDirectory = NO;
+        if (hostPath != nil && [files fileExistsAtPath:hostPath isDirectory:&isDirectory])
+            entry.isDirectory = isDirectory;
+        entry.scanning = hostPath != nil;
+        [places addObject:entry];
+        return entry;
+    };
+
+    NSString *defaultRoot = Roots.instance.defaultRoot;
+    NSMutableSet<NSString *> *listed = [NSMutableSet set];
+    for (NSString *rootName in Roots.instance.roots) {
+        NSString *abi = [Roots.instance guestABIForRootNamed:rootName] ?: NSLocalizedString(@"Unknown ABI", @"root filesystem ABI when unknown");
+        NSString *marker = [rootName isEqualToString:defaultRoot]
+            ? NSLocalizedString(@"default", @"Storage tool marker for the default root")
+            : NSLocalizedString(@"root", @"Storage tool marker for a non-default root");
+        NSString *path = [Roots.instance rootUrl:rootName].path;
+        ISHStorageEntry *entry = place(rootName, [NSString stringWithFormat:@"%@  •  %@", abi, marker], path);
+        entry.isRoot = YES;
+        if (path != nil)
+            [listed addObject:path.stringByStandardizingPath];
+    }
+
+    // The rest of the container, by what each thing is for where that is
+    // known and by its own name where it is not: nothing in it goes uncounted.
+    NSString *container = ContainerURL().path.stringByStandardizingPath;
+    NSDictionary<NSString *, NSString *> *known = @{
+        @"AOK/fakefs": NSLocalizedString(@"Shared files", @"Storage tool row: the shared /AOK/fakefs filesystem"),
+        @"AOK/persist": NSLocalizedString(@"Persistent storage", @"Storage tool row: /AOK/persist"),
+        @"sessions": NSLocalizedString(@"Saved sessions", @"Storage tool row: suspended session images"),
+        @"suspend.img": NSLocalizedString(@"Saved sessions", @"Storage tool row: suspended session images"),
+        @"Diagnostics": NSLocalizedString(@"Diagnostics", @"Storage tool row: diagnostic logs"),
+        @"MetricKitDiagnostics": NSLocalizedString(@"Diagnostics", @"Storage tool row: diagnostic logs"),
+    };
+    NSDictionary<NSString *, NSString *> *guestNames = @{@"AOK/fakefs": @"/AOK/fakefs", @"AOK/persist": @"/AOK/persist"};
+    if (container != nil) {
+        NSMutableArray<NSString *> *relativeNames = [NSMutableArray array];
+        for (NSString *name in [files contentsOfDirectoryAtPath:container error:nil] ?: @[]) {
+            if ([name isEqualToString:@"roots"])
+                continue; // each root is a row of its own, above
+            if ([name isEqualToString:@"AOK"]) {
+                for (NSString *inner in [files contentsOfDirectoryAtPath:[container stringByAppendingPathComponent:name] error:nil] ?: @[]) {
+                    if (![inner isEqualToString:@"roots"]) // mount points for the other roots: empty directories
+                        [relativeNames addObject:[name stringByAppendingPathComponent:inner]];
+                }
+                continue;
+            }
+            [relativeNames addObject:name];
+        }
+        for (NSString *relative in relativeNames) {
+            NSString *path = [container stringByAppendingPathComponent:relative];
+            place(known[relative] ?: relative.lastPathComponent, guestNames[relative], path);
+            [listed addObject:path.stringByStandardizingPath];
+        }
+    }
+
+    // The app's own sandbox, unless the container above is inside it (an
+    // install with no app group keeps the container under Application Support).
+    void (^sandbox)(NSString *, NSString *_Nullable) = ^(NSString *name, NSString *path) {
+        NSString *standard = path.stringByStandardizingPath;
+        if (standard.length == 0 || ![files fileExistsAtPath:standard])
+            return;
+        for (NSString *other in listed) {
+            if ([other isEqualToString:standard] || [other hasPrefix:[standard stringByAppendingString:@"/"]] ||
+                    [standard hasPrefix:[other stringByAppendingString:@"/"]])
+                return;
+        }
+        if (container != nil && ([container isEqualToString:standard] || [container hasPrefix:[standard stringByAppendingString:@"/"]]))
+            return;
+        place(name, nil, standard);
+        [listed addObject:standard];
+    };
+    sandbox(NSLocalizedString(@"Temporary files", @"Storage tool row: the app's temporary directory"), NSTemporaryDirectory());
+    sandbox(NSLocalizedString(@"Caches", @"Storage tool row: the app's cache directory"),
+            [files URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject.path);
+    sandbox(NSLocalizedString(@"Documents", @"Storage tool row: the app's Documents directory"),
+            [files URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject.path);
+
+    // Swap is a file with no name (it is unlinked as soon as it is made), so
+    // no walk finds it; it holds its whole size for as long as the app runs.
+    if (swap_enabled() && swap_area_bytes() > 0) {
+        ISHStorageEntry *swap = place(NSLocalizedString(@"Swap", @"Storage tool row: the swap file"), nil, nil);
+        swap.bytes = swap_area_bytes();
+    }
+    return places;
+}
+
+static NSString *const ISHWorkspaceStorageRowReuseIdentifier = @"ISHWorkspaceStorageRow";
+
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable): the rows, the path above them and the summary
+// scale. The ROOT STORAGE heading and the Refresh button stay, as card furniture does elsewhere.
+@interface WorkspaceStorageToolViewController () <WorkspaceTextScalable, WorkspaceStatefulTool, UITableViewDataSource, UITableViewDelegate>
 @end
 
 @implementation WorkspaceStorageToolViewController {
-    UIScrollView *_scrollView;
-    UIStackView *_contentStack;
     UILabel *_summaryLabel;
-    UITextView *_detailsTextView;
-    NSLayoutConstraint *_detailsMinimumHeightConstraint;
+    UILabel *_pathLabel;
     UIButton *_refreshButton;
+    UITableView *_tableView;
     NSUInteger _refreshGeneration;
+    NSArray<ISHStorageEntry *> *_places;
+    // Where the list is: nil at the top, else the place and the directory under it.
+    ISHStorageEntry *_Nullable _currentPlace;
+    NSString *_currentRelativePath;
+    NSArray<ISHStorageEntry *> *_rows;
+    // A place and path to go back to once its scan finishes (a restored window).
+    NSString *_Nullable _pendingPlaceName;
+    NSString *_Nullable _pendingRelativePath;
 }
 
 - (UIButton *)storageActionButton {
@@ -10438,173 +10646,395 @@ static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController 
     return button;
 }
 
+- (CGFloat)storageRowHeight {
+    return 46.0 * MAX(0.8, self.workspaceTextScale);
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.title = NSLocalizedString(@"Storage", @"Storage tool title");
-
-    _scrollView = [UIScrollView new];
-    _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
-    _scrollView.alwaysBounceVertical = YES;
-    [self.toolContentView addSubview:_scrollView];
-
-    _contentStack = [UIStackView new];
-    _contentStack.translatesAutoresizingMaskIntoConstraints = NO;
-    _contentStack.axis = UILayoutConstraintAxisVertical;
-    _contentStack.spacing = 8;
-    [_scrollView addSubview:_contentStack];
+    _currentRelativePath = @"";
+    _rows = @[];
 
     UIView *summaryCard = [self workspaceThemeCardView];
-    UIStackView *summaryStack = [UIStackView new];
-    summaryStack.translatesAutoresizingMaskIntoConstraints = NO;
-    summaryStack.axis = UILayoutConstraintAxisVertical;
-    summaryStack.spacing = 6;
-    [summaryCard addSubview:summaryStack];
+    summaryCard.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.toolContentView addSubview:summaryCard];
     UILabel *summaryTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
     summaryTitle.text = NSLocalizedString(@"ROOT STORAGE", @"Storage tool section eyebrow");
     summaryTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
     _summaryLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
     _summaryLabel.numberOfLines = 0;
-    [summaryStack addArrangedSubview:summaryTitle];
-    [summaryStack addArrangedSubview:_summaryLabel];
-    [NSLayoutConstraint activateConstraints:@[
-        [summaryStack.topAnchor constraintEqualToAnchor:summaryCard.topAnchor constant:12],
-        [summaryStack.leadingAnchor constraintEqualToAnchor:summaryCard.leadingAnchor constant:12],
-        [summaryStack.trailingAnchor constraintEqualToAnchor:summaryCard.trailingAnchor constant:-12],
-        [summaryStack.bottomAnchor constraintEqualToAnchor:summaryCard.bottomAnchor constant:-12],
-    ]];
-
-    UIView *actionsCard = [self workspaceThemeCardView];
-    UIStackView *actionsStack = [UIStackView new];
-    actionsStack.translatesAutoresizingMaskIntoConstraints = NO;
-    actionsStack.axis = UILayoutConstraintAxisHorizontal;
-    actionsStack.alignment = UIStackViewAlignmentCenter;
-    actionsStack.spacing = 8;
-    [actionsCard addSubview:actionsStack];
-    UILabel *actionsLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
-    actionsLabel.text = NSLocalizedString(@"Rescan roots and container directories.", @"Storage tool caption");
+    UIStackView *summaryText = [[UIStackView alloc] initWithArrangedSubviews:@[summaryTitle, _summaryLabel]];
+    summaryText.axis = UILayoutConstraintAxisVertical;
+    summaryText.spacing = 4;
     _refreshButton = [self storageActionButton];
-    [actionsStack addArrangedSubview:actionsLabel];
-    [actionsStack addArrangedSubview:_refreshButton];
-    [actionsLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [_refreshButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [_refreshButton setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    UIStackView *summaryRow = [[UIStackView alloc] initWithArrangedSubviews:@[summaryText, _refreshButton]];
+    summaryRow.translatesAutoresizingMaskIntoConstraints = NO;
+    summaryRow.axis = UILayoutConstraintAxisHorizontal;
+    summaryRow.alignment = UIStackViewAlignmentCenter;
+    summaryRow.spacing = 8;
+    [summaryCard addSubview:summaryRow];
+
+    UIView *listCard = [self workspaceThemeCardView];
+    listCard.translatesAutoresizingMaskIntoConstraints = NO;
+    listCard.clipsToBounds = YES;
+    [self.toolContentView addSubview:listCard];
+    _pathLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:YES];
+    _pathLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _pathLabel.lineBreakMode = NSLineBreakByTruncatingHead;
+    [listCard addSubview:_pathLabel];
+
+    _tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    _tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.backgroundColor = UIColor.clearColor;
+    _tableView.separatorInset = UIEdgeInsetsZero;
+    _tableView.rowHeight = [self storageRowHeight];
+    _tableView.tableFooterView = [UIView new];
+    [listCard addSubview:_tableView];
+
     [NSLayoutConstraint activateConstraints:@[
-        [actionsStack.topAnchor constraintEqualToAnchor:actionsCard.topAnchor constant:8],
-        [actionsStack.leadingAnchor constraintEqualToAnchor:actionsCard.leadingAnchor constant:10],
-        [actionsStack.trailingAnchor constraintEqualToAnchor:actionsCard.trailingAnchor constant:-10],
-        [actionsStack.bottomAnchor constraintEqualToAnchor:actionsCard.bottomAnchor constant:-8],
+        [summaryCard.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor constant:6],
+        [summaryCard.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor constant:6],
+        [summaryCard.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor constant:-6],
+        [summaryRow.topAnchor constraintEqualToAnchor:summaryCard.topAnchor constant:10],
+        [summaryRow.leadingAnchor constraintEqualToAnchor:summaryCard.leadingAnchor constant:12],
+        [summaryRow.trailingAnchor constraintEqualToAnchor:summaryCard.trailingAnchor constant:-10],
+        [summaryRow.bottomAnchor constraintEqualToAnchor:summaryCard.bottomAnchor constant:-10],
+
+        [listCard.topAnchor constraintEqualToAnchor:summaryCard.bottomAnchor constant:6],
+        [listCard.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor constant:6],
+        [listCard.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor constant:-6],
+        [listCard.bottomAnchor constraintEqualToAnchor:self.toolContentView.bottomAnchor constant:-6],
+        [_pathLabel.topAnchor constraintEqualToAnchor:listCard.topAnchor constant:8],
+        [_pathLabel.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor constant:12],
+        [_pathLabel.trailingAnchor constraintEqualToAnchor:listCard.trailingAnchor constant:-12],
+        [_tableView.topAnchor constraintEqualToAnchor:_pathLabel.bottomAnchor constant:6],
+        [_tableView.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor],
+        [_tableView.trailingAnchor constraintEqualToAnchor:listCard.trailingAnchor],
+        [_tableView.bottomAnchor constraintEqualToAnchor:listCard.bottomAnchor],
     ]];
 
-    UIView *detailsCard = [self workspaceThemeCardView];
-    _detailsTextView = [self workspaceThemeTextView];
-    [detailsCard addSubview:_detailsTextView];
-    _detailsMinimumHeightConstraint = [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:[self storageDetailsMinimumHeight]];
-    [NSLayoutConstraint activateConstraints:@[
-        _detailsMinimumHeightConstraint,
-        [_detailsTextView.topAnchor constraintEqualToAnchor:detailsCard.topAnchor constant:8],
-        [_detailsTextView.leadingAnchor constraintEqualToAnchor:detailsCard.leadingAnchor constant:8],
-        [_detailsTextView.trailingAnchor constraintEqualToAnchor:detailsCard.trailingAnchor constant:-8],
-        [_detailsTextView.bottomAnchor constraintEqualToAnchor:detailsCard.bottomAnchor constant:-8],
-    ]];
-
-    [_contentStack addArrangedSubview:summaryCard];
-    [_contentStack addArrangedSubview:actionsCard];
-    [_contentStack addArrangedSubview:detailsCard];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [_scrollView.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor],
-        [_scrollView.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor],
-        [_scrollView.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor],
-        [_scrollView.bottomAnchor constraintEqualToAnchor:self.toolContentView.bottomAnchor],
-
-        [_contentStack.topAnchor constraintEqualToAnchor:_scrollView.contentLayoutGuide.topAnchor constant:6],
-        [_contentStack.leadingAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.leadingAnchor constant:6],
-        [_contentStack.trailingAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.trailingAnchor constant:-6],
-        [_contentStack.bottomAnchor constraintEqualToAnchor:_scrollView.contentLayoutGuide.bottomAnchor constant:-6],
-        [_contentStack.widthAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.widthAnchor constant:-12],
-    ]];
-
+    [self workspaceApplyTheme];
     [self refreshStorage:nil];
 }
 
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self refreshStorage:nil];
-}
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    _contentStack.spacing = ISHWorkspaceDensityValue(4, 8);
-}
+#pragma mark Scanning
 
 - (void)refreshStorage:(id)sender {
     (void) sender;
     NSUInteger generation = ++_refreshGeneration;
-    _detailsTextView.text = NSLocalizedString(@"Scanning roots and container directories…", @"Storage tool status while scanning");
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSArray<NSDictionary<NSString *, id> *> *rootRecords = ISHWorkspaceRootUsageRecords();
-        NSDictionary<NSString *, NSNumber *> *tmpUsage = ISHWorkspaceDirectoryUsage([NSURL fileURLWithPath:NSTemporaryDirectory()]);
-        NSArray<NSURL *> *cacheDirectories =
-            [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask];
-        NSDictionary<NSString *, NSNumber *> *cacheUsage =
-            ISHWorkspaceDirectoryUsage(cacheDirectories.firstObject ?: [NSURL fileURLWithPath:NSHomeDirectory()]);
-        uint64_t totalRootBytes = 0;
-        NSMutableArray<NSString *> *lines = [NSMutableArray array];
-        [lines addObject:NSLocalizedString(@"Workspace roots:", @"Storage tool details heading")];
-        for (NSDictionary<NSString *, id> *record in rootRecords) {
-            totalRootBytes += [record[@"bytes"] unsignedLongLongValue];
-            NSString *marker = [record[@"isDefault"] boolValue] ? NSLocalizedString(@"default", @"Storage tool marker for the default root") : NSLocalizedString(@"root", @"Storage tool marker for a non-default root");
-            [lines addObject:[NSString stringWithFormat:@"%@  •  %@  •  %@",
-                              record[@"name"],
-                              record[@"abi"],
-                              marker]];
-            [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"  %@  •  %@ files  •  %@ dirs", @"Storage tool details: size, file count, directory count"),
-                              ISHWorkspaceByteCountString([record[@"bytes"] unsignedLongLongValue]),
-                              record[@"files"],
-                              record[@"directories"]]];
-        }
-        if (rootRecords.count == 0) {
-            [lines addObject:NSLocalizedString(@"No installed roots.", @"Storage tool details")];
-        }
-        [lines addObject:@""];
-        [lines addObject:NSLocalizedString(@"Container directories:", @"Storage tool details heading")];
-        [lines addObject:[NSString stringWithFormat:@"tmp  •  %@", ISHWorkspaceByteCountString([tmpUsage[@"bytes"] unsignedLongLongValue])]];
-        [lines addObject:[NSString stringWithFormat:@"cache  •  %@", ISHWorkspaceByteCountString([cacheUsage[@"bytes"] unsignedLongLongValue])]];
+    // A rescan lands back where the list was, once that place has been read again.
+    if (_currentPlace != nil) {
+        _pendingPlaceName = _currentPlace.name;
+        _pendingRelativePath = _currentRelativePath;
+    }
+    _currentPlace = nil;
+    _currentRelativePath = @"";
+    _places = ISHStoragePlaces();
+    _summaryLabel.text = NSLocalizedString(@"Scanning…", @"Storage tool status while scanning");
+    [self rebuildRows];
 
-        NSDictionary<NSFileAttributeKey, id> *attributes =
-            [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
-        uint64_t freeBytes = [attributes[NSFileSystemFreeSize] unsignedLongLongValue];
-        NSString *summary = [NSString stringWithFormat:NSLocalizedString(@"%@ free  •  %@ across %lu roots", @"Storage tool summary: free space, total root size, root count"),
-                                                       ISHWorkspaceByteCountString(freeBytes),
-                                                       ISHWorkspaceByteCountString(totalRootBytes),
-                                                       (unsigned long) rootRecords.count];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (generation != self->_refreshGeneration)
-                return;
-            self->_summaryLabel.text = summary;
-            self->_detailsTextView.text = [lines componentsJoinedByString:@"\n"];
+    __weak typeof(self) weakSelf = self;
+    BOOL (^cancelled)(void) = ^BOOL {
+        typeof(self) strongSelf = weakSelf;
+        return strongSelf == nil || strongSelf->_refreshGeneration != generation;
+    };
+    for (ISHStorageEntry *place in _places) {
+        if (place.hostPath == nil)
+            continue;
+        NSString *path = place.hostPath;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            ISHStorageUsage total;
+            NSDictionary<NSString *, NSValue *> *tree = ISHStorageScan(path, &total, cancelled);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) strongSelf = weakSelf;
+                if (strongSelf == nil || strongSelf->_refreshGeneration != generation)
+                    return;
+                place.tree = tree;
+                place.bytes = total.bytes;
+                place.files = total.files;
+                place.scanning = NO;
+                [strongSelf storagePlaceDidFinish:place];
+            });
         });
-    });
+    }
+    [self updateSummary];
 }
 
-// A scrolling text view has no height of its own, so the details card sits at this minimum. It
-// follows the text size, to show as many lines as at 1.0, but not below its 1.0 height: smaller
-// text shows more lines instead of leaving a gap under the card in a window that does not shrink.
-- (CGFloat)storageDetailsMinimumHeight {
-    return (ISHWorkspaceUsesPhoneLayout() ? 132.0 : 168.0) * MAX(1.0, self.workspaceTextScale);
+- (void)storagePlaceDidFinish:(ISHStorageEntry *)place {
+    if (_pendingPlaceName != nil && [place.name isEqualToString:_pendingPlaceName]) {
+        NSString *relative = _pendingRelativePath ?: @"";
+        _pendingPlaceName = nil;
+        _pendingRelativePath = nil;
+        // Only if it is still there: the directory may be what was deleted.
+        if (relative.length == 0 || place.tree[relative] != nil) {
+            _currentPlace = place;
+            _currentRelativePath = relative;
+        }
+    }
+    [self updateSummary];
+    if (_currentPlace == nil || _currentPlace == place)
+        [self rebuildRows];
 }
+
+- (void)updateSummary {
+    uint64_t rootBytes = 0, allBytes = 0;
+    NSUInteger roots = 0;
+    BOOL scanning = NO;
+    for (ISHStorageEntry *place in _places) {
+        scanning = scanning || place.scanning;
+        allBytes += place.bytes;
+        if (place.isRoot) {
+            roots++;
+            rootBytes += place.bytes;
+        }
+    }
+    if (scanning) {
+        _summaryLabel.text = NSLocalizedString(@"Scanning…", @"Storage tool status while scanning");
+        return;
+    }
+    NSDictionary<NSFileAttributeKey, id> *attributes =
+        [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
+    uint64_t freeBytes = [attributes[NSFileSystemFreeSize] unsignedLongLongValue];
+    _summaryLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%@ free  •  %@ across %lu roots", @"Storage tool summary: free space, total root size, root count"),
+                          ISHWorkspaceByteCountString(freeBytes),
+                          ISHWorkspaceByteCountString(rootBytes),
+                          (unsigned long) roots];
+    (void) allBytes;
+}
+
+#pragma mark The list
+
+// The directory on the device that the list is showing, for a place being browsed.
+- (NSString *)currentHostDirectory {
+    NSString *base = _currentPlace.hostPath;
+    if (_currentPlace.isRoot)
+        base = [base stringByAppendingPathComponent:@"data"];
+    return _currentRelativePath.length > 0 ? [base stringByAppendingPathComponent:_currentRelativePath] : base;
+}
+
+// ...and the key its directories have in the place's table.
+- (NSString *)currentTreePath {
+    if (!_currentPlace.isRoot)
+        return _currentRelativePath;
+    return _currentRelativePath.length > 0 ? [@"data" stringByAppendingPathComponent:_currentRelativePath] : @"data";
+}
+
+- (void)rebuildRows {
+    if (_currentPlace == nil) {
+        _rows = [_places sortedArrayUsingComparator:^NSComparisonResult(ISHStorageEntry *a, ISHStorageEntry *b) {
+            if (a.scanning != b.scanning)
+                return a.scanning ? NSOrderedDescending : NSOrderedAscending;
+            if (a.bytes != b.bytes)
+                return a.bytes > b.bytes ? NSOrderedAscending : NSOrderedDescending;
+            return [a.name localizedStandardCompare:b.name];
+        }];
+        _pathLabel.text = NSLocalizedString(@"All storage", @"Storage tool: the top of the list, every place the app keeps data");
+    } else {
+        NSMutableArray<ISHStorageEntry *> *rows =
+            [ISHStorageChildren([self currentHostDirectory], [self currentTreePath], _currentPlace.tree ?: @{}) mutableCopy];
+        if (_currentPlace.isRoot && _currentRelativePath.length == 0) {
+            // What a filesystem costs beside its files: the database that
+            // holds every owner, mode and device number.
+            ISHStorageUsage data = ISHStorageUsageFromValue(_currentPlace.tree[@"data"]);
+            if (_currentPlace.bytes > data.bytes) {
+                ISHStorageEntry *metadata = [ISHStorageEntry new];
+                metadata.name = NSLocalizedString(@"Filesystem metadata", @"Storage tool row: a root's metadata database");
+                metadata.bytes = _currentPlace.bytes - data.bytes;
+                [rows addObject:metadata];
+                [rows sortUsingComparator:^NSComparisonResult(ISHStorageEntry *a, ISHStorageEntry *b) {
+                    if (a.bytes != b.bytes)
+                        return a.bytes > b.bytes ? NSOrderedAscending : NSOrderedDescending;
+                    return [a.name localizedStandardCompare:b.name];
+                }];
+            }
+        }
+        _rows = rows;
+        NSString *shown = _currentPlace.isRoot || _currentRelativePath.length > 0
+            ? [@"/" stringByAppendingString:_currentRelativePath]
+            : @"";
+        _pathLabel.text = shown.length > 0 ? [NSString stringWithFormat:@"%@: %@", _currentPlace.name, shown] : _currentPlace.name;
+    }
+    [_tableView reloadData];
+}
+
+- (BOOL)storageShowsBackRow {
+    return _currentPlace != nil;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    NSUInteger count = _rows.count + ([self storageShowsBackRow] ? 1 : 0);
+    // A directory with nothing in it still says so.
+    if (_rows.count == 0 && _currentPlace != nil)
+        count += 1;
+    return (NSInteger) count;
+}
+
+- (UIColor *)storageColorForKey:(NSString *)key fallback:(UIColor *)fallback {
+    UIColor *color = self.workspaceTheme[key];
+    return color != nil ? color : fallback;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:ISHWorkspaceStorageRowReuseIdentifier];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:ISHWorkspaceStorageRowReuseIdentifier];
+        UILabel *size = [UILabel new];
+        size.textAlignment = NSTextAlignmentRight;
+        cell.accessoryView = size;
+    }
+    UIColor *primary = [self storageColorForKey:@"primary" fallback:UIColor.labelColor];
+    UIColor *secondary = [self storageColorForKey:@"secondary" fallback:UIColor.secondaryLabelColor];
+    UIColor *accent = [self storageColorForKey:@"accent" fallback:UIColor.systemBlueColor];
+    // Set on every dequeue, from the unscaled size: a reused cell carries the
+    // font of whatever row it last showed.
+    cell.backgroundColor = UIColor.clearColor;
+    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                            weight:UIFontWeightMedium];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1))];
+    cell.textLabel.textColor = primary;
+    cell.detailTextLabel.textColor = secondary;
+    cell.textLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    UILabel *size = (UILabel *) cell.accessoryView;
+    size.font = [UIFont monospacedDigitSystemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                                 weight:UIFontWeightRegular];
+    size.textColor = accent;
+    cell.imageView.tintColor = accent;
+    cell.accessibilityTraits = UIAccessibilityTraitNone;
+
+    NSInteger row = indexPath.row;
+    BOOL back = [self storageShowsBackRow] && row == 0;
+    if ([self storageShowsBackRow])
+        row -= 1;
+    UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightMedium];
+    if (back) {
+        cell.textLabel.text = NSLocalizedString(@"‹ Back", @"launcher back button");
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
+        size.text = nil;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        cell.accessibilityTraits = UIAccessibilityTraitButton;
+    } else if (row >= (NSInteger) _rows.count) {
+        cell.textLabel.text = NSLocalizedString(@"Empty", @"Storage tool: a directory with nothing in it");
+        cell.textLabel.textColor = secondary;
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
+        size.text = nil;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    } else {
+        ISHStorageEntry *entry = _rows[(NSUInteger) row];
+        BOOL opens = [self storageEntryOpens:entry];
+        cell.textLabel.text = entry.name;
+        if (entry.scanning)
+            cell.detailTextLabel.text = NSLocalizedString(@"Scanning…", @"Storage tool status while scanning");
+        else if (entry.detail.length > 0)
+            cell.detailTextLabel.text = entry.detail;
+        else if (entry.isDirectory)
+            cell.detailTextLabel.text = [NSString localizedStringWithFormat:NSLocalizedString(@"%lu items", @"file manager folder item count"), (unsigned long) entry.files];
+        else
+            cell.detailTextLabel.text = nil;
+        size.text = entry.scanning ? @"…" : ISHWorkspaceByteCountString(entry.bytes);
+        NSString *symbolName = entry.isRoot ? @"internaldrive" : (entry.isDirectory ? @"folder.fill" : @"doc");
+        cell.imageView.image = [[UIImage systemImageNamed:symbolName] imageByApplyingSymbolConfiguration:symbol];
+        cell.selectionStyle = opens ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+        if (opens)
+            cell.accessibilityTraits = UIAccessibilityTraitButton;
+    }
+    [size sizeToFit];
+    return cell;
+}
+
+// A directory that has been measured can be gone into; a file, swap and a
+// place still being read cannot.
+- (BOOL)storageEntryOpens:(ISHStorageEntry *)entry {
+    return entry.isDirectory && entry.hostPath != nil && !entry.scanning;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSInteger row = indexPath.row;
+    if ([self storageShowsBackRow]) {
+        if (row == 0) {
+            if (_currentRelativePath.length > 0)
+                _currentRelativePath = _currentRelativePath.stringByDeletingLastPathComponent;
+            else
+                _currentPlace = nil;
+            [self rebuildRows];
+            return;
+        }
+        row -= 1;
+    }
+    if (row < 0 || row >= (NSInteger) _rows.count)
+        return;
+    ISHStorageEntry *entry = _rows[(NSUInteger) row];
+    if (![self storageEntryOpens:entry])
+        return;
+    if (_currentPlace == nil) {
+        _currentPlace = entry;
+        _currentRelativePath = @"";
+    } else {
+        _currentRelativePath = _currentRelativePath.length > 0
+            ? [_currentRelativePath stringByAppendingPathComponent:entry.name]
+            : entry.name;
+    }
+    [self rebuildRows];
+    if (_rows.count > 0 || [self storageShowsBackRow])
+        [_tableView scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0] atScrollPosition:UITableViewScrollPositionTop animated:NO];
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// Which directory the list was in: a restored window that is back at the top
+// has forgotten what was being looked at.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    NSString *placeName = _currentPlace != nil ? _currentPlace.name : _pendingPlaceName;
+    NSString *relative = _currentPlace != nil ? _currentRelativePath : _pendingRelativePath;
+    if (placeName.length == 0)
+        return nil;
+    return @{@"place": placeName, @"path": relative ?: @""};
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSString *placeName = [state[@"place"] isKindOfClass:NSString.class] ? state[@"place"] : nil;
+    NSString *relative = [state[@"path"] isKindOfClass:NSString.class] ? state[@"path"] : @"";
+    if (placeName.length == 0)
+        return;
+    // Applied when that place's scan finishes; until then the list is the top.
+    _pendingPlaceName = placeName;
+    _pendingRelativePath = relative;
+    for (ISHStorageEntry *place in _places) {
+        if (!place.scanning && place.tree != nil && [place.name isEqualToString:placeName]) {
+            [self storagePlaceDidFinish:place];
+            break;
+        }
+    }
+}
+
+#pragma mark Text scale and theme
 
 - (void)workspaceApplyTextScale {
     [super workspaceApplyTextScale];
     [self workspaceScaleLabel:_summaryLabel];
-    _detailsMinimumHeightConstraint.constant = [self storageDetailsMinimumHeight];
+    [self workspaceScaleLabel:_pathLabel];
+    _tableView.rowHeight = [self storageRowHeight];
+    [_tableView reloadData];
 }
 
 - (void)workspaceApplyTheme {
     [super workspaceApplyTheme];
+    if (_tableView == nil)
+        return; // the base class calls this before viewDidLoad has built anything
     NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
     _summaryLabel.textColor = theme[@"accent"];
     _refreshButton.backgroundColor = [theme[@"cardAlt"] colorWithAlphaComponent:0.96];
     _refreshButton.layer.borderColor = theme[@"stroke"].CGColor;
     [_refreshButton setTitleColor:theme[@"accentAlt"] forState:UIControlStateNormal];
+    _tableView.separatorColor = [self storageColorForKey:@"stroke" fallback:[UIColor colorWithWhite:0.5 alpha:0.35]];
+    [_tableView reloadData];
 }
 
 @end

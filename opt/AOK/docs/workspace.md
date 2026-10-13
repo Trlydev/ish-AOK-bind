@@ -425,6 +425,30 @@ You may also come across `docs/historical/wayland_workspace_plan.md` in the proj
 docs. That is the forward design document this applet came out of; where it and
 the shipped applet disagree, the applet is right.
 
+## Storage
+
+**Utilities → Storage → Open Storage** (or `ws-storage` from a shell, or
+`{storage}` in the Launcher) shows where the app's disk has gone. The top of
+the list is every place the app keeps data, largest first: each installed
+filesystem, the shared `/AOK/fakefs` files, `/AOK/persist`, saved sessions,
+caches and temporary files, and swap while it is on. The line above it gives
+the device's free space and the total across filesystems.
+
+Tap a row to go into it. Inside a filesystem the list is its directories and
+files by their guest paths, again largest first, with the item count under
+each directory; keep tapping to follow the space down to what is using it, and
+**‹ Back** to come up. A filesystem also has a **Filesystem metadata** row: the
+database that holds every file's owner, mode and device number.
+
+The sizes are what the files occupy on the device — whole blocks, a hard link
+counted once — which is what `du` reports and can differ from the lengths
+`ls -l` shows. **Refresh** reads everything again and returns to the directory
+you were in. A big filesystem takes a few seconds to read the first time; its
+row says **Scanning…** until it has been.
+
+To free space, delete from inside the guest (or remove a whole filesystem in
+Settings → Filesystems); this window only reports.
+
 ## `/proc/ish/workspace`: asking the app to open something
 
 Everything above is driven from the screen. `/proc/ish/workspace` is the other
