@@ -14,17 +14,25 @@ inventory:
 - **Structural ceilings** — bounded by physics or arithmetic rather than by
   effort.
 
-## 41.1 Architectural: there are no namespaces
+## 41.1 Architectural: three namespaces out of seven
 
-No PID namespaces, no mount namespaces, no network, user or cgroup namespaces.
-`CLONE_NEWUTS` and `CLONE_NEWIPC` are the two exceptions: a UTS namespace is a
-hostname in a refcounted struct, and an IPC namespace is System V shared
-memory, semaphores and message queues kept per namespace instead of global.
-`setns(2)` can join either one — or a namespace nothing is in any more — through
-its `/proc/<pid>/ns` file. Every other kind is `ENOSYS` to `unshare`, and
-`setns` into one is the no-op of joining the only one there is — a mount
-namespace's join moves the caller's root and working directory to the real
-root, as Linux's does, and changes nothing else.
+No PID namespaces, no network, user or cgroup namespaces. UTS, IPC and mount
+are the three there are: a UTS namespace is a hostname in a refcounted struct,
+an IPC namespace is System V shared memory, semaphores and message queues kept
+per namespace instead of global, and a mount namespace (559) is a mount table
+of the process's own — a copy of its parent's tree that it can mount in,
+unmount from and `pivot_root` on without anyone else seeing. `setns(2)` can
+join any of the three — or a namespace nothing is in any more — through its
+`/proc/<pid>/ns` file. Every other kind is `ENOSYS` to `unshare`, and `setns`
+into one is the no-op of joining the only one there is.
+
+A mount namespace here is not everything Linux's is. Nothing propagates:
+every mount is private, so `--make-shared` is accepted and not done. A mount
+that is covered when the namespace is copied is not in the copy. A session
+with a process in a mount namespace of its own cannot be saved (the save is
+refused, and says which process). And on its own it confines nothing — a
+process in one is still root over the one machine, which is why a sandbox
+also asks for the user and PID namespaces that are not here.
 
 Network is the one kind with no `/proc/<pid>/ns` file at all, as on a Linux
 kernel built without network namespaces. systemd decides whether a kind
@@ -35,22 +43,30 @@ with `PrivateNetwork=yes` went on to call `unshare(CLONE_NEWNET)`, got
 `localectl` could not start their daemons. With the file absent systemd says
 "proceeding without" and runs them.
 
-`clone` refuses the same flags (`CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`,
-`CLONE_NEWUSER`, `CLONE_NEWCGROUP`), but with `EINVAL`, the answer of a Linux
-kernel built without that namespace type. The two calls give different errnos
-on purpose: each is the one its callers read as "no sandbox here, carry on".
-systemd forks its generator sandbox with `clone(CLONE_NEWNS)` and runs the
-generators unsandboxed on `EPERM` or `EINVAL`, while its `unshare(CLONE_NEWNS)`
-for a service's mount namespace accepts `ENOSYS` and treats `EINVAL` as a
-failure. Build 557 briefly made `clone` say `ENOSYS` too, and systemd as PID 1
-stopped at "Failed to start up manager." (Before that `clone` answered `EPERM`,
-which reads as "you may not" to a caller who is root and may.)
+`clone` refuses the missing kinds (`CLONE_NEWPID`, `CLONE_NEWNET`,
+`CLONE_NEWUSER`, `CLONE_NEWCGROUP`) too, but with `EINVAL`, the answer of a
+Linux kernel built without that namespace type. The two calls give different
+errnos on purpose: each is the one its callers read as "no sandbox here, carry
+on". systemd forks its generator sandbox with `clone` and runs the generators
+unsandboxed on `EPERM` or `EINVAL`, while its `unshare` for a service's
+namespaces accepts `ENOSYS` and treats `EINVAL` as a failure. Build 557
+briefly made `clone` say `ENOSYS` too, and systemd as PID 1 stopped at "Failed
+to start up manager." (Before that `clone` answered `EPERM`, which reads as
+"you may not" to a caller who is root and may.)
 `tests/manual/namespace_errno.c` holds both rules.
 
-So nothing container-shaped runs. No Docker, no `unshare -m` or `-n`, no
-rootless podman, no per-service filesystem views. There is one process table,
-one filesystem tree, and one network, visible identically from every root and
-every chroot.
+Mount namespaces changed what systemd does on the roots that boot it: a unit
+with `PrivateTmp=`, `ProtectSystem=`, `ProtectHome=`, `ProtectProc=` or
+`ReadOnlyPaths=` now gets the private mount tree it asks for, where before
+the setup was skipped. That took `mount_setattr`, mounts that cover what is
+under them, and `/proc/sys/kernel/domainname` to get right, and all of
+logind, resolved, networkd, udevd and userdbd run inside one on Arch.
+
+So nothing container-shaped runs. No Docker, no `unshare -n` or `-p`, no
+rootless podman. `unshare -m` works, and so does `bwrap` when it is asked for
+a mount namespace alone (`--ro-bind / / --dev /dev --proc /proc --tmpfs
+/tmp`). There is one process table and one network, visible identically from
+every root and every chroot.
 
 This is not a missing feature with a ticket. The absence runs through the design
 — Chapter 10's task model, Chapter 16's global mount table, Chapter 21's

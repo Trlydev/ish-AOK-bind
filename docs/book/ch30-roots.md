@@ -209,9 +209,10 @@ it**. A root whose `/etc` has been broken badly enough that it will not boot is
 still just a directory to the root that can boot, which is a recovery story that
 a single-root design does not have.
 
-It works because there are no mount namespaces (Chapters 10 and 21). There is
-one `/proc`, one `/sys` and one `/dev`, and they describe the single true system
-from wherever you are standing.
+It works because every root's processes share one mount table unless one of
+them asks for its own, and one process table always (Chapters 10 and 21). There
+is one `/proc`, one `/sys` and one `/dev`, and they describe the single true
+system from wherever you are standing.
 
 `/AOK/tools/mount-root.sh` sets up the bind mounts a chroot needs — `/proc`,
 `/sys`, `/dev`, `/dev/pts`, `/run`, plus `/AOK/native`, `/AOK/docs`, `/AOK/tools`,

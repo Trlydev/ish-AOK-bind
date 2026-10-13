@@ -314,12 +314,13 @@ is the most reliable way to introduce a bug.
 A book about a system should say early where the system is weak, so the reader
 can calibrate.
 
-**There are no namespaces.** No PID namespaces, no mount namespaces. There is
+**There is one machine.** No PID, network or user namespaces. There is
 exactly one Linux underneath everything, so `/proc`, `/sys` and `/dev` show the
 same true state no matter which root you booted or which chroot you are standing
-in. Nothing container-shaped works. This is architectural, not a missing
-feature; Chapter 21 shows the one place it is an advantage, and Chapter 41 is
-honest about the rest.
+in. A process can have a mount table of its own (mount namespaces arrived in
+559), and that is as far as it goes: nothing container-shaped works. This is
+architectural, not a missing feature; Chapter 21 shows the one place it is an
+advantage, and Chapter 41 is honest about the rest.
 
 **Everything is one process, so everything is one blast radius.** An assertion
 failure in a routine `/proc/meminfo` read aborts the whole application, terminal

@@ -1,17 +1,18 @@
 // What clone() and unshare() answer, as root, for each namespace flag.
 //
-// On Linux as root both succeed. For a namespace type AOK does not have
-// (mount, PID, network, user, cgroup) each entry point must fail with the
-// errno its consumers read as "no sandbox here, carry on", and those differ:
+// On Linux as root both succeed, and so they do here for the namespaces AOK
+// has (UTS, IPC, mount). For a type it does not have (PID, network, user,
+// cgroup) each entry point must fail with the errno its consumers read as
+// "no sandbox here, carry on", and those differ:
 //
 //   clone:   EINVAL (Linux's answer for a namespace type it was built
 //            without). systemd forks its generator sandbox with
 //            raw_clone(SIGCHLD|CLONE_NEWNS) and falls back on
 //            EPERM/EACCES/EINVAL only; 557 answered ENOSYS and PID 1 froze at
-//            "Failed to start up manager" on Arch Linux ARM.
-//   unshare: ENOSYS. systemd's unshare(CLONE_NEWNS) (namespace setup for a
-//            service) falls back on EPERM/EACCES/EOPNOTSUPP/ENOSYS, and
-//            treats EINVAL as a failure.
+//            "Failed to start up manager" on Arch Linux ARM. (Mount
+//            namespaces are real now, and that clone succeeds.)
+//   unshare: ENOSYS. systemd's namespace setup for a service falls back on
+//            EPERM/EACCES/EOPNOTSUPP/ENOSYS, and treats EINVAL as a failure.
 //
 // EPERM would satisfy both, but says "you may not" to a root caller who may,
 // so it is refused too.

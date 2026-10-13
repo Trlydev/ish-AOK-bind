@@ -118,18 +118,21 @@ The implemented flag set is explicit in `kernel/fork.c`:
 CLONE_VM CLONE_FILES CLONE_FS CLONE_SIGHAND CLONE_SYSVSEM CLONE_VFORK
 CLONE_THREAD CLONE_SETTLS CLONE_CHILD_SETTID CLONE_PARENT_SETTID
 CLONE_CHILD_CLEARTID CLONE_DETACHED CLONE_PARENT CLONE_PIDFD CLONE_IO
-CLONE_NEWUTS
+CLONE_NEWUTS CLONE_NEWIPC CLONE_NEWNS
 ```
 
-That covers everything a threading library or a shell needs. What it does not
-cover is the namespace family — `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`,
-`CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWCGROUP` — with the single exception
-of `CLONE_NEWUTS`, which is cheap because a UTS namespace is a hostname and a
-domain name in a refcounted struct.
+That covers everything a threading library or a shell needs. Of the namespace
+family it covers three. `CLONE_NEWUTS` is cheap because a UTS namespace is a
+hostname and a domain name in a refcounted struct; `CLONE_NEWIPC` is System V
+IPC kept per namespace; and `CLONE_NEWNS`, since 559, gives the child a mount
+table of its own — a copy of its parent's tree in which nothing it mounts,
+unmounts or pivots is seen by anyone else (`kernel/mnt_ns.h`; Chapter 16 has
+how a table of path strings holds more than one tree). `CLONE_NEWPID`,
+`CLONE_NEWNET`, `CLONE_NEWUSER` and `CLONE_NEWCGROUP` are refused.
 
 The absent ones are why nothing container-shaped runs here, and they are absent
-architecturally rather than accidentally: there is one filesystem tree, one pid
-space, and one network. Chapter 21 shows the one place that turns out to be an
+architecturally rather than accidentally: there is one pid space, one set of
+user ids, and one network. Chapter 21 shows the one place that turns out to be an
 advantage, and Chapter 41 is honest about the rest. `CLONE_IO` is accepted
 because on Linux it is only a hint about I/O scheduling, and AOK has no I/O
 scheduler for it to hint at.

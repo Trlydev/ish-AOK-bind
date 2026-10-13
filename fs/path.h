@@ -100,6 +100,19 @@ struct statbuf;
 // fs/path.c sets it for itself on a relative symlink inside a detached mount,
 // whose target is re-walked from the top.
 #define N_DETACHED_OK 2048
+// N_IN_ROOT: openat2's RESOLVE_IN_ROOT. The directory the walk starts from is
+// its root for the length of the walk, as if the caller had chroot()ed to it:
+// an absolute path starts there, an absolute symlink target starts there, and
+// `..` does not climb above it. It is the chroot rule with a different
+// directory, and holds exactly as well as chroot does here.
+#define N_IN_ROOT 4096
+// N_NO_MAGICLINKS: openat2's RESOLVE_NO_MAGICLINKS. A procfs link that names
+// a file rather than spelling a path -- /proc/<pid>/{cwd,root,exe,fd/N,ns/*}
+// -- is ELOOP instead of being followed. /proc/self and its like are ordinary
+// links and are followed. N_IN_ROOT refuses the same links with EXDEV, as
+// Linux does for any scoped walk: where they land is outside the scope by
+// construction.
+#define N_NO_MAGICLINKS 8192
 
 // Normalizes the path specified and writes the result into the out buffer.
 //

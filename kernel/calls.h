@@ -438,6 +438,8 @@ dword_t sys_mount(addr_t source_addr, addr_t target_addr, addr_t type_addr, dwor
 dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t target_addr, guest_addr_t type_addr, dword_t flags, guest_addr_t data_addr);
 dword_t sys_umount2(addr_t target_addr, dword_t flags);
 dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags);
+dword_t sys_pivot_root(addr_t new_root_addr, addr_t put_old_addr);
+dword_t sys_pivot_root_guest(guest_addr_t new_root_addr, guest_addr_t put_old_addr);
 // New mount API (fsopen/fsconfig/fsmount/move_mount), fs/mount.c -- see its
 // implementation comment for scope (systemd's per-service credentials tmpfs).
 fd_t sys_fsopen(addr_t fsname_addr, dword_t flags);
@@ -447,6 +449,8 @@ dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_add
 fd_t sys_fsmount(fd_t f, dword_t flags, dword_t attr_flags);
 fd_t sys_fsmount_guest(fd_t f, dword_t flags, dword_t attr_flags);
 dword_t sys_move_mount(fd_t from_dfd, addr_t from_path_addr, fd_t to_dfd, addr_t to_path_addr, dword_t flags);
+dword_t sys_mount_setattr(fd_t dfd, addr_t path_addr, dword_t flags, addr_t attr_addr, dword_t size);
+dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags, guest_addr_t attr_addr, guest_addr_t size);
 dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to_dfd, guest_addr_t to_path_addr, dword_t flags);
 
 // kernel/xattr.c. The i386 table's forms take its 32-bit words; the _guest

@@ -219,9 +219,20 @@ mount --bind  /a /b     # anything mounted *under* /a is not visible under /b
 mount --rbind /a /c     # it is under /c
 ```
 
-Recursive propagation flags (`--make-rprivate` and friends) are accepted and do
-nothing, which is the honest answer here: there are no mount namespaces to
-propagate between.
+Propagation flags (`--make-rprivate` and friends) are accepted and do
+nothing. Every mount here is private: a mount namespace (`unshare -m`, since
+559) gets a copy of the tree, and nothing mounted on either side afterwards
+reaches the other. That is what `--make-private` and `--make-slave` ask for;
+`--make-shared` is the one that is accepted without being true.
+
+Mounting over a directory hides what was mounted below it, as on Linux, and
+unmounting brings it back:
+
+```sh
+mount -t tmpfs none /mnt/a/b      # a mount at /mnt/a/b
+mount -t tmpfs none /mnt/a        # /mnt/a/b is the new tmpfs's now (and not there)
+umount /mnt/a                     # the first one is back
+```
 
 That last point is the one real difference from a normal Linux box, and it is
 worth keeping in mind — **a bind mount you create is visible to everything**,
@@ -425,8 +436,9 @@ an `/etc/pacman.conf`; it goes quiet once the three things above are dealt
 with, and replacing its contents with a comment turns it off for good.
 
 `/AOK/fixes/codex` is for OpenAI's Codex CLI, which works until it runs a shell
-command: it runs each one inside bubblewrap, which needs user and mount
-namespaces AOK does not have, and it has no fallback. The script tells Codex to
+command: it runs each one inside bubblewrap, which needs user and PID
+namespaces AOK does not have (it has mount namespaces, since 559, and
+`bwrap` asked for one alone works), and it has no fallback. The script tells Codex to
 run commands without that sandbox, by putting
 `sandbox_mode = "danger-full-access"` at the top of `~/.codex/config.toml`;
 Codex's approval policy is unchanged, so it still asks before what it would

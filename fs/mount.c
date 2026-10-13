@@ -6,6 +6,8 @@
 #include "fs/real.h"
 #include "fs/dev.h"
 #include "kernel/binfmt_misc.h"
+#include "kernel/mnt_ns.h"
+#include "kernel/ipc_ns.h" // ns_alloc_inum
 
 // Sized for the static set below plus the two the iOS app registers at
 // startup (iosfs and iosfs_unsafe) with room to spare -- overflowing this
@@ -486,9 +488,21 @@ int mount_set_display_source(const char *point, const char *display_source) {
 // The teardown half of mount_remove, once nothing is using the mount. Caller
 // holds mounts_lock; list_remove on an already-removed, re-initialised node is
 // a no-op, so this is safe for both entry points below.
+static void mount_uncover_locked(const struct mount *top);
+
 static void mount_destroy(struct mount *mount) {
+    // What it covered is in view again (and, when a whole namespace is going,
+    // is found there and taken in its turn).
+    mount_uncover_locked(mount);
     // A mount umount -l parked at a staging point goes as the mount it was:
-    // its filesystem is told the point it was attached at.
+    // its filesystem is told the point it was attached at. So does one that
+    // was covered.
+    if (mount->attached_point == NULL && mount->covered_point != NULL) {
+        mount->attached_point = mount->covered_point;
+        mount->covered_point = NULL;
+    }
+    free((void *) mount->covered_point);
+    mount->covered_point = NULL;
     if (mount->attached_point != NULL) {
         free((void *) mount->point);
         mount->point = mount->attached_point;
@@ -545,6 +559,94 @@ static void mount_list_insert(struct mount *mount) {
     list_add_before(&after->mounts, &mount->mounts);
 }
 
+// ---- Covered mounts (struct mount's covered_by, kernel/fs.h) ---------------
+
+// Are two points in one mount tree? Each namespace's tree is under a staging
+// point of its own, and the initial one's is under none.
+static bool mount_points_same_tree(const char *a, size_t a_len, const char *b, size_t b_len) {
+    size_t tree_a = mount_staging_point_len(a, a_len), tree_b = mount_staging_point_len(b, b_len);
+    return tree_a == tree_b && memcmp(a, b, tree_a) == 0;
+}
+
+#define MOUNT_COVER_ALL 0x7fffffff
+
+// `top` has just been mounted: every mount below its point with an ID under
+// `older_than` is underneath it now, and out of view. (The limit is for a
+// recursive bind, whose copies of the submounts are made below it and are
+// part of it; they are newer than it is.) Caller holds mounts_lock.
+static void mount_cover_below_locked(struct mount *top, int older_than) {
+    bool again = true;
+    while (again) {
+        again = false;
+        struct mount *below;
+        list_for_each_entry(&mounts, below, mounts) {
+            if (below == top || below->detached || below->lazy_umount || below->id >= older_than)
+                continue;
+            if (below->point_len <= top->point_len ||
+                    strncmp(below->point, top->point, top->point_len) != 0 ||
+                    below->point[top->point_len] != '/')
+                continue;
+            if (!mount_points_same_tree(below->point, below->point_len, top->point, top->point_len))
+                continue;
+            char staging[MAX_PATH];
+            mount_staging_point(staging, sizeof(staging));
+            char *point = strdup(staging);
+            if (point == NULL)
+                return;
+            below->covered_point = below->point;
+            below->covered_by = top->id;
+            below->point = point;
+            below->point_len = strlen(point);
+            below->detached = true;
+            list_remove(&below->mounts);
+            mount_list_insert(below);
+            again = true;
+            break;
+        }
+    }
+}
+
+// The mount on top at `point`, covering what is below it. Caller holds
+// mounts_lock.
+static void mount_cover_at_locked(const char *point, bool keep_newer) {
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (!mount->detached && !mount->lazy_umount && strcmp(mount->point, point) == 0) {
+            mount_cover_below_locked(mount, keep_newer ? mount->id : MOUNT_COVER_ALL);
+            return;
+        }
+    }
+}
+
+// `top` is leaving its point: what it covered is where it was again. Not one
+// that was unmounted in the meantime, which stays parked until its last user
+// lets go. Caller holds mounts_lock.
+static void mount_uncover_locked(const struct mount *top) {
+    if (top->id <= 0)
+        return;
+    bool again = true;
+    while (again) {
+        again = false;
+        struct mount *under;
+        list_for_each_entry(&mounts, under, mounts) {
+            if (under->covered_by != top->id)
+                continue;
+            under->covered_by = 0;
+            if (under->lazy_umount || under->covered_point == NULL)
+                continue;
+            free((void *) under->point);
+            under->point = under->covered_point;
+            under->point_len = strlen(under->point);
+            under->covered_point = NULL;
+            under->detached = false;
+            list_remove(&under->mounts);
+            mount_list_insert(under);
+            again = true;
+            break;
+        }
+    }
+}
+
 // Take one mount out of the tree for umount -l, as the last step of
 // mount_remove_lazy. Caller holds mounts_lock.
 static void mount_detach_one(struct mount *mount) {
@@ -552,6 +654,7 @@ static void mount_detach_one(struct mount *mount) {
         mount_destroy(mount);
         return;
     }
+    mount_uncover_locked(mount);
     mount->lazy_umount = true;
     // Already parked: fsmount() made it and nothing placed it.
     if (mount->detached)
@@ -654,7 +757,30 @@ static int do_umount_flags(const char *point, bool lazy) {
     }
     if (!found)
         return _EINVAL;
-    return lazy ? mount_remove_lazy(mount) : mount_remove(mount);
+    if (lazy)
+        return mount_remove_lazy(mount);
+    // What other mount namespaces hold of it is no business of an unmount
+    // here: their copies are mounts of their own (binds of this one, each
+    // with a reference on it), and on Linux this one goes while those stay.
+    // So if nothing BUT such copies is using it, it leaves this tree the way
+    // a lazy unmount takes it out, and lives on for them. Anything else
+    // holding it -- a descriptor, a working directory, a bind in this same
+    // tree -- is EBUSY as before.
+    if (mount->refcount != 0) {
+        unsigned foreign = 0;
+        size_t own = mount_staging_point_len(mount->point, mount->point_len);
+        struct mount *other;
+        list_for_each_entry(&mounts, other, mounts) {
+            if (other->bind_origin != mount)
+                continue;
+            size_t theirs = mount_staging_point_len(other->point, other->point_len);
+            if (theirs != own || memcmp(other->point, mount->point, own) != 0)
+                foreign++;
+        }
+        if (foreign != 0 && foreign == mount->refcount)
+            return mount_remove_lazy(mount);
+    }
+    return mount_remove(mount);
 }
 
 #define MNT_DETACH_ 2
@@ -741,6 +867,454 @@ int mount_detach_tree(const char *point) {
     if (changed || err >= 0)
         proc_mountinfo_notify_changed();
     return err;
+}
+
+// ---- Mount namespaces (kernel/mnt_ns.h) ------------------------------------
+
+struct mnt_namespace init_mnt_ns = {
+    .refcount = 1,
+    // Linux's PROC_MNT_INIT_INO... which it has no constant for: the first
+    // dynamic one a boot hands out, and what /proc/<pid>/ns/mnt has read here.
+    .inode = 4026531840ul,
+};
+
+struct mnt_namespace *mnt_ns_current(void) {
+    return mnt_ns_or_init(current != NULL ? current->mnt_ns : NULL);
+}
+
+bool mnt_ns_has_point(const struct mnt_namespace *ns, const char *point) {
+    size_t staging = mount_staging_point_len(point, strlen(point));
+    if (ns->root_len == 0)
+        return staging == 0;
+    return staging == ns->root_len && memcmp(point, ns->root, ns->root_len) == 0;
+}
+
+// A mount that is in `ns`'s tree now: one a lazy unmount has parked is in no
+// tree, wherever it is. Caller holds mounts_lock.
+static bool mount_in_ns_locked(const struct mount *mount, const struct mnt_namespace *ns) {
+    return !mount->detached && !mount->lazy_umount && mnt_ns_has_point(ns, mount->point);
+}
+
+struct mnt_namespace *mnt_ns_retain(struct mnt_namespace *ns) {
+    if (ns == NULL || ns == &init_mnt_ns)
+        return ns;
+    lock(&mounts_lock, 0);
+    ns->refcount++;
+    unlock(&mounts_lock);
+    return ns;
+}
+
+// The last task, or the last descriptor naming it, is gone: its tree goes
+// with it, each mount as a lazy unmount takes one -- destroyed if nothing is
+// open in it, kept alive off every tree for whoever still holds a descriptor
+// there (one passed to a process in another namespace, say).
+void mnt_ns_release(struct mnt_namespace *ns) {
+    if (ns == NULL || ns == &init_mnt_ns)
+        return;
+    lock(&mounts_lock, 0);
+    if (--ns->refcount != 0) {
+        unlock(&mounts_lock);
+        return;
+    }
+    // Deepest first, which is the list's order; and from the top each time,
+    // since taking one mount out can take others with it.
+    bool again = true;
+    while (again) {
+        again = false;
+        struct mount *mount;
+        list_for_each_entry(&mounts, mount, mounts) {
+            if (!mount_in_ns_locked(mount, ns))
+                continue;
+            mount_detach_one(mount);
+            again = true;
+            break;
+        }
+    }
+    unlock(&mounts_lock);
+    proc_mountinfo_notify_changed();
+    free(ns);
+}
+
+// `mount`, which is in `from`, as it appears in `to`: a bind of the same
+// filesystem at the same place in the tree. Caller holds mounts_lock.
+static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespace *from,
+        const struct mnt_namespace *to) {
+    struct mount *origin = mount->bind_origin != NULL ? mount->bind_origin : mount;
+    const char *rel = mount->point + from->root_len;
+    // calloc for the same reason as do_mount: a field nobody names starts zero.
+    struct mount *copy = calloc(1, sizeof(struct mount));
+    if (copy == NULL)
+        return _ENOMEM;
+    size_t point_len = to->root_len + strlen(rel);
+    char *point = malloc(point_len + 1);
+    if (point != NULL) {
+        memcpy(point, to->root, to->root_len);
+        strcpy(point + to->root_len, rel);
+    }
+    copy->point = point;
+    copy->point_len = point_len;
+    copy->source = strdup(mount->source != NULL ? mount->source : "");
+    // What the mount is listed as is the same in both namespaces.
+    copy->display_source = mount->display_source != NULL ? strdup(mount->display_source) : NULL;
+    copy->info = strdup(mount->info != NULL ? mount->info : "");
+    copy->bind_prefix = strdup(mount->bind_prefix != NULL ? mount->bind_prefix : "");
+    if (copy->point == NULL || copy->source == NULL || copy->info == NULL || copy->bind_prefix == NULL ||
+            (mount->display_source != NULL && copy->display_source == NULL)) {
+        free((void *) copy->point);
+        free((void *) copy->source);
+        free((void *) copy->display_source);
+        free((void *) copy->info);
+        free((void *) copy->bind_prefix);
+        free(copy);
+        return _ENOMEM;
+    }
+    copy->flags = mount->flags;
+    copy->fs = origin->fs;
+    copy->refcount = 0;
+    copy->root_fd = -1;
+    copy->data = NULL;
+    copy->fake_dev = origin->fake_dev;
+    copy->bind_origin = origin;
+    origin->refcount++; // a bind owns one reference on its origin (mount_destroy)
+    copy->id = mount_new_id();
+    mount_list_insert(copy);
+    return 0;
+}
+
+struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from) {
+    from = mnt_ns_or_init(from);
+    struct mnt_namespace *ns = calloc(1, sizeof(*ns));
+    if (ns == NULL)
+        return NULL;
+    ns->refcount = 1;
+    ns->inode = ns_alloc_inum();
+    mount_staging_point(ns->root, sizeof(ns->root));
+    ns->root_len = strlen(ns->root);
+
+    lock(&mounts_lock, 0);
+    // From the tail: shallowest first, and of mounts stacked on one point the
+    // lowest first, so that inserting each (which puts it ahead of the others
+    // at its point) leaves the stack in the order it was. The copies land
+    // elsewhere in the list and are not in `from`, so the walk passes them.
+    int err = 0;
+    struct list *item = mounts.prev;
+    while (item != &mounts) {
+        struct list *prev = item->prev;
+        struct mount *mount = list_entry(item, struct mount, mounts);
+        if (mount_in_ns_locked(mount, from)) {
+            err = mount_copy_to_ns_locked(mount, from, ns);
+            if (err < 0)
+                break;
+        }
+        item = prev;
+    }
+    unlock(&mounts_lock);
+    if (err < 0) {
+        mnt_ns_release(ns);
+        return NULL;
+    }
+    return ns;
+}
+
+// The directory `dir` is, opened where it is in `to`: `from`'s root replaced
+// by `to`'s in its path. NULL when it has no place in `from`'s tree (a
+// directory in a detached mount) or cannot be opened there.
+static struct fd *mnt_ns_same_dir(struct fd *dir, const struct mnt_namespace *from, const struct mnt_namespace *to) {
+    char path[MAX_PATH], moved[MAX_PATH];
+    if (generic_getpath(dir, path) < 0)
+        return NULL;
+    const char *rel = strcmp(path, "/") == 0 ? "" : path;
+    if (!mnt_ns_has_point(from, rel))
+        return NULL;
+    rel += from->root_len;
+    if (to->root_len + strlen(rel) + 1 >= sizeof(moved))
+        return NULL;
+    snprintf(moved, sizeof(moved), "%s%s", to->root, rel);
+    if (moved[0] == '\0')
+        strcpy(moved, "/");
+    struct fd *fd = generic_open_realroot(moved, O_RDONLY_ | O_DIRECTORY_ | O_NOACCESS_CHECK_, 0);
+    return IS_ERR(fd) ? NULL : fd;
+}
+
+int mnt_ns_move_fs(struct fs_info *fs, struct mnt_namespace *from, struct mnt_namespace *to, bool same_place) {
+    from = mnt_ns_or_init(from);
+    to = mnt_ns_or_init(to);
+    lock(&fs->lock, 0);
+    struct fd *old_root = fs->root != NULL ? fd_retain(fs->root) : NULL;
+    struct fd *old_pwd = fs->pwd != NULL ? fd_retain(fs->pwd) : NULL;
+    unlock(&fs->lock);
+
+    struct fd *new_root = NULL, *new_pwd = NULL;
+    if (same_place) {
+        if (old_root != NULL)
+            new_root = mnt_ns_same_dir(old_root, from, to);
+        if (old_pwd != NULL)
+            new_pwd = mnt_ns_same_dir(old_pwd, from, to);
+    }
+    // The namespace's own root for a root that has no counterpart there, and
+    // for every setns: Linux's mntns_install sets both to the tree's root.
+    if (new_root == NULL) {
+        new_root = generic_open_realroot(to->root_len != 0 ? to->root : "/",
+                O_RDONLY_ | O_DIRECTORY_ | O_NOACCESS_CHECK_, 0);
+        if (IS_ERR(new_root)) {
+            int err = (int) PTR_ERR(new_root);
+            if (new_pwd != NULL)
+                fd_close(new_pwd);
+            if (old_root != NULL)
+                fd_close(old_root);
+            if (old_pwd != NULL)
+                fd_close(old_pwd);
+            return err;
+        }
+    }
+    if (new_pwd == NULL && !same_place)
+        new_pwd = fd_retain(new_root);
+
+    lock(&fs->lock, 0);
+    struct fd *dead_root = fs->root;
+    fs->root = new_root;
+    struct fd *dead_pwd = NULL;
+    if (new_pwd != NULL) {
+        dead_pwd = fs->pwd;
+        fs->pwd = new_pwd;
+    }
+    unlock(&fs->lock);
+    if (dead_root != NULL)
+        fd_close(dead_root);
+    if (dead_pwd != NULL)
+        fd_close(dead_pwd);
+    if (old_root != NULL)
+        fd_close(old_root);
+    if (old_pwd != NULL)
+        fd_close(old_pwd);
+    return 0;
+}
+
+// pivot_root: the mount at new_root becomes the root of the caller's
+// namespace, and what was the root, with everything else in the tree, hangs
+// at put_old inside it. In a table of points that is every point in the
+// namespace rewritten at once:
+//
+//     under new_root:   <ns><new_root><x>  ->  <ns><x>
+//     everything else:  <ns><y>            ->  <ns><put_old below new_root><y>
+//
+// Descriptors follow by themselves, since a descriptor's path is its mount's
+// point plus the path inside it. put_old may be new_root itself --
+// pivot_root(".", "."), the form that needs no directory for the old root --
+// and then the old root is stacked on top of the new one at "/", where the
+// umount2(".", MNT_DETACH) that always follows takes it off.
+//
+// The caller's root and working directory move to the new root where they
+// were the old one, as Linux's chroot_fs_refs does for it. (Linux does that
+// for every process in the namespace; other processes here keep the old
+// root, now at put_old, until they chroot. A sandbox pivots before it has
+// anyone else in it.)
+int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
+    struct mnt_namespace *ns = mnt_ns_current();
+    // The initial namespace's root is the machine's: the app's own paths
+    // (/AOK, the other roots, a saved session's files) are all in terms of
+    // it. Linux says EINVAL for a root that is the kernel's own rootfs.
+    if (ns->root_len == 0)
+        return _EINVAL;
+    size_t new_len = strlen(new_root);
+    if (!mnt_ns_has_point(ns, new_root) || !mnt_ns_has_point(ns, put_old))
+        return _EINVAL;
+    // put_old must be at or underneath new_root.
+    if (strncmp(put_old, new_root, new_len) != 0 || (put_old[new_len] != '/' && put_old[new_len] != '\0'))
+        return _EINVAL;
+    // new_root must not be the current root.
+    if (new_len == ns->root_len)
+        return _EBUSY;
+    const char *old_below_new = put_old + new_len; // "" or "/dir..."
+
+    // The caller's root must be the namespace's root (a mount point, as
+    // pivot_root wants it); and the directory that will be its root, held
+    // before any point changes, while new_root still names it.
+    char root_path[MAX_PATH], pwd_path[MAX_PATH] = "";
+    int err = fs_root_path(current->fs, root_path);
+    if (err < 0)
+        return err;
+    if (strcmp(root_path, ns->root) != 0)
+        return _EINVAL;
+    lock(&current->fs->lock, 0);
+    struct fd *pwd = current->fs->pwd != NULL ? fd_retain(current->fs->pwd) : NULL;
+    unlock(&current->fs->lock);
+    if (pwd != NULL) {
+        if (generic_getpath(pwd, pwd_path) < 0)
+            pwd_path[0] = '\0';
+        fd_close(pwd);
+    }
+    struct fd *root_fd = generic_open_realroot(new_root, O_RDONLY_ | O_DIRECTORY_ | O_NOACCESS_CHECK_, 0);
+    if (IS_ERR(root_fd))
+        return (int) PTR_ERR(root_fd);
+
+    lock(&mounts_lock, 0);
+    // new_root has to be a mount point.
+    struct mount *mount;
+    bool is_point = false;
+    size_t count = 0;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (!mount_in_ns_locked(mount, ns))
+            continue;
+        count++;
+        if (strcmp(mount->point, new_root) == 0)
+            is_point = true;
+    }
+    if (!is_point) {
+        unlock(&mounts_lock);
+        fd_close(root_fd);
+        return _EINVAL;
+    }
+    struct mount **moved = calloc(count, sizeof(*moved));
+    char **points = calloc(count, sizeof(*points));
+    bool *under_new = calloc(count, sizeof(*under_new));
+    err = moved == NULL || points == NULL || under_new == NULL ? _ENOMEM : 0;
+    // Tail to head, as in mnt_ns_copy: reinserting in this order keeps each
+    // stack of mounts on one point in the order it was.
+    size_t n = 0;
+    for (struct list *item = mounts.prev; err == 0 && item != &mounts; item = item->prev) {
+        mount = list_entry(item, struct mount, mounts);
+        if (!mount_in_ns_locked(mount, ns))
+            continue;
+        bool under = strncmp(mount->point, new_root, new_len) == 0 &&
+            (mount->point[new_len] == '/' || mount->point[new_len] == '\0');
+        const char *rest = under ? mount->point + new_len : mount->point + ns->root_len;
+        size_t len = ns->root_len + (under ? 0 : strlen(old_below_new)) + strlen(rest);
+        char *point = len < MAX_PATH ? malloc(len + 1) : NULL;
+        if (point == NULL) {
+            err = len < MAX_PATH ? _ENOMEM : _ENAMETOOLONG;
+            break;
+        }
+        snprintf(point, len + 1, "%s%s%s", ns->root, under ? "" : old_below_new, rest);
+        moved[n] = mount;
+        points[n] = point;
+        under_new[n] = under;
+        n++;
+    }
+    if (err < 0) {
+        for (size_t i = 0; i < n; i++)
+            free(points[i]);
+        free(moved);
+        free(points);
+        free(under_new);
+        unlock(&mounts_lock);
+        fd_close(root_fd);
+        return err;
+    }
+    // Nothing can fail from here. The new root's tree first, then the old
+    // one's, so that an old root put at "/" (put_old == new_root) is the one
+    // on top.
+    //
+    // Mounts covered in this tree move with it: the point each returns to is
+    // rewritten by the same rule. (Best effort: one whose new point cannot be
+    // had stays parked for good.)
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount->covered_by == 0 || mount->covered_point == NULL ||
+                !mnt_ns_has_point(ns, mount->covered_point))
+            continue;
+        const char *was = mount->covered_point;
+        bool under = strncmp(was, new_root, new_len) == 0 && (was[new_len] == '/' || was[new_len] == '\0');
+        const char *rest = under ? was + new_len : was + ns->root_len;
+        size_t len = ns->root_len + (under ? 0 : strlen(old_below_new)) + strlen(rest);
+        char *point = len < MAX_PATH ? malloc(len + 1) : NULL;
+        if (point != NULL)
+            snprintf(point, len + 1, "%s%s%s", ns->root, under ? "" : old_below_new, rest);
+        free((void *) was);
+        mount->covered_point = point;
+    }
+    // The old root, for the stacked form below: the mount on top at the
+    // namespace's root before anything moves.
+    struct mount *old_root_mount = NULL;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount_in_ns_locked(mount, ns) && mount->point_len == ns->root_len) {
+            old_root_mount = mount;
+            break;
+        }
+    }
+    char **old_points = calloc(n, sizeof(*old_points));
+    for (size_t i = 0; i < n; i++)
+        list_remove(&moved[i]->mounts);
+    for (int pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < n; i++) {
+            if (under_new[i] != (pass == 0))
+                continue;
+            if (old_points != NULL)
+                old_points[i] = (char *) moved[i]->point;
+            else
+                free((void *) moved[i]->point);
+            moved[i]->point = points[i];
+            moved[i]->point_len = strlen(points[i]);
+            mount_list_insert(moved[i]);
+            moved[i]->refcount++; // for mount_notify_relocated, below
+        }
+    }
+    // pivot_root(".", "."): the old root is mounted over the new one, so what
+    // is mounted in the new one is underneath it until the old root is
+    // unmounted -- which then leaves exactly the new root's tree. Without
+    // this that unmount, of the mount at "/" and all below it, took the new
+    // root's mounts with it.
+    if (old_below_new[0] == '\0' && old_root_mount != NULL) {
+        for (size_t i = 0; i < n; i++) {
+            if (!under_new[i] || moved[i]->point_len == ns->root_len || moved[i]->detached)
+                continue;
+            char staging[MAX_PATH];
+            mount_staging_point(staging, sizeof(staging));
+            char *parked = strdup(staging);
+            if (parked == NULL)
+                continue;
+            // (Its old point is told to its filesystem below; the point it
+            // was just given is the one it comes back to.)
+            moved[i]->covered_point = moved[i]->point;
+            moved[i]->covered_by = old_root_mount->id;
+            moved[i]->point = parked;
+            moved[i]->point_len = strlen(parked);
+            moved[i]->detached = true;
+            list_remove(&moved[i]->mounts);
+            mount_list_insert(moved[i]);
+        }
+    }
+    // Where each is now, as its filesystem is to hear it: for one just
+    // covered, the point it returns to.
+    char **new_points = old_points != NULL ? calloc(n, sizeof(*new_points)) : NULL;
+    for (size_t i = 0; new_points != NULL && i < n; i++)
+        new_points[i] = strdup(moved[i]->covered_point != NULL ? moved[i]->covered_point : moved[i]->point);
+    unlock(&mounts_lock);
+    // A filesystem with something keyed to its point hears of the move
+    // (fs_ops.relocated), outside the lock as for MS_MOVE.
+    for (size_t i = 0; i < n; i++) {
+        if (new_points != NULL && new_points[i] != NULL)
+            mount_notify_relocated(moved[i], old_points[i], new_points[i]);
+        else
+            mount_release(moved[i]);
+        if (old_points != NULL)
+            free(old_points[i]);
+        if (new_points != NULL)
+            free(new_points[i]);
+    }
+    free(new_points);
+    free(old_points);
+    free(moved);
+    free(points);
+    free(under_new);
+    proc_mountinfo_notify_changed();
+
+    // The caller's root was the old root: it is the new one now. So is its
+    // working directory, if that was the old root too.
+    struct fd *pwd_fd = strcmp(pwd_path, ns->root) == 0 ? fd_retain(root_fd) : NULL;
+    lock(&current->fs->lock, 0);
+    struct fd *dead_root = current->fs->root;
+    current->fs->root = root_fd;
+    struct fd *dead_pwd = NULL;
+    if (pwd_fd != NULL) {
+        dead_pwd = current->fs->pwd;
+        current->fs->pwd = pwd_fd;
+    }
+    unlock(&current->fs->lock);
+    if (dead_root != NULL)
+        fd_close(dead_root);
+    if (dead_pwd != NULL)
+        fd_close(dead_pwd);
+    return 0;
 }
 
 // Checks whether `flag` appears as a whole comma-separated token in `info`
@@ -1004,6 +1578,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         printk("INFO: elogind mount pid=%d comm=%s source=%s target=%s type=%s flags=%#x data=%s\n",
                current->pid, current->comm, source, point_raw, type, flags, data_addr != 0 ? data : "");
 
+    // The magic number 2.2-era callers put in the top half of the flags, and
+    // some still do (bubblewrap passes MS_MGC_VAL with every bind): Linux's
+    // path_mount discards it before it reads a single flag.
+    if ((flags & 0xffff0000) == 0xc0ed0000)
+        flags &= ~0xffff0000;
     dword_t unhandled = flags & ~MS_SUPPORTED & ~MS_OP & ~MS_IGNORED;
     if (unhandled) {
         FIXME("missing mount flags %#x from %s[%d]", unhandled, current->comm, current->pid);
@@ -1011,9 +1590,12 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     }
 
     // A propagation-type change (mount --make-[r]private/shared/slave/unbindable)
-    // is its own operation that carries no new filesystem. iSH has no mount
-    // namespaces or peer groups, so the change has no observable effect -- accept
-    // it as a no-op rather than rejecting the caller (systemd issues these at boot).
+    // is its own operation that carries no new filesystem. AOK has no peer
+    // groups: every mount is private, a mount namespace's copy of the tree
+    // included (kernel/mnt_ns.h), and nothing ever propagates. Private and
+    // slave are therefore what is already true; shared is accepted and not
+    // done, which is the one a caller could notice (systemd issues these at
+    // boot, and a sandbox makes its tree private or slave before anything else).
     if ((flags & MS_PROPAGATION) && !(flags & MS_BIND_))
         return 0;
 
@@ -1035,7 +1617,9 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     // A point inside a detached mount -- reachable only from a cwd or dirfd
     // already in it -- is in no mount tree for a mount to join or be changed
     // in. Linux's check_mnt() refuses it with EINVAL for every operation.
-    if (mount_staging_point_len(point, strlen(point)) != 0)
+    // (A mount namespace's tree is under a staging point too, and that is
+    // not this: its points are in the caller's tree. kernel/mnt_ns.h.)
+    if (!mnt_ns_has_point(mnt_ns_current(), point))
         return _EINVAL;
 
     // MS_MOVE and MS_BIND name an existing path as their "source"; resolve it
@@ -1051,7 +1635,7 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         if (err < 0)
             return err;
         // Nor is anything bound or moved out of one.
-        if ((flags & MS_BIND_) && mount_staging_point_len(op_source, strlen(op_source)) != 0)
+        if ((flags & MS_BIND_) && !mnt_ns_has_point(mnt_ns_current(), op_source))
             return _EINVAL;
     }
 
@@ -1076,6 +1660,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
         if (err >= 0) {
             if (flags & MS_REC_)
                 bind_replicate_submounts(op_source, point, data, flags & MS_FLAGS);
+            // What was mounted below the point is under the bind now. Not the
+            // copies a recursive bind has just made there: they are its own.
+            lock(&mounts_lock, 0);
+            mount_cover_at_locked(point, true);
+            unlock(&mounts_lock);
             proc_mountinfo_notify_changed();
         }
         return err;
@@ -1109,6 +1698,8 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
             unlock(&mounts_lock);
             return _ENOMEM;
         }
+        // It uncovers what it was over, and covers what it lands on.
+        mount_uncover_locked(found);
         free((void *) found->point);
         found->point = new_point;
         found->point_len = strlen(new_point);
@@ -1120,6 +1711,7 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
                 break;
         }
         list_add_before(&after->mounts, &found->mounts);
+        mount_cover_below_locked(found, MOUNT_COVER_ALL);
         found->refcount++;  // for mount_notify_relocated
         unlock(&mounts_lock);
         mount_notify_relocated(found, op_source, point);
@@ -1136,8 +1728,12 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
                 // The filesystem's own options (tmpfs's size=) first, so a
                 // refusal changes nothing. MS_REMOUNT|MS_BIND changes the
                 // mount's flags alone, as on Linux.
+                // A bind has no filesystem of its own to reconfigure: its
+                // origin's is the one (and every mount of a copied mount
+                // namespace is a bind, so `mount -o remount /` gets here).
                 if (mount->fs->remount != NULL && !(flags & MS_BIND_)) {
-                    int err = mount->fs->remount(mount, data);
+                    struct mount *sb = mount->bind_origin != NULL ? mount->bind_origin : mount;
+                    int err = sb->fs->remount(sb, data);
                     if (err < 0) {
                         unlock(&mounts_lock);
                         return err;
@@ -1191,6 +1787,11 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     }
 
     err = do_mount(fs, source, point, data, flags & MS_FLAGS);
+    // The kernel's own mounts (do_mount from boot, the app, a restored
+    // session) come in no particular order and cover nothing; a guest's
+    // covers what was mounted below its point, as on Linux.
+    if (err >= 0)
+        mount_cover_at_locked(point, false);
     unlock(&mounts_lock);
     if (err >= 0)
         proc_mountinfo_notify_changed();
@@ -1232,6 +1833,39 @@ dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags) {
 
 dword_t sys_umount2(addr_t target_addr, dword_t flags) {
     return sys_umount2_guest(target_addr, flags);
+}
+
+// pivot_root(new_root, put_old): see mnt_ns_pivot_root.
+dword_t sys_pivot_root_guest(guest_addr_t new_root_addr, guest_addr_t put_old_addr) {
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
+    char new_raw[MAX_PATH], old_raw[MAX_PATH];
+    int path_err = user_read_path(new_root_addr, new_raw, sizeof(new_raw));
+    if (path_err == 0)
+        path_err = user_read_path(put_old_addr, old_raw, sizeof(old_raw));
+    if (path_err)
+        return path_err;
+    STRACE("pivot_root(\"%s\", \"%s\")", new_raw, old_raw);
+    // Both name directories that exist.
+    char new_root[MAX_PATH], put_old[MAX_PATH];
+    const char *raw[2] = {new_raw, old_raw};
+    char *norm[2] = {new_root, put_old};
+    for (int i = 0; i < 2; i++) {
+        struct statbuf stat;
+        int err = generic_statat(AT_PWD, raw[i], &stat, 0);
+        if (err < 0)
+            return err;
+        if (!S_ISDIR(stat.mode))
+            return _ENOTDIR;
+        err = path_normalize(AT_PWD, raw[i], norm[i], N_SYMLINK_FOLLOW);
+        if (err < 0)
+            return err;
+    }
+    return mnt_ns_pivot_root(new_root, put_old);
+}
+
+dword_t sys_pivot_root(addr_t new_root_addr, addr_t put_old_addr) {
+    return sys_pivot_root_guest(new_root_addr, put_old_addr);
 }
 
 struct list mounts = {&mounts, &mounts};
@@ -1698,6 +2332,176 @@ fd_t sys_fsmount(fd_t f, dword_t flags, dword_t attr_flags) {
     return sys_fsmount_guest(f, flags, attr_flags);
 }
 
+// ---- mount_setattr ----------------------------------------------------------
+//
+// The per-mount flags of the mount whose root a path names, and with
+// AT_RECURSIVE of every mount below it. It is what MS_REMOUNT|MS_BIND does,
+// said without a filesystem's options in the way, and how bubblewrap makes a
+// tree read-only.
+
+#define AT_RECURSIVE_ 0x8000
+#define MOUNT_ATTR_IDMAP_ 0x100000
+
+struct mount_attr_ {
+    qword_t attr_set;
+    qword_t attr_clr;
+    qword_t propagation;
+    qword_t userns_fd;
+};
+
+// The MS_ flags the MOUNT_ATTR_ bits in `attr` stand for, the atime ones
+// apart.
+static int mount_attr_ms_flags(qword_t attr) {
+    int flags = 0;
+    if (attr & MOUNT_ATTR_RDONLY_) flags |= MS_READONLY_;
+    if (attr & MOUNT_ATTR_NOSUID_) flags |= MS_NOSUID_;
+    if (attr & MOUNT_ATTR_NODEV_) flags |= MS_NODEV_;
+    if (attr & MOUNT_ATTR_NOEXEC_) flags |= MS_NOEXEC_;
+    if (attr & MOUNT_ATTR_NODIRATIME_) flags |= MS_NODIRATIME_;
+    if (attr & MOUNT_ATTR_NOSYMFOLLOW_) flags |= MS_NOSYMFOLLOW_;
+    return flags;
+}
+
+dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags,
+        guest_addr_t attr_addr, guest_addr_t size) {
+    char path_raw[MAX_PATH];
+    if (user_read_string(path_addr, path_raw, sizeof(path_raw)))
+        return _EFAULT;
+    STRACE("mount_setattr(%d, \"%s\", %#x, %#llx, %llu)", dfd, path_raw, flags,
+            (unsigned long long) attr_addr, (unsigned long long) size);
+    if (flags & ~(AT_EMPTY_PATH_ | AT_RECURSIVE_ | AT_SYMLINK_NOFOLLOW_ | AT_NO_AUTOMOUNT_))
+        return _EINVAL;
+    // copy_struct_from_user: a struct shorter than the first version is
+    // EINVAL, one larger than a page E2BIG, and anything past what is known
+    // here must be zero. Between the size and the copy, may_mount().
+    struct mount_attr_ attr;
+    if (size > 4096)
+        return _E2BIG;
+    if (size < sizeof(attr))
+        return _EINVAL;
+    if (!current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
+    if (user_read(attr_addr, &attr, sizeof(attr)))
+        return _EFAULT;
+    for (guest_addr_t offset = sizeof(attr); offset < size; offset++) {
+        char extra;
+        if (user_read(attr_addr + offset, &extra, 1))
+            return _EFAULT;
+        if (extra != 0)
+            return _E2BIG;
+    }
+    // Nothing asked: nothing looked at, the path included.
+    if (attr.attr_set == 0 && attr.attr_clr == 0 && attr.propagation == 0)
+        return 0;
+
+    const qword_t known = MOUNT_ATTR_RDONLY_ | MOUNT_ATTR_NOSUID_ | MOUNT_ATTR_NODEV_ |
+            MOUNT_ATTR_NOEXEC_ | MOUNT_ATTR__ATIME_ | MOUNT_ATTR_NODIRATIME_ |
+            MOUNT_ATTR_NOSYMFOLLOW_ | MOUNT_ATTR_IDMAP_;
+    if ((attr.attr_set | attr.attr_clr) & ~known)
+        return _EINVAL;
+    switch (attr.propagation) {
+        case 0: case MS_UNBINDABLE_: case MS_PRIVATE_: case MS_SLAVE_: case MS_SHARED_: break;
+        default: return _EINVAL;
+    }
+    // The atime mode is one field, not three bits: it changes only when the
+    // whole of it is cleared, and then to the one mode set.
+    int set = mount_attr_ms_flags(attr.attr_set);
+    int clear = mount_attr_ms_flags(attr.attr_clr);
+    if (attr.attr_clr & MOUNT_ATTR__ATIME_) {
+        if ((attr.attr_clr & MOUNT_ATTR__ATIME_) != MOUNT_ATTR__ATIME_)
+            return _EINVAL;
+        clear |= MS_NOATIME_ | MS_STRICTATIME_ | MS_RELATIME_;
+        switch (attr.attr_set & MOUNT_ATTR__ATIME_) {
+            case MOUNT_ATTR_RELATIME_: set |= MS_RELATIME_; break;
+            case MOUNT_ATTR_NOATIME_: set |= MS_NOATIME_; break;
+            case MOUNT_ATTR_STRICTATIME_: break;
+            default: return _EINVAL;
+        }
+    } else if (attr.attr_set & MOUNT_ATTR__ATIME_) {
+        return _EINVAL;
+    }
+    // An id-mapped mount needs a user namespace to map through, and there
+    // are none of those to name.
+    if ((attr.attr_set | attr.attr_clr) & MOUNT_ATTR_IDMAP_)
+        return _EINVAL;
+
+    char point[MAX_PATH];
+    if (path_raw[0] == '\0') {
+        if (!(flags & AT_EMPTY_PATH_))
+            return _ENOENT;
+        struct fd *fd = at_fd_for_path(dfd, "");
+        if (fd == NULL)
+            return _EBADF;
+        lock(&current->fs->lock, 0);
+        if (fd == AT_PWD)
+            fd = current->fs->pwd;
+        fd_retain(fd);
+        unlock(&current->fs->lock);
+        int err = generic_getpath(fd, point);
+        fd_close(fd);
+        if (err < 0)
+            return err;
+        if (!path_is_normalized(point))
+            return _EINVAL;     // a pipe, a socket: on no mount a caller may change
+    } else {
+        struct fd *at = at_fd_for_path(dfd, path_raw);
+        if (at == NULL)
+            return _EBADF;
+        int err = path_normalize(at, path_raw, point,
+                (flags & AT_SYMLINK_NOFOLLOW_) ? N_SYMLINK_NOFOLLOW : N_SYMLINK_FOLLOW);
+        if (err < 0)
+            return err;
+        struct statbuf stat;
+        err = generic_statat(at, path_raw, &stat,
+                (flags & AT_SYMLINK_NOFOLLOW_) ? AT_SYMLINK_NOFOLLOW_ : 0);
+        if (err < 0)
+            return err;
+    }
+    if (strcmp(point, "/") == 0)
+        point[0] = '\0';
+    // check_mnt(): a mount in the caller's tree -- or in none yet, the one
+    // fsmount() has made and move_mount() not placed, which is how systemd
+    // sets the flags of the /proc it is about to give a service. Not a mount
+    // of another namespace, nor one unmounted or covered.
+    bool in_tree = mnt_ns_has_point(mnt_ns_current(), point);
+
+    size_t point_len = strlen(point);
+    lock(&mounts_lock, 0);
+    // path_mounted(): the path is the root of a mount, not somewhere in one.
+    struct mount *top = NULL, *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount->lazy_umount || mount->covered_by != 0 || strcmp(mount->point, point) != 0)
+            continue;
+        if (in_tree ? !mount->detached : mount->detached)
+            top = mount;
+        break;
+    }
+    if (top == NULL) {
+        unlock(&mounts_lock);
+        return _EINVAL;
+    }
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount != top) {
+            if (!(flags & AT_RECURSIVE_) || mount->detached || mount->lazy_umount)
+                continue;
+            if (strncmp(mount->point, point, point_len) != 0 || mount->point[point_len] != '/')
+                continue;
+            // The whole table sorts under the initial namespace's root, the
+            // trees of the others included, and those are not below it.
+            if (!mnt_ns_has_point(mnt_ns_current(), mount->point))
+                continue;
+        }
+        mount->flags = (mount->flags & ~clear) | set;
+    }
+    unlock(&mounts_lock);
+    proc_mountinfo_notify_changed();
+    return 0;
+}
+
+dword_t sys_mount_setattr(fd_t dfd, addr_t path_addr, dword_t flags, addr_t attr_addr, dword_t size) {
+    return sys_mount_setattr_guest(dfd, path_addr, flags, attr_addr, size);
+}
+
 // The filesystem backing the mount rooted exactly at `point`, or NULL.
 // Caller must hold mounts_lock.
 static struct mount *mount_at_point_locked(const char *point) {
@@ -1757,6 +2561,14 @@ static int mount_relocate(const char *from_point, const char *to_point) {
         unlock(&mounts_lock);
         return _ENOMEM;
     }
+    // A covered mount, moved by a descriptor inside it, is covered no more;
+    // and wherever it comes from, it covers what it lands on.
+    mount_uncover_locked(found);
+    if (found->covered_by != 0) {
+        found->covered_by = 0;
+        free((void *) found->covered_point);
+        found->covered_point = NULL;
+    }
     free((void *) found->point);
     found->point = new_point;
     found->point_len = strlen(new_point);
@@ -1767,6 +2579,10 @@ static int mount_relocate(const char *from_point, const char *to_point) {
             break;
     }
     list_add_before(&after->mounts, &found->mounts);
+    bool was_detached = found->detached;
+    found->detached = false;
+    mount_cover_below_locked(found, MOUNT_COVER_ALL);
+    found->detached = was_detached;
     found->refcount++;  // for mount_notify_relocated
     unlock(&mounts_lock);
     mount_notify_relocated(found, from_point, to_point);

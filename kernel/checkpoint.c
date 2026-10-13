@@ -2914,6 +2914,15 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
     free(exe_memfd);
     if (rec.ngroups > 0)
         wr(w, task->groups, rec.ngroups * sizeof(*task->groups));
+    // A mount namespace of its own is not in an image: the task's files are
+    // recorded by where they are on their filesystems, and a restore would
+    // put it back in the machine's own tree -- out of whatever it had been
+    // confined to. Refuse rather than do that.
+    if (task->mnt_ns != NULL && w->err == 0) {
+        ckpt_refuse("pid %d is in a mount namespace of its own (a sandbox, or a "
+                    "service with private mounts), which a saved session does not carry", task->pid);
+        w->err = _EBUSY;
+    }
     if (rec.seccomp_nprogs > 0) {
         // The task is frozen, so no sibling's TSYNC can change the chain
         // between the count above and this.
@@ -3405,6 +3414,26 @@ static int ckpt_save(const char *host_path, unsigned flags) {
     // restore counts as time spent stopped is measured from here.
     struct guest_clock_reading clocks;
     guest_clock_read(&clocks);
+
+    // A mount another was mounted over is not in an image either: a restore
+    // makes the mounts it knows of in an order of its own, and the one
+    // underneath would be gone for good when the one over it is unmounted.
+    lock(&mounts_lock, 0);
+    char covered_at[MAX_PATH] = "";
+    struct mount *covered;
+    list_for_each_entry(&mounts, covered, mounts) {
+        if (covered->covered_by != 0 && !covered->lazy_umount && covered->covered_point != NULL) {
+            snprintf(covered_at, sizeof(covered_at), "%s", covered->covered_point);
+            break;
+        }
+    }
+    unlock(&mounts_lock);
+    if (covered_at[0] != '\0') {
+        ckpt_thaw_all();
+        ckpt_refuse("the mount at %s has another mounted over it, which a saved "
+                    "session does not carry", covered_at);
+        return _EBUSY;
+    }
 
     // Zombies and departed leaders included: the ordinary collection skips
     // both, and every zombie in a session used to be lost at a save.

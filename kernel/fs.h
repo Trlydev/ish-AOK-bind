@@ -264,6 +264,18 @@ struct mount {
     // filesystem's umount hook is shown this point again when the last user
     // lets go: iosfs keys a mount's bookmark by it.
     const char *attached_point;
+
+    // A mount another was mounted over: `mount -t tmpfs none /dev` hides the
+    // devpts at /dev/pts, and unmounting that tmpfs brings it back. In a
+    // table of points the two would both answer for "/dev/pts" -- the longer
+    // point wins every lookup, so the mount underneath stayed in view and the
+    // new /dev came with the old /dev/pts in it. So a covered mount is parked
+    // at a staging point, as a busy lazily-unmounted one is and for the same
+    // reason (what is open in it goes on working), with the ID of the mount
+    // that covers it and the point it returns to when that one goes.
+    // fs/mount.c, mount_cover_below_locked.
+    int covered_by;
+    const char *covered_point;
 };
 extern lock_t mounts_lock;
 

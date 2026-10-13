@@ -97,7 +97,7 @@ derived from the listed paths rather than declared in `fs/aok.c`.
 
 ## A note on `/proc`, `/sys`, and `/dev`
 
-iSH-AOK has no mount or PID namespaces — there's exactly one Linux kernel
+iSH-AOK has no PID namespaces — there's exactly one Linux kernel
 underneath everything, so `/proc`, `/sys`, and `/dev` always reflect the
 single true system state no matter which root or chroot you're looking at
 them from. That's what makes tools like [ktop](ktop.md) useful from outside

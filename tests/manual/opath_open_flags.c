@@ -15,6 +15,12 @@
 // F_SETFD and F_GETFL, and everything else -- F_SETFL, locks, owners, seals
 // -- is EBADF (check_fcntl_cmd). AOK went on to act on it.
 //
+// Nor does it open a device: it names the node. /dev/tty in a session with no
+// controlling terminal is ENXIO to an open and a handle to O_PATH, with the
+// node's type. AOK opened the device either way, and bubblewrap -- which
+// binds /dev/tty into every sandbox's /dev from such a handle -- stopped
+// there whenever it was run without a terminal.
+//
 // Run as root the truncation cases are run again as uid 65534 in a child.
 //
 // Oracle: Linux 6.12 (camd), glibc x86_64 and -m32, as root and as uid 1000.
@@ -195,6 +201,42 @@ int main(int argc, char **argv) {
             close((int) r);
     }
     check(size_of(file) == 5, "the file still has its 5 bytes (size %ld)", size_of(file));
+
+    // A device that will not open. The child has a session of its own, so
+    // no controlling terminal; its exit status says what it found.
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        if (setsid() < 0)
+            _exit(10);
+        struct stat st;
+        if (stat("/dev/tty", &st) != 0 || !S_ISCHR(st.st_mode))
+            _exit(11); // no /dev/tty here to ask about
+        int fd = open("/dev/tty", O_RDONLY | O_NOCTTY);
+        if (fd >= 0 || errno != ENXIO)
+            _exit(12); // the control: it must be a device that refuses
+        fd = open("/dev/tty", O_PATH);
+        if (fd < 0)
+            _exit(errno == ENXIO ? 13 : 14);
+        if (fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
+            _exit(15);
+        char c;
+        errno = 0;
+        if (read(fd, &c, 1) != -1 || errno != EBADF)
+            _exit(16);
+        _exit(0);
+    }
+    int status = -1;
+    waitpid(pid, &status, 0);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    if (code == 11 || code == 12)
+        test_logf("/dev/tty is absent or opens with no controlling terminal (%d): not checked\n", code);
+    else
+        check(code == 0, "O_PATH on /dev/tty with no controlling terminal: %s (%d)",
+              code == 13 ? "ENXIO, the device's own answer" :
+              code == 14 ? "another error" :
+              code == 15 ? "not a character device to fstat" :
+              code == 16 ? "the handle reads" : code == 0 ? "a handle" : "the child died", code);
 
     unlink(file);
     rmdir(dir);

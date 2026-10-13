@@ -8,6 +8,7 @@
 #include "emu/memory.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/uts.h"
+#include "kernel/mnt_ns.h"
 #include "kernel/rseq.h"
 #include "kernel/calls.h"
 #include "fs/proc.h"
@@ -1938,11 +1939,20 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
     unsigned nstype = proc_ns_types[index].nstype;
     if (ns_out != NULL)
         *ns_out = NULL;
-    if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_)
+    if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_ && nstype != CLONE_NEWNS_)
         return inode;
     // Not a plain lock: see task_lock_unless_exiting.
     if (!task_lock_unless_exiting(task))
         return 0;
+    if (nstype == CLONE_NEWNS_) {
+        // A task's NULL is the initial namespace, and so is a descriptor's:
+        // only another one is held.
+        inode = mnt_ns_or_init(task->mnt_ns)->inode;
+        if (ns_out != NULL)
+            *ns_out = mnt_ns_retain(task->mnt_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
     inode = 0;
     if (nstype == CLONE_NEWUTS_ && task->uts_ns != NULL) {
         inode = task->uts_ns->inode;
@@ -1969,6 +1979,8 @@ static void proc_ns_release(unsigned index, void *ns) {
         uts_ns_release(ns);
     else if (proc_ns_types[index].nstype == CLONE_NEWIPC_)
         ipc_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWNS_)
+        mnt_ns_release(ns);
 }
 
 static int proc_pid_ns_readlink(struct proc_entry *entry, char *buf) {
@@ -2137,6 +2149,8 @@ bool proc_ns_fd_is_initial(struct fd *fd) {
         return ns == NULL || ns == &init_uts_ns;
     if (nstype == CLONE_NEWIPC_)
         return ns == NULL || ns == &init_ipc_ns;
+    if (nstype == CLONE_NEWNS_)
+        return ns == NULL || ns == &init_mnt_ns;
     return true;
 }
 

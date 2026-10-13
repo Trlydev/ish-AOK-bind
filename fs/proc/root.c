@@ -1014,6 +1014,10 @@ static int proc_mounts_root(struct proc_entry *entry, char *root_path) {
 // chroot legs a bind the test had just made never matched its own path.
 static bool proc_mount_point_in_root(const char *point, const char *root, char *out) {
     if (strcmp(root, "/") == 0) {
+        // Another mount namespace's tree is under a staging point
+        // (kernel/mnt_ns.h), where no path from this root leads.
+        if (mount_staging_point_len(point, strlen(point)) != 0)
+            return false;
         strcpy(out, point[0] == '\0' ? "/" : point);
         return true;
     }
@@ -1097,6 +1101,11 @@ int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf) {
 // is the rootfs outside every process's root.
 static int proc_mountinfo_parent_id(struct mount *target) {
     struct mount *mount;
+    // The root of a mount namespace's tree sits on nothing a listing shows,
+    // as the initial root does; its point has the initial root's "" for a
+    // prefix like every other, which is not the same thing.
+    bool ns_root = mount_staging_point_len(target->point, target->point_len) == target->point_len &&
+        target->point_len != 0;
     // Mounted on top of another mount at the very same point -- a second
     // mount on /mnt, or on / -- it sits on that one, as on Linux. The list
     // keeps equal points newest first, so the mount directly beneath is the
@@ -1115,7 +1124,12 @@ static int proc_mountinfo_parent_id(struct mount *target) {
     // point is "", a prefix of every other point.
     list_for_each_entry(&mounts, mount, mounts) {
         size_t n = mount->point_len;
+        if (ns_root)
+            break;
         if (mount->detached || n >= target->point_len)
+            continue;
+        // ...and nothing in a namespace's tree sits on a mount outside it.
+        if (mount_staging_point_len(target->point, target->point_len) != mount_staging_point_len(mount->point, n))
             continue;
         if (strncmp(target->point, mount->point, n) == 0 && target->point[n] == '/')
             return mount_id(mount);

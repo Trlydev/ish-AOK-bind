@@ -130,6 +130,8 @@ chroot_dotdot.c
 proc_link_chroot_escape.c
 proc_net_socket_ids.c
 mount_lazy_detached.c
+mntns_basic.c
+mount_cover_setattr.c
 exec_link_by_fd.c
 exec_fd_pathless.c
 tmpfs_nlink.c

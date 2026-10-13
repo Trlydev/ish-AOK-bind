@@ -4,6 +4,7 @@
 #include "emu/cpu.h"
 #include "kernel/rseq.h"
 #include "kernel/ipc_ns.h"
+#include "kernel/mnt_ns.h"
 #include "kernel/calls.h"
 #include "kernel/acct.h"
 #include "fs/sock.h"
@@ -895,6 +896,11 @@ noreturn void do_exit(struct task *task, int status) {
     struct uts_namespace *dead_uts = task->uts_ns;
     task->uts_ns = NULL;
     uts_ns_release(dead_uts);
+    // After the fs_info above, whose root and working directory were in it:
+    // the last task out takes the namespace's tree with it.
+    struct mnt_namespace *dead_mnt = task->mnt_ns;
+    task->mnt_ns = NULL;
+    mnt_ns_release(dead_mnt);
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads
 

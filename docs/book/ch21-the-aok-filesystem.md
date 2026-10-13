@@ -157,16 +157,17 @@ misconfigured something or whether the feature was never compiled in.
 
 ## 21.6 The advantage hiding inside a limitation
 
-Chapter 10 established that AOK has no PID or mount namespaces, and treated it
-as a limitation — nothing container-shaped works, and that is architectural.
+Chapter 10 established that AOK has no PID namespaces, and that a mount table
+of one's own is something a process has to ask for; it treated that as a
+limitation — nothing container-shaped works, and that is architectural.
 
 `/AOK` is where the same fact reads as an advantage, and the in-app overview
 states it directly:
 
-> iSH-AOK has no mount or PID namespaces — there's exactly one emulated Linux kernel
+> iSH-AOK has no PID namespaces — there's exactly one Linux kernel
 > underneath everything, so `/proc`, `/sys`, and `/dev` always reflect the
-> single true system state no matter which root or chroot you're looking at them
-> from.
+> single true system state no matter which root or chroot you're looking at
+> them from.
 
 So a process viewer running inside a chroot sees *every* process on the system,
 across every mounted root, labelled by guest architecture. `ktop` — the tool in

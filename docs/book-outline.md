@@ -855,8 +855,8 @@ reader can take to a different project:
 ## Chapter 41. The honest gaps
 
 - No `PROT_EXEC` enforcement — no NX for guest pages.
-- No PID or mount namespaces, so nothing container-shaped works; this is
-  architectural, not a missing feature.
+- No PID, network or user namespaces (mount namespaces arrived in 559), so
+  nothing container-shaped works; this is architectural, not a missing feature.
 - The interpreters are legacy and being retired.
 - Known native-program gaps: the applet argv ownership class, unrouted host
   symbols, process substitution where the rootfs lacks `/dev/fd`.

@@ -93,6 +93,7 @@ struct futex; // opaque; defined in kernel/futex.c (see futex_restart_futex belo
 struct native_exec_pending; // opaque; defined in kernel/native.c
 struct native_program;   // kernel/native.h
 
+struct mnt_namespace;
 struct task {
     enum guest_abi abi;
     // Ticks since boot when this task was created -- /proc/<pid>/stat field 22
@@ -766,6 +767,12 @@ struct task {
     // inherited; cleared where native_helper_threads is. At the end for the
     // reason given above native_standin_child.
     int native_delivering;
+    // The mount namespace this task is in (kernel/mnt_ns.h), NULL for the
+    // initial one. Owns a reference. Not inherited by task_create_: a clone
+    // takes it from its parent in copy_task, and a task the app starts is in
+    // the initial namespace whatever its parent did. At the end for the
+    // reason given above.
+    struct mnt_namespace *mnt_ns;
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {

@@ -8,6 +8,7 @@
 #include "kernel/rseq.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/uts.h"
+#include "kernel/mnt_ns.h"
 #include "fs/proc.h"
 #include "util/sync.h"
 #include <string.h>
@@ -49,7 +50,7 @@
 // stress-ng's clone stressor outright, not just noisy logging.
 #define IMPLEMENTED_FLAGS (CLONE_VM_|CLONE_FILES_|CLONE_FS_|CLONE_SIGHAND_|CLONE_SYSVSEM_|CLONE_VFORK_|CLONE_THREAD_|\
         CLONE_SETTLS_|CLONE_CHILD_SETTID_|CLONE_PARENT_SETTID_|CLONE_CHILD_CLEARTID_|CLONE_DETACHED_|CLONE_PARENT_|\
-        CLONE_PIDFD_|CLONE_IO_|CLONE_NEWUTS_|CLONE_NEWIPC_)
+        CLONE_PIDFD_|CLONE_IO_|CLONE_NEWUTS_|CLONE_NEWIPC_|CLONE_NEWNS_)
 // The remaining namespace flags are recognized but never implemented (no
 // mount/user/pid/cgroup/net namespaces; UTS and IPC are real, see kernel/uts.h
 // and kernel/ipc_ns.h).
@@ -58,7 +59,7 @@
 // CAP_SYS_ADMIN/CAP_SYS_USER_NS) instead of the generic "unrecognized flag"
 // EINVAL -- callers that already fall back when they lack namespace privilege
 // need to see that, not a malformed-argument error.
-#define CLONE_NEW_FLAGS_ (CLONE_NEWNS_|CLONE_NEWCGROUP_|CLONE_NEWUSER_|CLONE_NEWPID_|CLONE_NEWNET_)
+#define CLONE_NEW_FLAGS_ (CLONE_NEWCGROUP_|CLONE_NEWUSER_|CLONE_NEWPID_|CLONE_NEWNET_)
 
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
@@ -186,6 +187,25 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
         task->fs = fs_info_copy(task->fs);
         if (task->fs == NULL)
             goto fail_free_files;
+    }
+
+    // The parent's mount namespace, or with CLONE_NEWNS a copy of its tree
+    // with the child's root and working directory in the same places there
+    // (kernel/mnt_ns.h). task_create_ left the field NULL.
+    if (flags & CLONE_NEWNS_) {
+        struct mnt_namespace *parent_ns = mnt_ns_current();
+        struct mnt_namespace *ns = mnt_ns_copy(parent_ns);
+        if (ns == NULL)
+            goto fail_free_fs;
+        err = mnt_ns_move_fs(task->fs, parent_ns, ns, true);
+        if (err < 0) {
+            mnt_ns_release(ns);
+            goto fail_free_fs;
+        }
+        err = _ENOMEM;
+        task->mnt_ns = ns;
+    } else {
+        task->mnt_ns = mnt_ns_retain(current->mnt_ns);
     }
 
     if (flags & CLONE_NEWUTS_) {
@@ -377,8 +397,11 @@ fail_free_fs:
     lock(&task->general_lock, 0);
     struct fs_info *dead_fs = task->fs;
     task->fs = NULL;
+    struct mnt_namespace *dead_mnt_early = task->mnt_ns;
+    task->mnt_ns = NULL;
     unlock(&task->general_lock);
     fs_info_release(dead_fs);
+    mnt_ns_release(dead_mnt_early);
 fail_free_files:
     lock(&task->general_lock, 0);
     struct fdtable *dead_files = task->files;
@@ -432,6 +455,8 @@ void task_never_ran_destroy(struct task *task) {
     task->uts_ns = NULL;
     struct ipc_namespace *dead_ipc = task->ipc_ns;
     task->ipc_ns = NULL;
+    struct mnt_namespace *dead_mnt = task->mnt_ns;
+    task->mnt_ns = NULL;
     struct fdtable *dead_files = task->files;
     task->files = NULL;
     struct mm *dead_mm = task->mm;
@@ -464,6 +489,7 @@ void task_never_ran_destroy(struct task *task) {
         uts_ns_release(dead_uts);
     if (dead_ipc != NULL)
         ipc_ns_release(dead_ipc);
+    mnt_ns_release(dead_mnt);
     if (dead_files != NULL)
         fdtable_release(dead_files);
     if (dead_mm != NULL)
@@ -543,13 +569,21 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
     // EPERM/EACCES/EOPNOTSUPP/ENOSYS and not EINVAL, which is why unshare
     // keeps ENOSYS. EPERM, the pre-557 answer, read as "you may not" to a root
     // caller who may. tests/manual/namespace_errno.c holds both rules.
+    // (That history is CLONE_NEWNS's, which is real now; the rule stands for
+    // the kinds that are not.)
     // (CLONE_NEWTIME is clone3/unshare-only: in clone its bit is part of the
     // exit signal.)
+    // (Mount namespaces are real since 559, kernel/mnt_ns.h, so systemd's
+    // generator sandbox now gets one.)
     if (flags & CLONE_NEW_FLAGS_)
         return _EINVAL;
     // Creating any namespace needs CAP_SYS_ADMIN in real Linux.
-    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_)) && !current_capable(CAP_SYS_ADMIN_))
+    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_)) && !current_capable(CAP_SYS_ADMIN_))
         return _EPERM;
+    // A new mount namespace has a root and working directory of its own in
+    // it, which a shared fs_struct cannot be (copy_process: EINVAL).
+    if ((flags & (CLONE_NEWNS_ | CLONE_FS_)) == (CLONE_NEWNS_ | CLONE_FS_))
+        return _EINVAL;
     // CLONE_SYSVSEM shares the parent's SEM_UNDO list, whose semaphores a new
     // IPC namespace cannot reach, so Linux refuses the pair (copy_namespaces).
     if ((flags & (CLONE_NEWIPC_ | CLONE_SYSVSEM_)) == (CLONE_NEWIPC_ | CLONE_SYSVSEM_))
@@ -1044,8 +1078,12 @@ dword_t sys_unshare(dword_t flags) {
     if (flags & CLONE_SIGHAND_)
         flags |= CLONE_THREAD_;
 
+    // A mount namespace takes the fs_struct with it: the root and working
+    // directory it holds are places in the old tree (ksys_unshare).
+    if (flags & CLONE_NEWNS_)
+        flags |= CLONE_FS_;
     const dword_t supported = CLONE_THREAD_ | CLONE_SIGHAND_ | CLONE_VM_ |
-        CLONE_FILES_ | CLONE_FS_ | CLONE_SYSVSEM_ | CLONE_NEWUTS_ | CLONE_NEWIPC_;
+        CLONE_FILES_ | CLONE_FS_ | CLONE_SYSVSEM_ | CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_;
     // Recognized, and not provided. The distinction from the ~known case
     // below is the whole point: a flag listed here is a real thing this
     // kernel does not have (ENOSYS), while one that is not listed at all is a
@@ -1063,7 +1101,7 @@ dword_t sys_unshare(dword_t flags) {
     // unshare(CLONE_NEWNS) treats ENOSYS as "not supported here" and EINVAL as
     // a failure (see sys_clone_common_). (CLONE_IO is not a namespace, and Linux's unshare
     // refuses it as malformed, so it is not listed here.)
-    const dword_t known_unsupported = CLONE_NEWNS_ | CLONE_NEWCGROUP_ | CLONE_NEWTIME_ |
+    const dword_t known_unsupported = CLONE_NEWCGROUP_ | CLONE_NEWTIME_ |
         CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_;
     const dword_t known = supported | known_unsupported;
 
@@ -1074,16 +1112,24 @@ dword_t sys_unshare(dword_t flags) {
         return err;
     if (flags & known_unsupported)
         return _ENOSYS;
-    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_)) && !current_capable(CAP_SYS_ADMIN_))
+    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_)) && !current_capable(CAP_SYS_ADMIN_))
         return _EPERM;
 
     // Everything that can fail to allocate is allocated before anything
     // changes, so a failure leaves the caller as it was.
+    struct mnt_namespace *old_mnt = mnt_ns_current(), *new_mnt = NULL;
+    if (flags & CLONE_NEWNS_) {
+        new_mnt = mnt_ns_copy(old_mnt);
+        if (new_mnt == NULL)
+            return _ENOMEM;
+    }
     struct uts_namespace *new_uts = NULL;
     if (flags & CLONE_NEWUTS_) {
         new_uts = uts_ns_copy(current->uts_ns);
-        if (new_uts == NULL)
+        if (new_uts == NULL) {
+            mnt_ns_release(new_mnt);
             return _ENOMEM;
+        }
     }
     struct ipc_namespace *new_ipc = NULL;
     if (flags & CLONE_NEWIPC_) {
@@ -1091,6 +1137,7 @@ dword_t sys_unshare(dword_t flags) {
         if (new_ipc == NULL) {
             if (new_uts != NULL)
                 uts_ns_release(new_uts);
+            mnt_ns_release(new_mnt);
             return _ENOMEM;
         }
     }
@@ -1101,6 +1148,7 @@ dword_t sys_unshare(dword_t flags) {
             if (new_uts != NULL)
                 uts_ns_release(new_uts);
             ipc_ns_release(new_ipc);
+            mnt_ns_release(new_mnt);
             return err;
         }
     }
@@ -1112,12 +1160,31 @@ dword_t sys_unshare(dword_t flags) {
             if (new_uts != NULL)
                 uts_ns_release(new_uts);
             ipc_ns_release(new_ipc);
+            mnt_ns_release(new_mnt);
             return _ENOMEM;
         }
         lock(&current->general_lock, 0);
         current->fs = new_fs;
         unlock(&current->general_lock);
         fs_info_release(old_fs);
+    }
+
+    // Into the copy of the tree: the root and working directory, now this
+    // task's alone, move to where they are there.
+    if (new_mnt != NULL) {
+        err = mnt_ns_move_fs(current->fs, old_mnt, new_mnt, true);
+        if (err < 0) {
+            if (new_uts != NULL)
+                uts_ns_release(new_uts);
+            ipc_ns_release(new_ipc);
+            mnt_ns_release(new_mnt);
+            return err;
+        }
+        lock(&current->general_lock, 0);
+        struct mnt_namespace *dead_mnt = current->mnt_ns;
+        current->mnt_ns = new_mnt;
+        unlock(&current->general_lock);
+        mnt_ns_release(dead_mnt);
     }
 
     // A new IPC namespace leaves the SEM_UNDO list, because its semaphores
@@ -1282,6 +1349,9 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
 
     struct uts_namespace *uts = NULL;
     struct ipc_namespace *ipc = NULL;
+    // The mount namespace to join: NULL is the initial one, which needs no
+    // reference; any other is held from here.
+    struct mnt_namespace *mnt = NULL;
     unsigned nstype;
     void *ns;
     int err = 0;
@@ -1293,6 +1363,8 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
             uts = uts_ns_retain(ns);
         if (nstype == CLONE_NEWIPC_ && ns != NULL)
             ipc = ipc_ns_retain(ns);
+        if (nstype == CLONE_NEWNS_ && ns != NULL)
+            mnt = mnt_ns_retain(ns);
     } else {
         // Anything that is neither a namespace fd nor a pidfd is EINVAL too.
         if (flags == 0 || (flags & ~all_kinds))
@@ -1315,6 +1387,8 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
                     uts = uts_ns_retain(task->uts_ns);
                 if (flags & CLONE_NEWIPC_)
                     ipc = ipc_ns_retain(task->ipc_ns);
+                if (flags & CLONE_NEWNS_)
+                    mnt = mnt_ns_retain(task->mnt_ns);
             }
             unlock(&task->general_lock);
         }
@@ -1339,31 +1413,24 @@ dword_t sys_setns(fd_t fd_no, dword_t flags) {
     else if ((flags & CLONE_NEWTIME_) && !admin)
         err = _EPERM;
 
-    // A mount namespace's root, found before anything changes.
-    struct fd *root = NULL;
-    if (err == 0 && (flags & CLONE_NEWNS_)) {
-        root = generic_open_realroot("/", O_RDONLY_ | O_DIRECTORY_ | O_NOACCESS_CHECK_, 0);
-        if (IS_ERR(root)) {
-            err = PTR_ERR(root);
-            root = NULL;
-        }
-    }
+    // Into the mount namespace first, the one step here that can fail: the
+    // root and working directory both become its root (mntns_install).
+    if (err == 0 && (flags & CLONE_NEWNS_))
+        err = mnt_ns_move_fs(current->fs, mnt_ns_current(), mnt, false);
     if (err < 0) {
         if (uts != NULL)
             uts_ns_release(uts);
         if (ipc != NULL)
             ipc_ns_release(ipc);
+        mnt_ns_release(mnt);
         return err;
     }
-
-    if (root != NULL) {
-        struct fd *pwd = fd_retain(root);
-        lock(&current->fs->lock, 0);
-        struct fd *old_root = current->fs->root;
-        current->fs->root = root;
-        unlock(&current->fs->lock);
-        fd_close(old_root);
-        fs_chdir(current->fs, pwd);
+    if (flags & CLONE_NEWNS_) {
+        lock(&current->general_lock, 0);
+        struct mnt_namespace *old_mnt = current->mnt_ns;
+        current->mnt_ns = mnt; // the reference taken above, or NULL
+        unlock(&current->general_lock);
+        mnt_ns_release(old_mnt);
     }
     // Linux leaves the SEM_UNDO list on any IPC setns, even into the
     // namespace the caller is already in.

@@ -631,7 +631,8 @@ static fd_t sys_openat_norm(fd_t at_f, guest_addr_t path_addr, dword_t flags, mo
     if (flags & O_CREAT_)
         apply_umask(&mode);
 
-    struct fd *at = at_fd_for_path(at_f, path);
+    // RESOLVE_IN_ROOT starts every path at the dirfd, absolute ones included.
+    struct fd *at = (extra_norm & N_IN_ROOT) ? at_fd(at_f) : at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct fd *fd;
@@ -702,27 +703,27 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
     if ((how.flags >> 32) != 0 || (how.mode >> 32) != 0)
         return _EINVAL;
 
-    // Every RESOLVE_* bit was rejected outright, so openat2's whole reason for
-    // existing over openat -- constraining how the path is allowed to resolve
-    // -- was unusable.
+    // How the path is allowed to resolve, which is openat2's whole reason for
+    // existing over openat.
     //
-    // The two implemented here are the two AOK can enforce exactly.
-    // NO_SYMLINKS is answered inside path resolution itself, and CACHED's
-    // "only if this is already cached, else EAGAIN" is a promise about speed
-    // that is honest to decline: every caller of it has a slow path, because
-    // on Linux the answer depends on what happens to be in the dcache.
+    // NO_SYMLINKS, NO_MAGICLINKS and IN_ROOT are answered inside path
+    // resolution itself (fs/path.c). IN_ROOT is Linux's "as if the caller had
+    // chroot()ed to dirfd", and it is implemented as exactly that: the walk
+    // that confines a chrooted task, with dirfd as its root. It therefore
+    // holds as well as chroot does here and no better. The walk produces a
+    // path with no symlink and no `..` left in it, and the open that follows
+    // is of that path: on fakefs a guest symlink is a regular file to the
+    // host, so a component swapped for a link between the two fails the open
+    // rather than redirecting it.
     //
-    // BENEATH, IN_ROOT, NO_XDEV and NO_MAGICLINKS stay refused with EINVAL,
-    // which is what a kernel without them says and what every caller already
-    // handles -- openat2 itself is Linux 5.6+, so nothing may assume it. They
-    // are not refused for lack of effort: they are SANDBOXES, and the property
-    // they promise is that no intermediate step of the resolution escaped,
-    // which is a statement about the resolution as it happens. AOK resolves
-    // the path and then opens it in a second pass, so anything checked in
-    // between is checked against a path that could have changed underneath --
-    // exactly the time-of-check-to-time-of-use hole RESOLVE_BENEATH exists to
-    // close. A sandbox that reports success without holding is worse than one
-    // that says it is not available.
+    // CACHED's "only if this is already cached, else EAGAIN" is a promise
+    // about speed that is honest to decline: every caller of it has a slow
+    // path, because on Linux the answer depends on what is in the dcache.
+    //
+    // BENEATH and NO_XDEV stay refused with EINVAL, which is what a kernel
+    // without them says and what every caller handles -- openat2 is Linux
+    // 5.6+, so nothing may assume it. A confinement reported and not held is
+    // worse than one reported as unavailable.
 #define RESOLVE_NO_XDEV_       0x01
 #define RESOLVE_NO_MAGICLINKS_ 0x02
 #define RESOLVE_NO_SYMLINKS_   0x04
@@ -730,12 +731,18 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
 #define RESOLVE_IN_ROOT_       0x10
 #define RESOLVE_CACHED_        0x20
     static const qword_t resolve_implemented =
-        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_;
+        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_ | RESOLVE_NO_MAGICLINKS_ | RESOLVE_IN_ROOT_;
     if (how.resolve & ~resolve_implemented)
         return _EINVAL;
     if (how.resolve & RESOLVE_CACHED_)
         return _EAGAIN;
-    int extra_norm = (how.resolve & RESOLVE_NO_SYMLINKS_) ? N_NO_SYMLINKS : 0;
+    int extra_norm = 0;
+    if (how.resolve & RESOLVE_NO_SYMLINKS_)
+        extra_norm |= N_NO_SYMLINKS;
+    if (how.resolve & RESOLVE_NO_MAGICLINKS_)
+        extra_norm |= N_NO_MAGICLINKS;
+    if (how.resolve & RESOLVE_IN_ROOT_)
+        extra_norm |= N_IN_ROOT;
 
     dword_t flags = (dword_t) how.flags;
     // The struct is read here rather than at the dispatch site, so plain

@@ -572,6 +572,40 @@ static int sys_update_kernel_hostname(struct proc_entry *UNUSED(entry), struct p
     return 0;
 }
 
+// /proc/sys/kernel/domainname, the same for the NIS domain: what
+// setdomainname(2) sets and uname(2) reports, per UTS namespace, "(none)"
+// until something names it. The file was missing, and systemd makes it
+// read-only (with hostname beside it) for every ProtectHostname=yes service
+// that keeps the host's UTS namespace -- logind, udevd, userdbd -- and fails
+// the service at step NAMESPACE when there is nothing there to bind.
+static int sys_show_kernel_domainname(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct uts_namespace *ns = uts_ns_current();
+    char domainname[sizeof(ns->domainname)];
+    lock(&ns->lock, 0);
+    memcpy(domainname, ns->domainname, sizeof(domainname));
+    unlock(&ns->lock);
+    domainname[sizeof(domainname) - 1] = '\0';
+    // Unset reads "(none)", as uname(2) reports it.
+    proc_printf(buf, "%s\n", domainname[0] != '\0' ? domainname : "(none)");
+    return 0;
+}
+
+static int sys_update_kernel_domainname(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    struct uts_namespace *ns = uts_ns_current();
+    size_t len = data->size;
+    while (len > 0 && (data->data[len - 1] == '\n' || data->data[len - 1] == '\r'))
+        len--;
+    if (len >= sizeof(ns->domainname))
+        return _EINVAL;
+    lock(&ns->lock, 0);
+    memcpy(ns->domainname, data->data, len);
+    ns->domainname[len] = '\0';
+    unlock(&ns->lock);
+    return 0;
+}
+
 static int sys_show_net_version(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "%s\n", proc_ish_version);
     return 0;
@@ -748,6 +782,7 @@ static int sys_update_kernel_randomize_va_space(struct proc_entry *UNUSED(entry)
 
 struct proc_dir_entry proc_sys_kernel[] = {
     {"cap_last_cap", .show = sys_show_kernel_cap_last_cap},
+    {"domainname", S_IFREG | 0644, .show = sys_show_kernel_domainname, .update = sys_update_kernel_domainname},
     {"hostname", S_IFREG | 0644, .show = sys_show_net_unix_hostname, .update = sys_update_kernel_hostname},
     {"ngroups_max", .show = sys_show_kernel_ngroups_max},
     {"osrelease", .show = sys_show_kernel_osrelease},

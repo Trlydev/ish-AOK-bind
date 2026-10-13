@@ -134,7 +134,7 @@ statement about the caller:
 - **`syscall_stub_silent`** returns `ENOSYS` without logging, and the entries
   using it carry their justification: `io_uring_setup`, `io_uring_enter`,
   `io_uring_register` ("so liburing/cmake fall back to epoll"), `open_tree`,
-  `fspick`, `mount_setattr` ("util-linux falls back to `mount(2)` on ENOSYS"),
+  `fspick`,
   `pidfd_getfd`, `process_madvise`.
 
 The silent set is the interesting one. Those are calls that well-written modern

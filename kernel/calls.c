@@ -1094,6 +1094,7 @@ static syscall_t i386_syscall_table[] = {
     [214] = (syscall_t) sys_setgid,
     [215] = (syscall_t) sys_setfsuid,
     [216] = (syscall_t) sys_setfsgid,
+    [217] = (syscall_t) sys_pivot_root,
     [218] = (syscall_t) sys_mincore,
     [219] = (syscall_t) sys_madvise,
     [220] = (syscall_t) sys_getdents64,
@@ -1300,7 +1301,7 @@ static syscall_t i386_syscall_table[] = {
     // dword-fit check for the two 64-bit-register ABIs (amd64/arm64); i386
     // registers are already word-sized, so a stub here can't SIGSYS the way
     // it did on arm64 before that table also got explicit arg counts.
-    [442] = (syscall_t) syscall_stub_silent, // mount_setattr
+    [442] = (syscall_t) sys_mount_setattr,
     [443] = (syscall_t) syscall_stub_silent, // quotactl_fd
     [444] = (syscall_t) syscall_stub_silent, // landlock_create_ruleset
     [445] = (syscall_t) syscall_stub_silent, // landlock_add_rule
@@ -1563,6 +1564,7 @@ static syscall_t amd64_syscall_table[470] = {
     [151] = (syscall_t) sys_mlockall,
     [152] = (syscall_t) sys_munlockall,
     [153] = (syscall_t) syscall_success_stub, // vhangup (tty-cleanup no-op)
+    [155] = (syscall_t) sys_pivot_root, // (its paths go through the native handler)
     [157] = (syscall_t) sys_prctl,
     [158] = (syscall_t) sys_arch_prctl,
     [159] = (syscall_t) sys_adjtimex, // adjtimex (pointer arg goes through the native handler)
@@ -1751,7 +1753,7 @@ static syscall_t amd64_syscall_table[470] = {
     // guest registers, so a stub without an arg-count override would trade
     // the noisy-but-safe "missing syscall" ENOSYS for a real SIGSYS on
     // garbage upper argument registers (exactly what happened on arm64).
-    [442] = (syscall_t) syscall_stub_silent, // mount_setattr
+    [442] = (syscall_t) sys_mount_setattr,
     [443] = (syscall_t) syscall_stub_silent, // quotactl_fd
     [444] = (syscall_t) syscall_stub_silent, // landlock_create_ruleset
     [445] = (syscall_t) syscall_stub_silent, // landlock_add_rule
@@ -2292,7 +2294,7 @@ static syscall_t arm64_syscall_table[470] = {
     // that already handle ENOSYS (all of the above are optional/best-effort
     // in real userspace) get it quietly, matching the rest of this table's
     // policy for post-5.x syscalls.
-    [442] = (syscall_t) syscall_stub_silent, // mount_setattr
+    [442] = (syscall_t) sys_mount_setattr,
     [443] = (syscall_t) syscall_stub_silent, // quotactl_fd
     [444] = (syscall_t) syscall_stub_silent, // landlock_create_ruleset
     [445] = (syscall_t) syscall_stub_silent, // landlock_add_rule
@@ -2806,6 +2808,9 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 429: // move_mount(from_dfd, from_path, to_dfd, to_path, flags)
         result = (dword_t) sys_move_mount_guest((fd_t) raw_args[0], raw_args[1],
                 (fd_t) raw_args[2], raw_args[3], (dword_t) raw_args[4]); break;
+    case 442: // mount_setattr(dfd, path, flags, uattr, usize)
+        result = (dword_t) sys_mount_setattr_guest((fd_t) raw_args[0], raw_args[1],
+                (dword_t) raw_args[2], raw_args[3], raw_args[4]); break;
 
     // The io_* family. An aio_context_t is the address of the context's ring
     // page, so arg 0 is a full 64-bit guest address on every call after
@@ -2989,6 +2994,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 36: result = (dword_t) sys_symlinkat_guest( raw_args[0], (fd_t) raw_args[1], raw_args[2]); break; // symlinkat
     case 39: result = (dword_t) sys_umount2_guest( raw_args[0], (dword_t) raw_args[1]); break; // umount2
     case 40: result = (dword_t) sys_mount_guest( raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], raw_args[4]); break; // mount
+    case 41: result = (dword_t) sys_pivot_root_guest(raw_args[0], raw_args[1]); break; // pivot_root
     case 51: result = (dword_t) sys_chroot_guest(raw_args[0]); break; // chroot
     case 59: result = (dword_t) sys_pipe2( raw_args[0], (int_t) raw_args[1]); break; // pipe2
     case 86: result = (dword_t) sys_timerfd_settime64_guest( (fd_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]); break; // timerfd_settime
@@ -3141,7 +3147,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     // (0-4 are the io_* family, implemented above -- they were on this
     // ENOSYS list, which is why wiring arm64_syscall_table alone changed
     // nothing: this native list runs first and answered for them.)
-    case 18: case 41: case 42:
+    case 18: case 42: // (41, pivot_root, is implemented above)
     case 60: case 104: case 105: case 106:
     case 128:
     // (186-193 are the real SysV msg/sem implementations above)
@@ -3638,6 +3644,9 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         }
         return true;
     }
+    case 155: // pivot_root
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_pivot_root_guest(raw_args[0], raw_args[1]));
+        return true;
     case 161:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_chroot_guest(raw_args[0]));
         return true;
@@ -4269,6 +4278,11 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3],
                 (dword_t) raw_args[4]));
         return true;
+    case 442: // mount_setattr(dfd, path, flags, uattr, usize)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_mount_setattr_guest(
+                (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2], raw_args[3],
+                raw_args[4]));
+        return true;
 
     // The io_* family, for the same reason again, and here it is unavoidable
     // rather than merely typical: an aio_context_t IS the address of the
@@ -4377,7 +4391,6 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
     // landlock's ruleset/rule attr, cachestat's range/result structs) that
     // would otherwise trip the dword-fit check and SIGSYS the caller (the
     // arm64 table hit this exact bug with process_mrelease/448).
-    case 442: // mount_setattr
     case 443: // quotactl_fd
     case 444: // landlock_create_ruleset
     case 445: // landlock_add_rule
@@ -4687,7 +4700,6 @@ static unsigned arm64_syscall_legacy_arg_count(qword_t syscall_num) {
     // range/result structs) that would otherwise trip the dword-fit check
     // and SIGSYS the caller instead of the intended silent ENOSYS (observed:
     // stress-ng's process_mrelease (448) probe got SIGSYS'd this way).
-    case 442: // mount_setattr
     case 443: // quotactl_fd
     case 444: // landlock_create_ruleset
     case 445: // landlock_add_rule

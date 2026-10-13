@@ -175,6 +175,16 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 // something to follow.
                 if (flags & N_NO_SYMLINKS)
                     return _ELOOP;
+                // A link under /proc/<pid>/ names a file, not a path (Linux's
+                // nd_jump_link): RESOLVE_NO_MAGICLINKS refuses it with ELOOP,
+                // and a scoped walk with EXDEV, in that order.
+                if (magic && possible_symlink[0] == '/' &&
+                        possible_symlink[1] >= '0' && possible_symlink[1] <= '9') {
+                    if (flags & N_NO_MAGICLINKS)
+                        return _ELOOP;
+                    if (flags & N_IN_ROOT)
+                        return _EXDEV;
+                }
                 // Linux's MAXSYMLINKS. Five was low enough that ordinary
                 // /etc/alternatives-style chains hit ELOOP: `levels` counts
                 // every link followed across the whole resolution, including
@@ -407,7 +417,14 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     if (flags & N_REALROOT)
         root = NULL;
     bool absolute = path[0] == '/';
-    if (absolute)
+    // N_IN_ROOT: the starting directory is the root of this walk, for an
+    // absolute path too.
+    bool in_root = (flags & N_IN_ROOT) != 0;
+    if (in_root) {
+        if (at == AT_PWD)
+            at = current->fs->pwd;
+        root = at;
+    } else if (absolute)
         at = root;
     else if (at == AT_PWD)
         at = current->fs->pwd;
@@ -444,7 +461,13 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         // Linux does not perform. The case this exists to stop -- openat()
         // through a dirfd on a directory with no search permission, and a cwd
         // whose search bit was removed -- is exactly the relative case.
-        if (!absolute) {
+        //
+        // An N_IN_ROOT walk starts at the dirfd whatever the path looks
+        // like, so the same holds for its absolute paths -- except that
+        // search permission is needed only to descend, and "/" alone names
+        // the directory itself.
+        bool descends = path[strspn(path, "/")] != '\0';
+        if (!absolute || in_root) {
             struct statbuf at_stat;
             if (at->mount != NULL && at->mount->fs->fstat != NULL &&
                     at->mount->fs->fstat(at, &at_stat) >= 0) {
@@ -457,7 +480,7 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
                 // looking at permissions rather than at the fd it passed.
                 if (!S_ISDIR(at_stat.mode))
                     return _ENOTDIR;
-                int perm_err = access_check(&at_stat, AC_X);
+                int perm_err = descends ? access_check(&at_stat, AC_X) : 0;
                 if (perm_err < 0)
                     return perm_err;
             }

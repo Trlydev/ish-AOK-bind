@@ -1057,6 +1057,28 @@ static struct fd *generic_openat_path(struct fd *at, const char *path_raw, int f
         else
             type = DEV_CHAR;
         err = dev_open(dev_major((dev_t_)stat.rdev), dev_minor((dev_t_)stat.rdev), type, fd);
+        // O_PATH opens no device: it names the node. So a node whose device
+        // will not open -- /dev/tty in a process with no controlling
+        // terminal (ENXIO), a node no driver answers for -- is still a handle
+        // on Linux, and what bubblewrap binds into a sandbox's /dev. The
+        // handle made here is the one a socket or FIFO gets above, and only
+        // when the device refused: one that opens keeps the description it
+        // always had, which a reopen through /proc/self/fd relies on.
+        if (err < 0 && (flags & O_PATH_) && !(flags & O_DIRECTORY_)) {
+            mode_t_ node_type = fd->type;
+            mount_retain(mount);
+            fd_close(fd);
+            struct fd *pfd = opath_link_fd_create(mount, path);
+            if (pfd == NULL) {
+                mount_release(mount);
+                return ERR_PTR(_ENOMEM);
+            }
+            pfd->type = node_type;
+            pfd->flags = flags;
+            pfd->mnt_id = seen_id;
+            pfd->mnt_root = seen_root;
+            return pfd;
+        }
         if (err < 0)
             goto error;
     }
@@ -1083,16 +1105,30 @@ error:
 struct fd *generic_openat_norm(struct fd *at, const char *path_raw, int flags, int mode, int extra_norm) {
     if (flags & O_RDWR_ && flags & O_WRONLY_)
         return ERR_PTR(_EINVAL);
-    if (flags & O_TMPFILE_)
+    // A walk that refuses symlinks, or magic links, or is confined to a root
+    // of its own (openat2's RESOLVE_*) does not take the two shortcuts below:
+    // they jump straight to the file a /proc/<pid>/{fd/N,ns/*} link names,
+    // which is the thing such a walk is asked not to do. The ordinary walk
+    // meets the link and answers for it (fs/path.c).
+    bool scoped = (extra_norm & (N_NO_SYMLINKS | N_NO_MAGICLINKS | N_IN_ROOT)) != 0;
+    if (flags & O_TMPFILE_) {
+        if (scoped) {
+            char path[MAX_PATH];
+            int err = path_normalize(at, path_raw, path, N_SYMLINK_FOLLOW | extra_norm);
+            return ERR_PTR(err < 0 ? err : _EOPNOTSUPP);
+        }
         return generic_open_tmpfile(at, path_raw, flags);
+    }
 
-    struct fd *procfd = procfd_openat(at, path_raw, flags);
-    if (procfd != NULL)
-        return procfd;
+    if (!scoped) {
+        struct fd *procfd = procfd_openat(at, path_raw, flags);
+        if (procfd != NULL)
+            return procfd;
 
-    struct fd *nsfd = procns_openat(at, path_raw, flags);
-    if (nsfd != NULL)
-        return nsfd;
+        struct fd *nsfd = procns_openat(at, path_raw, flags);
+        if (nsfd != NULL)
+            return nsfd;
+    }
 
     // A descriptor opened through a bind holds the bind as well as the origin
     // behind it, so the bind is busy while it is open: see fd->bind_mount.

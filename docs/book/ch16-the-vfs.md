@@ -42,9 +42,22 @@ descriptor: the fifo buffer for a named pipe, the lock list, the reference
 counts that keep a Unix socket's name alive while a listener exists.
 
 **`struct mount`** binds a path prefix to a `struct fs_ops` — the vtable each
-filesystem implements — and to a source. The mount table is flat and global,
-because there are no mount namespaces (Chapter 10): one tree, visible identically
-from every process and every chroot.
+filesystem implements — and to a source. The mount table is flat and global:
+one list of points for the whole machine, and a path belongs to the mount with
+the longest point that is a prefix of it.
+
+Two things Linux gets from a tree of mount objects have to be said in that
+list some other way. A **mount namespace** (Chapter 10) is a region of it: its
+tree hangs under a point no path can spell (`/.ish-fsmount/<n>`, the same
+staging directory a detached mount is parked in), its mounts are bind copies
+of its parent's at the same places below that point, and its tasks have their
+root there. `pivot_root` is every point in the region rewritten at once. And a
+mount that another is **mounted over** — the `devpts` at `/dev/pts` when a
+sandbox mounts a fresh tmpfs on `/dev` — would go on answering for its path,
+since the longer point wins; so it is parked at a staging point too, with the
+ID of the mount covering it, and put back when that one is unmounted. What is
+open in it goes on working in the meantime, which is the reason a parked mount
+keeps a point at all.
 
 ## 16.2 One funnel: `path_normalize`
 
@@ -114,7 +127,7 @@ future tooling; it is a package in the guest's own repository.
 `struct open_how` carrying a `resolve` mask, which is the whole reason it exists
 over `openat`: it constrains *how* the path is allowed to resolve. AOK used to
 reject every bit in that mask, which left `openat2` doing nothing `openat` did
-not already do. Two of the bits are honoured now, and the other four are refused
+not already do. Four of the bits are honoured now, and the other two are refused
 rather than pretended:
 
 - **`RESOLVE_NO_SYMLINKS`** is answered inside path resolution itself. A symlink
@@ -124,15 +137,25 @@ rather than pretended:
   "only if this is already cached." Declining is honest, because on Linux the
   answer depends on what happens to be in the dcache, so every caller of it has
   a slow path already.
-- **`RESOLVE_BENEATH`, `RESOLVE_IN_ROOT`, `RESOLVE_NO_XDEV` and
-  `RESOLVE_NO_MAGICLINKS`** are refused with `EINVAL`, and the refusal is the
-  interesting part. Those four are *sandboxes*, and what they promise is that no
-  intermediate step of the resolution escaped — a statement about the resolution
-  as it happens. AOK resolves the path and then opens it in a second pass, so
-  anything checked in between is checked against a path that could have changed
-  underneath, which is exactly the time-of-check-to-time-of-use hole
-  `RESOLVE_BENEATH` exists to close. `EINVAL` is what a kernel without them
-  says, and `openat2` is Linux 5.6+, so nothing may assume it is there.
+- **`RESOLVE_NO_MAGICLINKS`** is answered there too: a link under
+  `/proc/<pid>/` — `cwd`, `root`, `exe`, `fd/N`, `ns/*` — names a file rather
+  than spelling a path, and is `ELOOP` instead of being followed. `/proc/self`
+  is an ordinary link and still is one.
+- **`RESOLVE_IN_ROOT`** is Linux's "as if the caller had `chroot`ed to the
+  directory", and it is implemented as exactly that: the walk that confines a
+  chrooted task, with the dirfd as its root. Absolute paths and absolute link
+  targets start there, `..` stops there, and a magic link is `EXDEV`.
+  bubblewrap opens every path it binds into a sandbox this way, from a
+  descriptor on the root it has pivoted away from. It holds as well as chroot
+  holds here and no better, and that deserves stating: AOK resolves a path
+  and then opens it in a second pass. On fakefs — every root — a guest
+  symlink is a regular file to the host, so a component swapped for a link
+  between the two passes fails the open rather than redirecting it. On a
+  host directory mounted in (realfs) the host follows it, for this as for a
+  chroot.
+- **`RESOLVE_BENEATH` and `RESOLVE_NO_XDEV`** are refused with `EINVAL`, which
+  is what a kernel without them says; `openat2` is Linux 5.6+, so nothing may
+  assume it is there.
 
 A sandbox that reports success without holding is worse than one that says it is
 not available — Chapter 40's capability-honesty rule applied to a security

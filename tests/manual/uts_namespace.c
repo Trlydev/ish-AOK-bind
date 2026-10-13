@@ -156,9 +156,9 @@ static void check_ns_probe(void) {
 // Reported from a device, and the -T is what decided the message.
 //
 // CLONE_NEWIPC left this list when IPC namespaces became real (kernel/ipc_ns.h)
-// -- as root it now succeeds here, as the UTS namespace does.
+// -- as root it now succeeds here, as the UTS namespace does -- and
+// CLONE_NEWNS when mount namespaces did (kernel/mnt_ns.h).
 #define UNSHARE_NEWTIME 0x00000080
-#define UNSHARE_NEWNS 0x00020000
 #define UNSHARE_NEWCGROUP 0x02000000
 #define UNSHARE_NEWUSER 0x10000000
 #define UNSHARE_NEWPID 0x20000000
@@ -187,7 +187,6 @@ static void check_unshare_consistency(void) {
         const char *name;
         int flag;
     } ns[] = {
-        {"CLONE_NEWNS", UNSHARE_NEWNS},
         {"CLONE_NEWCGROUP", UNSHARE_NEWCGROUP},
         {"CLONE_NEWUSER", UNSHARE_NEWUSER},
         {"CLONE_NEWPID", UNSHARE_NEWPID},
