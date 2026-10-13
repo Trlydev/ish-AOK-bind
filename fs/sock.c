@@ -3678,6 +3678,11 @@ static bool sock_bound_inet_conflicts(struct fd *sock, const struct inet_bind_in
             struct fd *other = fdtable_get(files, fd_no);
             if (other == NULL || other == sock || other->ops != &socket_fdops)
                 continue;
+            // An address in another network namespace is another address
+            // (kernel/net_ns.h): a sandbox's recorded bind takes no port
+            // from anyone outside it.
+            if (other->socket.net_ns != sock->socket.net_ns)
+                continue;
             if (other->socket.domain != sock->socket.domain ||
                     other->socket.type != sock->socket.type ||
                     other->real_fd < 0) {
