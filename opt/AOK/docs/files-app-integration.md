@@ -2,8 +2,8 @@
 
 iSH-AOK ships a File Provider extension (a separate iOS extension target) that
 exposes your installed root filesystems through Apple's Files framework. In the
-Files app it appears as the location **iSH** — the extension's display name has
-not been renamed to match the fork. Once set up, your guest files
+Files app it appears as the location **iSH-AOK** (builds before 559 called it
+**iSH**). Once set up, your guest files
 show up as a regular location in the iOS **Files** app, and in any other
 app's document picker — no `scp`, no manual export step.
 
