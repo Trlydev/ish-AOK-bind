@@ -26,6 +26,35 @@
 // The standalone gadgets are defined from the same bodies with `last` 1
 // (alu_spec.S, memory.S, simd_spec.S, math.S), so a pair cannot drift from
 // the instructions it is made of.
+//
+// A second host. These bodies, alu_spec.S and pairs.h are also the source of
+// the arm64 front end of the QEMU plug-in (qemu-aok, target/arm/tcg/aok),
+// which assembles copies of them unchanged, as it does guest-riscv64's
+// (frag.h there has the longer account). A host that is not iSH-AOK defines
+// A64_GADGET_HOST, and before including a shared file supplies what
+// gadgets.h supplies here:
+//
+//   _cpu, _ip     the guest state every slot offset is relative to, and the
+//                 stream pointer
+//   .gadget NAME  begins a gadget; gret N ends one, N parameter words on;
+//                 gret_ahead for a body that has already moved _ip past the
+//                 next gadget's word (f_ip_past)
+//   load_flags    the guest's NZCV into the host's flags, and store_flags
+//   store_flags   back; they may use x16 and x17 and nothing else
+//   _addr         the address of an access; read_prep BITS, ID, AHEAD and
+//                 write_prep turn it from a guest address into a host one,
+//                 read_bullshit/write_bullshit are their out-of-line halves,
+//                 write_done BITS, ID follows a store. BITS is the size of
+//                 the whole access, both halves of a pair
+//   _fofs, _fslot1, _fslot2, _fnewb, _frn, _fval2
+//                 what a load or store body keeps across the prep macros
+//                 besides x8 and x17: registers the host's prep and its slow
+//                 path preserve (here the callee-saved x19 and x21-x25)
+//
+// A body uses x8-x14, x16, x17 and those, reads its operands through _ip,
+// and reaches guest state only as [_cpu, slot]. The last parameter word of a
+// load or store belongs to the host (here the instruction's address, for the
+// fault paths).
 
 // A body's source operand, into host register x<dst>: loaded from its
 // cpu_state slot (whose offset is in `slotreg`), or -- `fw` a register number
@@ -326,10 +355,10 @@
 // [rt_slot][rn_slot][offset][orig_ip]: bits, ldinsn, reg
 .macro f_load_body id, last, bits, ldinsn, reg, a4, a5, fn=_, fm=_
     ldp x8, x9, [_ip]         // rt_slot, rn_slot
-    ldr x19, [_ip, #16]       // offset
+    ldr _fofs, [_ip, #16]       // offset
     f_ip_past \last
     f_src 10, x9, \fn        // base
-    add x7, x10, x19
+    add _addr, x10, _fofs
     f_read_prep \last, \bits, \id
     \ldinsn \reg, [_addr]
     str x17, [_cpu, x8]       // full X store: 32-bit loads must clear the upper half
@@ -342,11 +371,11 @@
 // [rt_slot][rn_slot][offset][orig_ip]: bits, stinsn, reg
 .macro f_store_body id, last, bits, stinsn, reg, a4, a5, fn=_, fm=_
     ldp x8, x9, [_ip]         // rt_slot, rn_slot
-    ldr x19, [_ip, #16]       // offset
+    ldr _fofs, [_ip, #16]       // offset
     f_ip_past \last
     f_src 10, x9, \fm        // base (before the value: a forward may come in x17)
     f_src 17, x8, \fn        // value (x17 survives write_prep's helpers)
-    add x7, x10, x19
+    add _addr, x10, _fofs
     f_write_prep \last, \bits, \id
     \stinsn \reg, [_addr]
     write_done \bits, \id     // clobbers x9 — rt_slot already consumed
@@ -377,7 +406,7 @@
     f_ip_past \last, 5
     f_src 10, x9, \fn
     rx_index \ext, \fm, x13
-    add x7, x10, x11
+    add _addr, x10, x11
     f_read_prep \last, \bits, \id
     \ldinsn \reg, [_addr]
     str x17, [_cpu, x8]
@@ -393,7 +422,7 @@
     f_ip_past \last, 5
     f_src 10, x9, \fm        // base; the index is not forwarded
     rx_index \ext, _, x13
-    add x7, x10, x11
+    add _addr, x10, x11
     f_src 17, x8, \fn        // value
     f_write_prep \last, \bits, \id
     \stinsn \reg, [_addr]
@@ -408,17 +437,17 @@
 // bits, bytes, reg1, reg2
 .macro f_ldp_body id, last, bits, bytes, ldr_reg1, ldr_reg2, a5, fn=_, fm=_
     ldp x8, x9, [_ip]          // [rt_slot | rt2_slot<<16], [rn_slot]
-    ldr x19, [_ip, #16]        // offset
+    ldr _fofs, [_ip, #16]        // offset
     f_ip_past \last
     f_src 10, x9, \fn         // base from precomputed rn_slot
-    add x7, x10, x19
+    add _addr, x10, _fofs
     f_read_prep \last, \bits, \id
     ldr \ldr_reg1, [_addr]
     ldr \ldr_reg2, [_addr, #\bytes]
     and x9, x8, #0xffff        // rt_slot (low 16 bits)
     str x17, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
     ubfx x9, x8, #16, 16      // rt2_slot (high 16 bits)
-    str x25, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
+    str _fval2, [_cpu, x9]        // full X store: 32-bit loads must clear upper half
     f_end_ahead \last
 .endm
 .macro f_ldp_stub id, last, bits, bytes, ldr_reg1, ldr_reg2, a5, fn=_, fm=_
@@ -427,14 +456,14 @@
 
 .macro f_stp_body id, last, bits, bytes, str_reg1, str_reg2, a5, fn=_, fm=_
     ldp x8, x9, [_ip]          // [rt_slot | rt2_slot<<16], [rn_slot]
-    ldr x19, [_ip, #16]        // offset
+    ldr _fofs, [_ip, #16]        // offset
     f_ip_past \last
-    and x21, x8, #0xffff       // rt_slot (callee-saved, survives write_prep)
-    ubfx x22, x8, #16, #16    // rt2_slot (callee-saved, survives write_prep)
+    and _fslot1, x8, #0xffff       // rt_slot (callee-saved, survives write_prep)
+    ubfx _fslot2, x8, #16, #16    // rt2_slot (callee-saved, survives write_prep)
     f_src 10, x9, \fn         // base from precomputed rn_slot (before x17 is a value)
-    ldr \str_reg1, [_cpu, x21] // load value from rt slot
-    ldr \str_reg2, [_cpu, x22] // load value from rt2 slot
-    add x7, x10, x19
+    ldr \str_reg1, [_cpu, _fslot1] // load value from rt slot
+    ldr \str_reg2, [_cpu, _fslot2] // load value from rt2 slot
+    add _addr, x10, _fofs
     f_write_prep \last, \bits, \id
     str \str_reg1, [_addr]
     str \str_reg2, [_addr, #\bytes]
@@ -446,19 +475,19 @@
 .endm
 
 // Pairs with writeback: the new base (base + offset) is computed before the
-// access and written to rn after it, so a fault leaves rn untouched. x23
-// holds the new base and x24 rn's slot across the prep helpers. Same stream
+// access and written to rn after it, so a fault leaves rn untouched. _fnewb
+// holds the new base and _frn rn's slot across the prep helpers. Same stream
 // as the offset form: bits, bytes, reg1, reg2, pre
 .macro f_ldp_wb_body id, last, bits, bytes, ldr_reg1, ldr_reg2, pre, fn=_, fm=_
-    ldp x8, x24, [_ip]
-    ldr x19, [_ip, #16]
+    ldp x8, _frn, [_ip]
+    ldr _fofs, [_ip, #16]
     f_ip_past \last
-    f_src 10, x24, \fn
-    add x23, x10, x19
+    f_src 10, _frn, \fn
+    add _fnewb, x10, _fofs
 .if \pre
-    mov x7, x23
+    mov _addr, _fnewb
 .else
-    mov x7, x10
+    mov _addr, x10
 .endif
     f_read_prep \last, \bits, \id
     ldr \ldr_reg1, [_addr]
@@ -466,8 +495,8 @@
     and x9, x8, #0xffff
     str x17, [_cpu, x9]
     ubfx x9, x8, #16, 16
-    str x25, [_cpu, x9]
-    str x23, [_cpu, x24]
+    str _fval2, [_cpu, x9]
+    str _fnewb, [_cpu, _frn]
     f_end_ahead \last
 .endm
 .macro f_ldp_wb_stub id, last, bits, bytes, ldr_reg1, ldr_reg2, pre, fn=_, fm=_
@@ -475,25 +504,25 @@
 .endm
 
 .macro f_stp_wb_body id, last, bits, bytes, str_reg1, str_reg2, pre, fn=_, fm=_
-    ldp x8, x24, [_ip]
-    ldr x19, [_ip, #16]
+    ldp x8, _frn, [_ip]
+    ldr _fofs, [_ip, #16]
     f_ip_past \last
-    and x21, x8, #0xffff
-    ubfx x22, x8, #16, #16
-    f_src 10, x24, \fn
-    ldr \str_reg1, [_cpu, x21]
-    ldr \str_reg2, [_cpu, x22]
-    add x23, x10, x19
+    and _fslot1, x8, #0xffff
+    ubfx _fslot2, x8, #16, #16
+    f_src 10, _frn, \fn
+    ldr \str_reg1, [_cpu, _fslot1]
+    ldr \str_reg2, [_cpu, _fslot2]
+    add _fnewb, x10, _fofs
 .if \pre
-    mov x7, x23
+    mov _addr, _fnewb
 .else
-    mov x7, x10
+    mov _addr, x10
 .endif
     f_write_prep \last, \bits, \id
     str \str_reg1, [_addr]
     str \str_reg2, [_addr, #\bytes]
     write_done \bits, \id
-    str x23, [_cpu, x24]
+    str _fnewb, [_cpu, _frn]
     f_end_ahead \last
 .endm
 .macro f_stp_wb_stub id, last, bits, bytes, str_reg1, str_reg2, pre, fn=_, fm=_

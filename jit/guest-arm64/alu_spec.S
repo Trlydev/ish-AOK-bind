@@ -13,7 +13,9 @@
 // A 32-bit form stores the whole 64-bit slot: the W-register op zeroes the
 // upper half.
 
+#ifndef A64_GADGET_HOST    // (frag.h, "A second host")
 #include "gadgets.h"
+#endif
 #include "frag.h"
 
 .text

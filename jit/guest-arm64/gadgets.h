@@ -66,6 +66,17 @@ _tmp    .req x0
 _tmp2   .req x8
 _addr   .req x7
 
+// What frag.h's load and store bodies keep across read_prep/write_prep and
+// their helpers (frag.h, "A second host", names them for a host whose
+// callee-saved registers are not free): the offset, a pair store's two value
+// slots, a write-back pair's new base and its rn slot, a pair's second value.
+_fofs   .req x19
+_fslot1 .req x21
+_fslot2 .req x22
+_fnewb  .req x23
+_frn    .req x24
+_fval2  .req x25
+
 // RULE: never hold live gadget state in x18. It's the platform-reserved
 // register on Apple targets (iOS/macOS) -- the OS is allowed to trash it
 // asynchronously, so a value parked there can silently corrupt between
