@@ -1,6 +1,6 @@
 #!/bin/bash
 # Pushes changed benchmark scripts into both AOK roots and rebuilds the QEMU initramfs images from them.
-# ARCHES names the guests (default: aarch64 riscv64; x86_64 once setup-roots.sh has built it).
+# ARCHES names the guests (default: aarch64 riscv64; x86_64 and x86 once setup-roots.sh has built them).
 set -euo pipefail
 export PATH=/opt/homebrew/bin:$PATH COPYFILE_DISABLE=1
 ARCHES=${ARCHES:-"aarch64 riscv64"}
@@ -11,7 +11,7 @@ DEV=$HOME/git/ish-AOK/build
 for a in $ARCHES; do
     R=$W/root-$a
     case $a in aarch64) dev=$DEV/alpine-arm64-324 ;; riscv64) dev=$DEV/alpine-riscv64-test ;;
-               x86_64) dev=$DEV/alpine-amd64-test ;; esac
+               x86_64) dev=$DEV/alpine-amd64-test ;; x86) dev=$DEV/alpine-i386-test ;; esac
     if [ ! -s "$W/bench/fptest.$a" ] || [ "$W/bench/fptest.c" -nt "$W/bench/fptest.$a" ]; then
         "$ISH" -f "$dev" /bin/sh -e -c 'mkdir -p /tmp/bench-utm && cd /tmp/bench-utm && cat > fptest.c &&
             gcc -O1 -static -ffp-contract=off -fno-math-errno -o fptest fptest.c -lm && cat fptest' \
@@ -38,6 +38,18 @@ for a in $ARCHES; do
         fi
         "$ISH" -f "$R" /bin/sh -c 'cat > /bench/simdtest && chmod +x /bench/simdtest' < "$W/bench/simdtest.$a"
     fi
+    # x86test (x86_64 and x86): the integer instructions on awkward operands, among them the ones Linux's
+    # compilers seldom emit and other systems' code is full of. For the QEMU plug-in's x86 front end.
+    case $a in x86_64|x86)
+        if [ ! -s "$W/bench/x86test.$a" ] || [ "$W/bench/x86test.c" -nt "$W/bench/x86test.$a" ]; then
+            "$ISH" -f "$dev" /bin/sh -e -c 'mkdir -p /tmp/bench-utm && cd /tmp/bench-utm && cat > x86test.c &&
+                gcc -O1 -mno-red-zone -static -o x86test x86test.c && cat x86test' \
+                < "$W/bench/x86test.c" > "$W/bench/x86test.$a.tmp"
+            mv "$W/bench/x86test.$a.tmp" "$W/bench/x86test.$a"
+        fi
+        "$ISH" -f "$R" /bin/sh -c 'cat > /bench/x86test && chmod +x /bench/x86test' < "$W/bench/x86test.$a"
+        ;;
+    esac
     tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/memtest.c bench/udhcpc.sh bench/gltest.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
     "$ISH" -f "$R" /bin/sh -e -c '
         cd /bench && rm -f ._*

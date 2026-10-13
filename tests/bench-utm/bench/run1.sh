@@ -21,6 +21,8 @@ for w in "$@"; do
     fptestv)  ./fptest -v; ./timeit fptestv true ;;
     simdtest) ./simdtest; ./timeit simdtest true ;;         # aarch64: every FP/SIMD encoding
     simdtest-*) ./simdtest -b "${w#simdtest-}"; ./timeit "$w" true ;;   # one bucket of it, a line an encoding
+    x86test)  ./x86test; ./timeit x86test true ;;           # x86 and x86_64: the integer instructions
+    x86testv) ./x86test -v; ./timeit x86testv true ;;       # every result of it
     *)        ./timeit "$w" true ;;
     esac
 done

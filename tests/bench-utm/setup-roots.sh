@@ -1,6 +1,6 @@
 #!/bin/bash
 # Builds one benchmark userland per guest arch as an AOK root, and the same tree as a QEMU initramfs.
-# ARCHES names the ones to build (default: aarch64 riscv64; x86_64 is the third).
+# ARCHES names the ones to build (default: aarch64 riscv64; x86_64 and x86, Alpine's name for i386, are the others).
 set -euo pipefail
 ARCHES=${ARCHES:-"aarch64 riscv64"}
 export PATH=/opt/homebrew/bin:$PATH
@@ -20,11 +20,13 @@ cd "$W/dl-kernel"
 [ -f linux-lts-riscv64.apk ] || curl -fsL -o linux-lts-riscv64.apk $ALPINE/main/riscv64/linux-lts-6.18.55-r0.apk
 [ -f "$W/kernel/vmlinuz-virt-aarch64" ] || { bsdtar -xOf linux-virt-aarch64.apk boot/vmlinuz-virt > "$W/kernel/vmlinuz-virt-aarch64"; }
 [ -f "$W/kernel/vmlinuz-lts-riscv64" ] || { bsdtar -xOf linux-lts-riscv64.apk boot/vmlinuz-lts > "$W/kernel/vmlinuz-lts-riscv64"; }
-case " $ARCHES " in *" x86_64 "*)
-    [ -f linux-virt-x86_64.apk ] || curl -fsL -o linux-virt-x86_64.apk $ALPINE/main/x86_64/linux-virt-6.18.55-r0.apk
-    [ -f "$W/kernel/vmlinuz-virt-x86_64" ] || { bsdtar -xOf linux-virt-x86_64.apk boot/vmlinuz-virt > "$W/kernel/vmlinuz-virt-x86_64"; }
-    ;;
-esac
+for a in x86_64 x86; do
+    case " $ARCHES " in *" $a "*)
+        [ -f linux-virt-$a.apk ] || curl -fsL -o linux-virt-$a.apk $ALPINE/main/$a/linux-virt-6.18.55-r0.apk
+        [ -f "$W/kernel/vmlinuz-virt-$a" ] || { bsdtar -xOf linux-virt-$a.apk boot/vmlinuz-virt > "$W/kernel/vmlinuz-virt-$a"; }
+        ;;
+    esac
+done
 file "$W"/kernel/*
 
 for a in $ARCHES; do
