@@ -22,7 +22,7 @@ index 7670d96d..b6bc9005 100644
  }
  
 diff --git a/Platform/VMData.swift b/Platform/VMData.swift
-index fb70720b..1b922daf 100644
+index fb70720b..16adbf03 100644
 --- a/Platform/VMData.swift
 +++ b/Platform/VMData.swift
 @@ -348,7 +348,16 @@ extension VMData {
@@ -35,7 +35,7 @@ index fb70720b..1b922daf 100644
 +        // narrow list still shows it. The guest architectures its QEMU has AOK gadgets for
 +        // (target/*/tcg/aok there); every other one runs on QEMU's own interpreter.
 +        if let qemuConfig = config as? UTMQemuConfiguration {
-+            let aok = ["riscv64", "aarch64"].contains(qemuConfig.system.architecture.rawValue)
++            let aok = ["riscv64", "aarch64", "x86_64", "i386"].contains(qemuConfig.system.architecture.rawValue)
 +            return (aok ? "AOK gadgets · " : "QEMU · ") + detailsSystemTargetLabel
 +        }
 +        #endif

@@ -42,13 +42,23 @@ WORKLOADS = "coremark,nbody,python,xz,sha256,awk"
 # INITRAMFS are then the arm64 guest's: kernel/vmlinuz-virt-aarch64, initramfs-aarch64-vm.cpio) and, with
 # DEVUAN_DIR (devuan-aarch64/), "Devuan Ultimate ARM64.utm". UTM gives an arm64 machine a cortex-a72.
 # Their UUIDs and MAC addresses are the RISC-V ones plus 0x10.
+#
+# ARCH=x86_64 and ARCH=i386 make "AOK x86-64 Console.utm" and "AOK x86 32-bit Console.utm" the same way
+# (kernel/vmlinuz-virt-x86_64 with initramfs-x86_64.cpio; kernel/vmlinuz-virt-x86 with initramfs-x86.cpio):
+# a PC, with a CPU that has rdrand and a kernel told to trust it, since without a source of entropy the
+# guest waits a quarter of a minute for some, and with no network card, the image having no modules.
 ARCH = os.environ.get("ARCH", "riscv64")
 A = {
     "riscv64": {"label": "RISC-V", "serial": "ttyS0", "kernel": "Image-lts-riscv64",
-                "initramfs": "initramfs-riscv64.cpio", "n": 0},
+                "initramfs": "initramfs-riscv64.cpio", "n": 0, "target": "virt", "cpu": "default"},
     "aarch64": {"label": "ARM64", "serial": "ttyAMA0", "kernel": "vmlinuz-virt-aarch64",
-                "initramfs": "initramfs-aarch64.cpio", "n": 0x10},
+                "initramfs": "initramfs-aarch64.cpio", "n": 0x10, "target": "virt", "cpu": "default"},
+    "x86_64": {"label": "x86-64", "serial": "ttyS0", "kernel": "vmlinuz-virt-x86_64",
+               "initramfs": "initramfs-x86_64.cpio", "n": 0x20, "target": "q35", "cpu": "qemu64"},
+    "i386": {"label": "x86 32-bit", "serial": "ttyS0", "kernel": "vmlinuz-virt-x86",
+             "initramfs": "initramfs-x86.cpio", "n": 0x30, "target": "q35", "cpu": "qemu32"},
 }[ARCH]
+X86 = ARCH in ("x86_64", "i386")
 
 
 def vm_uuid(n):
@@ -65,8 +75,8 @@ def base(name, notes, vm_uuid, cpus, memory):
         "ConfigurationVersion": 4,
         "Information": {"Name": name, "IconCustom": False, "Icon": "linux", "Notes": notes, "UUID": vm_uuid},
         "System": {
-            "Architecture": ARCH, "Target": "virt", "CPU": "default",
-            "CPUFlagsAdd": [], "CPUFlagsRemove": [],
+            "Architecture": ARCH, "Target": A["target"], "CPU": A["cpu"],
+            "CPUFlagsAdd": ["rdrand"] if X86 else [], "CPUFlagsRemove": [],
             "CPUCount": cpus, "ForceMulticore": False, "MemorySize": memory, "JITCacheSize": 0,
         },
         "QEMU": {
@@ -167,10 +177,11 @@ def main():
                    "leaves a shell on the terminal.",
                    vm_uuid(1), cpus=1, memory=1024)
     console["QEMU"]["AdditionalArguments"] = [
-        f'-append "console={A["serial"]} rdinit=/init quiet bench={WORKLOADS} then=shell"',
+        f'-append "console={A["serial"]} rdinit=/init quiet {"random.trust_cpu=on " if X86 else ""}'
+        f'bench={WORKLOADS} then=shell"',
     ]
     console["Serial"] = [terminal()]
-    console["Network"] = [network(mac(1))]
+    console["Network"] = [] if X86 else [network(mac(1))]
     console["Drive"] = direct_boot(1)
     write(outdir, console, {A["kernel"]: kernel, A["initramfs"]: initramfs})
     if ARCH != "riscv64":

@@ -113,11 +113,13 @@ static void end(void)
 #define WIDE(X) X("k", 32) X("q", 64)
 #define INCW "incq"
 #define JCXZ "jrcxz"
+#define STK1 "(%%rsp)"
 #else
 #define SIZES(X) X("b", 8) X("w", 16) X("k", 32)
 #define WIDE(X) X("k", 32)
 #define INCW "incl"
 #define JCXZ "jecxz"
+#define STK1 "(%%esp)"
 #endif
 
 static void arith(void)
@@ -501,6 +503,19 @@ static void control(void)
                          : : "cc", "memory");
         mix(a); mix(b); mix(c); mix(d); mix(fi & FL);
         (void)fo;
+        {
+            /* the carry set, cleared and turned; the flags through ah; a pop to memory that uses the stack pointer */
+            W v = val(), w = val(), f1, f2, f3, cell[2] = { 0, 0 };
+            __asm__ volatile("cmp %[w], %[v]\n stc\n adc $0, %[v]\n clc\n sbb $0, %[w]\n cmc\n pushf\n pop %[f1]\n"
+                             "cmp %[v], %[w]\n lahf\n mov %%eax, %k[f2]\n xor $0x4100, %%eax\n sahf\n"
+                             "push %[v]\n pop (%[p])\n push %[w]\n push %[v]\n pop " STK1 "\n pop %[v]\n"
+                             /* what sahf left, read here: a flag after anything the compiler put between */
+                             /* two statements is the stack pointer's, which is another one at every start */
+                             "pushf\n pop %[f3]"
+                             : [v] "+b" (v), [w] "+c" (w), [f1] "=&S" (f1), [f2] "=&D" (f2), [f3] "=&a" (f3)
+                             : [p] "d" (cell) : "cc", "memory");
+            mix(v); mix(w); mix(f1 & FL); mix(f2 & 0xd500); mix(cell[0]); mix(f3 & 0xd5);
+        }
 #ifndef __x86_64__
         {
             /* segment registers, as a 32-bit system's entry and exit code handles them */

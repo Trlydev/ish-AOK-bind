@@ -23,6 +23,15 @@ for w in "$@"; do
     simdtest-*) ./simdtest -b "${w#simdtest-}"; ./timeit "$w" true ;;   # one bucket of it, a line an encoding
     x86test)  ./x86test; ./timeit x86test true ;;           # x86 and x86_64: the integer instructions
     x86testv) ./x86test -v; ./timeit x86testv true ;;       # every result of it
+    poke)     # a kernel patching its own code under the other CPUs' feet: Linux flips a static key by
+              # writing a breakpoint, then the new bytes, and counts on no CPU meeting the breakpoint
+              # after that. The scheduler's statistics key sits in paths the three busy shells never leave.
+              for i in 1 2 3; do ( while :; do ./check.sh > /dev/null 2>&1; done ) & done
+              n=0; while [ $n -lt 1500 ]; do
+                  echo 1 > /proc/sys/kernel/sched_schedstats; echo 0 > /proc/sys/kernel/sched_schedstats
+                  n=$((n + 1))
+              done
+              kill $(jobs -p) 2> /dev/null; echo "POKE $n"; ./timeit poke true ;;
     *)        ./timeit "$w" true ;;
     esac
 done

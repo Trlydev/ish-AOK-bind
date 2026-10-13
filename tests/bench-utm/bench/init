@@ -40,9 +40,16 @@ if [ -d "/lib/modules/$(uname -r)" ]; then
             echo "NET $n $(ifconfig "$n" | sed -n 's/.*inet addr:\([^ ]*\).*/\1/p')"
     done
 fi
-# (which engine: the AOK gadget engine says so in the device tree; nothing there is QEMU's own)
-E=$(tr -d '\000' < /proc/device-tree/chosen/aok,engine 2> /dev/null)
-echo "BENCH-START $(uname -m) $(uname -r) $B [engine: ${E:-QEMU, without the AOK gadgets}]"
+# Which engine: the AOK gadget engine says so in the device tree, where the machine has one, and a PC's
+# in the name of its processor (and both in a fw_cfg file, which takes a driver to read).
+E=
+if [ -d /proc/device-tree ]; then
+    [ -r /proc/device-tree/chosen/aok,engine ] && E=$(tr -d '\000' < /proc/device-tree/chosen/aok,engine)
+elif grep -q "(AOK gadgets)" /proc/cpuinfo; then
+    E="AOK gadgets ($(uname -m))"
+fi
+E=${E:-QEMU, without the AOK gadgets}
+echo "BENCH-START $(uname -m) $(uname -r) $B [engine: $E]"
 /bench/run1.sh $(echo "$B" | tr , ' ')
 echo BENCH-END
 [ -n "$GLTEST" ] && /bench/gltest.sh "$GLTEST"
