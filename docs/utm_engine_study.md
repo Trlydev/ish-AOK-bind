@@ -369,11 +369,18 @@ per-guest decoders in `jit/gen.c`.
   with a generator that declines everything, then one guest's integer core,
   then memory, branches, FP, vectors. Each is testable on its own because of
   the fallback.
-- **Licence.** QEMU is GPLv2 (most files "or later"). AOK's riscv64 and arm64
-  guest engines are entirely this fork's own commits, so they can be offered
-  under whatever QEMU needs; `LICENSE.md` already names QEMU as a reason for
-  the GPLv2 grant. Shared files with upstream iSH history need a per-file
-  check before anything is copied.
+- **Licence.** QEMU is GPLv2 (most files "or later"). AOK's riscv64 guest
+  engine is entirely this fork's own commits, so it can be offered under
+  whatever QEMU needs; `LICENSE.md` already names QEMU as a reason for the
+  GPLv2 grant. Shared files with upstream iSH history need a per-file check
+  before anything is copied. **The arm64 engine is not all ours**
+  (corrected 2026-10-13): `docs/CREDITS-aarch64.md` lists what was adapted
+  from OpenMinis/ish-arm64, a GPLv3 fork of iSH -- `gadgets.h`, `math.S`,
+  `control.S`, and the SIMD files `simd_arith.S`, `simd_misc.S`,
+  `simd_shift.S` and `crypto.S`, with much of their decoding in `jit/gen.c`.
+  None of that has been copied into the QEMU fork, and none should be
+  without that project's word on GPLv2. What is there from the arm64 engine
+  is `frag.h` and `alu_spec.S`, which are this fork's own (section 11).
 - **Mainline QEMU** is a separate matter and not needed for this: TCTI itself
   is not there.
 
@@ -543,7 +550,7 @@ tests, each compared between the two:
 ### Not done
 
 - GL-accelerated displays in the UTM build (section 9).
-- arm64 and x86 guests. Each needs its gadgets retargeted the same way.
+- x86 guests. (arm64: section 11.)
 - Single-precision FP natively, and `ecall`/`sret` without leaving the stream.
 - AOK's fused pairs with a load, a store or a branch in them, and its cached
   register runs (section 10 has the pairs of integer gadgets).
@@ -1010,6 +1017,98 @@ does not get as far as the test: the kernel does not boot.)
   yet. With pairs on, the finished build is about 2% ahead of the previous
   one (integer pairs only) on CoreMark and 5% to 8% on the other five
   (medians of separate runs).
+
+## 11. The AArch64 plug-in
+
+Added 2026-10-13, in the same fork (`emkey1/qemu`, branch `aok-gadgets`,
+`target/arm/tcg/aok`; `docs/devel/aok-gadgets.rst` there has the design).
+The guest here is the host's own architecture, which is what AOK's arm64
+engine was built on: an instruction is most often the same instruction with
+its registers read from the CPU state and written back.
+
+### What it does
+
+| Part | How |
+|------|-----|
+| Integer, conditional selects and compares | AOK's operand-specialised gadgets (`jit/guest-arm64/alu_spec.S`), assembled in the fork unchanged, plus the fork's own for what AOK does with run-time decoding |
+| Loads, stores, pairs (X and W) | AOK's bodies (`jit/guest-arm64/frag.h`) with QEMU's softmmu fast path in place of AOK's TLB; the slow path is one call into QEMU's cputlb, which may raise |
+| Branches | direct ones linked as TCG links them; indirect ones through QEMU's per-CPU jump cache, probed in the gadget |
+| System registers, exclusives, `svc`, `eret`, DAIF | one call to C each, with the helpers QEMU's own code calls; `mrs xt, sp_el0` (a kernel's "current") and plain fields are moves |
+| Floating point and SIMD | the instruction itself: every encoding of the class is assembled in the fork on fixed registers, as a two-instruction thunk, and a gadget loads the registers, calls the thunk and stores the result. The host's FPCR is the guest's while they run |
+
+The FP and SIMD part is the fork's own and shares nothing with AOK: AOK's
+SIMD gadget files are the ones ported from OpenMinis/ish-arm64 (GPLv3; see
+"Licence" in section 5), and they decode register numbers at run time
+anyway. A thunk table needs no list of mnemonics, only the shape of the
+encoding space, so what the translator decides is which encodings exist for
+the guest's CPU (the base architecture's tables; half-precision arithmetic
+and every later extension stay QEMU's).
+
+### Results
+
+An Alpine arm64 guest (`-M virt -cpu cortex-a72`, UTM's default CPU), one
+CPU, on an Apple M5, in host CPU cycles, against the same binary with the
+plug-in off (QEMU's threaded interpreter), two runs each, the boot
+subtracted from the workloads:
+
+| Workload | QEMU's engine | AOK gadgets | Ratio |
+|----------|--------------:|------------:|------:|
+| Boot to the test script | 12.10 G | 4.75 G | 2.5 |
+| CoreMark | 10.61 G | 4.19 G | 2.5 |
+| n-body (doubles) | 10.74 G | 3.12 G | 3.4 |
+| Python | 31.18 G | 9.83 G | 3.2 |
+| xz -3 | 9.96 G | 4.37 G | 2.3 |
+| sha256sum | 4.17 G | 1.95 G | 2.1 |
+| awk | 10.59 G | 4.12 G | 2.6 |
+
+99.9% of the guest's translated blocks are gadget streams, and QEMU's main
+loop enters its own engine's code 3,700 times in a boot and the check
+programs (44 million times before FP and SIMD were added). No fused pairs
+yet: this is one gadget an instruction.
+
+### How it was checked
+
+The same way as RISC-V (section 8), against the same binary with the plug-in
+off: the check programs, the FP test, the memory test (now with B, H, S, D
+and Q registers and pairs of them, in each addressing mode, across page
+boundaries and over faulting pages), with one guest CPU and with four, and
+with `-cpu max`.
+
+And one new program, `tests/bench-utm/bench/simdtest.c`: all 560,640
+encodings of the scalar FP and Advanced SIMD data-processing space on fixed
+registers, each run on four sets of inputs (one under round-to-zero with
+flush-to-zero and default NaN), the result, the flags and FPSR hashed, and a
+SIGILL hashed as that. It checks both which instructions a guest CPU has and
+what each computes. Against stock QEMU 11.0.3 with its JIT backend the
+transcript is identical.
+
+### Bugs worth remembering
+
+- **QEMU's threaded interpreter computes three SIMD instructions wrongly**,
+  in the fork's base and so presumably in UTM SE: `cmlt #0` and `cmle #0` on
+  8-, 16- and 32-bit lanes, and `sshl` on 16- and 32-bit lanes. simdtest
+  found it as 18 encodings where the plug-in and the reference differed; the
+  plug-in, QEMU's JIT backend and the hardware (the same guest under HVF)
+  agree with each other. Not reported: it waits with everything else for
+  the maintainers (`docs/TODO.md`).
+- `sev` and `sevl` were NOPs in the first version. This QEMU models the
+  event register a `wfe` waits for, so the kernel's `sevl; wfe`
+  (`smp_cond_load_relaxed`, the spinlock slow path) went to sleep on an
+  event that had not been set, and a guest with four CPUs hung in one boot
+  out of three while bringing them up. One CPU never showed it.
+- An `ARMCPRegInfo` belongs to one CPU and a translated block to all of
+  them: a register's descriptor found at translation must not be kept in
+  the stream. QEMU's own code looks it up again at run time, and so does
+  the plug-in now.
+
+### Not done
+
+- Fused pairs (AOK's arm64 pair list, `jit/guest-arm64/pairs.h`).
+- The structure loads and stores (`ld1` and the like), the LSE atomics.
+- A CPU newer than the base: with `-cpu max` the guest is correct but
+  hardly faster, because pointer authentication, BTI's indirect branches,
+  LSE and LSE2 are all left to QEMU.
+- A UTM SE build with it, and an arm64 Linux machine on the iPads.
 
 ## Appendix: reproducing the race
 

@@ -24,6 +24,17 @@ for a in aarch64 riscv64; do
         mv "$W/bench/memtest.$a.tmp" "$W/bench/memtest.$a"
     fi
     "$ISH" -f "$R" /bin/sh -c 'cat > /bench/memtest && chmod +x /bench/memtest' < "$W/bench/memtest.$a"
+    # simdtest (aarch64 only): every FP and SIMD encoding on a few inputs, for an engine that runs them
+    # another way than its reference does (the QEMU plug-in's AArch64 front end runs them on the host).
+    if [ "$a" = aarch64 ]; then
+        if [ ! -s "$W/bench/simdtest.$a" ] || [ "$W/bench/simdtest.c" -nt "$W/bench/simdtest.$a" ]; then
+            "$ISH" -f "$dev" /bin/sh -e -c 'mkdir -p /tmp/bench-utm && cd /tmp/bench-utm && cat > simdtest.c &&
+                gcc -O2 -static -o simdtest simdtest.c && cat simdtest' \
+                < "$W/bench/simdtest.c" > "$W/bench/simdtest.$a.tmp"
+            mv "$W/bench/simdtest.$a.tmp" "$W/bench/simdtest.$a"
+        fi
+        "$ISH" -f "$R" /bin/sh -c 'cat > /bench/simdtest && chmod +x /bench/simdtest' < "$W/bench/simdtest.$a"
+    fi
     tar -cf - -C "$W" bench/init bench/run1.sh bench/check.sh bench/fptest.c bench/memtest.c bench/udhcpc.sh bench/gltest.sh | "$ISH" -f "$R" /bin/sh -c 'tar -xf - -C /'
     "$ISH" -f "$R" /bin/sh -e -c '
         cd /bench && rm -f ._*

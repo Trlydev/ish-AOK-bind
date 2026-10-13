@@ -19,6 +19,8 @@ for w in "$@"; do
     fptest)   ./fptest; ./timeit fptest true ;;
     memtest)  ./memtest; ./timeit memtest true ;;
     fptestv)  ./fptest -v; ./timeit fptestv true ;;
+    simdtest) ./simdtest; ./timeit simdtest true ;;         # aarch64: every FP/SIMD encoding
+    simdtest-*) ./simdtest -b "${w#simdtest-}"; ./timeit "$w" true ;;   # one bucket of it, a line an encoding
     *)        ./timeit "$w" true ;;
     esac
 done
