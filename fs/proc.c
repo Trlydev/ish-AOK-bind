@@ -520,8 +520,19 @@ void proc_printf(struct proc_data *buf, const char *format, ...) {
     proc_buf_append(buf, data, size);
 }
 
+// may_block: generic.c and stat.c do not hold inodes_lock across a call in
+// here (kernel/fs.h). There is nothing of procfs's for that lock to guard --
+// no file on a host, no metadata beside it -- and what a handler waits for
+// is a task's lock, pids_lock or a memory lock, each of which someone can be
+// holding while they wait for inodes_lock. One such ring stopped a guest for
+// good: an open of /proc/<pid>/fdinfo held inodes_lock and waited for the
+// task's lock; the task held it in a copy-on-write fault and waited for its
+// memory lock; and two readers of its smaps_rollup held that, waiting for
+// inodes_lock to ask whether a mapped file still had its name
+// (tests/manual/proc_pid_exit_race.c, on the i386 leg of a suite run).
 const struct fs_ops procfs = {
     .name = "proc", .magic = 0x9fa0,
+    .may_block = true,
     .mount = proc_mount,
     .open = proc_open,
     .getpath = proc_getpath,

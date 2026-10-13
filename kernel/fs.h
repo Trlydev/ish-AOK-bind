@@ -468,6 +468,10 @@ struct fs_ops {
     // global lock while waiting on a daemon whose own filesystem work needs
     // that lock is a deadlock, and even without the cycle it would wedge every
     // other file operation in the emulator behind one slow daemon.
+    //
+    // And for one whose operations wait on the kernel's own locks: procfs,
+    // whose handlers take a task's lock, pids_lock and memory locks (fs/proc.c
+    // has the ring that made it one).
     bool may_block;
 
     int (*mount)(struct mount *mount);
