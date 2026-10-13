@@ -40,12 +40,21 @@
 #     switch is through, where the finger landed. UTM sent it at once: pressed on the old device, wherever
 #     its cursor was, and released on the new one (the guest's mouse kept its button down and the desktop
 #     ignored every later click), or, if the switch was already through, not at all.
+#   - the app is "AOK VM" on the home screen and on its welcome page, which says what it is based on. A
+#     fork is not UTM's to be named for (its licence grants the code, not the name), and UTM SE is on the
+#     App Store under that name.
+# Its icon is icon/AppIcon.icon (beside this script; copy the directory to ~/aok-utm/icon), which replaces
+# UTM's Icon Composer document of the same name. The bundle id, the App Group and the product's file name
+# ("UTM SE.app") are still the ones above.
 set -e
 U=${U:-$HOME/aok-utm}
 cd "$U/UTM"
 if [ -f "$U/utm-frontend.patch" ] && git apply --check "$U/utm-frontend.patch" 2> /dev/null; then
     git apply "$U/utm-frontend.patch"
     echo "applied utm-frontend.patch"
+fi
+if [ -d "$U/icon/AppIcon.icon" ]; then
+    rsync -a --delete "$U/icon/AppIcon.icon/" Platform/AppIcon.icon/
 fi
 [ -f CodeSigning.xcconfig ] || cat > CodeSigning.xcconfig <<'XC'
 DEVELOPMENT_TEAM = UYU5FM4LQ4

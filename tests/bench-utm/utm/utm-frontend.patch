@@ -1,3 +1,26 @@
+diff --git a/Platform/Shared/VMPlaceholderView.swift b/Platform/Shared/VMPlaceholderView.swift
+index 7670d96d..b6bc9005 100644
+--- a/Platform/Shared/VMPlaceholderView.swift
++++ b/Platform/Shared/VMPlaceholderView.swift
+@@ -70,9 +70,18 @@ fileprivate struct VMPlaceholderViewNew: View {
+ 
+ fileprivate struct Title: View {
+     var body: some View {
++        #if os(iOS) || os(visionOS)
++        // iSH-AOK's build: a name of its own, and where it comes from.
++        VStack(spacing: 6) {
++            Text(verbatim: "Welcome to AOK VM").font(.title)
++            Text(verbatim: "Based on UTM SE and QEMU, with the AOK gadget engine")
++                .font(.footnote).foregroundColor(.secondary)
++        }
++        #else
+         HStack {
+             Text("Welcome to UTM").font(.title)
+         }
++        #endif
+     }
+ }
+ 
 diff --git a/Platform/iOS/Display/VMDisplayMetalViewController+Keyboard.m b/Platform/iOS/Display/VMDisplayMetalViewController+Keyboard.m
 index 3bafa9a7..d37655a9 100644
 --- a/Platform/iOS/Display/VMDisplayMetalViewController+Keyboard.m
@@ -318,6 +341,19 @@ index 502df052..ed6bdf09 100644
              UIPress.pressResponderOverride = self
          }
          #if !os(visionOS) && WITH_LOCATION_BACKGROUND
+diff --git a/Platform/iOS/Info.plist b/Platform/iOS/Info.plist
+index 60a5f1e8..f46af006 100644
+--- a/Platform/iOS/Info.plist
++++ b/Platform/iOS/Info.plist
+@@ -27,6 +27,8 @@
+ 	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
++	<key>CFBundleDisplayName</key>
++	<string>AOK VM</string>
+ 	<key>CFBundleName</key>
+ 	<string>$(PRODUCT_NAME)</string>
+ 	<key>CFBundlePackageType</key>
 diff --git a/Platform/iOS/Settings.bundle/Root.plist b/Platform/iOS/Settings.bundle/Root.plist
 index 985a8040..964e9dda 100644
 --- a/Platform/iOS/Settings.bundle/Root.plist
