@@ -6,6 +6,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/fs.h"
@@ -764,7 +765,7 @@ static int proc_readlink_self(struct proc_entry *UNUSED(entry), char *buf) {
     // Linux's /proc/self points at the bare pid ("123"), with no trailing slash.
     // The path resolver appends "/rest" itself, so the slash was never needed and
     // only corrupted readlink("/proc/self") for callers that parse the pid.
-    snprintf(buf, MAX_PATH, "%d", current->pid);
+    snprintf(buf, MAX_PATH, "%d", current_pid_shown(current->pid));
     return 0;
 }
 
@@ -774,7 +775,7 @@ static int proc_readlink_self(struct proc_entry *UNUSED(entry), char *buf) {
 // has no other way to name itself, and glibc's sched_getcpu and several
 // tracing libraries open it by name. It did not exist at all.
 static int proc_readlink_thread_self(struct proc_entry *UNUSED(entry), char *buf) {
-    snprintf(buf, MAX_PATH, "%d/task/%d", current->tgid, current->pid);
+    snprintf(buf, MAX_PATH, "%d/task/%d", current_pid_shown(current->tgid), current_pid_shown(current->pid));
     return 0;
 }
 
@@ -986,7 +987,7 @@ static void proc_print_escaped(struct proc_data *buf, const char *str) {
 static int proc_mounts_root(struct proc_entry *entry, char *root_path) {
     struct fs_info *fs = NULL;
     if (entry->pid != 0) {
-        struct task *task = pid_get_task_zombie_ref(entry->pid);
+        struct task *task = pid_get_task_zombie_global_ref(entry->pid);
         if (task != NULL) {
             if (task_lock_unless_exiting(task)) {
                 if (task->fs != NULL)
@@ -1255,8 +1256,9 @@ static int proc_root_pid_compare(const void *lhs, const void *rhs) {
 // top show each thread of a program as another process (waybar: 13 rows for
 // one). A leader that exited before its other threads stays linked, so its
 // process is still listed, as on Linux.
+// And only what the reader's pid namespace holds (kernel/pid_ns.h).
 static bool proc_root_lists_task(struct task *task) {
-    return task != NULL && task->group != NULL && task->group->leader == task;
+    return task != NULL && task->group != NULL && task->group->leader == task && task_visible(task);
 }
 
 static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
@@ -1281,8 +1283,9 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     // Room for the synthetic kernel threads too (kernel/task.c): they have no
     // task in alive_pids_list, so the walk above cannot see them, but /proc has
     // to list them or nothing will look.
+    // (The machine's: a pid namespace has none of its own.)
     unsigned nkthreads = 0;
-    while (pid_kthread_at(nkthreads) != 0)
+    while (current_pid_ns() == NULL && pid_kthread_at(nkthreads) != 0)
         nkthreads++;
     used += nkthreads;
 

@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include "fs/poll.h"
+#include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/rseq.h"
 #include "kernel/calls.h"
@@ -1359,7 +1360,7 @@ static void group_snapshot_release(struct group_snapshot *snap) {
 static bool process_snapshot_take_locked(struct tgroup **group, struct task **target,
         struct group_snapshot *snap) {
     if (*target != NULL) {
-        if (pid_get_task_zombie((*target)->pid) != *target || (*target)->group == NULL)
+        if (pid_get_task_zombie_global((*target)->pid) != *target || (*target)->group == NULL)
             return false;
         *group = (*target)->group;
     }
@@ -2725,7 +2726,7 @@ int send_group_signal(dword_t pgid, int sig, struct siginfo_ info) {
     struct tgroup *tgroup;
     complex_lockt(&pids_lock, 0);
 retry:
-    pid = pid_get(pgid);
+    pid = pid_get_global(pgid);
     if (pid == NULL) {
         unlock(&pids_lock);
         if (targets != stack_targets)
@@ -2776,7 +2777,7 @@ retry:
 
 int send_tgid_signal(dword_t tgid, int sig, struct siginfo_ info) {
     complex_lockt(&pids_lock, 0);
-    struct task *task = pid_get_task(tgid);
+    struct task *task = pid_get_task_global(tgid);
     if (task == NULL || task->group == NULL || task->group->leader != task ||
             !tgroup_live_locked(task->group)) {
         unlock(&pids_lock);
@@ -4771,8 +4772,34 @@ bool may_signal_task(struct task *task, dword_t sig) {
 static int signal_send_checked(struct task *task, dword_t sig, struct siginfo_ info,
         bool process) {
     // FIXME: Need to check references to kernel here to be sure they are zero
+    // A task outside the sender's pid namespace is not there to be signalled
+    // (kernel/pid_ns.h). The lookups by number already say so; this is for
+    // what was reached some other way -- a member of a process group that
+    // spans namespaces.
+    if (!task_visible(task))
+        return _ESRCH;
     if (!may_signal_task(task, sig))
         return _EPERM;
+    // The init of the sender's own pid namespace takes from inside only the
+    // signals it has a handler for: nothing in a namespace can kill or stop
+    // what the namespace hangs from (Linux's SIGNAL_UNKILLABLE) -- the init
+    // itself included, whose `kill -9 $$` does nothing.
+    if (sig != 0 && task_is_init_seen_from_inside(task)) {
+        struct sighand *sighand = task->sighand;
+        bool handled = false;
+        if (sighand != NULL && sig != SIGKILL_ && sig != SIGSTOP_) {
+            lock(&sighand->lock, 0);
+            handled = signal_action(sighand, (int) sig) == SIGNAL_CALL_HANDLER;
+            unlock(&sighand->lock);
+        }
+        if (!handled)
+            return 0;
+    }
+    // The sender, as the receiver's pid namespace knows it: 0 for one that
+    // is outside it.
+    if (info.kill.pid == current->tgid && task->pid_ns != NULL)
+        info.kill.pid = pid_ns_in(current->pid_ns, task->pid_ns) ?
+            pid_ns_shown(task->pid_ns, current->tgid) : 0;
     if (process) {
         send_signal_to_process(task, (int) sig, info);
     } else {
@@ -4812,7 +4839,7 @@ static int signal_send_to_pid(pid_t_ pid, pid_t_ tgid, dword_t sig, struct sigin
         bool process) {
     complex_lockt(&pids_lock, 0);
     struct task *task = pid_get_task_zombie(pid);
-    if (task == NULL || (tgid != 0 && task->tgid != tgid)) {
+    if (task == NULL || (tgid != 0 && task->tgid != current_pid_global(tgid))) {
         unlock(&pids_lock);
         return _ESRCH;
     }
@@ -4936,8 +4963,12 @@ retry:
         return _ENOMEM;
 
     for (int i = 2; i < MAX_PID; i++) {
-        struct task *task = pid_get_task(i);
+        struct task *task = pid_get_task_global(i);
         if (task == NULL || task == current || !task_is_leader(task))
+            continue;
+        // "Every process" is every process the caller can see, and not the
+        // init of its pid namespace (kernel/pid_ns.h).
+        if (!task_visible(task) || task_is_init_seen_from_inside(task))
             continue;
         if (target_count == target_cap) {
             unlock(&pids_lock);
@@ -5003,7 +5034,7 @@ static int do_kill_common(pid_t_ pid, dword_t sig, pid_t_ tgid, int si_code,
         pid_t_ pgid = current->group->pgid;
         unlock(&current->group->lock);
         complex_lockt(&pids_lock, 0);
-        err = kill_group(pgid, sig, si_code);
+        err = kill_group(current_pid_shown(pgid), sig, si_code);
     } else if (pid == -1) {
         complex_lockt(&pids_lock, 0);
         err = kill_everything(sig, si_code);
@@ -5048,7 +5079,7 @@ dword_t sys_rt_sigqueueinfo(pid_t_ pid, dword_t sig, addr_t uinfo_addr) {
 // id, so sigqueue() from any thread but the main one named a pid no process
 // had, and passed kill()'s code or the kernel's on to any process at all.
 static int queueinfo_claim_checked(const struct siginfo_ *info, pid_t_ target) {
-    if ((info->code >= 0 || info->code == SI_TKILL_) && target != current->pid)
+    if ((info->code >= 0 || info->code == SI_TKILL_) && current_pid_global(target) != current->pid)
         return _EPERM;
     return 0;
 }

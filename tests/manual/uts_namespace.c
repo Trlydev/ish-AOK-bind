@@ -157,11 +157,11 @@ static void check_ns_probe(void) {
 //
 // CLONE_NEWIPC left this list when IPC namespaces became real (kernel/ipc_ns.h)
 // -- as root it now succeeds here, as the UTS namespace does -- and
-// CLONE_NEWNS when mount namespaces did (kernel/mnt_ns.h), and CLONE_NEWUSER
-// with user namespaces (kernel/user_ns.h).
+// CLONE_NEWNS when mount namespaces did (kernel/mnt_ns.h), CLONE_NEWUSER
+// with user namespaces (kernel/user_ns.h), and CLONE_NEWPID with pid
+// namespaces (kernel/pid_ns.h).
 #define UNSHARE_NEWTIME 0x00000080
 #define UNSHARE_NEWCGROUP 0x02000000
-#define UNSHARE_NEWPID 0x20000000
 #define UNSHARE_NEWNET 0x40000000
 
 // 0 if the unshare succeeded, else the errno. Run in a child, because a
@@ -188,7 +188,6 @@ static void check_unshare_consistency(void) {
         int flag;
     } ns[] = {
         {"CLONE_NEWCGROUP", UNSHARE_NEWCGROUP},
-        {"CLONE_NEWPID", UNSHARE_NEWPID},
         {"CLONE_NEWNET", UNSHARE_NEWNET},
         {"CLONE_NEWTIME", UNSHARE_NEWTIME},
     };

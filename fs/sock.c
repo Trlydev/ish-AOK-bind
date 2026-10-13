@@ -21,6 +21,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include "kernel/pid_ns.h"
 #include "util/wait_spin.h"
 #include "kernel/user_ns.h"
 #include "kernel/calls.h"
@@ -5866,7 +5867,7 @@ static int scm_check_creds(const struct ucred_ *cred) {
     uid_t_ uid = current_make_kuid(cred->uid), gid = current_make_kgid(cred->gid);
     if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID)
         return _EINVAL;
-    if (cred->pid != current->tgid && !current_capable(CAP_SYS_ADMIN_))
+    if (current_pid_global(cred->pid) != current->tgid && !current_capable(CAP_SYS_ADMIN_))
         return _EPERM;
     if (uid != current->uid && uid != current->euid && uid != current->suid &&
             !ns_capable(current_user_ns(), CAP_SETUID_))
@@ -8542,7 +8543,9 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             cred.uid = cred.gid = -1;
         }
         unlock(&peer_lock);
-        // As the asker's user namespace names the peer.
+        // As the asker's namespaces name the peer: 0 for a process outside
+        // its pid namespace.
+        cred.pid = current_pid_shown_or_zero(cred.pid);
         if (cred.uid != (uid_t_) -1)
             cred.uid = current_uid_shown(cred.uid);
         if (cred.gid != (uid_t_) -1)
@@ -10466,7 +10469,8 @@ out_recvmsg_done:
                 assert(appended);
             }
             if (have_passcred) {
-                // As the receiver's user namespace names the sender.
+                // As the receiver's namespaces name the sender.
+                cred.pid = current_pid_shown_or_zero(cred.pid);
                 if (cred.uid != (uid_t_) -1)
                     cred.uid = current_uid_shown(cred.uid);
                 if (cred.gid != (uid_t_) -1)

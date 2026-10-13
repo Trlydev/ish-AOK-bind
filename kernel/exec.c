@@ -896,7 +896,7 @@ static void exec_de_thread(void) {
 
     complex_lockt(&pids_lock, 0);
     // Give up the tid we were allocated as a thread...
-    struct pid *own = pid_get(current->pid);
+    struct pid *own = pid_get_global(current->pid);
     if (own != NULL && own->task == current) {
         own->task = NULL;
         // Self-pointing, not NULL -- see the matching comment in
@@ -907,7 +907,7 @@ static void exec_de_thread(void) {
     }
     // ...and take the leader's, which is this process's pid. Session and
     // process-group membership hang off struct pid, so they travel with it.
-    struct pid *lead_pid = pid_get(leader->pid);
+    struct pid *lead_pid = pid_get_global(leader->pid);
     if (lead_pid != NULL)
         lead_pid->task = current;
     current->pid = leader->pid;
@@ -920,7 +920,7 @@ static void exec_de_thread(void) {
     // parent's wait() reports ECHILD.
     struct task *new_parent = inherit_parent;
     if (new_parent == NULL || new_parent == current || new_parent->exiting)
-        new_parent = pid_get_task(1);
+        new_parent = pid_get_task_global(1);
     if (new_parent != NULL && new_parent != current) {
         list_remove(&current->siblings);
         // Into the old leader's place among its siblings, as Linux's de_thread

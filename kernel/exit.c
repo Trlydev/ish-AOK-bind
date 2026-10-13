@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <string.h>
 #include "emu/cpu.h"
+#include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/rseq.h"
 #include "kernel/ipc_ns.h"
@@ -26,6 +27,7 @@ struct halt_target {
 };
 static struct halt_target *halt_system_collect_locked(size_t *count);
 static void halt_system_kill(struct halt_target *targets, size_t count);
+static struct halt_target *pid_ns_collect_locked(struct pid_namespace *ns, struct tgroup *dying, size_t *count);
 
 static bool trace_session_exit_task(struct task *UNUSED(task)) {
     return false;
@@ -192,8 +194,12 @@ static struct task *find_new_parent(struct task *task) {
     // Walk up from the dying process's own parent. A subreaper that is itself
     // exiting is no use, and the loop is bounded by the tree's depth -- plus a
     // hard cap, because a corrupted parent chain must not spin here forever.
+    // ...and no further than the pid namespace: a subreaper outside it is
+    // nobody its orphans could be the children of.
     struct task *ancestor = task->group->leader != NULL ? task->group->leader->parent : NULL;
     for (int depth = 0; ancestor != NULL && depth < MAX_PID; depth++) {
+        if (ancestor->pid_ns != task->pid_ns)
+            break;
         if (ancestor->group != NULL && ancestor->group->child_subreaper &&
                 !ancestor->exiting && !ancestor->zombie)
             return ancestor;
@@ -202,7 +208,15 @@ static struct task *find_new_parent(struct task *task) {
             break;                      // self-parented: nothing above it
         ancestor = ancestor->parent;
     }
-    return pid_get_task(1);
+    // The init of its pid namespace (kernel/pid_ns.h); when that is the one
+    // dying, or gone, the init of the namespace above; and at the top the
+    // machine's.
+    for (struct pid_namespace *ns = task->pid_ns; ns != NULL; ns = ns->parent) {
+        struct task *init = pid_get_task_global((dword_t) atomic_load(&ns->init_pid));
+        if (init != NULL && init->group != task->group && !init->exiting)
+            return init;
+    }
+    return pid_get_task_global(1);
 }
 
 static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) {
@@ -685,7 +699,7 @@ static void pdeath_notes_send(struct pdeath_notes *pd, struct siginfo_ info) {
         // can, as Linux's complete_signal prefers it, and another thread of its
         // process otherwise -- the only choice once it has exited.
         complex_lockt(&pids_lock, 0);
-        struct task *thread = pid_get_task(note->tid);
+        struct task *thread = pid_get_task_global(note->tid);
         if (thread != NULL && thread->tgid == note->tgid)
             task_ref_cnt_mod(thread, 1);
         else
@@ -737,7 +751,7 @@ static void exit_hangup_session_tty(struct task *leader, struct tty_hangup_targe
     if (tty == NULL || sid != leader->pid)
         return;
 
-    struct pid *sid_pid = pid_get(sid);
+    struct pid *sid_pid = pid_get_global(sid);
     if (sid_pid == NULL)
         return;
 
@@ -905,6 +919,9 @@ noreturn void do_exit(struct task *task, int status) {
     struct user_namespace *dead_user = task->user_ns;
     task->user_ns = NULL;
     user_ns_release(dead_user);
+    struct pid_namespace *dead_pid_for_children = task->pid_ns_for_children;
+    task->pid_ns_for_children = NULL;
+    pid_ns_release(dead_pid_for_children);
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads
 
@@ -1236,6 +1253,13 @@ noreturn void do_exit(struct task *task, int status) {
         }
         unlock(&task->group->lock);
         struct task *parent = leader->parent;
+        // A pid namespace's init died: the namespace goes with it. Nothing
+        // more is forked into it, and every process still inside -- in it
+        // or in one made inside it -- is killed (zap_pid_ns_processes).
+        struct pid_namespace *own_ns = leader->pid_ns;
+        if (parent != NULL && own_ns != NULL &&
+                atomic_load(&own_ns->init_pid) == leader->tgid && !atomic_exchange(&own_ns->dead, true))
+            halt_targets = pid_ns_collect_locked(own_ns, task->group, &halt_target_count);
         if (parent == NULL) {
             // init died. The CLI's halt_hook exits the host process with init's
             // status (and does not return), so the host exit code mirrors the guest
@@ -1471,7 +1495,7 @@ noreturn void do_exit_group(int status) {
 static struct halt_target *halt_system_collect_locked(size_t *count) {
     size_t cap = 0;
     for (int i = 2; i < MAX_PID; i++) {
-        struct task *task = pid_get_task(i);
+        struct task *task = pid_get_task_global(i);
         if (task != NULL && !task->zombie && task->sighand != NULL)
             cap++;
     }
@@ -1482,9 +1506,36 @@ static struct halt_target *halt_system_collect_locked(size_t *count) {
     if (targets == NULL)
         return NULL;
     for (int i = 2; i < MAX_PID && *count < cap; i++) {
-        struct task *task = pid_get_task(i);
+        struct task *task = pid_get_task_global(i);
         if (task == NULL || task->zombie || task->sighand == NULL)
             continue;
+        task_ref_cnt_mod(task, 1);
+        sighand_retain(task->sighand);
+        targets[*count] = (struct halt_target) {.task = task, .sighand = task->sighand};
+        (*count)++;
+    }
+    return targets;
+}
+
+// The same for one pid namespace: every task in `ns` or below it, other than
+// the dying init's own. Caller holds pids_lock.
+static struct halt_target *pid_ns_collect_locked(struct pid_namespace *ns, struct tgroup *dying, size_t *count) {
+    *count = 0;
+    size_t cap = 0;
+    struct halt_target *targets = NULL;
+    for (int i = 2; i < MAX_PID; i++) {
+        struct task *task = pid_get_task_global(i);
+        if (task == NULL || task->zombie || task->sighand == NULL || task->group == dying ||
+                task->pid_ns == NULL || !pid_ns_in(task->pid_ns, ns))
+            continue;
+        if (*count == cap) {
+            size_t new_cap = cap == 0 ? 16 : cap * 2;
+            struct halt_target *grown = realloc(targets, sizeof(*targets) * new_cap);
+            if (grown == NULL)
+                break;
+            targets = grown;
+            cap = new_cap;
+        }
         task_ref_cnt_mod(task, 1);
         sighand_retain(task->sighand);
         targets[*count] = (struct halt_target) {.task = task, .sighand = task->sighand};
@@ -1801,6 +1852,10 @@ static bool wait_eligible(const struct task *leader, int options) {
 int do_wait(int idtype, pid_t_ id, struct siginfo_ *info, struct rusage_ *rusage, int options) {
     if (idtype != P_ALL_ && idtype != P_PID_ && idtype != P_PGID_)
         return _EINVAL;
+    // A process group is matched by number against what each child holds,
+    // which is the machine's (kernel/pid_ns.h).
+    if (idtype == P_PGID_)
+        id = current_pid_global(id);
     // Linux's wait4 and waitid both take __WNOTHREAD, __WCLONE and __WALL;
     // wait4 refuses waitid's WEXITED and WNOWAIT itself.
     if (options & ~(WNOHANG_|WUNTRACED_|WEXITED_|WCONTINUED_|WNOWAIT_|
@@ -1842,7 +1897,7 @@ retry:
                     if (!wait_traces(task, this_thread_only) && !wait_eligible(task, options))
                         continue;
                     no_children = false;
-                    info->child.pid = task->pid;
+                    info->child.pid = current_pid_shown(task->pid);
                     if (reap_if_needed(task, info, rusage, options, &notes))
                         goto found_something;
                 }
@@ -1863,7 +1918,7 @@ retry:
                             continue;
                     }
                     no_children = false;
-                    info->child.pid = task->pid;
+                    info->child.pid = current_pid_shown(task->pid);
                     if (report_tracee(task, info, rusage, options, &notes))
                         goto found_something;
                 }

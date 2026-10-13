@@ -1,7 +1,7 @@
 // What clone() and unshare() answer, as root, for each namespace flag.
 //
 // On Linux as root both succeed, and so they do here for the namespaces AOK
-// has (UTS, IPC, mount, user). For a type it does not have (PID, network,
+// has (UTS, IPC, mount, user, PID). For a type it does not have (network,
 // cgroup) each entry point must fail with the errno its consumers read as
 // "no sandbox here, carry on", and those differ:
 //

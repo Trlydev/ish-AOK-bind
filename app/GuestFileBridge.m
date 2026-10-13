@@ -360,7 +360,7 @@ static ISHGuestFileKind ISHGuestFileKindFromMode(mode_t mode) {
 // and MotePadDocumentStore.m; those migrate onto this bridge in a later pass.
 - (BOOL)withGuestTaskContext:(void (^)(void))block {
     struct task *previous = current;
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init != NULL) {
         bool usable;
         lock(&init->general_lock, 0);
@@ -378,7 +378,7 @@ static ISHGuestFileKind ISHGuestFileKindFromMode(mode_t mode) {
 }
 
 - (BOOL)isGuestAvailable {
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init == NULL)
         return NO;
     bool usable;
@@ -1913,7 +1913,7 @@ static NSString *ISHForegroundDirectoryForTTY(int type, int number) {
     if (fg <= 0)
         return nil;
 
-    struct task *task = pid_get_task_ref(fg);
+    struct task *task = pid_get_task_global_ref(fg);
     if (task == NULL)
         return nil;
     struct fs_info *fs = NULL;

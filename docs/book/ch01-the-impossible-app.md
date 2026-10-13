@@ -314,12 +314,12 @@ is the most reliable way to introduce a bug.
 A book about a system should say early where the system is weak, so the reader
 can calibrate.
 
-**There is one machine.** No PID or network namespaces. There is
-exactly one Linux underneath everything, so `/proc`, `/sys` and `/dev` show the
-same true state no matter which root you booted or which chroot you are standing
-in. A process can have a mount table of its own, and be root in a user
-namespace of its own (both arrived in 559), and that is as far as it goes:
-nothing container-shaped works. This is
+**There is one machine.** There is exactly one Linux underneath everything,
+so `/proc`, `/sys` and `/dev` show the same true state no matter which root
+you booted or which chroot you are standing in. A process can ask for a
+mount table, a user namespace and a pid namespace of its own (all three
+arrived in 559, for sandboxes), but there is one network and no cgroup
+namespaces, and nothing container-shaped works. This is
 architectural, not a missing feature; Chapter 21 shows the one place it is an
 advantage, and Chapter 41 is honest about the rest.
 

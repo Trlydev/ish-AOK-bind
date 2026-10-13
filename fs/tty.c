@@ -1,4 +1,5 @@
 #define DEFAULT_CHANNEL debug
+#include "kernel/pid_ns.h"
 #include "debug.h"
 #include <string.h>
 #include "kernel/calls.h"
@@ -1214,7 +1215,9 @@ static int tiocspgrp(struct tty *tty, pid_t_ pgid) {
     if (err < 0)
         goto out;
 
-    tty->fg_group = pgid;
+    // The machine's number (kernel/pid_ns.h): the terminal signals this
+    // group from threads that are in no pid namespace at all.
+    tty->fg_group = current_pid_global(pgid);
     STRACE("tty group set to = %d\n", tty->fg_group);
 
 out:
@@ -1243,7 +1246,7 @@ static int tiocsctty(struct tty *tty, int force) {
     if (tty->session) {
         if (force == 1 && superuser()) {
             // steal it
-            struct pid *pid = pid_get(tty->session);
+            struct pid *pid = pid_get_global(tty->session);
             struct tgroup *tgroup;
             list_for_each_entry(&pid->session, tgroup, session) {
                 lock(&tgroup->lock, 0);
@@ -1304,7 +1307,7 @@ static int tiocnotty(struct tty *tty, struct tty_hangup_targets *hup) {
         hup->fg_group = tty->fg_group;
         hup->session = 0;
 
-        struct pid *pid = pid_get(tty->session);
+        struct pid *pid = pid_get_global(tty->session);
         if (pid != NULL) {
             struct tgroup *tgroup;
             list_for_each_entry(&pid->session, tgroup, session) {
@@ -1357,7 +1360,7 @@ static int tiocgsid(struct tty *tty, pid_t_ *out) {
         err = _ENOTTY;
         goto out_unlock;
     }
-    *out = slave->session;
+    *out = current_pid_shown(slave->session);
     STRACE("tty session = %d\n", slave->session);
 
 out_unlock:
@@ -1377,7 +1380,7 @@ static int tiocgpgrp(struct tty *tty, pid_t_ *fg_group) {
         err = _ENOTTY;
         goto error_no_ctrl_tty;
     }
-    *fg_group = slave->fg_group;
+    *fg_group = current_pid_shown(slave->fg_group);
     STRACE("tty group = %d\n", slave->fg_group);
 
 error_no_ctrl_tty:
@@ -1686,7 +1689,7 @@ void tty_set_winsize(struct tty *tty, struct winsize_ winsize) {
         return;
     if (trylock(&pids_lock) != 0)
         return;
-    struct pid *pid = pid_get(tty->fg_group);
+    struct pid *pid = pid_get_global(tty->fg_group);
     if (pid != NULL) {
         struct tgroup *tgroup;
         list_for_each_entry(&pid->pgroup, tgroup, pgroup) {

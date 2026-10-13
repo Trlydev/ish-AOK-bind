@@ -3,6 +3,8 @@
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
 #include "kernel/native.h"
@@ -150,11 +152,160 @@ static bool pid_empty(struct pid *pid) {
 
 _Atomic uint64_t total_forks = 0;
 
-struct pid *pid_get(dword_t id) {
+struct pid *pid_get_global(dword_t id) {
     if (id >= sizeof(pids)/sizeof(pids[0]))
         return NULL;
     struct pid *pid = &pids[id];
     if (pid_empty(pid))
+        return NULL;
+    return pid;
+}
+
+struct task *pid_get_task_zombie_global(dword_t id) {
+    struct pid *pid = pid_get_global(id);
+    if (pid == NULL)
+        return NULL;
+    struct task *task = pid->task;
+    return task;
+}
+
+struct task *pid_get_task_global(dword_t id) {
+    struct task *task = pid_get_task_zombie_global(id);
+    if (task != NULL && task->zombie)
+        return NULL;
+    return task;
+}
+
+struct task *pid_get_task_global_ref(dword_t id) {
+    complex_lockt(&pids_lock, 0);
+    struct task *task = pid_get_task_global(id);
+    if (task != NULL)
+        task_ref_cnt_mod(task, 1);
+    unlock(&pids_lock);
+    return task;
+}
+
+// Same, but a zombie counts as existing. A task that has exited and not yet
+// been reaped is still a process: it holds its pid, wait() can still find it,
+// and pidfd_open(2) on Linux succeeds for one -- an immediately-readable
+// pidfd is how a pidfd reports an exit at all.
+struct task *pid_get_task_zombie_global_ref(dword_t id) {
+    complex_lockt(&pids_lock, 0);
+    struct task *task = pid_get_task_zombie_global(id);
+    if (task != NULL)
+        task_ref_cnt_mod(task, 1);
+    unlock(&pids_lock);
+    return task;
+}
+
+// ---- Pid namespaces (kernel/pid_ns.h) --------------------------------------
+
+struct pid_namespace *pid_ns_retain(struct pid_namespace *ns) {
+    if (ns != NULL)
+        atomic_fetch_add(&ns->refcount, 1);
+    return ns;
+}
+
+void pid_ns_release(struct pid_namespace *ns) {
+    while (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
+        struct pid_namespace *parent = ns->parent;
+        user_ns_release(ns->user_ns);
+        free(ns);
+        ns = parent;
+    }
+}
+
+struct pid_namespace *pid_ns_new(struct pid_namespace *parent, struct user_namespace *owner, int *err) {
+    if (parent != NULL && parent->level >= PID_NS_MAX_LEVEL) {
+        *err = _EINVAL;
+        return NULL;
+    }
+    struct pid_namespace *ns = calloc(1, sizeof(*ns));
+    if (ns == NULL) {
+        *err = _ENOMEM;
+        return NULL;
+    }
+    atomic_init(&ns->refcount, 1);
+    ns->inode = ns_alloc_inum();
+    ns->parent = pid_ns_retain(parent);
+    ns->level = parent != NULL ? parent->level + 1 : 1;
+    ns->user_ns = user_ns_retain(owner);
+    return ns;
+}
+
+bool pid_ns_in(const struct pid_namespace *ns, const struct pid_namespace *ancestor) {
+    for (;;) {
+        if (ns == ancestor)
+            return true;
+        if (ns == NULL)
+            return false;
+        ns = ns->parent;
+    }
+}
+
+struct pid_namespace *current_pid_ns(void) {
+    return current != NULL ? current->pid_ns : NULL;
+}
+
+pid_t_ pid_ns_shown(struct pid_namespace *viewer, pid_t_ pid) {
+    if (viewer == NULL || pid <= 0)
+        return pid;
+    return pid == atomic_load(&viewer->init_pid) ? 1 : pid;
+}
+
+pid_t_ pid_ns_global(struct pid_namespace *viewer, pid_t_ pid) {
+    if (viewer == NULL || pid <= 0)
+        return pid;
+    pid_t_ init = atomic_load(&viewer->init_pid);
+    if (pid == 1)
+        return init != 0 ? init : PID_NS_NO_PID;
+    return pid == init ? PID_NS_NO_PID : pid;
+}
+
+pid_t_ current_pid_shown(pid_t_ pid) { return pid_ns_shown(current_pid_ns(), pid); }
+pid_t_ current_pid_global(pid_t_ pid) { return pid_ns_global(current_pid_ns(), pid); }
+pid_t_ task_pid_shown(struct task *task, pid_t_ pid) { return pid_ns_shown(task->pid_ns, pid); }
+
+bool task_visible(struct task *task) {
+    return pid_ns_in(task->pid_ns, current_pid_ns());
+}
+
+bool task_is_init_seen_from_inside(struct task *task) {
+    struct pid_namespace *ns = task->pid_ns;
+    if (ns == NULL || task->tgid != atomic_load(&ns->init_pid))
+        return false;
+    return pid_ns_in(current_pid_ns(), ns);
+}
+
+// The namespace a pid slot's holder is in: its task's, or -- a group or
+// session that has outlived its leader keeps the number -- a member's.
+// Caller holds pids_lock.
+static bool pid_slot_visible(struct pid *pid, struct pid_namespace *viewer) {
+    struct task *task = pid->task;
+    if (task == NULL && !list_empty(&pid->pgroup))
+        task = list_first_entry(&pid->pgroup, struct tgroup, pgroup)->leader;
+    if (task == NULL && !list_empty(&pid->session))
+        task = list_first_entry(&pid->session, struct tgroup, session)->leader;
+    return task != NULL && pid_ns_in(task->pid_ns, viewer);
+}
+
+pid_t_ current_pid_shown_or_zero(pid_t_ pid) {
+    struct pid_namespace *viewer = current_pid_ns();
+    if (viewer == NULL || pid <= 0)
+        return pid;
+    complex_lockt(&pids_lock, 0);
+    struct pid *slot = pid_get_global((dword_t) pid);
+    bool visible = slot != NULL && pid_slot_visible(slot, viewer);
+    unlock(&pids_lock);
+    return visible ? pid_ns_shown(viewer, pid) : 0;
+}
+
+struct pid *pid_get(dword_t id) {
+    struct pid_namespace *viewer = current_pid_ns();
+    if (viewer == NULL)
+        return pid_get_global(id);
+    struct pid *pid = pid_get_global((dword_t) pid_ns_global(viewer, (pid_t_) id));
+    if (pid != NULL && !pid_slot_visible(pid, viewer))
         return NULL;
     return pid;
 }
@@ -183,10 +334,6 @@ struct task *pid_get_task_ref(dword_t id) {
     return task;
 }
 
-// Same, but a zombie counts as existing. A task that has exited and not yet
-// been reaped is still a process: it holds its pid, wait() can still find it,
-// and pidfd_open(2) on Linux succeeds for one -- an immediately-readable
-// pidfd is how a pidfd reports an exit at all.
 struct task *pid_get_task_zombie_ref(dword_t id) {
     complex_lockt(&pids_lock, 0);
     struct task *task = pid_get_task_zombie(id);
@@ -355,7 +502,7 @@ dword_t task_count_for_uid(uid_t_ uid) {
     dword_t count = 0;
     complex_lockt(&pids_lock, 0);
     for (dword_t id = 1; id < MAX_PID; id++) {
-        struct task *task = pid_get_task(id);
+        struct task *task = pid_get_task_global(id);
         if (task != NULL && task->uid == uid && task->pid == task->tgid)
             count++;
     }
@@ -1339,6 +1486,8 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     task->native_delivering = 0;
     task->mnt_ns = NULL; // copy_task gives a clone its parent's
     task->user_ns = NULL; // likewise
+    task->pid_ns = NULL;
+    task->pid_ns_for_children = NULL;
     task->exit_arch = NULL;
     memset(task->ptrace_debugreg, 0, sizeof(task->ptrace_debugreg));
     task->ptrace_singlestep = false;
@@ -1423,7 +1572,7 @@ void task_unlink_locked(struct task *task) {
     task->exiting = true;
     list_remove(&task->siblings);
     list_remove_safe(&task->ptrace_siblings);
-    struct pid *pid = pid_get(task->pid);
+    struct pid *pid = pid_get_global(task->pid);
     // pid_get returns NULL for a pid it considers empty, and pid_empty is
     // satisfied by `task == NULL` alone once session and pgroup are gone -- so
     // a second unlink of the same task arrives here with nothing to unlink.
@@ -1472,6 +1621,10 @@ static void task_free_final(struct task *task) {
     }
     free(task->groups);
     task->groups = NULL;
+    // Kept to here and not let go in do_exit: a zombie is still in its pid
+    // namespace, where the parent that will reap it has to be able to see it.
+    pid_ns_release(task->pid_ns);
+    task->pid_ns = NULL;
     seccomp_filter_release(task->seccomp_filter);
     task->seccomp_filter = NULL;
     sockrestart_task_gone(task);

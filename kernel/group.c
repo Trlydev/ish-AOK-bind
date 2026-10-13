@@ -1,6 +1,7 @@
 #include <string.h>
 #include "util/list.h"
 #include "util/sync.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "fs/tty.h"
@@ -8,8 +9,10 @@
 dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
     STRACE("setpgid(%d, %d)", id, pgid);
     int err;
+    // Both numbers are the caller's pid namespace's (kernel/pid_ns.h), its
+    // own included; what is stored below is the machine's.
     if (id == 0)
-        id = current->pid;
+        id = current_pid_shown(current->pid);
     if (pgid == 0)
         pgid = id;
     // a negative process-group id is invalid (checked before any task lookup,
@@ -75,9 +78,10 @@ dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
     // job-controlled pipeline missed its ^C, ^Z and hangup, and once the
     // leader was reaped the group looked gone -- kill(-pgid) said ESRCH and
     // joining it said EPERM.
-    if (tgroup->pgid != pgid) {
+    pid_t_ machine_pgid = current_pid_global(pgid);
+    if (tgroup->pgid != machine_pgid) {
         list_remove(&tgroup->pgroup);
-        tgroup->pgid = pgid;
+        tgroup->pgid = machine_pgid;
         list_add(&group_pid->pgroup, &tgroup->pgroup);
     }
 
@@ -108,7 +112,7 @@ pid_t_ sys_getpgid(pid_t_ pid) {
     unlock(&task->group->lock);
     if (release_task)
         task_ref_cnt_mod(task, -1);
-    return pgid;
+    return current_pid_shown(pgid);
 }
 pid_t_ sys_getpgrp(void) {
     return sys_getpgid(0);
@@ -117,7 +121,7 @@ pid_t_ sys_getpgrp(void) {
 // Must lock pids_lock and task->group->lock.
 void task_leave_session(struct task *task) {
     struct tgroup *group = task->group;
-    struct pid *sid_pid = pid_get(group->sid);
+    struct pid *sid_pid = pid_get_global(group->sid);
     bool last_session_group = sid_pid == NULL || list_size(&sid_pid->session) <= 1;
     list_remove_safe(&group->session);
     if (group->tty) {
@@ -144,7 +148,7 @@ void task_leave_session(struct task *task) {
 //
 // Caller holds pids_lock, which is what keeps the membership lists still.
 bool pgroup_is_orphaned(pid_t_ pgid, pid_t_ sid) {
-    struct pid *pid = pid_get(pgid);
+    struct pid *pid = pid_get_global(pgid);
     if (pid == NULL)
         return true;
     struct tgroup *tgroup;
@@ -190,7 +194,7 @@ pid_t_ task_setsid(struct task *task) {
     // leader in group->sid while filing the membership under the thread's pid.
     // Linux uses task_pid(group_leader) for both (ksys_setsid ->
     // set_special_pids).
-    struct pid *pid = pid_get(new_sid);
+    struct pid *pid = pid_get_global(new_sid);
     list_add(&pid->session, &group->session);
     group->sid = new_sid;
 
@@ -226,10 +230,10 @@ void tgroup_restore_ids(struct task *task, pid_t_ sid, pid_t_ pgid) {
     // the checkpoint and the members were left behind) has no pid struct to
     // hang off. Keeping the task's own is what a live orphan would look like
     // and is better than a dangling id.
-    struct pid *spid = pid_get((dword_t) sid);
-    struct pid *gpid = pid_get((dword_t) pgid);
-    if (spid == NULL) { spid = pid_get((dword_t) task->pid); sid = task->pid; }
-    if (gpid == NULL) { gpid = pid_get((dword_t) task->pid); pgid = task->pid; }
+    struct pid *spid = pid_get_global((dword_t) sid);
+    struct pid *gpid = pid_get_global((dword_t) pgid);
+    if (spid == NULL) { spid = pid_get_global((dword_t) task->pid); sid = task->pid; }
+    if (gpid == NULL) { gpid = pid_get_global((dword_t) task->pid); pgid = task->pid; }
     if (spid != NULL) {
         list_remove_safe(&group->session);
         list_add(&spid->session, &group->session);
@@ -246,7 +250,7 @@ void tgroup_restore_ids(struct task *task, pid_t_ sid, pid_t_ pgid) {
 
 dword_t sys_setsid(void) {
     STRACE("setsid()");
-    return task_setsid(current);
+    return current_pid_shown(task_setsid(current));
 }
 
 dword_t sys_getsid(pid_t_ pid) {
@@ -264,5 +268,5 @@ dword_t sys_getsid(pid_t_ pid) {
     unlock(&task->group->lock);
     if (release_task)
         task_ref_cnt_mod(task, -1);
-    return sid;
+    return current_pid_shown(sid);
 }

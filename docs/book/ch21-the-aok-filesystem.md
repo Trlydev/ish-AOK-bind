@@ -157,14 +157,15 @@ misconfigured something or whether the feature was never compiled in.
 
 ## 21.6 The advantage hiding inside a limitation
 
-Chapter 10 established that AOK has no PID namespaces, and that a mount table
-of one's own is something a process has to ask for; it treated that as a
-limitation — nothing container-shaped works, and that is architectural.
+Chapter 10 established that AOK is one machine: a mount table or a pid
+namespace of one's own is something a process has to ask for, and nothing
+else has one. It treated that as a limitation — nothing container-shaped
+works, and that is architectural.
 
 `/AOK` is where the same fact reads as an advantage, and the in-app overview
 states it directly:
 
-> iSH-AOK has no PID namespaces — there's exactly one Linux kernel
+> iSH-AOK is one machine — there's exactly one Linux kernel
 > underneath everything, so `/proc`, `/sys`, and `/dev` always reflect the
 > single true system state no matter which root or chroot you're looking at
 > them from.

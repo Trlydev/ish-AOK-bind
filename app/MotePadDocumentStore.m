@@ -147,7 +147,7 @@ static NSString *const kPersistGuestPrefix = @"/AOK/persist/";
 // and restore afterward. Returns NO if init isn't usable yet.
 - (BOOL)withGuestTaskContext:(void (^)(void))block {
     struct task *previous = current;
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init != NULL) {
         bool usable;
         lock(&init->general_lock, 0);

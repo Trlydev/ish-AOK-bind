@@ -209,8 +209,8 @@ it**. A root whose `/etc` has been broken badly enough that it will not boot is
 still just a directory to the root that can boot, which is a recovery story that
 a single-root design does not have.
 
-It works because every root's processes share one mount table unless one of
-them asks for its own, and one process table always (Chapters 10 and 21). There
+It works because every root's processes share one mount table and one
+process table unless one of them asks for its own (Chapters 10 and 21). There
 is one `/proc`, one `/sys` and one `/dev`, and they describe the single true
 system from wherever you are standing.
 

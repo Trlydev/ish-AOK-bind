@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 #include <sys/resource.h>
 #endif
+#include "kernel/pid_ns.h"
 #include "debug.h"
 #include <time.h>
 #include <signal.h>
@@ -1807,7 +1808,7 @@ dword_t sys_adjtimex_guest(guest_addr_t tx_addr) {
 // spinning thread). Late by up to that, as Linux is by up to a tick.
 static struct timespec posix_timer_thread_cpu_now(void *data) {
     struct posix_timer *timer = data;
-    struct task *task = pid_get_task_ref(timer->cpu_clock_pid);
+    struct task *task = pid_get_task_global_ref(timer->cpu_clock_pid);
     if (task == NULL) {
         struct timespec forever = { .tv_sec = INT64_MAX / 2, .tv_nsec = 0 };
         return forever;
@@ -1839,7 +1840,7 @@ static void posix_timer_callback(void *data, uint64_t expirations) {
     };
     struct task *thread = NULL;
     if (timer->thread_pid != 0) {
-        thread = pid_get_task_ref(timer->thread_pid);
+        thread = pid_get_task_global_ref(timer->thread_pid);
     } else if (timer->tgroup->leader != NULL) {
         // SIGEV_SIGNAL targets the process, so fall back to the thread-group leader.
         thread = timer->tgroup->leader;
@@ -1914,7 +1915,7 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
         // process's CPU clock only for a process you already control, and
         // nothing in the guest asks for it; EINVAL is what it answers when the
         // clock names someone else.
-        if (cpu_pid != 0 && cpu_pid != current->tgid && cpu_pid != current->pid)
+        if (cpu_pid != 0 && current_pid_global(cpu_pid) != current->tgid && current_pid_global(cpu_pid) != current->pid)
             return _EINVAL;
         real_clockid = cpu_perthread ? CLOCK_THREAD_CPUTIME_ID
                                      : CLOCK_PROCESS_CPUTIME_ID;
@@ -2024,7 +2025,9 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
         timer->thread_pid = 0;
     } else if (sigev.method == SIGEV_THREAD_ID_) {
         timer->tgroup = group;
-        timer->thread_pid = sigev.tid;
+        // The machine's number (kernel/pid_ns.h): the timer fires on a
+        // thread that is in no pid namespace.
+        timer->thread_pid = current_pid_global(sigev.tid);
     }
     unlock(&group->lock);
     return 0;

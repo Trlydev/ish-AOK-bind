@@ -2976,7 +2976,7 @@ static NSDictionary *MetricKitDiagnosticSummary(MXDiagnostic *diagnostic, NSStri
 static bool PushInitTaskAsCurrent(struct task **previousCurrent) {
     *previousCurrent = current;
 
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
 
     if (init != NULL) {
         bool usable = false;

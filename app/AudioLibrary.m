@@ -166,7 +166,7 @@ static const int kMaxScanDepth = 8;
 // init isn't usable yet (e.g. before the guest has booted).
 - (BOOL)withGuestTaskContext:(void (^)(void))block {
     struct task *previous = current;
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init != NULL) {
         bool usable;
         lock(&init->general_lock, 0);

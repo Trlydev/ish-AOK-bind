@@ -118,11 +118,11 @@ The implemented flag set is explicit in `kernel/fork.c`:
 CLONE_VM CLONE_FILES CLONE_FS CLONE_SIGHAND CLONE_SYSVSEM CLONE_VFORK
 CLONE_THREAD CLONE_SETTLS CLONE_CHILD_SETTID CLONE_PARENT_SETTID
 CLONE_CHILD_CLEARTID CLONE_DETACHED CLONE_PARENT CLONE_PIDFD CLONE_IO
-CLONE_NEWUTS CLONE_NEWIPC CLONE_NEWNS CLONE_NEWUSER
+CLONE_NEWUTS CLONE_NEWIPC CLONE_NEWNS CLONE_NEWUSER CLONE_NEWPID
 ```
 
 That covers everything a threading library or a shell needs. Of the namespace
-family it covers four. `CLONE_NEWUTS` is cheap because a UTS namespace is a
+family it covers five. `CLONE_NEWUTS` is cheap because a UTS namespace is a
 hostname and a domain name in a refcounted struct; `CLONE_NEWIPC` is System V
 IPC kept per namespace; and `CLONE_NEWNS`, since 559, gives the child a mount
 table of its own — a copy of its parent's tree in which nothing it mounts,
@@ -137,12 +137,21 @@ kernel that had decided privilege by "is euid 0" since its first day:
 namespace", so nothing they guard is reachable from inside one, and the few
 things a namespace's root *is* given — the mount, UTS and user namespaces it
 makes, the ids its maps cover, the files those ids own — are asked for by
-name with `ns_capable()`. `CLONE_NEWPID`, `CLONE_NEWNET` and `CLONE_NEWCGROUP`
-are refused.
+name with `ns_capable()`. `CLONE_NEWPID`, the third of 559's, is the one that
+shows how far "one machine" bends. There is still one pid table and a task
+still has one number in it; a pid namespace is a *filter* on what a number
+may name — from inside, only the tasks in the namespace or below it — plus a
+single exchange: the namespace's first process is `1` to those inside
+(`kernel/pid_ns.h`). The lookups by number apply both for whoever is asking,
+so a number a guest hands the kernel is confined without the call site's
+knowing, and what holds a machine number asks the `_global` forms. `ps` in
+one shows pid 1 and then numbers that are not small, which is the visible
+difference from Linux. When that pid 1 exits, everything left inside is
+killed. `CLONE_NEWNET` and `CLONE_NEWCGROUP` are refused.
 
 The absent ones are why nothing container-shaped runs here, and they are absent
-architecturally rather than accidentally: there is one pid space and one
-network. Chapter 21 shows the one place that turns out to be an
+architecturally rather than accidentally: there is one network, and one
+hierarchy of control groups. Chapter 21 shows the one place that turns out to be an
 advantage, and Chapter 41 is honest about the rest. `CLONE_IO` is accepted
 because on Linux it is only a hint about I/O scheduling, and AOK has no I/O
 scheduler for it to hint at.

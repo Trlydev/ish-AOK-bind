@@ -95,6 +95,7 @@ struct native_program;   // kernel/native.h
 
 struct mnt_namespace;
 struct user_namespace;
+struct pid_namespace;
 struct task {
     enum guest_abi abi;
     // Ticks since boot when this task was created -- /proc/<pid>/stat field 22
@@ -780,6 +781,13 @@ struct task {
     // task_create_: copy_task hands it on, and nothing else may -- a task
     // that came by it any other way would be the machine's root again.
     struct user_namespace *user_ns;
+
+    // The pid namespace this task is in (kernel/pid_ns.h), NULL for the
+    // initial one, and the one its children will be made in when that is
+    // another (unshare(CLONE_NEWPID); NULL for "the same"). Each owns a
+    // reference. Like the two above, handed on by copy_task alone.
+    struct pid_namespace *pid_ns;
+    struct pid_namespace *pid_ns_for_children;
 };
 // whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
 static inline bool riscv64_v_enabled(struct task *task) {
@@ -1070,12 +1078,24 @@ struct task_snapshot {
 // synchronizes obtaining a pointer to a task and freeing that task
 extern lock_t pids_lock;
 // these functions must be called with pids_lock
+//
+// By number AS THE CALLING TASK KNOWS IT (kernel/pid_ns.h): in a pid
+// namespace a number names only what is in that namespace, and 1 is its init.
+// For a number a guest supplied. Off a task, and in the initial namespace,
+// these are the _global ones.
 struct pid *pid_get(dword_t pid);
 struct pid *pid_get_last_allocated(void);
 struct task *pid_get_task(dword_t pid);
 struct task *pid_get_task_ref(dword_t pid);
 struct task *pid_get_task_zombie(dword_t id); // don't return null if the task exists as a zombie
 struct task *pid_get_task_zombie_ref(dword_t id); // ...and take a reference, like pid_get_task_ref
+// By machine number, whoever is asking: for a number the kernel holds (a
+// task's own pid or tgid, a stored group, a timer's target, the app's).
+struct pid *pid_get_global(dword_t pid);
+struct task *pid_get_task_global(dword_t pid);
+struct task *pid_get_task_global_ref(dword_t pid);
+struct task *pid_get_task_zombie_global(dword_t id);
+struct task *pid_get_task_zombie_global_ref(dword_t id);
 int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only);
 int task_snapshot_collect_all(struct task_snapshot *snapshot);
 void task_snapshot_release(struct task_snapshot *snapshot);

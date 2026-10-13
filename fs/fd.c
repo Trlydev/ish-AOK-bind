@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
+#include "kernel/pid_ns.h"
 #include "debug.h"
 #include "kernel/calls.h"
 #include "kernel/resource.h"
@@ -504,7 +505,9 @@ static int fd_setown(struct fd *fd, pid_t_ who) {
     unlock(&pids_lock);
     if (!target_exists)
         return _ESRCH;
-    fd->owner = who;
+    // Kept as the machine's number (kernel/pid_ns.h): whoever asks later
+    // may be in another pid namespace.
+    fd->owner = who > 0 ? current_pid_global(who) : -current_pid_global(-who);
     return 0;
 }
 
@@ -737,7 +740,7 @@ static dword_t sys_fcntl_common(fd_t f, dword_t cmd, guest_addr_t arg, bool gues
 
         case F_GETOWN_:
             STRACE("fcntl(%d, F_GETOWN)", f);
-            ret = (dword_t) fd->owner;
+            ret = (dword_t) (fd->owner >= 0 ? current_pid_shown(fd->owner) : -current_pid_shown(-fd->owner));
             break;
         case F_SETOWN_: {
             pid_t_ who = (pid_t_) arg;
@@ -754,7 +757,7 @@ static dword_t sys_fcntl_common(fd_t f, dword_t cmd, guest_addr_t arg, bool gues
         case F_GETOWN_EX_: {
             STRACE("fcntl(%d, F_GETOWN_EX)", f);
             struct f_owner_ex_ owner_ex;
-            pid_t_ who = fd->owner;
+            pid_t_ who = fd->owner >= 0 ? current_pid_shown(fd->owner) : -current_pid_shown(-fd->owner);
             if (who < 0) {
                 owner_ex.type = F_OWNER_PGRP_;
                 owner_ex.pid = -who;

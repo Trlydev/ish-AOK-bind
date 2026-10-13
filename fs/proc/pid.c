@@ -5,6 +5,7 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#include "kernel/pid_ns.h"
 #include "kernel/user_ns.h"
 #include "emu/memory.h"
 #include "kernel/ipc_ns.h"
@@ -23,8 +24,10 @@
 #include "kernel/seccomp.h"
 #include "util/sync.h"
 
+// A process's directory is named as the reader's pid namespace numbers it:
+// the namespace's own init is "1" (kernel/pid_ns.h).
 static void proc_pid_getname(struct proc_entry *entry, char *buf) {
-    snprintf(buf, 256, "%d", entry->pid);
+    snprintf(buf, 256, "%d", current_pid_shown(entry->pid));
 }
 
 static char proc_task_state_char_from_snapshot(pid_t_ pid, bool zombie, bool io_block, bool stopped) {
@@ -41,7 +44,7 @@ static struct task *proc_get_task(struct proc_entry *entry) {
     // whole directory, so a zombie was invisible to every tool. The handlers
     // below were already written for one (proc_task_state_char_from_snapshot
     // takes a `zombie` flag and returns 'Z'); they simply never received it.
-    return pid_get_task_zombie_ref(entry->pid);
+    return pid_get_task_zombie_global_ref(entry->pid);
 }
 static void proc_put_task(struct task *task) {
     if (task != NULL)
@@ -366,7 +369,8 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     // task_tgid_nr(real_parent). See sys_getppid() for why ->pid is wrong here,
     // and task_process_parent for why a thread's own ->parent is.
     struct task *parent = task_process_parent(task);
-    parent_pid = parent != NULL ? parent->tgid : 0;
+    // (0 for a parent the reader's pid namespace does not hold.)
+    parent_pid = parent != NULL && task_visible(parent) ? parent->tgid : 0;
     thread_count = list_size(&task->group->threads);
     pending = task->pending;
     blocked = task->blocked;
@@ -379,14 +383,15 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
 
     proc_state = proc_task_state_char_from_snapshot(pid, zombie, io_block, stopped);
 
-    proc_printf(buf, "%d ", pid);
+    // Every pid here as the reader's pid namespace numbers it.
+    proc_printf(buf, "%d ", current_pid_shown(pid));
     proc_printf(buf, "(%.16s) ", comm);
     proc_printf(buf, "%c ", proc_state);
-    proc_printf(buf, "%d ", parent_pid);
-    proc_printf(buf, "%d ", pgid);
-    proc_printf(buf, "%d ", sid);
+    proc_printf(buf, "%d ", current_pid_shown(parent_pid));
+    proc_printf(buf, "%d ", current_pid_shown(pgid));
+    proc_printf(buf, "%d ", current_pid_shown(sid));
     proc_printf(buf, "%d ", tty_dev);
-    proc_printf(buf, "%d ", tty_fg_group);
+    proc_printf(buf, "%d ", current_pid_shown(tty_fg_group));
     proc_printf(buf, "%u ", 0); // flags
 
     // page faults (no data available)
@@ -806,7 +811,7 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     // PPid is the parent PROCESS (task_tgid_nr(real_parent)), see sys_getppid()
     // and task_process_parent.
     struct task *parent = task_process_parent(task);
-    if (parent != NULL)
+    if (parent != NULL && task_visible(parent))
         ppid = parent->tgid;
     zombie = task->zombie;
     io_block = task->io_block;
@@ -849,10 +854,10 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
 
     proc_printf(buf, "Name:\t%s\n", task->comm);
     proc_printf(buf, "State:\t%c\n", proc_task_state_char_from_snapshot(task->pid, zombie, io_block, stopped));
-    proc_printf(buf, "Tgid:\t%d\n", task->tgid);
+    proc_printf(buf, "Tgid:\t%d\n", current_pid_shown(task->tgid));
     proc_printf(buf, "Ngid:\t0\n");
-    proc_printf(buf, "Pid:\t%d\n", task->pid);
-    proc_printf(buf, "PPid:\t%d\n", ppid);
+    proc_printf(buf, "Pid:\t%d\n", current_pid_shown(task->pid));
+    proc_printf(buf, "PPid:\t%d\n", current_pid_shown(ppid));
     proc_printf(buf, "TracerPid:\t0\n");
     // As the READER's user namespace names them (kernel/user_ns.h).
     proc_printf(buf, "Uid:\t%u\t%u\t%u\t%u\n", current_uid_shown(task->uid), current_uid_shown(task->euid),
@@ -1877,7 +1882,7 @@ static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
 }
 
 static void proc_pid_task_getname(struct proc_entry *entry, char *buf) {
-    snprintf(buf, 256, "%d", entry->pid);
+    snprintf(buf, 256, "%d", current_pid_shown(entry->pid));
 }
 
 static struct proc_dir_entry proc_pid_task;
@@ -2013,7 +2018,7 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
     if (ns_out != NULL)
         *ns_out = NULL;
     if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_ && nstype != CLONE_NEWNS_ &&
-            nstype != CLONE_NEWUSER_)
+            nstype != CLONE_NEWUSER_ && nstype != CLONE_NEWPID_)
         return inode;
     // Not a plain lock: see task_lock_unless_exiting.
     if (!task_lock_unless_exiting(task))
@@ -2024,6 +2029,19 @@ static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, voi
         inode = mnt_ns_or_init(task->mnt_ns)->inode;
         if (ns_out != NULL)
             *ns_out = mnt_ns_retain(task->mnt_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    if (nstype == CLONE_NEWPID_) {
+        // "pid" is the namespace the task is in; "pid_for_children" the one
+        // its next child will be, when an unshare has set one aside.
+        struct pid_namespace *pid_ns = task->pid_ns;
+        if (strcmp(proc_ns_types[index].name, "pid_for_children") == 0 && task->pid_ns_for_children != NULL)
+            pid_ns = task->pid_ns_for_children;
+        if (pid_ns != NULL)
+            inode = pid_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = pid_ns_retain(pid_ns);
         unlock(&task->general_lock);
         return inode;
     }
@@ -2066,6 +2084,8 @@ static void proc_ns_release(unsigned index, void *ns) {
         mnt_ns_release(ns);
     else if (proc_ns_types[index].nstype == CLONE_NEWUSER_)
         user_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWPID_)
+        pid_ns_release(ns);
 }
 
 static int proc_pid_ns_readlink(struct proc_entry *entry, char *buf) {
@@ -2236,7 +2256,7 @@ bool proc_ns_fd_is_initial(struct fd *fd) {
         return ns == NULL || ns == &init_ipc_ns;
     if (nstype == CLONE_NEWNS_)
         return ns == NULL || ns == &init_mnt_ns;
-    if (nstype == CLONE_NEWUSER_)
+    if (nstype == CLONE_NEWUSER_ || nstype == CLONE_NEWPID_)
         return ns == NULL;
     return true;
 }

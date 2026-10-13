@@ -478,7 +478,7 @@ static void mq_note_fire(struct mq_note *note) {
             .rt.value = note->value,
         };
         complex_lockt(&pids_lock, 0);
-        struct task *owner = pid_get_task(note->tgid);
+        struct task *owner = pid_get_task_global(note->tgid);
         if (owner != NULL && owner->exec_gen == note->exec_gen)
             task_ref_cnt_mod(owner, 1);
         else

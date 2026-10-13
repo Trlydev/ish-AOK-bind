@@ -350,7 +350,7 @@ intptr_t become_first_process(void) {
 }
 
 intptr_t become_new_init_child(void) {
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init == NULL)
         return _ESRCH;
     // An exited init stays in the pid table -- it has no parent, so it is never
@@ -603,7 +603,7 @@ void guest_process_stop(struct guest_process *process) {
     // Reap, bounded, as the capture does: the guest's own init may win the
     // race, which only loses an exit status nobody here reads.
     struct task *saved = current;
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init == NULL)
         return;
     current = init;
@@ -644,7 +644,7 @@ static void capture_child_kill(dword_t child_pid, bool own_pgroup) {
     size_t count = 0;
 
     complex_lockt(&pids_lock, 0);
-    struct task *root = pid_get_task(child_pid);
+    struct task *root = pid_get_task_global(child_pid);
     if (root != NULL) {
         task_ref_cnt_mod(root, 1);
         victims[count++] = root;
@@ -907,7 +907,7 @@ static int run_guest_command_capture_argv(const char *const *args, int argc,
     // after a short grace. The captured output does not depend on this -- if the
     // guest's real init wins the reap race we just lose the exit code, not output.
     struct task *saved = current;
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init != NULL) {
         current = init;
         int status = 0;

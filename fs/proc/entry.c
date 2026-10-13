@@ -41,7 +41,7 @@ int proc_entry_stat(struct proc_entry *entry, struct statbuf *stat) {
                     stat->nlink++;
     }
 
-    struct task *task = pid_get_task_ref(entry->pid);
+    struct task *task = pid_get_task_global_ref(entry->pid);
     if (task != NULL) {
         // generic_openat() holds inodes_lock across stat/open/fstat. Never
         // block procfs stat on a task lock while that global lock is held, or

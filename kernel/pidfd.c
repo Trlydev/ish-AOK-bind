@@ -75,7 +75,7 @@ static int pidfd_poll(struct fd *fd) {
         // thread group empty, and a thread zombie its tracer has not reaped
         // yet still counts. Its group is safe to read while the task is
         // still in the pid table -- a released task is done by definition.
-        bool released = pid_get_task_zombie(task->pid) != task;
+        bool released = pid_get_task_zombie_global(task->pid) != task;
         if (released || task->group->traced_zombies == 0)
             types = POLL_READ;
     }
@@ -245,7 +245,7 @@ int_t sys_pidfd_send_signal(fd_t pidfd, dword_t sig, addr_t UNUSED(info_addr), d
     // dropped as it always was.
     complex_lockt(&pids_lock, 0);
     struct task *task = data->task;
-    bool registered = pid_get_task_zombie(task->pid) == task;
+    bool registered = pid_get_task_zombie_global(task->pid) == task;
     task_ref_cnt_mod(task, 1);
     unlock(&pids_lock);
     int err = registered ? signal_kill_process(task, sig, SI_USER_) : 0;
@@ -262,7 +262,7 @@ struct task *pidfd_task_ref(fd_t pidfd, int *err) {
     struct pidfd_data *data = fd->data;
     complex_lockt(&pids_lock, 0);
     struct task *task = data->task;
-    if (task == NULL || pid_get_task_zombie(task->pid) != task) {
+    if (task == NULL || pid_get_task_zombie_global(task->pid) != task) {
         unlock(&pids_lock);
         *err = _ESRCH;
         return NULL;
@@ -327,7 +327,7 @@ int32_t pidfd_ckpt_pid(struct fd *fd) {
         return 0;
     complex_lockt(&pids_lock, 0);
     struct task *task = data->task;
-    int32_t pid = pid_get_task_zombie(task->pid) == task ? (int32_t) task->pid : 0;
+    int32_t pid = pid_get_task_zombie_global(task->pid) == task ? (int32_t) task->pid : 0;
     unlock(&pids_lock);
     return pid;
 }

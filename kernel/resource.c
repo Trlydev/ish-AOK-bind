@@ -14,6 +14,8 @@
 #include <time.h>
 #include <string.h>
 #include <pthread.h>
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "platform/platform.h"
 #include "util/sync.h"
@@ -812,14 +814,18 @@ int_t sys_sched_setaffinity_guest(pid_t_ pid, dword_t cpusetsize, guest_addr_t c
 #define PRIO_USER_    2
 
 static bool prio_target_matches(struct task *task, int_t which, pid_t_ who) {
+    // Only what the caller's pid namespace holds, by the numbers and ids its
+    // namespaces know (kernel/pid_ns.h, kernel/user_ns.h).
+    if (!task_visible(task))
+        return false;
     switch (which) {
         case PRIO_PROCESS_:
-            return who == 0 ? task == current : task->pid == who;
+            return who == 0 ? task == current : task->pid == current_pid_global(who);
         case PRIO_PGRP_:
-            return task->group->pgid == (who == 0 ? current->group->pgid : (pid_t_) who);
+            return task->group->pgid == (who == 0 ? current->group->pgid : current_pid_global(who));
         case PRIO_USER_:
             // The REAL uid, as Linux matches it.
-            return task->uid == (who == 0 ? current->uid : (uid_t_) who);
+            return task->uid == (who == 0 ? current->uid : current_make_kuid((uid_t_) who));
     }
     return false;
 }
@@ -836,7 +842,7 @@ int_t sys_getpriority(int_t which, pid_t_ who) {
     bool found = false;
     lock(&pids_lock, 0);
     for (dword_t p = 1; p < MAX_PID; p++) {
-        struct task *task = pid_get_task(p);
+        struct task *task = pid_get_task_global(p);
         if (task == NULL || !prio_target_matches(task, which, who))
             continue;
         if (!found || task->nice < best)
@@ -868,7 +874,7 @@ int_t sys_setpriority(int_t which, pid_t_ who, int_t prio) {
     bool privileged = current_capable(CAP_SYS_NICE_);
     lock(&pids_lock, 0);
     for (dword_t p = 1; p < MAX_PID; p++) {
-        struct task *task = pid_get_task(p);
+        struct task *task = pid_get_task_global(p);
         if (task == NULL || !prio_target_matches(task, which, who))
             continue;
         found = true;

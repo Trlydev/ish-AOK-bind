@@ -1,6 +1,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "fs/proc.h"
@@ -38,17 +39,21 @@ static bool proc_lookup_task_dir(const char *component, struct proc_entry *next_
     }
     if (id > MAX_PID)
         return false;
+    // The number is the reader's pid namespace's (kernel/pid_ns.h); what the
+    // entry keeps is the machine's, which is what everything under it looks
+    // the task up by again, whoever is reading by then.
     complex_lockt(&pids_lock, 0);
-    bool exists = pid_get_task_zombie((dword_t) id) != NULL;
+    struct task *named = pid_get_task_zombie((dword_t) id);
+    pid_t_ machine_pid = named != NULL ? named->pid : 0;
     unlock(&pids_lock);
-    if (!exists)
+    if (named == NULL)
         return false;
-    *next_entry = (struct proc_entry) {&proc_pid, .pid = (pid_t_) id};
+    *next_entry = (struct proc_entry) {&proc_pid, .pid = machine_pid};
     return true;
 }
 
 bool proc_entry_may_read(struct proc_entry *entry) {
-    struct task *task = pid_get_task_ref(entry->pid);
+    struct task *task = pid_get_task_global_ref(entry->pid);
     if (task == NULL)
         return true;
     bool ok = task_ptrace_may_access(task, PTRACE_MODE_READ_ | PTRACE_MODE_FSCREDS_);

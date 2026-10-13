@@ -152,7 +152,7 @@ static void DisplayHangUpSession(int pid, BOOL throughSu) {
     if (pid <= 0)
         return;
     complex_lockt(&pids_lock, 0);
-    struct task *task = pid_get_task(pid);
+    struct task *task = pid_get_task_global(pid);
     if (task != NULL) {
         if (throughSu) {
             struct task *child;

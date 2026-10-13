@@ -2925,6 +2925,13 @@ static int ckpt_save_task(struct ckpt_writer *w, struct task *task,
                     "saved session does not carry", task->pid);
         w->err = _EBUSY;
     }
+    // Nor a pid namespace: restored, the task would be an ordinary process
+    // among all the others, seeing them and seen.
+    if ((task->pid_ns != NULL || task->pid_ns_for_children != NULL) && w->err == 0) {
+        ckpt_refuse("pid %d is in a pid namespace of its own (a sandbox), which a "
+                    "saved session does not carry", task->pid);
+        w->err = _EBUSY;
+    }
     if (task->mnt_ns != NULL && w->err == 0) {
         ckpt_refuse("pid %d is in a mount namespace of its own (a sandbox, or a "
                     "service with private mounts), which a saved session does not carry", task->pid);
@@ -4329,7 +4336,7 @@ static int ckpt_restore_epoll_regs(FILE *f, const struct ckpt_header *h,
 // A zombie counts as there: a pidfd on one is how its parent may reap it.
 static void ckpt_restore_pidfds(struct ckpt_restore_state *st) {
     for (uint32_t i = 0; i < st->pidfd_count; i++) {
-        struct task *task = pid_get_task_zombie_ref((dword_t) st->pidfds[i].pid);
+        struct task *task = pid_get_task_zombie_global_ref((dword_t) st->pidfds[i].pid);
         if (task == NULL) {
             printk("checkpoint: a pidfd named pid %d, which did not come back; "
                    "it reads as a process that has gone\n", st->pidfds[i].pid);
@@ -6553,7 +6560,7 @@ int checkpoint_request(const char *host_path, bool and_halt) {
 // Whether the task that asked for a pending checkpoint can still take it.
 static bool ckpt_asker_alive(pid_t_ asker) {
     complex_lockt(&pids_lock, 0);
-    struct task *t = pid_get_task((dword_t) asker);
+    struct task *t = pid_get_task_global((dword_t) asker);
     bool alive = t != NULL && !t->zombie && !t->exiting;
     unlock(&pids_lock);
     return alive;

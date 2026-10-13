@@ -14,18 +14,19 @@ inventory:
 - **Structural ceilings** — bounded by physics or arithmetic rather than by
   effort.
 
-## 41.1 Architectural: four namespaces out of seven
+## 41.1 Architectural: five namespaces out of seven
 
-No PID namespaces, no network or cgroup namespaces. UTS, IPC, mount and user
-are the four there are: a UTS namespace is a hostname in a refcounted struct,
+No network or cgroup namespaces (nor time). UTS, IPC, mount, user and pid
+are the five there are: a UTS namespace is a hostname in a refcounted struct,
 an IPC namespace is System V shared memory, semaphores and message queues kept
 per namespace instead of global, a mount namespace (559) is a mount table
 of the process's own — a copy of its parent's tree that it can mount in,
 unmount from and `pivot_root` on without anyone else seeing — and a user
 namespace (559) is a process being root, with every capability, over a world
-of its own and nobody new over the machine. `setns(2)` can join a UTS, IPC or
-mount namespace — or one nothing is in any more — through its
-`/proc/<pid>/ns` file; it cannot join a user namespace. Every other kind is
+of its own and nobody new over the machine; and a pid namespace (559) is a
+set of processes that see only each other, the first of them as pid 1.
+`setns(2)` can join a UTS, IPC or mount namespace — or one nothing is in any more — through its
+`/proc/<pid>/ns` file; it cannot join a user or a pid namespace. Every other kind is
 `ENOSYS` to `unshare`, and `setns` into one is the no-op of joining the only
 one there is.
 
@@ -40,6 +41,17 @@ not yet in System V `ipc_perm`, process accounting or FUSE requests, which
 show the machine's ids. A mount namespace made in one has its inherited
 mounts locked, and takes only tmpfs, proc, sysfs and devpts as new
 filesystems. A session with a process in one is refused a save.
+
+A pid namespace here keeps the machine's pid numbers: it is a filter on what
+a number names, and "the namespace's init is 1". So the other processes in
+one do not have the small numbers they would on Linux, `/proc` shows what
+the *reader's* namespace holds whichever mount it is read through (Linux
+ties that to the mount), and `/proc/<pid>/status` has no `NSpid` lines. The
+parts that confine are as Linux's: a pid outside the namespace is `ESRCH`
+and absent from `/proc`, a parent outside is 0, a signal's sender outside is
+0, `kill(-1)` reaches only the namespace, the init takes from inside only
+signals it handles, orphans go to it, and when it exits everything left
+inside is killed and nothing more can be forked in.
 
 A mount namespace here is not everything Linux's is. Nothing propagates:
 every mount is private, so `--make-shared` is accepted and not done. A mount
@@ -58,8 +70,7 @@ with `PrivateNetwork=yes` went on to call `unshare(CLONE_NEWNET)`, got
 `localectl` could not start their daemons. With the file absent systemd says
 "proceeding without" and runs them.
 
-`clone` refuses the missing kinds (`CLONE_NEWPID`, `CLONE_NEWNET`,
-`CLONE_NEWCGROUP`) too, but with `EINVAL`, the answer of a
+`clone` refuses the missing kinds (`CLONE_NEWNET`, `CLONE_NEWCGROUP`) too, but with `EINVAL`, the answer of a
 Linux kernel built without that namespace type. The two calls give different
 errnos on purpose: each is the one its callers read as "no sandbox here, carry
 on". systemd forks its generator sandbox with `clone` and runs the generators
@@ -77,12 +88,12 @@ with `PrivateTmp=`, `ProtectSystem=`, `ProtectHome=`, `ProtectProc=` or
 under them, and `/proc/sys/kernel/domainname` to get right, and all of
 logind, resolved, networkd, udevd and userdbd run inside one on Arch.
 
-So nothing container-shaped runs. No Docker, no `unshare -n` or `-p`, no
-rootless podman. `unshare -m`, `-U` and `-r` work, for an ordinary user
-too, and so does `bwrap` when it is asked for user and mount namespaces
-(`--unshare-user --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp`); what
-Codex asks of it, `--unshare-pid --unshare-net` as well, does not. There is one process table and one network, visible identically from
-every root and every chroot.
+So nothing container-shaped runs. No Docker, no `unshare -n`, no rootless
+podman. `unshare -m`, `-U`, `-r` and `-p` work, for an ordinary user too, and
+so does `bwrap` when it is asked for user, mount and pid namespaces
+(`--unshare-user --unshare-pid --ro-bind / / --dev /dev --proc /proc --tmpfs
+/tmp`); what Codex asks of it, `--unshare-net` as well, does not yet. There
+is one network, the same from every root, chroot and sandbox.
 
 This is not a missing feature with a ticket. The absence runs through the design
 — Chapter 10's task model, Chapter 16's global mount table, Chapter 21's

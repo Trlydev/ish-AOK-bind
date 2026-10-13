@@ -2,6 +2,7 @@
 #include "kernel/task.h"
 #include "kernel/personality.h"
 #include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/mnt_ns.h"
 #include "kernel/ipc_ns.h" // ns_alloc_inum
 #include "fs/proc.h"
@@ -530,11 +531,11 @@ static void cap_emulate_setxuid(uid_t_ old_ruid, uid_t_ old_euid, uid_t_ old_sui
 
 pid_t_ sys_getpid(void) {
     STRACE("getpid()");
-    return current->tgid;
+    return current_pid_shown(current->tgid);
 }
 pid_t_ sys_gettid(void) {
     STRACE("gettid()");
-    return current->pid;
+    return current_pid_shown(current->pid);
 }
 pid_t_ sys_getppid(void) {
     STRACE("getppid()");
@@ -561,7 +562,8 @@ pid_t_ sys_getppid(void) {
     // getppid() from every thread but the first returned this process's own
     // pid. Go asks from whichever thread the runtime is on.
     struct task *parent = task_process_parent(current);
-    ppid = parent != NULL ? parent->tgid : 0;
+    // 0 for a parent outside the caller's pid namespace: its init's is.
+    ppid = parent != NULL && task_visible(parent) ? current_pid_shown(parent->tgid) : 0;
     unlock(&pids_lock);
     return ppid;
 }
@@ -911,7 +913,7 @@ int_t sys_capget_guest(guest_addr_t header_addr, guest_addr_t data_addr) {
     }
     // Accept the tgid too: glibc/systemd pass getpid() (the tgid) here,
     // while current->pid is the tid.
-    if (header.pid != 0 && header.pid != current->pid && header.pid != current->tgid)
+    if (header.pid != 0 && current_pid_global(header.pid) != current->pid && current_pid_global(header.pid) != current->tgid)
         return _EPERM;
 
     struct cap_user_data_ data[2] = {};
@@ -939,7 +941,7 @@ int_t sys_capset_guest(guest_addr_t header_addr, guest_addr_t data_addr) {
     int count = cap_data_count(header.version);
     if (count < 0)
         return _EINVAL;
-    if (header.pid != 0 && header.pid != current->pid && header.pid != current->tgid)
+    if (header.pid != 0 && current_pid_global(header.pid) != current->pid && current_pid_global(header.pid) != current->tgid)
         return _EPERM;
 
     struct cap_user_data_ data[2] = {};

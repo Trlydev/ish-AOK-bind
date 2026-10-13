@@ -936,7 +936,7 @@ int main(int argc, char *const argv[]) {
             err[n > 0 ? n : 0] = '\0';
             fprintf(stderr, "[guest-proc] stderr: %s\n", err);
             guest_process_stop(&process);
-            struct task *left = pid_get_task_zombie_ref((dword_t) pid);
+            struct task *left = pid_get_task_zombie_global_ref((dword_t) pid);
             fprintf(stderr, "[guest-proc] after stop: %s\n", left == NULL ? "reaped" : (left->zombie ? "zombie" : "still running"));
             if (left != NULL)
                 task_ref_cnt_mod(left, -1);

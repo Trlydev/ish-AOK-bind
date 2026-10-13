@@ -1,4 +1,5 @@
 #include <stdatomic.h>
+#include "kernel/pid_ns.h"
 #include "util/wait_spin.h"
 #include "kernel/calls.h"
 #include "kernel/checkpoint.h"
@@ -1226,7 +1227,9 @@ static struct futex_wait *futex_pi_first_waiter(struct futex *futex, struct fute
 static int futex_lock_pi(guest_addr_t uaddr, dword_t op, const struct timespec *timeout, bool trylock) {
     struct futex_key key;
     futex_key_of(uaddr, op, &key);
-    dword_t tid = current->pid;
+    // (As the task was told it, and so as its libc writes it into the lock
+    // word: 1 for the init of a pid namespace. kernel/pid_ns.h.)
+    dword_t tid = (dword_t) task_pid_shown(current, current->pid);
     struct timespec deadline = {};
     if (timeout != NULL)
         deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), *timeout);
@@ -1363,7 +1366,9 @@ static int futex_lock_pi(guest_addr_t uaddr, dword_t op, const struct timespec *
 static int futex_unlock_pi(guest_addr_t uaddr, dword_t op) {
     struct futex_key key;
     futex_key_of(uaddr, op, &key);
-    dword_t tid = current->pid;
+    // (As the task was told it, and so as its libc writes it into the lock
+    // word: 1 for the init of a pid namespace. kernel/pid_ns.h.)
+    dword_t tid = (dword_t) task_pid_shown(current, current->pid);
     struct futex *futex = futex_get(&key);
     if (futex == NULL)
         return _ENOMEM;
@@ -1404,7 +1409,7 @@ void futex_exit_pi(struct task *task) {
     for (int i = 0; futex_pi_waiting != 0 && i < FUTEX_HASH_SIZE; i++) {
         struct futex *futex;
         list_for_each_entry(&futex_hash[i], futex, chain) {
-            if (futex->pi_owner != (dword_t) task->pid)
+            if (futex->pi_owner != (dword_t) task_pid_shown(task, task->pid))
                 continue;
             struct futex_wait *next = futex_pi_first_waiter(futex, NULL);
             if (next != NULL)
@@ -1662,14 +1667,14 @@ void futex_exit_robust_list(struct task *task) {
         // The pending entry is handled after the loop: it is mid-operation,
         // and Linux deliberately leaves it until last.
         if (entry != pending)
-            robust_handle_death(robust_futex_addr(entry, futex_offset, is64), task->pid, pi);
+            robust_handle_death(robust_futex_addr(entry, futex_offset, is64), task_pid_shown(task, task->pid), pi);
         if (!have_next)
             return;
         pi = next & 1;
         entry = next & ~(uint64_t) 1;
     }
     if (pending != 0)
-        robust_handle_death(robust_futex_addr(pending, futex_offset, is64), task->pid, pending_pi);
+        robust_handle_death(robust_futex_addr(pending, futex_offset, is64), task_pid_shown(task, task->pid), pending_pi);
 }
 
 static dword_t robust_list_head_size(enum guest_abi abi) {
