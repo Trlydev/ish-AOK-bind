@@ -616,8 +616,8 @@ The display half is now carried to the plug-in's QEMU 11, on a third branch
   there is GBM, the fork's IOSurface code where there is not.
 - `hw/display` keeps QEMU 11's own virgl code. UTM's front end asks for
   Vulkan (`venus`), Direct3D (`neptune`) and blob resources by default; the
-  device accepts those options on Apple hosts, says so, and runs with
-  OpenGL.
+  device at first accepted those options on Apple hosts and ran with OpenGL
+  only (see "Vulkan" below for why that was not needed).
 
 Checked in the iOS simulator inside UTM SE, with the arguments UTM passes by
 default: virglrenderer comes up on ANGLE's Metal renderer, the guest's
@@ -675,10 +675,35 @@ composites with GLES2 and is on the screen, and es2gears turns in a window
 on that desktop, drawn by the host's GPU from end to end. The lesson is in
 the first paragraph: a renderer string and a frame count are not a picture.
 
-Not done: the fork's work in `virtio-gpu-virgl.c` (its in-process render
-server for Vulkan, Direct3D contexts, Metal-backed guest-visible memory, its
-fencing changes), which overlaps QEMU 11's own rework of the same code. A
-guest that wants Vulkan or Direct3D gets OpenGL until then.
+**Vulkan.** I had this wrong for a day, and told the user the VM had no
+Vulkan. The paragraph that stood here said Vulkan waited on the fork's work
+in `virtio-gpu-virgl.c`, and the port cleared `venus` and `blob` at start.
+The user pointed at the "Vulkan Driver" setting in the app. Everything was
+already there: the front end passes `venus=true` and names the MoltenVK it
+bundles, UTM's virglrenderer is built with venus and runs its render server
+as a thread, Devuan's riscv64 Mesa ships `libvulkan_virtio.so`, and the
+device code is QEMU's own since 9.2. With the flags left alone the guest saw
+the capability set and failed in `vkCreateInstance` for one reason, which
+the engine printed once asked to:
+
+    map(fixed) res 4 at offset 0x21000 size 0x100000 failed: Invalid argument
+
+QEMU 11 maps a blob at a fixed address inside one mapping of the whole
+host-visible region. The guest allots the region in its 4K pages and an
+Apple host's are 16K, so `mmap()` refuses the address. `1983c8d` leaves fixed
+mappings out on Darwin (a blob becomes a subregion, as before QEMU 11) and
+with them the region's backing, 8G of address space as UTM asks for it.
+
+In the simulator, with that: `vulkaninfo` says "Virtio-GPU Venus (Apple iOS
+simulator GPU)", and the GLES2 desktop and es2gears are on the screen as
+before. No swapchain can be made there, by vkcube or by vkmark's headless
+mode: the host side gives a guest's window-system images linear tiling, and
+MoltenVK does not render to linear images in the simulator (`MVK_OS_SIMULATOR`
+sets `renderLinearTextures` false; every Apple GPU family has it otherwise).
+So a cube on a screen is for an iPad to show. Direct3D (`neptune`) does rest
+on the fork and is still switched off, as are the fork's own refinements of
+the blob and fence code (an unmap that does not hold the queue, fences
+retired off the poll timer).
 
 ### The "ultimate" machine: AOK's own scripts in a VM
 

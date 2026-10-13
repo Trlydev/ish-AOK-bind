@@ -6,7 +6,8 @@
 #
 # From its first boot a machine's disk is its user's (a password, keys, packages), so a fix to the scripts
 # cannot reach it as a new image. This fetches the scripts of /AOK/tools again, replaces one only if what
-# arrived parses, and repeats what later images set outside /AOK/tools (so far: the power key is ignored).
+# arrived parses, and repeats what later images set outside /AOK/tools (the power key is ignored; Mesa's
+# Vulkan drivers are installed).
 # AOK_UPDATE_URL names another place to fetch from, laid out like the repository.
 set -e
 [ "$(id -u)" = 0 ] || { echo "aok-update: run it as root (sudo)"; exit 1; }
@@ -43,5 +44,17 @@ HandleSuspendKey=ignore
 HandleHibernateKey=ignore
 L
     echo "  $k: written (in force from the next boot)"
+fi
+# Vulkan: the engine offers it since 2026-10-13 (venus); the guest's half is Mesa's virtio driver, which
+# images before that did not carry.
+if ! dpkg -s mesa-vulkan-drivers vulkan-tools > /dev/null 2>&1; then
+    echo "  mesa-vulkan-drivers, vulkan-tools: installing (Vulkan in the guest) ..."
+    export DEBIAN_FRONTEND=noninteractive
+    if apt-get update -qq > /dev/null 2>&1 &&
+       apt-get install -y -qq --no-install-recommends mesa-vulkan-drivers vulkan-tools > /dev/null 2>&1; then
+        echo "  mesa-vulkan-drivers, vulkan-tools: installed"
+    else
+        echo "  mesa-vulkan-drivers, vulkan-tools: NOT installed (apt failed; run aok-update again)"
+    fi
 fi
 echo "aok-update: done. A desktop that is running keeps its old script until it is started again."

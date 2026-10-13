@@ -17,6 +17,9 @@ sh /AOK/tools/setup-wayland.sh || exit 2
 # X11 programs on the desktop, and a browser and file manager for its menu: best-effort.
 sh /AOK/tools/setup-wayland-extras.sh x11 tools || echo "wayland extras: not all installed"
 id aok
+# Vulkan in the guest: Mesa's virtio driver (venus) is the guest's half of what the engine's virtio-gpu
+# offers when the front end's "Vulkan Driver" is not Disabled. vkcube and vulkaninfo to see it with.
+apt-get install -y --no-install-recommends mesa-vulkan-drivers vulkan-tools || echo "vulkan: not installed"
 # The power key. A key of the host's keyboard can arrive as one: an iPad keyboard's did, through UTM, and
 # elogind shut the machine down under its user twice in twenty minutes ("Power key pressed short.
 # Powering off..." in auth.log). The machine is stopped from its front end, or by its owner's poweroff.
@@ -37,6 +40,7 @@ cat > /etc/motd <<'M'
    desktop  :  desktop                  (Wayland: labwc, foot, waybar)
                desktop soft             (the same, drawn without the GPU)
    display  :  gltest                   which GL renderer programs get
+               vulkaninfo --summary     the Vulkan device (venus), vkcube
    re-setup :  sudo sh /AOK/tools/provision-ultimate-devuan.sh
                (timezone, login, hostname: it asks)
    services :  service <name> {start|stop|status}
@@ -46,4 +50,4 @@ M
 apt-get clean
 rm -rf /var/lib/apt/lists/*
 df -h / | tail -1
-dpkg-query -W -f '${Package} ${Version}\n' labwc foot waybar seatd neovim gcc 2>&1
+dpkg-query -W -f '${Package} ${Version}\n' labwc foot waybar seatd neovim gcc mesa-vulkan-drivers vulkan-tools 2>&1
