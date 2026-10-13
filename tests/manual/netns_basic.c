@@ -31,10 +31,17 @@
 //                was made in: a datagram sent through it arrives outside,
 //                and one sent through a socket made after does not
 //
-// And where AOK is narrower than Linux, asked only of AOK (detected by
-// /proc/ish): a private namespace carries no loopback traffic yet, so
-// listen() on an inet socket is refused (EOPNOTSUPP) rather than left waiting
-// for connections that cannot come.
+//   loopback     inside the namespace its own traffic flows: a TCP listener
+//                on 127.0.0.1 is connected to, accept() names the client by
+//                the address the client's getsockname gives, data goes both
+//                ways, and getpeername still answers after the peer has
+//                closed; a second bind of the port is EADDRINUSE; a datagram
+//                reaches a bound socket with its sender's address, and the
+//                reply to that address comes back; one to a port nobody has
+//                is sent and gone; the same over ::1. None of it is the
+//                machine's: the port the listener has inside is refused from
+//                outside, and a listener on the machine's loopback is refused
+//                from inside
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -62,7 +69,6 @@
 static int failures;
 static uid_t outer_uid;
 static gid_t outer_gid;
-static bool on_aok;
 
 #define MUST(cond, ...) do { if (!(cond)) { printf(NAME ": " __VA_ARGS__); printf(" (errno %d: %s)\n", errno, strerror(errno)); fflush(stdout); _exit(1 + __LINE__ % 200); } } while (0)
 
@@ -269,10 +275,6 @@ static void case_new_and_up(void) {
     MUST(getsockname(s, (struct sockaddr *) &got, &got_len) == 0 && got.sin_family == AF_INET &&
          got.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && got.sin_port != 0,
          "getsockname after bind to 127.0.0.1:0 says port %d", ntohs(got.sin_port));
-    if (on_aok) {
-        errno = 0;
-        MUST(listen(s, 5) == -1 && errno == EOPNOTSUPP, "listen on an inet socket in a private namespace did not fail with EOPNOTSUPP");
-    }
     close(s);
     s = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in foreign = in_addr("192.0.2.5", 0);
@@ -280,6 +282,94 @@ static void case_new_and_up(void) {
     MUST(bind(s, (struct sockaddr *) &foreign, sizeof(foreign)) == -1 && errno == EADDRNOTAVAIL,
          "bind to an address the namespace does not have did not fail with EADDRNOTAVAIL");
     close(s);
+}
+
+static int machine_tcp_port;    // a listener on the machine's loopback, made by the parent
+
+static void case_loopback(void) {
+    enter(CLONE_NEWNET);
+    bring_lo_up();
+
+    // TCP.
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in any_port = in_addr("127.0.0.1", 0), laddr = {0}, caddr = {0}, peer = {0}, got = {0};
+    socklen_t len = sizeof(laddr);
+    MUST(bind(l, (struct sockaddr *) &any_port, sizeof(any_port)) == 0 && listen(l, 4) == 0, "bind and listen on 127.0.0.1 inside the namespace failed");
+    MUST(getsockname(l, (struct sockaddr *) &laddr, &len) == 0 && laddr.sin_port != 0, "the listener has no port");
+    int dup_bind = socket(AF_INET, SOCK_STREAM, 0);
+    errno = 0;
+    MUST(bind(dup_bind, (struct sockaddr *) &laddr, sizeof(laddr)) == -1 && errno == EADDRINUSE, "a second bind of the listener's port did not fail with EADDRINUSE");
+    close(dup_bind);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    MUST(connect(c, (struct sockaddr *) &laddr, sizeof(laddr)) == 0, "connect to the listener inside the namespace failed");
+    len = sizeof(caddr);
+    MUST(getsockname(c, (struct sockaddr *) &caddr, &len) == 0 && caddr.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && caddr.sin_port != 0,
+         "the connected socket's own address is %s:%d", inet_ntoa(caddr.sin_addr), ntohs(caddr.sin_port));
+    len = sizeof(peer);
+    int a = accept(l, (struct sockaddr *) &peer, &len);
+    MUST(a >= 0, "accept failed");
+    MUST(len == sizeof(peer) && peer.sin_family == AF_INET && peer.sin_addr.s_addr == caddr.sin_addr.s_addr && peer.sin_port == caddr.sin_port,
+         "accept names its peer %s:%d; the client is port %d", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port), ntohs(caddr.sin_port));
+    char buf[16] = "";
+    MUST(write(c, "ping", 4) == 4 && read(a, buf, sizeof(buf)) == 4 && memcmp(buf, "ping", 4) == 0, "data did not cross from client to server");
+    MUST(write(a, "pong!", 5) == 5 && read(c, buf, sizeof(buf)) == 5 && memcmp(buf, "pong!", 5) == 0, "data did not cross from server to client");
+    int one = 1;
+    MUST(setsockopt(c, IPPROTO_TCP, 1 /* TCP_NODELAY */, &one, sizeof(one)) == 0, "TCP_NODELAY was refused");
+    close(a);
+    MUST(read(c, buf, sizeof(buf)) == 0, "the client did not read end-of-file after the server closed");
+    len = sizeof(got);
+    MUST(getpeername(c, (struct sockaddr *) &got, &len) == 0 && got.sin_port == laddr.sin_port, "getpeername after the peer closed: port %d, wanted %d", ntohs(got.sin_port), ntohs(laddr.sin_port));
+    close(c);
+    close(l);
+
+    // UDP.
+    int r = socket(AF_INET, SOCK_DGRAM, 0), u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in raddr = {0}, from = {0}, uaddr = {0};
+    MUST(bind(r, (struct sockaddr *) &any_port, sizeof(any_port)) == 0, "UDP bind failed");
+    len = sizeof(raddr);
+    MUST(getsockname(r, (struct sockaddr *) &raddr, &len) == 0 && raddr.sin_port != 0, "the UDP socket has no port");
+    MUST(sendto(u, "dgram", 5, 0, (struct sockaddr *) &raddr, sizeof(raddr)) == 5, "sendto inside the namespace failed");
+    len = sizeof(from);
+    MUST(recvfrom(r, buf, sizeof(buf), 0, (struct sockaddr *) &from, &len) == 5 && memcmp(buf, "dgram", 5) == 0, "the datagram did not arrive");
+    len = sizeof(uaddr);
+    MUST(getsockname(u, (struct sockaddr *) &uaddr, &len) == 0 && uaddr.sin_port != 0, "the sender was given no port");
+    MUST(from.sin_family == AF_INET && from.sin_addr.s_addr == htonl(INADDR_LOOPBACK) && from.sin_port == uaddr.sin_port,
+         "the datagram's sender reads %s:%d; it is port %d", inet_ntoa(from.sin_addr), ntohs(from.sin_port), ntohs(uaddr.sin_port));
+    MUST(sendto(r, "reply", 5, 0, (struct sockaddr *) &from, sizeof(from)) == 5 && recv(u, buf, sizeof(buf), 0) == 5 && memcmp(buf, "reply", 5) == 0,
+         "the reply to the sender's address did not come back");
+    struct sockaddr_in nobody = in_addr("127.0.0.1", 9);
+    MUST(sendto(u, "x", 1, 0, (struct sockaddr *) &nobody, sizeof(nobody)) == 1, "a datagram to a port nobody has was not accepted for sending");
+    close(u);
+    close(r);
+
+    // The same over ::1.
+    int l6 = socket(AF_INET6, SOCK_STREAM, 0);
+    struct sockaddr_in6 a6 = {.sin6_family = AF_INET6, .sin6_addr = IN6ADDR_LOOPBACK_INIT}, got6 = {0};
+    MUST(bind(l6, (struct sockaddr *) &a6, sizeof(a6)) == 0 && listen(l6, 1) == 0, "bind and listen on ::1 failed");
+    len = sizeof(got6);
+    MUST(getsockname(l6, (struct sockaddr *) &got6, &len) == 0 && got6.sin6_port != 0, "the ::1 listener has no port");
+    int c6 = socket(AF_INET6, SOCK_STREAM, 0);
+    MUST(connect(c6, (struct sockaddr *) &got6, sizeof(got6)) == 0, "connect over ::1 failed");
+    int a6fd = accept(l6, NULL, NULL);
+    MUST(a6fd >= 0 && write(c6, "six", 3) == 3 && read(a6fd, buf, sizeof(buf)) == 3, "data did not cross over ::1");
+    close(a6fd);
+    close(c6);
+    close(l6);
+
+    // And none of it is the machine's: its listener is not here.
+    int e = connect_errno(SOCK_STREAM, "127.0.0.1", machine_tcp_port);
+    MUST(e == ECONNREFUSED, "the machine's loopback listener answered from inside the namespace (errno %d)", e);
+
+    // A listener left for the parent to find absent on the machine's side.
+    int stay = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in fixed = in_addr("127.0.0.1", machine_tcp_port + 1);
+    if (bind(stay, (struct sockaddr *) &fixed, sizeof(fixed)) == 0 && listen(stay, 1) == 0) {
+        MUST(write(3, "l", 1) == 1, "cannot tell the parent");
+        char c2;
+        (void) !read(4, &c2, 1);
+    } else {
+        MUST(write(3, "n", 1) == 1, "cannot tell the parent");
+    }
 }
 
 static struct sockaddr_un abstract_name(socklen_t *len) {
@@ -333,7 +423,6 @@ static void case_old_sockets(void) {
 
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
-    on_aok = access("/proc/ish", F_OK) == 0;
     if (geteuid() == 0) {
         if (setgroups(0, NULL) != 0 || setresgid(1000, 1000, 1000) != 0 || setresuid(1000, 1000, 1000) != 0) {
             printf(NAME ": FAIL setup: cannot become uid 1000: %s\n", strerror(errno));
@@ -377,6 +466,52 @@ int main(void) {
     close(abstract);
     close(named);
     unlink(unix_path);
+
+    // Loopback inside a namespace, and the machine's loopback outside it.
+    {
+        int machine = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in any = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)}, got = {0};
+        socklen_t got_len = sizeof(got);
+        if (bind(machine, (struct sockaddr *) &any, sizeof(any)) != 0 || listen(machine, 4) != 0 ||
+                getsockname(machine, (struct sockaddr *) &got, &got_len) != 0) {
+            printf(NAME ": FAIL setup: the machine's listener: %s\n", strerror(errno));
+            return 1;
+        }
+        machine_tcp_port = ntohs(got.sin_port);
+        int up[2], down[2];
+        if (pipe(up) != 0 || pipe(down) != 0)
+            return 1;
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+            dup2(up[1], 3);
+            dup2(down[0], 4);
+            close(up[0]);
+            close(down[1]);
+            case_loopback();
+            _exit(0);
+        }
+        close(up[1]);
+        close(down[0]);
+        char told = 0;
+        if (read(up[0], &told, 1) == 1 && told == 'l') {
+            // The child is listening on machine_tcp_port + 1 INSIDE its
+            // namespace. Out here that port has nobody.
+            int e = connect_errno(SOCK_STREAM, "127.0.0.1", machine_tcp_port + 1);
+            if (e != ECONNREFUSED) {
+                printf(NAME ": a listener inside a namespace answered on the machine's loopback (errno %d)\n", e);
+                failures++;
+            }
+        }
+        close(down[1]);
+        int status = -1;
+        if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            printf(NAME ": loopback: child status %#x\n", status);
+            failures++;
+        }
+        close(up[0]);
+        close(machine);
+    }
 
     // A datagram socket on the machine's loopback, for the old-socket case.
     int udp = socket(AF_INET, SOCK_DGRAM, 0);

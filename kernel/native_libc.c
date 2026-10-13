@@ -6,6 +6,9 @@
 
 #define NATIVE_LIBC_NO_REDIRECT
 
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
@@ -27,6 +30,7 @@
 #include <unistd.h>
 #include <utmpx.h>
 
+#include "kernel/net_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/nlibc_shadow.h"
@@ -5368,6 +5372,54 @@ int nlibc_getifaddrs(struct ifaddrs **ifap) {
         return -1;
     }
     *ifap = NULL;
+    // A program in a private network namespace has that namespace's
+    // interfaces, which is "lo" (kernel/net_ns.h), and not the host's. One
+    // block, as the host's own list is, so that freeifaddrs frees it.
+    struct net_namespace *net_ns = current_net_ns();
+    if (net_ns != NULL) {
+        struct {
+            struct ifaddrs link, v4;
+            struct sockaddr_in addr, mask;
+#ifdef __APPLE__
+            struct sockaddr_dl dl;
+#endif
+            char name[4];
+        } *lo = calloc(1, sizeof(*lo));
+        if (lo == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        strcpy(lo->name, "lo");
+        unsigned flags = IFF_LOOPBACK | (atomic_load(&net_ns->lo_up) ? IFF_UP | IFF_RUNNING : 0);
+        lo->link.ifa_name = lo->name;
+        lo->link.ifa_flags = flags;
+#ifdef __APPLE__
+        // The link-level entry every interface has on this host: callers
+        // written against it read ifa_addr without asking whether it is there.
+        lo->dl.sdl_len = sizeof(lo->dl);
+        lo->dl.sdl_family = AF_LINK;
+        lo->dl.sdl_index = 1;
+        lo->dl.sdl_type = 24; // IFT_LOOP
+        lo->dl.sdl_nlen = 2;
+        memcpy(lo->dl.sdl_data, "lo", 2);
+        lo->link.ifa_addr = (struct sockaddr *) &lo->dl;
+#endif
+        if (atomic_load(&net_ns->lo_addr4)) {
+            lo->link.ifa_next = &lo->v4;
+            lo->v4.ifa_name = lo->name;
+            lo->v4.ifa_flags = flags;
+            lo->addr.sin_family = lo->mask.sin_family = AF_INET;
+#ifdef __APPLE__
+            lo->addr.sin_len = lo->mask.sin_len = sizeof(struct sockaddr_in);
+#endif
+            lo->addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            lo->mask.sin_addr.s_addr = htonl(0xff000000u);
+            lo->v4.ifa_addr = (struct sockaddr *) &lo->addr;
+            lo->v4.ifa_netmask = (struct sockaddr *) &lo->mask;
+        }
+        *ifap = &lo->link;
+        return 0;
+    }
     // The real one: this file is built with NATIVE_LIBC_NO_REDIRECT, so the
     // name is not the macro that brought us here.
     return getifaddrs(ifap);

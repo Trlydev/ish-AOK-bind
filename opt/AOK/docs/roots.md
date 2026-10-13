@@ -444,8 +444,7 @@ putting `sandbox_mode = "danger-full-access"` at the top of
 `~/.codex/config.toml`. The script now does the opposite: it takes that line
 out again (only the one it added), so that a root set up on an older build
 goes back to running Codex's commands confined. `README.txt` beside it says
-what the sandbox is here, including the one thing narrower than on Linux — a
-sandboxed command with network access off cannot listen on a TCP port.
+what the sandbox is here.
 
 ```sh
 sh /AOK/fixes/codex/fix-codex.sh         # or, for one session: codex --sandbox danger-full-access

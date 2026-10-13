@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <inttypes.h>
 #include <string.h>
+#include "kernel/net_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "fs/proc.h"
@@ -55,6 +56,21 @@
 #define PROC_NET_DEV_MAX_IFACES 64
 
 int net_iface_snapshot(struct net_iface_stats *out, int max) {
+    // The reader's network: in a private network namespace that is "lo" and
+    // nothing of the host's (kernel/net_ns.h). Up or down as the namespace
+    // has it; no counters, since nothing counts what crosses it.
+    struct net_namespace *net_ns = current_net_ns();
+    if (net_ns != NULL) {
+        if (out != NULL && max >= 1) {
+            memset(&out[0], 0, sizeof(out[0]));
+            strcpy(out[0].name, "lo");
+            out[0].flags = IFF_LOOPBACK | (atomic_load(&net_ns->lo_up) ? IFF_UP | IFF_RUNNING : 0);
+            out[0].mtu = 65536;
+            out[0].has_mac = true;      // all zero, as a loopback's is
+            out[0].has_stats = true;
+        }
+        return 1;
+    }
     struct ifaddrs *addrs;
     if (getifaddrs(&addrs) != 0)
         return 0;
@@ -133,6 +149,13 @@ int net_iface_snapshot(struct net_iface_stats *out, int max) {
  00000000000000000000000000000001 01 80 10 80       lo
  */
 static int proc_show_if_inet6(struct proc_entry * UNUSED(entry), struct proc_data *buf) {
+    // A private network namespace: its loopback's ::1, once it has it.
+    struct net_namespace *net_ns = current_net_ns();
+    if (net_ns != NULL) {
+        if (atomic_load(&net_ns->lo_addr6))
+            proc_printf(buf, "00000000000000000000000000000001 01 80 10 80       lo\n");
+        return 0;
+    }
     struct ifaddrs *addrs;
     bool success = (getifaddrs(&addrs) == 0);
     if (success) {
@@ -189,6 +212,9 @@ static int proc_show_arp(struct proc_entry * UNUSED(entry), struct proc_data *bu
      10.211.55.1      0x1         0x2         00:1c:42:00:00:18     *        eth0
      */
     proc_printf(buf, "IP address       HW type     Flags       HW address            Mask     Device\n");
+    // (No neighbours in a private network namespace: it has only "lo".)
+    if (current_net_ns() != NULL)
+        return 0;
     proc_printf(buf, "192.168.1.1      0x1         0x2         00:BE:EF:CA:FE:00     *        en0\n");
     return 0;
 }
@@ -415,7 +441,9 @@ static int proc_show_unix(struct proc_entry *UNUSED(entry), struct proc_data *bu
 static int proc_show_route(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "Iface    Destination    Gateway     Flags    RefCnt    Use    Metric    Mask        MTU    Window    IRTT \n");
     struct host_route_table routes = {};
-    if (host_route_table_collect(&routes) == 0) {
+    // (A private network namespace has no routes this file lists: the
+    // loopback's own are in the local table, which it never shows.)
+    if (current_net_ns() == NULL && host_route_table_collect(&routes) == 0) {
         for (size_t i = 0; i < routes.count; i++) {
             const struct host_route_entry *route = &routes.entries[i];
             // The whole name, as Linux prints it: a precision here cut

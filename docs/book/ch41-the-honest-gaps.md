@@ -38,17 +38,20 @@ A network namespace here is the network a sandbox is given so that it has
 none. AOK's sockets are the host's and the host has one network, so a
 private namespace cannot be a second network; it is "lo", which comes up
 and takes 127.0.0.1 when told to over rtnetlink, and sockets that never
-touch the host: `bind` is recorded and reported back with nothing bound on
-the host, a destination outside is `ENETUNREACH`, a loopback connect is
-`ECONNREFUSED` — and that is the truth, because `listen` on an inet socket
-there is refused (`EOPNOTSUPP`). There is no loopback traffic between a
-namespace's sockets yet, and a server that could never be reached is told so
-where it asks rather than left waiting. Abstract `AF_UNIX` names are the
-namespace's own; pathname sockets are the filesystem's, as on Linux. A socket
-keeps the namespace it was made in wherever its descriptor goes. The native
-`curl` and `wget`, which fetch through the host rather than through a guest
-socket, ask the same question by name. `/proc/net/dev` and `/sys/class/net`
-still describe the machine's interfaces to whoever reads them.
+touch the host. A TCP or UDP socket there is not the host's TCP or UDP at
+all: underneath it is an `AF_UNIX` socket, a port is an entry in a table of
+the namespace's own, and loopback traffic goes from one such socket to
+another. So a server in a sandbox listens on 127.0.0.1 and its client
+connects, datagrams are answered, `accept` and `recvfrom` name the other end
+by address and port — and a destination anywhere else is `ENETUNREACH`,
+because there is nowhere for it to go. One port space serves IPv4 and IPv6,
+raw and ICMP sockets can send nothing (`ping 127.0.0.1` does not work
+there), and there is no second interface to make. Abstract `AF_UNIX` names
+are the namespace's own; pathname sockets are the filesystem's, as on Linux.
+A socket keeps the namespace it was made in wherever its descriptor goes.
+The native `curl` and `wget`, which fetch through the host rather than
+through a guest socket, ask the same question by name. `/proc/net`,
+`/sys/class/net` and the interface ioctls show the reader's own namespace.
 
 A user namespace here is narrower than Linux's, always on the refusing side.
 Its capabilities reach the namespaces made inside it, the ids its maps cover

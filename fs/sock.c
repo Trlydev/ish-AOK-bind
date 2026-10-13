@@ -2926,7 +2926,8 @@ static bool host_sockaddr_is_loopback(const void *addr) {
 // listening, since listen() is refused there -- and ENETUNREACH beyond it.
 // 0 for a socket this does not concern, and for AF_UNSPEC (a disconnect).
 static int sock_net_dest_gate(const struct fd *sock, const void *addr) {
-    if (!sock_net_private_inet(sock))
+    // (A TCP or UDP socket there is translated instead: net_emul_dest.)
+    if (!sock_net_private_inet(sock) || sock->socket.net_emul)
         return 0;
     const struct sockaddr *sa = addr;
     if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
@@ -2942,12 +2943,13 @@ static int sock_net_dest_gate(const struct fd *sock, const void *addr) {
 // receives whatever the LAN sends it). To the wildcard address, or to a
 // loopback address the namespace's "lo" has been given.
 static _Atomic unsigned net_ns_next_port = 0;
+static int net_emul_bind_port(struct fd *sock, uint16_t port);
 static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
     struct net_namespace *ns = sock->socket.net_ns;
     struct sockaddr *sa = addr;
     if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
         return _EAFNOSUPPORT;
-    if (sock->socket.bind_deferred)
+    if (sock->socket.bind_deferred || sock->socket.net_emul_bound)
         return _EINVAL;     // bound already
     bool wildcard = sa->sa_family == AF_INET
         ? ((struct sockaddr_in *) sa)->sin_addr.s_addr == htonl(INADDR_ANY)
@@ -2963,6 +2965,17 @@ static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
                                                : &((struct sockaddr_in6 *) sa)->sin6_port;
     if (*port != 0 && ntohs(*port) < 1024 && !ns_capable(ns->user_ns, CAP_NET_BIND_SERVICE_))
         return _EACCES;
+    if (sock->socket.net_emul) {
+        // Recorded first, so that the binding fills the port into it.
+        memcpy(sock->socket.deferred_addr, addr,
+               addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
+        sock->socket.deferred_addr_len = (socklen_t) addr_len;
+        sock->socket.bind_deferred = true;
+        int err = net_emul_bind_port(sock, *port);
+        if (err < 0)
+            sock->socket.bind_deferred = false;
+        return err;
+    }
     // A port of the socket's own when it asked for any.
     if (*port == 0)
         *port = htons((uint16_t) (32768 + atomic_fetch_add(&net_ns_next_port, 1) % 28000));
@@ -2970,6 +2983,288 @@ static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
            addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
     sock->socket.deferred_addr_len = (socklen_t) addr_len;
     sock->socket.bind_deferred = true;
+    return 0;
+}
+
+// ---- Loopback in a private network namespace --------------------------------
+//
+// The namespace's own traffic: a TCP or UDP socket there talking to another
+// one there, over 127.0.0.1 or ::1. None of it may touch the host's network,
+// so none of it is the host's TCP or UDP: such a socket's host socket is an
+// AF_UNIX one of the matching kind (stream for TCP, datagram for UDP), and a
+// port is a binding in the table below, each with a host path of its own.
+//
+//   bind(127.0.0.1:P)     the table gains (namespace, kind, P), and the host
+//                         socket is bound to that entry's path
+//   connect / sendto      the destination port is looked up in the caller's
+//                         namespace and the host call goes to its path;
+//                         nobody bound there is ECONNREFUSED for TCP and a
+//                         datagram dropped for UDP, as on Linux
+//   accept / recvfrom     the host hands back the other end's path, which is
+//                         a binding too (a socket that connects or sends is
+//                         bound first, to a port of its own, as Linux binds
+//                         it), and that is read back as 127.0.0.1:port
+//
+// One port space serves both address families and the wildcard, so a
+// listener on [::1]:P is reached at 127.0.0.1:P; nothing has wanted them
+// apart. The socket stays AF_INET or AF_INET6 to everything the guest can
+// ask of it.
+
+struct net_emul_bind {
+    const struct net_namespace *ns; // compared, never followed
+    bool dgram;
+    uint16_t port;                  // network order
+    uint32_t id;                    // unix_socket_next_id(): names the host path
+    struct list links;
+};
+static lock_t net_emul_lock = LOCK_INITIALIZER;
+static struct list net_emul_binds;
+static uint32_t unix_socket_next_id(void);
+static int unix_host_sun_path(uint32_t socket_id, struct sockaddr_un *addr, size_t *len_out);
+
+static struct net_emul_bind *net_emul_find_locked(const struct net_namespace *ns, bool dgram, uint16_t port) {
+    if (list_null(&net_emul_binds))
+        list_init(&net_emul_binds);
+    struct net_emul_bind *bind;
+    list_for_each_entry(&net_emul_binds, bind, links)
+        if (bind->ns == ns && bind->dgram == dgram && bind->port == port)
+            return bind;
+    return NULL;
+}
+
+static bool sock_net_emul_dgram(const struct fd *sock) {
+    return (sock->socket.type & SOCKET_TYPE_MASK) == SOCK_DGRAM_;
+}
+
+// The host address of binding `id`.
+static int net_emul_host_addr(uint32_t id, struct sockaddr_un *un, uint_t *len) {
+    memset(un, 0, sizeof(*un));
+    size_t path_len = 0;
+    int err = unix_host_sun_path(id, un, &path_len);
+    if (err < 0)
+        return err;
+    un->sun_family = AF_UNIX;
+#ifdef __APPLE__
+    un->sun_len = (unsigned char) (offsetof(struct sockaddr_un, sun_path) + path_len);
+#endif
+    *len = (uint_t) (offsetof(struct sockaddr_un, sun_path) + path_len);
+    return 0;
+}
+
+// Bind `sock` to `port` (network order; 0 for a free one of the kernel's
+// choosing). EADDRINUSE for a port something in the namespace has.
+static _Atomic unsigned net_emul_next_port = 0;
+static int net_emul_bind_port(struct fd *sock, uint16_t port) {
+    if (sock->socket.net_emul_bound)
+        return _EINVAL;
+    bool dgram = sock_net_emul_dgram(sock);
+    struct net_emul_bind *entry = calloc(1, sizeof(*entry));
+    if (entry == NULL)
+        return _ENOMEM;
+    lock(&net_emul_lock, 0);
+    if (port == 0) {
+        for (int tries = 0; tries < 28000 && port == 0; tries++) {
+            uint16_t candidate = htons((uint16_t) (32768 + atomic_fetch_add(&net_emul_next_port, 1) % 28000));
+            if (net_emul_find_locked(sock->socket.net_ns, dgram, candidate) == NULL)
+                port = candidate;
+        }
+    } else if (net_emul_find_locked(sock->socket.net_ns, dgram, port) != NULL) {
+        port = 0;
+    }
+    if (port == 0) {
+        unlock(&net_emul_lock);
+        free(entry);
+        return _EADDRINUSE;
+    }
+    *entry = (struct net_emul_bind) {.ns = sock->socket.net_ns, .dgram = dgram, .port = port,
+                                     .id = unix_socket_next_id()};
+    list_add(&net_emul_binds, &entry->links);
+    unlock(&net_emul_lock);
+
+    struct sockaddr_un un;
+    uint_t len;
+    int err = net_emul_host_addr(entry->id, &un, &len);
+    if (err >= 0) {
+        unlink(un.sun_path);
+        if (bind(sock->real_fd, (struct sockaddr *) &un, len) < 0)
+            err = errno_map();
+    }
+    if (err < 0) {
+        lock(&net_emul_lock, 0);
+        list_remove(&entry->links);
+        unlock(&net_emul_lock);
+        free(entry);
+        return err;
+    }
+    sock->socket.net_emul_bound = true;
+    sock->socket.net_emul_id = entry->id;
+    // What getsockname reports: the address bind() was given, or loopback
+    // for a socket bound because it connected or sent.
+    if (!sock->socket.bind_deferred) {
+        memset(sock->socket.deferred_addr, 0, sizeof(sock->socket.deferred_addr));
+        if (sock->socket.domain == AF_INET6_) {
+            struct sockaddr_in6 *in6 = (struct sockaddr_in6 *) sock->socket.deferred_addr;
+#ifdef __APPLE__
+            in6->sin6_len = sizeof(*in6);
+#endif
+            in6->sin6_family = AF_INET6;
+            in6->sin6_addr = (struct in6_addr) IN6ADDR_LOOPBACK_INIT;
+            sock->socket.deferred_addr_len = sizeof(*in6);
+        } else {
+            struct sockaddr_in *in = (struct sockaddr_in *) sock->socket.deferred_addr;
+#ifdef __APPLE__
+            in->sin_len = sizeof(*in);
+#endif
+            in->sin_family = AF_INET;
+            in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            sock->socket.deferred_addr_len = sizeof(*in);
+        }
+        sock->socket.bind_deferred = true;
+    }
+    // (sin_port and sin6_port are at the same place.)
+    ((struct sockaddr_in *) sock->socket.deferred_addr)->sin_port = port;
+    return 0;
+}
+
+// The socket is closing: its port is free again.
+static void net_emul_release(struct fd *sock) {
+    if (!sock->socket.net_emul_bound)
+        return;
+    struct net_emul_bind *entry, *found = NULL;
+    lock(&net_emul_lock, 0);
+    if (!list_null(&net_emul_binds)) {
+        list_for_each_entry(&net_emul_binds, entry, links) {
+            if (entry->id == sock->socket.net_emul_id) {
+                found = entry;
+                break;
+            }
+        }
+    }
+    if (found != NULL)
+        list_remove(&found->links);
+    unlock(&net_emul_lock);
+    if (found != NULL) {
+        struct sockaddr_un un;
+        uint_t len;
+        if (net_emul_host_addr(found->id, &un, &len) >= 0)
+            unlink(un.sun_path);
+        free(found);
+    }
+    sock->socket.net_emul_bound = false;
+}
+
+// A destination, given as a host-format inet address, as the host address
+// of the binding it names: `addr` is rewritten in place. ENETUNREACH for an
+// address that is not the namespace's loopback (or while "lo" is down);
+// ECONNREFUSED when nothing in the namespace is bound to the port. A socket
+// that has no port of its own yet is given one first.
+static int net_emul_dest(struct fd *sock, void *addr, uint_t *addr_len) {
+    const struct sockaddr *sa = addr;
+    if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
+        return _EAFNOSUPPORT;
+    if (!host_sockaddr_is_loopback(addr) || !atomic_load(&sock->socket.net_ns->lo_up))
+        return _ENETUNREACH;
+    uint16_t port = ((const struct sockaddr_in *) sa)->sin_port;
+    if (!sock->socket.net_emul_bound) {
+        int err = net_emul_bind_port(sock, 0);
+        if (err < 0)
+            return err;
+    }
+    lock(&net_emul_lock, 0);
+    struct net_emul_bind *entry = net_emul_find_locked(sock->socket.net_ns, sock_net_emul_dgram(sock), port);
+    uint32_t id = entry != NULL ? entry->id : 0;
+    unlock(&net_emul_lock);
+    if (entry == NULL)
+        return _ECONNREFUSED;
+    return net_emul_host_addr(id, addr, addr_len);
+}
+
+// The other way: an address the host reported for the far end (its binding's
+// path, or nothing for one with no name) as the loopback address and port it
+// is in the namespace, in host format and in `sock`'s own family.
+static void net_emul_from_host(const struct fd *sock, void *addr, uint_t *addr_len) {
+    uint16_t port = 0;
+    const struct sockaddr_un *un = addr;
+    if (*addr_len > offsetof(struct sockaddr_un, sun_path) && un->sun_family == AF_UNIX) {
+        char path[sizeof(un->sun_path) + 1];
+        size_t path_len = *addr_len - offsetof(struct sockaddr_un, sun_path);
+        if (path_len > sizeof(un->sun_path))
+            path_len = sizeof(un->sun_path);
+        memcpy(path, un->sun_path, path_len);
+        path[path_len] = '\0';
+        // The id is the path's last run of digits (unix_host_sun_path).
+        size_t end = strlen(path), start = end;
+        while (start > 0 && path[start - 1] >= '0' && path[start - 1] <= '9')
+            start--;
+        if (start < end) {
+            uint32_t id = (uint32_t) strtoul(path + start, NULL, 10);
+            struct net_emul_bind *entry;
+            lock(&net_emul_lock, 0);
+            if (!list_null(&net_emul_binds)) {
+                list_for_each_entry(&net_emul_binds, entry, links) {
+                    if (entry->id == id) {
+                        port = entry->port;
+                        break;
+                    }
+                }
+            }
+            unlock(&net_emul_lock);
+        }
+    }
+    memset(addr, 0, sizeof(struct sockaddr_in6));
+    if (sock->socket.domain == AF_INET6_) {
+        struct sockaddr_in6 *in6 = addr;
+#ifdef __APPLE__
+        in6->sin6_len = sizeof(*in6);
+#endif
+        in6->sin6_family = AF_INET6;
+        in6->sin6_port = port;
+        in6->sin6_addr = (struct in6_addr) IN6ADDR_LOOPBACK_INIT;
+        *addr_len = sizeof(*in6);
+    } else {
+        struct sockaddr_in *in = addr;
+#ifdef __APPLE__
+        in->sin_len = sizeof(*in);
+#endif
+        in->sin_family = AF_INET;
+        in->sin_port = port;
+        in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        *addr_len = sizeof(*in);
+    }
+}
+
+// Where a send on such a socket goes. `addr` holds the destination the
+// caller gave (host-format inet) when `have_addr`, and is where the host
+// destination is left when *use_addr comes back true. A stream ignores an
+// address: it is connected. A datagram goes to the address given, or to the
+// one connect() recorded; one for a port nobody in the namespace is bound to
+// is *drop: reported sent and gone, as UDP's are.
+static int net_emul_send_dest(struct fd *sock, bool have_addr, void *addr, uint_t *addr_len,
+        bool *use_addr, bool *drop) {
+    *use_addr = *drop = false;
+    if (!sock_net_emul_dgram(sock))
+        return 0;
+    if (!have_addr) {
+        if (sock->socket.net_emul_dest_port == 0)
+            return _EDESTADDRREQ;
+        struct sockaddr_in *in = addr;
+        memset(in, 0, sizeof(*in));
+#ifdef __APPLE__
+        in->sin_len = sizeof(*in);
+#endif
+        in->sin_family = AF_INET;
+        in->sin_port = sock->socket.net_emul_dest_port;
+        in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        *addr_len = sizeof(*in);
+    }
+    int err = net_emul_dest(sock, addr, addr_len);
+    if (err == _ECONNREFUSED) {
+        *drop = true;
+        return 0;
+    }
+    if (err < 0)
+        return err;
+    *use_addr = true;
     return 0;
 }
 
@@ -3184,8 +3479,26 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     if (type == SOCK_RAW_ && protocol == IPPROTO_RAW)
         protocol = IPPROTO_ICMP;
 
+    // In a private network namespace a TCP or UDP socket carries the
+    // namespace's own loopback traffic and nothing else, over a host socket
+    // that is not the host's network at all (see "Loopback in a private
+    // network namespace"). Raw and ICMP sockets stay what they are, and stay
+    // shut in by the gates.
+    int plain_type = type & SOCKET_TYPE_MASK;
+    bool net_emul = current_net_ns() != NULL && (domain == AF_INET_ || domain == AF_INET6_) &&
+        ((plain_type == SOCK_STREAM_ && (protocol == 0 || protocol == IPPROTO_TCP)) ||
+         (plain_type == SOCK_DGRAM_ && (protocol == 0 || protocol == IPPROTO_UDP)));
     int sock;
-    if (seqpacket_denied_by_host(domain, type, protocol)) {
+    if (net_emul) {
+        sock = socket(AF_UNIX, plain_type == SOCK_STREAM_ ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            // Room for a datagram as large as UDP's, and a stream buffer
+            // like TCP's rather than a unix socket's 8K.
+            int size = 262144;
+            (void) setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+            (void) setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+        }
+    } else if (seqpacket_denied_by_host(domain, type, protocol)) {
         sock = -1;
         errno = EPERM;
     } else {
@@ -3204,7 +3517,7 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
                 domain, type, protocol, sock);
 
 #ifdef __APPLE__
-    if (domain == AF_INET_ && type == SOCK_DGRAM_) {
+    if (domain == AF_INET_ && type == SOCK_DGRAM_ && !net_emul) {
         // in some cases, such as ICMP, datagram sockets on mac can default to
         // including the IP header like raw sockets
         int one = 1;
@@ -3212,6 +3525,15 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     }
 #endif
 
+    if (net_emul) {
+        struct fd *fd = sock_fd_adopt(sock, (int) domain, (int) type, (int) protocol);
+        if (fd == NULL) {
+            close(sock);
+            return _ENOMEM;
+        }
+        fd->socket.net_emul = true;
+        return f_install(fd, type & ~SOCKET_TYPE_MASK);
+    }
     return sock_fd_create(sock, domain, type, protocol);
 }
 
@@ -6674,8 +6996,34 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
     int net_gate = sock_net_dest_gate(sock, &sockaddr);
     if (net_gate < 0)
         return net_gate;
+    uint16_t net_emul_stream_port = 0;
+    if (sock->socket.net_emul) {
+        const struct sockaddr *dest = (const struct sockaddr *) &sockaddr;
+        if (sock_net_emul_dgram(sock)) {
+            // A datagram socket's connect is a note of where to send: no
+            // receiver need exist yet, so there is nothing to ask the host.
+            if (dest->sa_family == AF_UNSPEC) {
+                sock->socket.net_emul_dest_port = 0;
+                return 0;
+            }
+            if (!host_sockaddr_is_loopback(dest) || !atomic_load(&sock->socket.net_ns->lo_up))
+                return _ENETUNREACH;
+            if (!sock->socket.net_emul_bound) {
+                int bind_err = net_emul_bind_port(sock, 0);
+                if (bind_err < 0)
+                    return bind_err;
+            }
+            sock->socket.net_emul_dest_port = ((const struct sockaddr_in *) dest)->sin_port;
+            return 0;
+        }
+        // A stream: to the listener's binding, from a port of its own.
+        net_emul_stream_port = ((const struct sockaddr_in *) dest)->sin_port;
+        int emul_err = net_emul_dest(sock, &sockaddr, &sockaddr_len);
+        if (emul_err < 0)
+            return emul_err;
+    }
 
-    if (sock->socket.domain == AF_INET_) {
+    if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul) {
         struct sockaddr_in guest_dest = *(struct sockaddr_in *) &sockaddr;
         if (inet_nat_rewrite_dest(sock, &sockaddr)) {
             // Remember the endpoint the guest THINKS it connected to, so
@@ -6719,7 +7067,32 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
         sock->socket.host_nonblock = false;
     }
     if (err < 0) {
+        int host_errno = errno;
         int mapped_err = unix_host_missing_is_refused(sock, errno_map());
+#if defined(__APPLE__)
+        // Darwin's connect() says EINVAL for a TCP connection that was
+        // refused before the call got as far as waiting -- on loopback the
+        // reset can come back that fast, and it then finds the socket already
+        // disconnected. Measured on macOS itself: a blocking connect to a
+        // closed port beside one just bound returns EINVAL the first time and
+        // ECONNREFUSED after, while SO_ERROR says ECONNREFUSED every time.
+        // The address was checked before the host was asked, so this EINVAL
+        // is not about an argument: it is the refusal, and Linux says so.
+        if (host_errno == EINVAL && sock->socket.type == SOCK_STREAM_ && !sock->socket.net_emul &&
+                (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_)) {
+            int so_error = 0;
+            socklen_t so_error_len = sizeof(so_error);
+            if (sock_host_so_error(sock->real_fd, &so_error, &so_error_len) == 0 && so_error != 0)
+                mapped_err = err_map(so_error);
+            else
+                mapped_err = _ECONNREFUSED;
+        }
+#else
+        (void) host_errno;
+#endif
+        // (A listener that closed between the lookup and the call.)
+        if (sock->socket.net_emul && mapped_err == _ENOENT)
+            mapped_err = _ECONNREFUSED;
         if ((mapped_err == _EINPROGRESS || mapped_err == _EALREADY) &&
                 !(fd_getflags(sock) & O_NONBLOCK_)) {
             if (sock_trace_enabled()) {
@@ -6768,6 +7141,9 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
     }
 #endif
 
+    // Connected (or, nonblocking, as good as): who to, for getpeername.
+    if (net_emul_stream_port != 0)
+        sock->socket.net_emul_dest_port = net_emul_stream_port;
     if (sock->socket.domain == AF_LOCAL_) {
         fill_cred(&sock->socket.unix_cred);
         // The listener's credentials are the client's SO_PEERCRED from now
@@ -6865,8 +7241,24 @@ int_t sys_listen(fd_t sock_fd, int_t backlog) {
     // (kernel/net_ns.h), and a listener nobody could ever reach is refused
     // here rather than left waiting -- which is also what makes ECONNREFUSED
     // the truth for a loopback connect there.
-    if (sock_net_private_inet(sock))
+    if (sock_net_private_inet(sock) && !sock->socket.net_emul)
         return _EOPNOTSUPP;
+    if (sock->socket.net_emul) {
+        // A TCP socket there listens on its binding, which is nothing of the
+        // host's to rebuild after a suspension. One that never bound is
+        // given a port, as Linux gives it.
+        if (sock_net_emul_dgram(sock))
+            return _EOPNOTSUPP;
+        if (!sock->socket.net_emul_bound) {
+            int emul_err = net_emul_bind_port(sock, 0);
+            if (emul_err < 0)
+                return emul_err;
+        }
+        if (listen(sock->real_fd, backlog > 0 ? backlog : 1) < 0)
+            return errno_map();
+        sock->socket.listening = true;
+        return 0;
+    }
     // The bind was deferred so the port would not sit on the host in a state
     // where Darwin swallows connections; this is the moment it must be real.
     int bind_err = sock_bind_materialize(sock);
@@ -7149,8 +7541,30 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
     if (client_fl >= 0 && (client_fl & O_NONBLOCK))
         (void) fcntl(client, F_SETFL, client_fl & ~O_NONBLOCK);
 
+    // In a private network namespace the peer is a binding (see "Loopback in
+    // a private network namespace"), which the host names by a path longer
+    // than the guest's sockaddr_in: asked for here, in full, and read back
+    // as the loopback address it is. Kept for getpeername too, since the
+    // host forgets a peer that has closed.
+    char emul_peer[128];
+    uint_t emul_peer_len = 0;
+    uint16_t emul_peer_port = 0;
+    if (sock->socket.net_emul) {
+        socklen_t host_len = sizeof(emul_peer);
+        memset(emul_peer, 0, sizeof(emul_peer));
+        if (getpeername(client, (struct sockaddr *) emul_peer, &host_len) == 0)
+            emul_peer_len = host_len;
+        net_emul_from_host(sock, emul_peer, &emul_peer_len);
+        emul_peer_port = ((struct sockaddr_in *) emul_peer)->sin_port;
+    }
     if (sockaddr_addr != 0) {
-        int err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
+        int err;
+        if (sock->socket.net_emul) {
+            err = sockaddr_write(sockaddr_addr, emul_peer, sizeof(sockaddr), &emul_peer_len);
+            sockaddr_len = emul_peer_len;
+        } else {
+            err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
+        }
         if (err < 0)
             return client;
         if (user_put(sockaddr_len_addr, sockaddr_len))
@@ -7172,6 +7586,15 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
     if (client_fd != NULL && client_fd->socket.net_ns != sock->socket.net_ns) {
         net_ns_release(client_fd->socket.net_ns);
         client_fd->socket.net_ns = net_ns_retain(sock->socket.net_ns);
+    }
+    // ...and, there, has its listener's address: the binding stays the
+    // listener's, and this one only reports it.
+    if (client_fd != NULL && sock->socket.net_emul) {
+        client_fd->socket.net_emul = true;
+        memcpy(client_fd->socket.deferred_addr, sock->socket.deferred_addr, sizeof(sock->socket.deferred_addr));
+        client_fd->socket.deferred_addr_len = sock->socket.deferred_addr_len;
+        client_fd->socket.bind_deferred = sock->socket.bind_deferred;
+        client_fd->socket.net_emul_dest_port = emul_peer_port;
     }
     if (client_fd == NULL) {
         close(client);
@@ -7286,6 +7709,25 @@ static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
         dword_t write_len = real_len < sockaddr_len ? real_len : sockaddr_len;
         if (user_write(sockaddr_addr, sockaddr, write_len))
             return _EFAULT;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
+
+    // An unbound socket of a private network namespace has the address any
+    // unbound inet socket has: none. (Its host socket would say "an unnamed
+    // AF_UNIX socket".)
+    if (sock->socket.net_emul && !sock->socket.bind_deferred) {
+        dword_t real_len = 0;
+        memset(sockaddr, 0, sizeof(sockaddr));
+        net_emul_from_host(sock, sockaddr, &real_len);
+        if (sock->socket.domain == AF_INET6_)
+            memset(&((struct sockaddr_in6 *) sockaddr)->sin6_addr, 0, sizeof(struct in6_addr));
+        else
+            ((struct sockaddr_in *) sockaddr)->sin_addr.s_addr = htonl(INADDR_ANY);
+        int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
+        if (err < 0)
+            return err;
         if (user_put(sockaddr_len_addr, real_len))
             return _EFAULT;
         return 0;
@@ -7414,6 +7856,25 @@ static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
         dword_t write_len = real_len < sockaddr_len ? real_len : sockaddr_len;
         if (user_write(sockaddr_addr, sockaddr, write_len))
             return _EFAULT;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
+
+    // A connected socket of a private network namespace: the port connect()
+    // or accept() recorded, on the namespace's loopback. Not asked of the
+    // host, which names the peer by a path and forgets it when it closes.
+    if (sock->socket.net_emul) {
+        if (sock->socket.net_emul_dest_port == 0)
+            return _ENOTCONN;
+        struct sockaddr_un none = {0};
+        dword_t real_len = 0;
+        memcpy(sockaddr, &none, sizeof(none));
+        net_emul_from_host(sock, sockaddr, &real_len);
+        ((struct sockaddr_in *) sockaddr)->sin_port = sock->socket.net_emul_dest_port;
+        int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
+        if (err < 0)
+            return err;
         if (user_put(sockaddr_len_addr, real_len))
             return _EFAULT;
         return 0;
@@ -7614,8 +8075,22 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
         err = sock_net_dest_gate(sock, &sockaddr);
         if (err < 0)
             goto error;
-        if (sock->socket.domain == AF_INET_)
+        if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul)
             inet_nat_rewrite_dest(sock, &sockaddr);
+    }
+    if (sock->socket.net_emul) {
+        // Loopback in a private network namespace: the destination is a
+        // binding there, or nothing.
+        bool use_addr, drop;
+        err = net_emul_send_dest(sock, sockaddr_addr != 0, &sockaddr, &sockaddr_len, &use_addr, &drop);
+        if (err < 0)
+            goto error;
+        if (drop) {
+            free(buffer);
+            return len;
+        }
+        // (Only asked from here on whether there is one.)
+        sockaddr_addr = use_addr ? 1 : 0;
     }
 
     if (sock->socket.domain == AF_NETLINK_) {
@@ -7815,7 +8290,14 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
     }
 
     char *buffer = malloc(recv_cap);
-    char sockaddr[sockaddr_len];
+    // What the guest's buffer holds, which is all that is written back. A
+    // socket of a private network namespace is told the sender by the HOST
+    // as a path (see "Loopback in a private network namespace"), which
+    // needs more room than the sockaddr_in the guest made space for.
+    uint_t guest_sockaddr_len = sockaddr_len;
+    char sockaddr[sock->socket.net_emul && sockaddr_len < 128 ? 128 : sockaddr_len];
+    if (sock->socket.net_emul && sockaddr_addr != 0)
+        sockaddr_len = sizeof(sockaddr);
     if (sock->socket.domain == AF_NETLINK_) {
         struct iovec iov = {
             .iov_base = buffer,
@@ -8044,9 +8526,11 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
     }
     free(buffer);
     if (sockaddr_addr != 0) {
-        if (sock->socket.domain == AF_INET_)
+        if (sock->socket.net_emul)
+            net_emul_from_host(sock, &sockaddr, &sockaddr_len);
+        else if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_src(sock, &sockaddr);
-        int err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
+        int err = sockaddr_write(sockaddr_addr, sockaddr, guest_sockaddr_len, &sockaddr_len);
         if (err < 0)
             return err;
     }
@@ -8315,6 +8799,14 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         if ((level == IPPROTO_IP && (option == IP_ADD_MEMBERSHIP_ || option == IP_DROP_MEMBERSHIP_)) ||
                 (level == IPPROTO_IPV6 && (option == IPV6_ADD_MEMBERSHIP_ || option == IPV6_DROP_MEMBERSHIP_)))
             return _ENODEV;
+        // The IP, TCP and UDP options of a socket whose traffic is the
+        // namespace's loopback (and whose host socket is not an inet one at
+        // all) have nothing to set: TCP_NODELAY on a path with no delay,
+        // a TTL on packets that are never packets. Accepted, as loopback
+        // would accept them, and without effect.
+        if (sock->socket.net_emul && (level == IPPROTO_IP || level == IPPROTO_TCP ||
+                    level == IPPROTO_UDP || level == IPPROTO_IPV6))
+            return 0;
     }
     if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
         char name[sizeof(sock->socket.so_bindtodevice)];
@@ -8875,7 +9367,14 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         return _EFAULT;
     dword_t value_len = user_value_len;
 
-    if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
+    if (sock->socket.net_emul && (level == IPPROTO_IP || level == IPPROTO_TCP ||
+                level == IPPROTO_UDP || level == IPPROTO_IPV6)) {
+        // See the setsockopt side: these read as unset. An int for all but
+        // TCP_INFO, which is a structure and reads all zero.
+        memset(value, 0, user_value_len != 0 ? user_value_len : 1);
+        if (!(level == IPPROTO_TCP && option == 11 /* TCP_INFO */) && value_len > sizeof(dword_t))
+            value_len = sizeof(dword_t);
+    } else if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
         dword_t value_p;
         if (option == SO_DOMAIN_)
             value_p = sock->socket.domain;
@@ -9678,18 +10177,38 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
         err = sock_net_dest_gate(sock, &msg_name);
         if (err < 0)
             return err;
-        if (sock->socket.domain == AF_INET_)
+        if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul)
             inet_nat_rewrite_dest(sock, &msg_name);
         msg.msg_name = &msg_name;
         msg.msg_namelen = msg_fake.msg_namelen;
     } else {
         msg.msg_name = NULL;
     }
+    // Loopback in a private network namespace: as in sendto.
+    bool net_emul_drop = false;
+    if (sock->socket.net_emul) {
+        bool use_addr;
+        uint_t name_len = msg.msg_name != NULL ? msg.msg_namelen : 0;
+        int emul_err = net_emul_send_dest(sock, msg.msg_name != NULL, &msg_name, &name_len,
+                &use_addr, &net_emul_drop);
+        if (emul_err < 0)
+            return emul_err;
+        msg.msg_name = use_addr ? &msg_name : NULL;
+        msg.msg_namelen = use_addr ? name_len : 0;
+    }
 
     // msg_iovec
     struct guest_iovec_ *msg_iov_fake = user_read_iovecs_abi(current, abi, msg_fake.msg_iov, msg_fake.msg_iovlen);
     if (IS_ERR(msg_iov_fake))
         return PTR_ERR(msg_iov_fake);
+    if (net_emul_drop) {
+        // A datagram for a port nobody has: sent, as far as the sender is told.
+        size_t total = 0;
+        for (size_t i = 0; i < (size_t) msg_fake.msg_iovlen; i++)
+            total += msg_iov_fake[i].len;
+        free(msg_iov_fake);
+        return (int_t) total;
+    }
     struct iovec *msg_iov = NULL;
     if (msg_fake.msg_iovlen != 0) {
         msg_iov = calloc(msg_fake.msg_iovlen, sizeof(*msg_iov));
@@ -10298,6 +10817,10 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     if (msg_fake.msg_name != 0) {
         msg.msg_name = msg_name;
         msg.msg_namelen = msg_fake.msg_namelen;
+        // (Room for the path the host names a private network namespace's
+        // sender by; see sys_recvfrom_common.)
+        if (sock->socket.net_emul && msg_name == msg_name_stack)
+            msg.msg_namelen = sizeof(msg_name_stack);
     } else {
         msg.msg_name = NULL;
         msg.msg_namelen = 0;
@@ -10874,7 +11397,9 @@ out_recvmsg_done:
 
     // msg_name (changed)
     if (msg.msg_name != 0) {
-        if (sock->socket.domain == AF_INET_)
+        if (sock->socket.net_emul)
+            net_emul_from_host(sock, msg.msg_name, &msg.msg_namelen);
+        else if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_src(sock, msg.msg_name);
         int err = sockaddr_write(msg_fake.msg_name, msg.msg_name, msg_fake.msg_namelen, &msg.msg_namelen);
         if (err < 0) {
@@ -11423,6 +11948,19 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
         dgram_msg.msg_iov = dgram_iov;
         dgram_msg.msg_iovlen = 2;
     }
+    // A connected datagram socket of a private network namespace: connect()
+    // only recorded where it goes (see sys_connect_common).
+    struct sockaddr_max_ emul_dest;
+    uint_t emul_dest_len = 0;
+    bool emul_to = false;
+    if (fd->socket.net_emul && sock_net_emul_dgram(fd)) {
+        bool drop;
+        int emul_err = net_emul_send_dest(fd, false, &emul_dest, &emul_dest_len, &emul_to, &drop);
+        if (emul_err < 0)
+            return emul_err;
+        if (drop)
+            return (ssize_t) size;
+    }
     ssize_t res = 0;
     // Plain write(2) on a socket is how most guests actually send, and a
     // blocking one must not come back short. See the sendto path: the host
@@ -11443,6 +11981,8 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
                 struct iovec whole = {.iov_base = (void *) buf, .iov_len = size};
                 struct msghdr one = {.msg_iov = &whole, .msg_iovlen = 1};
                 res = unix_seqpacket_sendmsg(fd, &one, 0, 0);
+            } else if (emul_to) {
+                res = sendto(fd->real_fd, buf, size, 0, (void *) &emul_dest, emul_dest_len);
             } else {
                 res = write(fd->real_fd, (const char *) buf + sent, size - sent);
             }
@@ -11785,6 +12325,8 @@ static int sock_close(struct fd *fd) {
         close(fd->socket.ipv6_recverr_fd);
         fd->socket.ipv6_recverr_fd = -1;
     }
+    if (fd->socket.net_emul)
+        net_emul_release(fd);
     net_ns_release(fd->socket.net_ns);
     fd->socket.net_ns = NULL;
     if (fd->real_fd < 0)

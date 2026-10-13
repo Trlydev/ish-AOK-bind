@@ -110,6 +110,16 @@ struct fd {
             // NULL for the initial one. Owns a reference, for the life of
             // the socket: set where the socket is made and nowhere else.
             struct net_namespace *net_ns;
+            // An inet stream or datagram socket of a private network
+            // namespace: its host socket is an AF_UNIX one, through which the
+            // namespace's loopback traffic travels (fs/sock.c, "Loopback in a
+            // private network namespace"). net_emul_id names its binding's
+            // host path while it is bound; net_emul_dest_port is a connected
+            // datagram socket's destination, in network order, or 0.
+            bool net_emul;
+            bool net_emul_bound;
+            uint16_t net_emul_dest_port;
+            uint32_t net_emul_id;
             int domain;
             int type;
             int protocol;

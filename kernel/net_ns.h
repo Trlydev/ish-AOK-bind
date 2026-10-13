@@ -14,19 +14,23 @@ struct fd;
 // private network namespace gets here is the network a sandbox is given so
 // that it has none: one interface, "lo" (index 1), which comes up and takes
 // 127.0.0.1 and ::1 when it is told to over rtnetlink (which is all
-// bubblewrap --unshare-net does), and through which nothing travels.
+// bubblewrap --unshare-net does), and through which only the namespace's own
+// traffic travels.
 //
 // A socket belongs to the namespace of the task that made it, for its whole
 // life, wherever the descriptor goes afterwards (fd->socket.net_ns; an
 // accepted socket is its listener's). For a socket of a private namespace:
 //
-//   - an inet socket never touches the host's network. bind() is recorded and
-//     reported back, to loopback and wildcard addresses only, and nothing is
-//     bound on the host. connect() and a send with a destination are
-//     ENETUNREACH, or for a loopback destination ECONNREFUSED -- which is the
-//     truth, because listen() is refused (EOPNOTSUPP): there is no loopback
-//     traffic between sockets yet, and a server that could never be reached
-//     is told so where it asks, not left waiting.
+//   - an inet socket never touches the host's network. A TCP or UDP socket
+//     is not the host's TCP or UDP at all: its host socket is an AF_UNIX one,
+//     a port is a binding in a table of the namespace's own, and loopback
+//     traffic between the namespace's sockets goes from one such socket to
+//     another (fs/sock.c, "Loopback in a private network namespace"). So a
+//     server there listens, a client connects to it, datagrams are answered
+//     -- and a destination that is not the namespace's loopback is
+//     ENETUNREACH, because there is nowhere for it to go. Raw and ICMP
+//     sockets are made, and can send nothing: `ping 127.0.0.1` does not
+//     work there.
 //   - an abstract AF_UNIX name is the namespace's own: it neither finds nor
 //     collides with one bound outside. Pathname sockets are the
 //     filesystem's, as on Linux.
@@ -36,9 +40,8 @@ struct fd;
 //     socket-diag family lists nothing.
 //   - the interface ioctls know "lo" and nothing else.
 //
-// What a private namespace does not yet do is carry loopback traffic, and
-// /proc/net and /sys/class/net still describe the machine's network to
-// whoever reads them.
+// /proc/net and /sys/class/net describe the reader's own namespace, like
+// everything else here that lists interfaces.
 //
 // The initial namespace is `task->net_ns == NULL` and `socket.net_ns == NULL`.
 struct net_namespace {
