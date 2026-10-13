@@ -167,7 +167,17 @@ which treats the whole view as a laptop's touchpad instead:
 
 A mouse, a trackpad and a pencil are unaffected: they already point.
 
-It needs those programs installed in the guest first, and two scripts do that:
+It needs those programs installed in the guest first. From build 559 the app
+does that for you: **Settings → Wayland Desktop → Install a Desktop…**, which
+is also in the display's own **···** menu — where its "not found" message
+appears when a filesystem has no desktop yet. The page lists the desktops with
+what is installed and which one starts; tapping one that is not installed runs
+its setup script and shows what it prints, and tapping one that is makes it the
+desktop the next session starts. **More Programs** installs the games, tools,
+X11 support and GPU drivers described below. It installs into the filesystem
+that is running, takes several minutes, and needs iSH-AOK left open meanwhile.
+
+The same scripts can be run by hand:
 
 ```sh
 sudo sh /AOK/tools/setup-wayland.sh   # once: labwc, sway, wofi, foot, wayvnc, waybar

@@ -534,6 +534,18 @@ UIViewController *ISHCreateDiagnosticsNavigationController(void) {
     return [self _visibleStoryboardSectionCount] + 4;
 }
 
+// Installing and choosing the Wayland display's desktop (GH #639).
+- (NSInteger)_desktopSectionIndex {
+    return [self _visibleStoryboardSectionCount] + 5;
+}
+
+- (UITableViewCell *)_desktopSetupCell {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+    cell.textLabel.text = NSLocalizedString(@"Install a Desktop…", @"Settings row and Wayland display menu action: opens the desktop setup page");
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    return cell;
+}
+
 static NSString *ISHForeignExecTitle(NSString *mode) {
     if ([mode isEqualToString:@"libs"])
         return NSLocalizedString(@"Use Their Libraries Here", @"Programs From Other Roots option");
@@ -628,6 +640,18 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == [self _foreignExecSectionIndex]) {
         [self _showForeignExecPickerFromCell:[tableView cellForRowAtIndexPath:indexPath]];
+        [tableView deselectRowAtIndexPath:indexPath animated:YES];
+        return;
+    }
+    if (indexPath.section == [self _desktopSectionIndex]) {
+        UIViewController *setup = ISHCreateDesktopSetupViewController();
+        if (self.ish_canPushSubpage) {
+            [self.navigationController pushViewController:setup animated:YES];
+        } else {
+            UINavigationController *navigationController = [[UINavigationController alloc] initWithRootViewController:setup];
+            ISHConfigureLLMSettingsNavigationController(navigationController);
+            [self presentViewController:navigationController animated:YES completion:nil];
+        }
         [tableView deselectRowAtIndexPath:indexPath animated:YES];
         return;
     }
@@ -828,6 +852,8 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
         return NSLocalizedString(@"Keeps the code iSH-AOK has translated after the program that needed it exits, so the next program that loads the same code starts faster. It helps scripts and builds that start many short programs (about a fifth faster in tests) and does little for one long-running program.\n\n"
                @"A cached translation is found by the address its code was loaded at, so while this is on, address space layout randomization (ASLR) is off in the Linux system: every program and library loads at the same addresses each time. ASLR does not prevent bugs; it makes a memory-corruption bug harder to turn into an attack, because the attacker cannot know where anything is. With it off, such a bug in a program you run here -- a network service above all -- is easier to exploit. iOS's own protection of the app is not affected.\n\n"
                @"Applies to programs started after the change, on arm64 filesystems. Uses up to 96 MB of memory.", @"Translated Code section footer: what the translation cache does and that it turns ASLR off");
+    if (section == [self _desktopSectionIndex])
+        return NSLocalizedString(@"Installs the desktop the Wayland display shows, in the filesystem that is running, and chooses which one it starts.", @"Wayland Desktop section footer in Settings");
     if (section == 1) { // filesystems / upgrade
         if (!FsIsManaged()) {
             return NSLocalizedString(@"The current filesystem is not managed by iSH-AOK.", @"Filesystem section footer");
@@ -851,14 +877,18 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
         return NSLocalizedString(@"Other Filesystems", @"Settings section header");
     if (section == [self _jitCacheSectionIndex])
         return NSLocalizedString(@"Translated Code", @"Settings section header");
+    if (section == [self _desktopSectionIndex])
+        return NSLocalizedString(@"Wayland Desktop", @"Desktop setup page title");
     return [super tableView:tableView titleForHeaderInSection:section];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
-    return [self _visibleStoryboardSectionCount] + 5;
+    return [self _visibleStoryboardSectionCount] + 6;
 }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == [self _desktopSectionIndex])
+        return 1;
     if (section == [self _userAccountSectionIndex])
         return 1;
     if (section == [self _llmSectionIndex])
@@ -901,6 +931,8 @@ static NSString *ISHForeignExecTitle(NSString *mode) {
         return [self _foreignExecCell];
     if (indexPath.section == [self _jitCacheSectionIndex])
         return [self _jitCacheCell];
+    if (indexPath.section == [self _desktopSectionIndex])
+        return [self _desktopSetupCell];
     return [super tableView:tableView cellForRowAtIndexPath:indexPath];
 }
 
@@ -1369,3 +1401,543 @@ static const NSInteger ISHToolbarKeysActionsSection = 2;
 }
 
 @end
+
+#pragma mark - Wayland desktop setup (GH #639)
+
+// The desktop the Wayland display shows is ordinary packages in the guest,
+// installed once per filesystem by /AOK/tools/setup-*.sh. That meant opening a
+// terminal and typing `sudo sh /AOK/tools/setup-wayland.sh`, which is what the
+// display's own failure message told people to do. These two pages run the
+// same scripts from the app: one lists the desktops with what is installed
+// and which one starts, the other runs a script and shows what it prints.
+
+// The line the wrapper prints when the script is done, carrying its status.
+// A guest process started with pipes reports no exit status of its own.
+static NSString *const ISHDesktopScriptDoneMarker = @"__AOK_SCRIPT_DONE__";
+
+// One queue for everything that starts, stops or runs a command in the guest
+// from these pages: guest_process_spawn_user and run_guest_command_capture
+// must not be called from the main thread or the shared pool.
+static dispatch_queue_t ISHDesktopSetupQueue(void) {
+    static dispatch_queue_t queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = dispatch_queue_create("app.ish.desktop-setup", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+// Runs one script as root in the guest and shows its output as it comes.
+@interface ISHDesktopScriptViewController : UIViewController
+- (instancetype)initWithTitle:(NSString *)title command:(NSString *)command completion:(void (^_Nullable)(BOOL succeeded))completion;
+@end
+
+@implementation ISHDesktopScriptViewController {
+    NSString *_command;
+    void (^_completion)(BOOL);
+    UITextView *_textView;
+    UIActivityIndicatorView *_spinner;
+    struct guest_process _process;
+    BOOL _started, _running, _stopRequested;
+    NSMutableData *_pending; // bytes read and not yet a whole line
+    BOOL _idleTimerWasDisabled;
+}
+
+- (instancetype)initWithTitle:(NSString *)title command:(NSString *)command completion:(void (^)(BOOL))completion {
+    self = [super initWithNibName:nil bundle:nil];
+    if (self != nil) {
+        self.title = title;
+        _command = [command copy];
+        _completion = [completion copy];
+        _pending = [NSMutableData data];
+    }
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = UIColor.systemBackgroundColor;
+    _textView = [UITextView new];
+    _textView.translatesAutoresizingMaskIntoConstraints = NO;
+    _textView.editable = NO;
+    _textView.alwaysBounceVertical = YES;
+    _textView.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular];
+    _textView.textContainerInset = UIEdgeInsetsMake(10, 8, 10, 8);
+    [self.view addSubview:_textView];
+    [NSLayoutConstraint activateConstraints:@[
+        [_textView.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor],
+        [_textView.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_textView.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_textView.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    ]];
+    _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (!_started) {
+        _started = YES;
+        [self startScript];
+    }
+}
+
+- (void)setRunning:(BOOL)running {
+    _running = running;
+    // Leaving the page would not stop the script, so there is no leaving it
+    // while it runs: Stop is how it ends early.
+    [self.navigationItem setHidesBackButton:running animated:YES];
+    self.navigationController.interactivePopGestureRecognizer.enabled = !running;
+    self.modalInPresentation = running;
+    if (running) {
+        [_spinner startAnimating];
+        self.navigationItem.rightBarButtonItems = @[
+            [[UIBarButtonItem alloc] initWithTitle:NSLocalizedString(@"Stop", @"Desktop setup: button that stops the running script")
+                                             style:UIBarButtonItemStylePlain target:self action:@selector(stopScript)],
+            [[UIBarButtonItem alloc] initWithCustomView:_spinner],
+        ];
+        // A package download that the screen locking suspends is a download
+        // started over, and the scripts say so themselves.
+        _idleTimerWasDisabled = UIApplication.sharedApplication.idleTimerDisabled;
+        UIApplication.sharedApplication.idleTimerDisabled = YES;
+    } else {
+        [_spinner stopAnimating];
+        self.navigationItem.rightBarButtonItems = nil;
+        UIApplication.sharedApplication.idleTimerDisabled = _idleTimerWasDisabled;
+    }
+}
+
+- (void)appendOutput:(NSString *)text {
+    if (text.length == 0)
+        return;
+    BOOL atEnd = _textView.contentOffset.y + _textView.bounds.size.height >= _textView.contentSize.height - 40.0;
+    NSAttributedString *more = [[NSAttributedString alloc] initWithString:text attributes:@{
+        NSFontAttributeName: _textView.font ?: [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightRegular],
+        NSForegroundColorAttributeName: UIColor.labelColor,
+    }];
+    [_textView.textStorage appendAttributedString:more];
+    if (atEnd)
+        [_textView scrollRangeToVisible:NSMakeRange(_textView.textStorage.length, 0)];
+}
+
+// What the scripts print is made for a terminal: colour sequences, and
+// carriage returns that redraw a progress line. A text view gets the text.
+static NSString *ISHDesktopPlainText(NSString *text) {
+    static NSRegularExpression *escapes;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        escapes = [NSRegularExpression regularExpressionWithPattern:@"\\x1b\\[[0-9;?]*[A-Za-z]|\\x1b[()][A-Za-z0-9]" options:0 error:nil];
+    });
+    NSString *plain = [escapes stringByReplacingMatchesInString:text options:0 range:NSMakeRange(0, text.length) withTemplate:@""];
+    plain = [plain stringByReplacingOccurrencesOfString:@"\r\n" withString:@"\n"];
+    return [plain stringByReplacingOccurrencesOfString:@"\r" withString:@"\n"];
+}
+
+- (void)startScript {
+    intptr_t booted = [AppDelegate ensureBooted];
+    if (booted < 0) {
+        [self finishWithStatus:-1 startError:(int) booted];
+        return;
+    }
+    [self setRunning:YES];
+    [self appendOutput:[NSString stringWithFormat:@"# %@\n\n", _command]];
+    // stderr into the same stream, in order, and the status on a line of its own.
+    NSString *wrapped = [NSString stringWithFormat:@"{ %@; echo; echo %@ $?; } 2>&1", _command, ISHDesktopScriptDoneMarker];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(ISHDesktopSetupQueue(), ^{
+        struct guest_process process = {0};
+        // No terminal, so apt and apk print lines rather than redrawn
+        // progress bars, and nothing asks a question.
+        int rc = guest_process_spawn_user(NULL, wrapped.UTF8String,
+                                          "PATH=/AOK/persist/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
+                                          "HOME=/root\0TERM=dumb\0LANG=C.UTF-8\0DEBIAN_FRONTEND=noninteractive\0",
+                                          &process);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf == nil) {
+                if (rc >= 0) {
+                    dispatch_async(ISHDesktopSetupQueue(), ^{
+                        struct guest_process orphan = process;
+                        guest_process_stop(&orphan);
+                    });
+                }
+                return;
+            }
+            if (rc < 0) {
+                [strongSelf finishWithStatus:-1 startError:rc];
+                return;
+            }
+            strongSelf->_process = process;
+            [strongSelf readOutputFrom:process.stdout_fd drain:process.stderr_fd];
+        });
+    });
+}
+
+- (void)readOutputFrom:(int)stdoutFD drain:(int)stderrFD {
+    __weak typeof(self) weakSelf = self;
+    // Nothing is written to stderr (it is folded into stdout above), but a
+    // pipe nobody reads stalls whoever does write to it.
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        char sink[512];
+        while (read(stderrFD, sink, sizeof(sink)) > 0)
+            ;
+    });
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        char buffer[4096];
+        ssize_t n;
+        while ((n = read(stdoutFD, buffer, sizeof(buffer))) > 0) {
+            NSData *chunk = [NSData dataWithBytes:buffer length:(NSUInteger) n];
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [weakSelf consumeOutput:chunk atEnd:NO];
+            });
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [weakSelf consumeOutput:[NSData data] atEnd:YES];
+        });
+    });
+}
+
+// Whole lines only, so that a multi-byte character split across two reads is
+// never decoded in halves, and the status line is seen whole.
+- (void)consumeOutput:(NSData *)chunk atEnd:(BOOL)atEnd {
+    [_pending appendData:chunk];
+    const char *bytes = _pending.bytes;
+    NSUInteger length = _pending.length, lineStart = 0;
+    NSMutableString *text = [NSMutableString string];
+    int status = INT_MIN;
+    for (NSUInteger i = 0; i < length; i++) {
+        if (bytes[i] != '\n')
+            continue;
+        NSString *line = [[NSString alloc] initWithBytes:bytes + lineStart length:i - lineStart encoding:NSUTF8StringEncoding]
+            ?: [[NSString alloc] initWithBytes:bytes + lineStart length:i - lineStart encoding:NSISOLatin1StringEncoding] ?: @"";
+        lineStart = i + 1;
+        if ([line hasPrefix:ISHDesktopScriptDoneMarker]) {
+            status = [line substringFromIndex:ISHDesktopScriptDoneMarker.length].intValue;
+            continue;
+        }
+        [text appendString:line];
+        [text appendString:@"\n"];
+    }
+    [_pending replaceBytesInRange:NSMakeRange(0, lineStart) withBytes:NULL length:0];
+    if (atEnd && _pending.length > 0) {
+        NSString *rest = [[NSString alloc] initWithData:_pending encoding:NSUTF8StringEncoding] ?: @"";
+        [text appendString:rest];
+        [_pending setLength:0];
+    }
+    [self appendOutput:ISHDesktopPlainText(text)];
+    if (status != INT_MIN)
+        [self finishWithStatus:status startError:0];
+    else if (atEnd && _running)
+        [self finishWithStatus:-1 startError:0]; // ended without saying how: stopped, or killed
+}
+
+- (void)stopScript {
+    if (!_running || _stopRequested)
+        return;
+    _stopRequested = YES;
+    [self appendOutput:[NSString stringWithFormat:@"\n%@\n", NSLocalizedString(@"Stopping…", @"Desktop setup: shown in the output while the script is being stopped")]];
+    struct guest_process process = _process;
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(ISHDesktopSetupQueue(), ^{
+        struct guest_process stopping = process;
+        guest_process_stop(&stopping);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf != nil && strongSelf->_running)
+                [strongSelf finishWithStatus:-1 startError:0];
+        });
+    });
+}
+
+- (void)finishWithStatus:(int)status startError:(int)startError {
+    BOOL wasRunning = _running;
+    if (wasRunning)
+        [self setRunning:NO];
+    else if (!_started || startError == 0)
+        return; // already finished
+    BOOL stopped = _stopRequested;
+    if (wasRunning && !stopped) {
+        // The script is gone; let go of its pipes and reap it.
+        struct guest_process process = _process;
+        dispatch_async(ISHDesktopSetupQueue(), ^{
+            struct guest_process done = process;
+            guest_process_stop(&done);
+        });
+    }
+    BOOL succeeded = status == 0 && startError == 0 && !stopped;
+    NSString *summary;
+    if (startError != 0)
+        summary = [NSString stringWithFormat:NSLocalizedString(@"The script could not be started (error %d).", @"Desktop setup result; %d is an error number"), startError];
+    else if (stopped)
+        summary = NSLocalizedString(@"Stopped.", @"Desktop setup result: the user stopped the script");
+    else if (succeeded)
+        summary = NSLocalizedString(@"Finished.", @"Desktop setup result: the script succeeded");
+    else
+        summary = [NSString stringWithFormat:NSLocalizedString(@"The script failed (status %d). What went wrong is in its output above.", @"Desktop setup result; %d is an exit status"), status];
+    [self appendOutput:[NSString stringWithFormat:@"\n%@\n", summary]];
+    [_textView scrollRangeToVisible:NSMakeRange(_textView.textStorage.length, 0)];
+    UIAccessibilityPostNotification(UIAccessibilityAnnouncementNotification, summary);
+    void (^completion)(BOOL) = _completion;
+    _completion = nil;
+    if (completion != nil)
+        completion(succeeded);
+}
+
+- (void)dealloc {
+    if (_running) {
+        struct guest_process process = _process;
+        dispatch_async(ISHDesktopSetupQueue(), ^{
+            struct guest_process orphan = process;
+            guest_process_stop(&orphan);
+        });
+        BOOL idle = _idleTimerWasDisabled;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIApplication.sharedApplication.idleTimerDisabled = idle;
+        });
+    }
+}
+
+@end
+
+@interface ISHDesktopSetupViewController : UITableViewController <WorkspaceTextScaledPage>
+@end
+
+typedef NS_ENUM(NSInteger, ISHDesktopSetupSection) {
+    ISHDesktopSetupSectionDesktops,
+    ISHDesktopSetupSectionExtras,
+    ISHDesktopSetupSectionCount,
+};
+
+@implementation ISHDesktopSetupViewController {
+    // What select-desktop.sh reports: which of the four are installed, and
+    // which one the next session starts. nil until the first answer.
+    NSSet<NSString *> *_Nullable _installed;
+    NSString *_Nullable _selected;
+    BOOL _probing, _probeFailed;
+}
+
+static NSArray<NSString *> *ISHDesktopNames(void) {
+    return @[@"labwc", @"xfce", @"wayfire", @"sway"];
+}
+
+static NSString *ISHDesktopTitle(NSString *name) {
+    if ([name isEqualToString:@"labwc"])
+        return NSLocalizedString(@"Basic Desktop (labwc)", @"Desktop setup: desktop name");
+    if ([name isEqualToString:@"xfce"])
+        return @"Xfce";
+    if ([name isEqualToString:@"wayfire"])
+        return @"Wayfire";
+    return @"Sway";
+}
+
+// The script that installs each. labwc and sway come together; Wayfire is
+// told which panel, so that it has nothing to ask.
+static NSString *ISHDesktopInstallCommand(NSString *name) {
+    if ([name isEqualToString:@"xfce"])
+        return @"sh /AOK/tools/setup-xfce.sh";
+    if ([name isEqualToString:@"wayfire"])
+        return @"sh /AOK/tools/setup-wayfire.sh --panel stock";
+    return @"sh /AOK/tools/setup-wayland.sh";
+}
+
+- (instancetype)init {
+    self = [super initWithStyle:UITableViewStyleInsetGrouped];
+    if (self != nil)
+        self.title = NSLocalizedString(@"Wayland Desktop", @"Desktop setup page title");
+    return self;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    [self probe];
+}
+
+// Asks the guest: `select-desktop.sh` with no argument lists the four with
+// "installed" or "not installed", a star on the one that starts.
+- (void)probe {
+    if (_probing)
+        return;
+    _probing = YES;
+    [self.tableView reloadData];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(ISHDesktopSetupQueue(), ^{
+        NSMutableSet<NSString *> *installed = nil;
+        NSString *selected = nil;
+        if ([AppDelegate ensureBooted] >= 0) {
+            struct guest_command_result result = {0};
+            int rc = run_guest_command_capture("sh /AOK/tools/select-desktop.sh 2>&1", NULL, 30000, 16384, &result);
+            if (rc == 0 && result.launched && result.output != NULL) {
+                installed = [NSMutableSet set];
+                NSString *output = [[NSString alloc] initWithBytes:result.output length:result.output_len encoding:NSUTF8StringEncoding] ?: @"";
+                for (NSString *line in [output componentsSeparatedByString:@"\n"]) {
+                    NSArray<NSString *> *words = [[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+                        componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+                    words = [words filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"length > 0"]];
+                    BOOL starred = words.count > 0 && [words[0] isEqualToString:@"*"];
+                    if (starred)
+                        words = [words subarrayWithRange:NSMakeRange(1, words.count - 1)];
+                    if (words.count < 2 || ![ISHDesktopNames() containsObject:words[0]])
+                        continue;
+                    if ([words[1] isEqualToString:@"installed"])
+                        [installed addObject:words[0]];
+                    if (starred)
+                        selected = words[0];
+                }
+            }
+            free(result.output);
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf == nil)
+                return;
+            strongSelf->_probing = NO;
+            strongSelf->_probeFailed = installed == nil;
+            strongSelf->_installed = installed;
+            strongSelf->_selected = selected;
+            [strongSelf.tableView reloadData];
+        });
+    });
+}
+
+- (NSArray<NSDictionary<NSString *, NSString *> *> *)extras {
+    return @[
+        @{@"title": NSLocalizedString(@"Games", @"Desktop setup: a set of extra programs"), @"command": @"sh /AOK/tools/setup-wayland-extras.sh games"},
+        @{@"title": NSLocalizedString(@"Tools", @"Desktop setup: a set of extra programs"), @"command": @"sh /AOK/tools/setup-wayland-extras.sh tools"},
+        @{@"title": NSLocalizedString(@"X11 Programs", @"Desktop setup: a set of extra programs"), @"command": @"sh /AOK/tools/setup-wayland-extras.sh x11"},
+        @{@"title": NSLocalizedString(@"GPU Drivers", @"Desktop setup: installs the GPU drivers"), @"command": @"sh /AOK/tools/setup-gpu.sh"},
+    ];
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+    return ISHDesktopSetupSectionCount;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    if (section == ISHDesktopSetupSectionDesktops)
+        return (NSInteger) ISHDesktopNames().count;
+    return (NSInteger) [self extras].count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+    if (section == ISHDesktopSetupSectionDesktops)
+        return NSLocalizedString(@"Desktops", @"Desktop setup section header");
+    return NSLocalizedString(@"More Programs", @"Desktop setup section header");
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+    if (section == ISHDesktopSetupSectionDesktops) {
+        if (_probeFailed)
+            return NSLocalizedString(@"The Linux system did not answer. It has to be running for a desktop to be installed in it.", @"Desktop setup footer when the guest cannot be asked");
+        return NSLocalizedString(@"Tap a desktop to install it in the filesystem that is running, or to make it the one the Wayland display starts. Installing downloads packages and takes several minutes; keep iSH-AOK open until it finishes. Wayfire needs Devuan and the GPU.", @"Desktop setup footer");
+    }
+    return NSLocalizedString(@"Programs for the desktop's Applications menu, and the drivers that let the desktop and its programs use the GPU.", @"Desktop setup footer for the extra programs");
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
+    if (indexPath.section == ISHDesktopSetupSectionDesktops) {
+        NSString *name = ISHDesktopNames()[(NSUInteger) indexPath.row];
+        cell.textLabel.text = ISHDesktopTitle(name);
+        if (_installed == nil) {
+            cell.detailTextLabel.text = _probing ? NSLocalizedString(@"Checking…", @"Desktop setup: state while asking the guest") : @"";
+        } else if ([_installed containsObject:name]) {
+            BOOL selected = [name isEqualToString:_selected];
+            cell.detailTextLabel.text = selected
+                ? NSLocalizedString(@"Starts", @"Desktop setup: the desktop the Wayland display starts")
+                : NSLocalizedString(@"Installed", @"Desktop setup: desktop state");
+            cell.accessoryType = selected ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+        } else {
+            cell.detailTextLabel.text = NSLocalizedString(@"Not Installed", @"Desktop setup: desktop state");
+            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        }
+    } else {
+        cell.textLabel.text = [self extras][(NSUInteger) indexPath.row][@"title"];
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+    }
+    cell.accessibilityTraits |= UIAccessibilityTraitButton;
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (void)confirmRunning:(NSString *)title command:(NSString *)command fromCell:(UITableViewCell *)cell {
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:title
+                                                         message:NSLocalizedString(@"This downloads packages into the filesystem that is running and takes several minutes. Keep iSH-AOK open until it finishes.", @"Desktop setup: confirmation before installing")];
+    __weak typeof(self) weakSelf = self;
+    [sheet addActionWithTitle:NSLocalizedString(@"Install", @"Desktop setup: confirm button")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf == nil)
+            return;
+        ISHDesktopScriptViewController *runner = [[ISHDesktopScriptViewController alloc] initWithTitle:title command:command completion:nil];
+        [strongSelf.navigationController pushViewController:runner animated:YES];
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"Action sheet button") style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:cell sourceRect:cell.bounds];
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    UITableViewCell *cell = [tableView cellForRowAtIndexPath:indexPath];
+    if (indexPath.section == ISHDesktopSetupSectionExtras) {
+        NSDictionary<NSString *, NSString *> *extra = [self extras][(NSUInteger) indexPath.row];
+        [self confirmRunning:extra[@"title"] command:extra[@"command"] fromCell:cell];
+        return;
+    }
+    if (_installed == nil)
+        return; // not known yet, or the guest did not answer
+    NSString *name = ISHDesktopNames()[(NSUInteger) indexPath.row];
+    if (![_installed containsObject:name]) {
+        [self confirmRunning:ISHDesktopTitle(name) command:ISHDesktopInstallCommand(name) fromCell:cell];
+        return;
+    }
+    if ([name isEqualToString:_selected])
+        return;
+    // Installed, and not the one that starts: make it so. Quick, and with
+    // nothing to show but the new checkmark.
+    // The status comes back in the output, on a line of its own: the guest's
+    // init is the command's parent as well, and when it reaps the command
+    // first the capture has no exit status to give.
+    NSString *command = [NSString stringWithFormat:@"sh /AOK/tools/select-desktop.sh %@ 2>&1; echo; echo %@ $?", name, ISHDesktopScriptDoneMarker];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(ISHDesktopSetupQueue(), ^{
+        struct guest_command_result result = {0};
+        int rc = run_guest_command_capture(command.UTF8String, NULL, 30000, 4096, &result);
+        NSString *output = result.output != NULL
+            ? [[NSString alloc] initWithBytes:result.output length:result.output_len encoding:NSUTF8StringEncoding] : nil;
+        free(result.output);
+        BOOL ok = NO;
+        NSRange marker = [output rangeOfString:ISHDesktopScriptDoneMarker options:NSBackwardsSearch];
+        if (rc == 0 && marker.location != NSNotFound) {
+            ok = [output substringFromIndex:NSMaxRange(marker)].intValue == 0;
+            output = [[output substringToIndex:marker.location] stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (strongSelf == nil)
+                return;
+            if (!ok) {
+                UIAlertController *alert = [UIAlertController alertControllerWithTitle:ISHDesktopTitle(name)
+                                                                               message:output.length > 0 ? output : NSLocalizedString(@"The Linux system did not answer. It has to be running for a desktop to be installed in it.", @"Desktop setup footer when the guest cannot be asked")
+                                                                        preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"Alert button") style:UIAlertActionStyleDefault handler:nil]];
+                [strongSelf presentViewController:alert animated:YES completion:nil];
+            }
+            [strongSelf probe];
+        });
+    });
+}
+
+@end
+
+UIViewController *ISHCreateDesktopSetupViewController(void) {
+    return [ISHDesktopSetupViewController new];
+}

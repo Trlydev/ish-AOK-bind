@@ -993,6 +993,10 @@ static void DisplayParkSession(Terminal *terminal, int pid, NSString *_Nullable 
     }];
 }
 
+- (void)dismissDesktopSetup {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
 - (void)connectRFBToGuestPort:(uint16_t)guestPort {
     _state = DisplayConnectionStateConnected; // optimistic; refined by DisplayRFBClientDelegate callbacks
     _statusLabel.text = NSLocalizedString(@"Connecting to compositor…", @"Wayland display status text");
@@ -1342,6 +1346,20 @@ static NSString *DisplayScaleChoiceTitle(NSString *name, NSInteger value, NSInte
         UINavigationController *settings = ISHCreateAboutNavigationController(NO, NO);
         settings.modalPresentationStyle = UIModalPresentationFormSheet;
         [weakSelf presentViewController:settings animated:YES completion:nil];
+    }];
+    // Where the display's own "not installed" message sends people: the
+    // page that installs a desktop, in place of a command to type (GH #639).
+    [sheet addActionWithTitle:NSLocalizedString(@"Install a Desktop…", @"Settings row and Wayland display menu action: opens the desktop setup page")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        UINavigationController *setup = [[UINavigationController alloc] initWithRootViewController:ISHCreateDesktopSetupViewController()];
+        setup.modalPresentationStyle = UIModalPresentationFormSheet;
+        UIViewController *root = setup.viewControllers.firstObject;
+        root.navigationItem.leftBarButtonItem =
+            [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                          target:weakSelf
+                                                          action:@selector(dismissDesktopSetup)];
+        [weakSelf presentViewController:setup animated:YES completion:nil];
     }];
     [sheet addActionWithTitle:NSLocalizedString(@"Reconnect", @"Wayland display menu action")
                         style:UIAlertActionStyleDefault

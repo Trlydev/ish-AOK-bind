@@ -12973,6 +12973,66 @@
         }
       }
     },
+    "Basic Desktop (labwc)" : {
+      "comment" : "Desktop setup: desktop name",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Einfacher Desktop (labwc)"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escritorio básico (labwc)"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bureau de base (labwc)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基本デスクトップ（labwc）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본 데스크탑(labwc)"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desktop Básico (labwc)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Базовый рабочий стол (labwc)"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基本桌面（labwc）"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "基本桌面（labwc）"
+          }
+        }
+      }
+    },
     "Battery" : {
       "comment" : "Info tool tile caption\n   Monitor tool gauge caption",
       "extractionState" : "manual",
@@ -19455,6 +19515,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "正在檢查 %@…"
+          }
+        }
+      }
+    },
+    "Checking…" : {
+      "comment" : "Desktop setup: state while asking the guest",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird geprüft …"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Comprobando…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vérification…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "確認中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인 중…"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Verificando…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Проверка…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在检查…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在檢查⋯"
           }
         }
       }
@@ -34909,6 +35029,66 @@
         }
       }
     },
+    "Finished." : {
+      "comment" : "Desktop setup result: the script succeeded",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fertig."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Finalizado."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Terminé."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完了しました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "완료되었습니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Concluído."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Готово."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已完成。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已完成。"
+          }
+        }
+      }
+    },
     "Fit" : {
       "comment" : "Image viewer zoom button: fit the image to the screen",
       "extractionState" : "manual",
@@ -36409,6 +36589,66 @@
         }
       }
     },
+    "Games" : {
+      "comment" : "Desktop setup: a set of extra programs",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Spiele"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Juegos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jeux"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ゲーム"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "게임"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jogos"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Игры"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "游戏"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "遊戲"
+          }
+        }
+      }
+    },
     "Gauge Style" : {
       "comment" : "Themes tool section title",
       "extractionState" : "manual",
@@ -36825,6 +37065,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "前往此資料夾"
+          }
+        }
+      }
+    },
+    "GPU Drivers" : {
+      "comment" : "Desktop setup: installs the GPU drivers",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU-Treiber"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Controladores de GPU"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pilotes GPU"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPUドライバ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 드라이버"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Drivers de GPU"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Драйверы GPU"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 驱动程序"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "GPU 驅動程式"
           }
         }
       }
@@ -39175,6 +39475,186 @@
         }
       }
     },
+    "Install" : {
+      "comment" : "Desktop setup: confirm button",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installieren"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instalar"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installer"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "インストール"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설치"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instalar"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Установить"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "安装"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "安裝"
+          }
+        }
+      }
+    },
+    "Install a Desktop…" : {
+      "comment" : "Settings row and Wayland display menu action: opens the desktop setup page",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desktop installieren …"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instalar un escritorio…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installer un bureau…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デスクトップをインストール…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "데스크탑 설치…"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instalar um Desktop…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Установить рабочий стол…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "安装桌面…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "安裝桌面⋯"
+          }
+        }
+      }
+    },
+    "Installed" : {
+      "comment" : "Desktop setup: desktop state",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installiert"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instalado"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installé"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "インストール済み"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설치됨"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instalado"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Установлен"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已安装"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已安裝"
+          }
+        }
+      }
+    },
     "Installed Filesystems" : {
       "comment" : "Section header",
       "extractionState" : "manual",
@@ -39291,6 +39771,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "已安裝的根檔案系統：%lu"
+          }
+        }
+      }
+    },
+    "Installs the desktop the Wayland display shows, in the filesystem that is running, and chooses which one it starts." : {
+      "comment" : "Wayland Desktop section footer in Settings",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installiert den Desktop, den die Wayland-Anzeige zeigt, im laufenden Dateisystem und legt fest, welcher gestartet wird."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instala el escritorio que muestra la pantalla Wayland en el sistema de archivos en ejecución y elige cuál se inicia."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Installe le bureau affiché par l’écran Wayland dans le système de fichiers en cours d’exécution et choisit celui qui démarre."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Waylandディスプレイに表示するデスクトップを実行中のファイルシステムにインストールし、起動するものを選びます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wayland 디스플레이가 표시하는 데스크탑을 실행 중인 파일 시스템에 설치하고, 어떤 것을 시작할지 선택합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instala o desktop que a tela Wayland mostra no sistema de arquivos em execução e escolhe qual deles é iniciado."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Устанавливает рабочий стол для дисплея Wayland в работающую файловую систему и выбирает, какой из них запускается."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在正在运行的文件系统中安装 Wayland 显示所用的桌面，并选择启动哪一个。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "在執行中的檔案系統安裝 Wayland 顯示所用的桌面，並選擇要啟動哪一個。"
           }
         }
       }
@@ -45109,6 +45649,66 @@
         }
       }
     },
+    "More Programs" : {
+      "comment" : "Desktop setup section header",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Weitere Programme"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Más programas"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Autres programmes"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "その他のプログラム"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "추가 프로그램"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mais Programas"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Другие программы"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更多程序"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更多程式"
+          }
+        }
+      }
+    },
     "MotePad Help" : {
       "comment" : "MotePad Help menu item\n   MotePad keyboard shortcut title",
       "extractionState" : "manual",
@@ -50871,6 +51471,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "找不到"
+          }
+        }
+      }
+    },
+    "Not Installed" : {
+      "comment" : "Desktop setup: desktop state",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nicht installiert"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No instalado"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Non installé"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未インストール"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설치되지 않음"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não Instalado"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не установлен"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未安装"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "未安裝"
           }
         }
       }
@@ -57194,6 +57854,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "列印…"
+          }
+        }
+      }
+    },
+    "Programs for the desktop's Applications menu, and the drivers that let the desktop and its programs use the GPU." : {
+      "comment" : "Desktop setup footer for the extra programs",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programme für das Anwendungsmenü des Desktops und die Treiber, mit denen der Desktop und seine Programme die GPU nutzen."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programas para el menú Aplicaciones del escritorio y los controladores que permiten al escritorio y a sus programas usar la GPU."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Des programmes pour le menu Applications du bureau, et les pilotes qui permettent au bureau et à ses programmes d’utiliser le GPU."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デスクトップのアプリケーションメニュー用のプログラムと、デスクトップとそのプログラムがGPUを使うためのドライバ。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "데스크탑의 응용 프로그램 메뉴에 들어갈 프로그램과, 데스크탑과 그 프로그램이 GPU를 쓸 수 있게 하는 드라이버입니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programas para o menu Aplicativos do desktop e os drivers que permitem que o desktop e seus programas usem a GPU."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Программы для меню приложений рабочего стола и драйверы, позволяющие рабочему столу и его программам использовать графический процессор."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用于桌面“应用程序”菜单的程序，以及让桌面及其程序使用 GPU 的驱动程序。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "桌面「應用程式」選單所用的程式，以及讓桌面和其中程式使用 GPU 的驅動程式。"
           }
         }
       }
@@ -69330,6 +70050,66 @@
         }
       }
     },
+    "Starts" : {
+      "comment" : "Desktop setup: the desktop the Wayland display starts",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Startet"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Se inicia"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Démarre"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "起動する"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시작됨"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inicia"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Запускается"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "启动此项"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "啟動此項"
+          }
+        }
+      }
+    },
     "Startup" : {
       "comment" : "Info tool tile caption\n   Monitor tool row title",
       "extractionState" : "manual",
@@ -69926,6 +70706,126 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "停止載入"
+          }
+        }
+      }
+    },
+    "Stopped." : {
+      "comment" : "Desktop setup result: the user stopped the script",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gestoppt."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Detenido."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arrêté."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止しました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "중지되었습니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Parado."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Остановлено."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已停止。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "已停止。"
+          }
+        }
+      }
+    },
+    "Stopping…" : {
+      "comment" : "Desktop setup: shown in the output while the script is being stopped",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gestoppt …"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deteniendo…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arrêt…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "중지하는 중…"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Parando…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Остановка…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在停止…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在停止⋯"
           }
         }
       }
@@ -72662,6 +73562,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "點一下書籤以移除。"
+          }
+        }
+      }
+    },
+    "Tap a desktop to install it in the filesystem that is running, or to make it the one the Wayland display starts. Installing downloads packages and takes several minutes; keep iSH-AOK open until it finishes. Wayfire needs Devuan and the GPU." : {
+      "comment" : "Desktop setup footer",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tippe auf einen Desktop, um ihn im laufenden Dateisystem zu installieren oder ihn zu dem zu machen, den die Wayland-Anzeige startet. Bei der Installation werden Pakete geladen; das dauert einige Minuten. Lass iSH-AOK geöffnet, bis sie fertig ist. Wayfire benötigt Devuan und die GPU."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Toca un escritorio para instalarlo en el sistema de archivos en ejecución o para que sea el que inicia la pantalla Wayland. La instalación descarga paquetes y tarda varios minutos; mantén iSH-AOK abierto hasta que termine. Wayfire necesita Devuan y la GPU."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Touchez un bureau pour l’installer dans le système de fichiers en cours d’exécution, ou pour en faire celui que l’écran Wayland démarre. L’installation télécharge des paquets et prend plusieurs minutes ; gardez iSH-AOK ouvert jusqu’à la fin. Wayfire nécessite Devuan et le GPU."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "デスクトップをタップすると、実行中のファイルシステムにインストールするか、Waylandディスプレイが起動するデスクトップに設定します。インストールではパッケージをダウンロードするため数分かかります。完了するまでiSH-AOKを開いたままにしてください。WayfireにはDevuanとGPUが必要です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "데스크탑을 탭하면 실행 중인 파일 시스템에 설치하거나 Wayland 디스플레이가 시작할 데스크탑으로 지정합니다. 설치할 때 패키지를 다운로드하며 몇 분이 걸립니다. 끝날 때까지 iSH-AOK를 열어 두십시오. Wayfire에는 Devuan과 GPU가 필요합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Toque em um desktop para instalá-lo no sistema de arquivos em execução ou para torná-lo o que a tela Wayland inicia. A instalação baixa pacotes e leva vários minutos; mantenha o iSH-AOK aberto até terminar. O Wayfire precisa do Devuan e da GPU."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Коснитесь рабочего стола, чтобы установить его в работающую файловую систему или сделать тем, который запускает дисплей Wayland. При установке загружаются пакеты, это занимает несколько минут; не закрывайте iSH-AOK до завершения. Для Wayfire нужны Devuan и графический процессор."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "轻点一个桌面，将其安装到正在运行的文件系统中，或将其设为 Wayland 显示启动的桌面。安装时会下载软件包，需要几分钟；在完成之前请保持 iSH-AOK 打开。Wayfire 需要 Devuan 和 GPU。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "點一下桌面，即可將其安裝到執行中的檔案系統，或設為 Wayland 顯示啟動的桌面。安裝時會下載套件，需要數分鐘；完成前請讓 iSH-AOK 保持開啟。Wayfire 需要 Devuan 和 GPU。"
           }
         }
       }
@@ -76398,6 +77358,66 @@
         }
       }
     },
+    "The Linux system did not answer. It has to be running for a desktop to be installed in it." : {
+      "comment" : "Desktop setup footer when the guest cannot be asked",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Linux-System hat nicht geantwortet. Es muss laufen, damit ein Desktop darin installiert werden kann."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El sistema Linux no respondió. Tiene que estar en ejecución para instalar un escritorio en él."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le système Linux n’a pas répondu. Il doit être en cours d’exécution pour qu’un bureau puisse y être installé."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Linuxシステムが応答しませんでした。デスクトップをインストールするには、システムが実行中である必要があります。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Linux 시스템이 응답하지 않았습니다. 데스크탑을 설치하려면 시스템이 실행 중이어야 합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O sistema Linux não respondeu. Ele precisa estar em execução para que um desktop seja instalado nele."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Система Linux не ответила. Чтобы установить в неё рабочий стол, она должна быть запущена."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Linux 系统没有响应。系统必须正在运行，才能在其中安装桌面。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Linux 系統沒有回應。系統必須正在執行，才能在其中安裝桌面。"
+          }
+        }
+      }
+    },
     "The Linux system has shut down (%@). That is what reboot, poweroff and halt do.\n\niSH-AOK can't start it again while the app is running. Quit, then open iSH-AOK again to boot it." : {
       "comment" : "System Halted alert message; %@ says how init ended",
       "extractionState" : "manual",
@@ -77138,6 +78158,126 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此檔案系統的已儲存工作階段也會被刪除。"
+          }
+        }
+      }
+    },
+    "The script could not be started (error %d)." : {
+      "comment" : "Desktop setup result; %d is an error number",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Skript konnte nicht gestartet werden (Fehler %d)."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo iniciar el script (error %d)."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le script n’a pas pu être lancé (erreur %d)."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "スクリプトを開始できませんでした（エラー %d）。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스크립트를 시작할 수 없습니다(오류 %d)."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Não foi possível iniciar o script (erro %d)."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось запустить сценарий (ошибка %d)."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "无法启动脚本（错误 %d）。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法啟動工序指令（錯誤 %d）。"
+          }
+        }
+      }
+    },
+    "The script failed (status %d). What went wrong is in its output above." : {
+      "comment" : "Desktop setup result; %d is an exit status",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Das Skript ist fehlgeschlagen (Status %d). Was schiefging, steht in der Ausgabe oben."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El script falló (estado %d). Lo que salió mal está en su salida, arriba."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le script a échoué (état %d). La cause figure dans sa sortie ci-dessus."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "スクリプトが失敗しました（ステータス %d）。原因は上の出力に示されています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "스크립트가 실패했습니다(상태 %d). 원인은 위 출력에 있습니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O script falhou (status %d). O que deu errado está na saída acima."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Сценарий завершился с ошибкой (код %d). Причина указана в его выводе выше."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "脚本失败（状态 %d）。出错原因见上方的输出。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工序指令失敗（狀態 %d）。出錯原因見上方的輸出。"
           }
         }
       }
@@ -78902,6 +80042,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "這看起來不是 iSH-AOK 能顯示的影像。"
+          }
+        }
+      }
+    },
+    "This downloads packages into the filesystem that is running and takes several minutes. Keep iSH-AOK open until it finishes." : {
+      "comment" : "Desktop setup: confirmation before installing",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dabei werden Pakete in das laufende Dateisystem geladen; das dauert einige Minuten. Lass iSH-AOK geöffnet, bis es fertig ist."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esto descarga paquetes en el sistema de archivos en ejecución y tarda varios minutos. Mantén iSH-AOK abierto hasta que termine."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cette opération télécharge des paquets dans le système de fichiers en cours d’exécution et prend plusieurs minutes. Gardez iSH-AOK ouvert jusqu’à la fin."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "実行中のファイルシステムにパッケージをダウンロードするため、数分かかります。完了するまでiSH-AOKを開いたままにしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 중인 파일 시스템에 패키지를 다운로드하며 몇 분이 걸립니다. 끝날 때까지 iSH-AOK를 열어 두십시오."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Isso baixa pacotes para o sistema de arquivos em execução e leva vários minutos. Mantenha o iSH-AOK aberto até terminar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "В работающую файловую систему будут загружены пакеты; это займёт несколько минут. Не закрывайте iSH-AOK до завершения."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "这会将软件包下载到正在运行的文件系统中，需要几分钟。在完成之前请保持 iSH-AOK 打开。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "這會將套件下載到執行中的檔案系統，需要數分鐘。完成前請讓 iSH-AOK 保持開啟。"
           }
         }
       }
@@ -85578,6 +86778,66 @@
         }
       }
     },
+    "Wayland Desktop" : {
+      "comment" : "Desktop setup page title",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wayland-Desktop"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Escritorio Wayland"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Bureau Wayland"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Waylandデスクトップ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wayland 데스크탑"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Desktop Wayland"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Рабочий стол Wayland"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wayland 桌面"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wayland 桌面"
+          }
+        }
+      }
+    },
     "Wayland Display" : {
       "comment" : "Action sheet title for the Wayland display menu\n   Startup Mode option\n   startup screen setting value",
       "extractionState" : "manual",
@@ -88460,6 +89720,66 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "將此工作階段寫入磁碟，以便下次啟動時恢復。按住以使用工作階段選項。"
+          }
+        }
+      }
+    },
+    "X11 Programs" : {
+      "comment" : "Desktop setup: a set of extra programs",
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "X11-Programme"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programas X11"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programmes X11"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "X11プログラム"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "X11 프로그램"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Programas X11"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Программы X11"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "X11 程序"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "X11 程式"
           }
         }
       }

@@ -18,6 +18,9 @@ extern UIViewController *ISHCreateDiagnosticsNavigationController(void);
 extern UIViewController *ISHCreateLLMClientViewController(void);
 extern UIViewController *ISHCreateLLMClientViewControllerWithInitialPrompt(NSString *_Nullable initialPrompt);
 extern UIViewController *ISHCreateLLMSettingsViewController(void);
+// The page that installs a desktop for the Wayland display and chooses which
+// one it starts (GH #639). Push it, or present it in a navigation controller.
+extern UIViewController *ISHCreateDesktopSetupViewController(void);
 extern BOOL ISHLLMClientEnabled(void);
 
 typedef NS_ENUM(NSInteger, AOKLLMBackend) {
