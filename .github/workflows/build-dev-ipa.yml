@@ -14,21 +14,29 @@ permissions:
 
 jobs:
   build:
-    # This job publishes an IPA under the dev-latest release, so it must only run
-    # in an iSH-AOK repository. A checkout whose origin has been repointed at an
-    # unrelated project still pushes `working`, and without this guard that repo
-    # runs THIS workflow and publishes an iSH-AOK build under someone else's name
-    # (happened 2026-08-07: a 40 MB iSH-AOK IPA appeared as a public prerelease
-    # on an unrelated project).
+    # Matched on the repository NAME, and the history of this line is the reason.
     #
-    # Upstream matches on repository NAME (endsWith '/ish-AOK') so that forks
-    # still build their own dev IPAs. That only holds for forks which kept the
-    # name: this one is `ish-AOK-bind`, so the name match skipped every run here
-    # and no dev IPA was ever produced. Pinned to this repository's full
-    # owner/name instead, which is strictly tighter than upstream's check -- it
-    # still cannot fire in a repo the tree was misplaced into, and it no longer
-    # depends on what this fork happens to be called.
-    if: github.repository == 'DogeKingC/ish-AOK-bind'
+    # Upstream matches endsWith '/ish-AOK' so that forks still build their own
+    # dev IPAs. That skipped every run here, because this fork is called
+    # `ish-AOK-bind`. So it was pinned to the full owner/name instead, on the
+    # reasoning that this "no longer depends on what this fork happens to be
+    # called" -- which was half right. It did not depend on the repo's name any
+    # more; it depended on the OWNER's. The account was renamed
+    # DogeKingC -> Trlydev, github.repository became
+    # `Trlydev/ish-AOK-bind`, and this condition quietly stopped matching.
+    #
+    # The cost was five weeks of nothing. A guard that does not match does not
+    # fail -- the job reports `skipped`, the run is green, and no issue is
+    # filed, so the daily sync silently stopped landing and the fork drifted
+    # 1225 commits behind upstream before anyone looked. The dev IPA build and
+    # the release build stopped at the same moment for the same reason.
+    #
+    # The name is the part that is actually stable: an owner can be renamed
+    # without touching the repository, and the misplaced-tree case this guard
+    # exists to prevent involves a repo with a DIFFERENT name, which this still
+    # refuses. If the repository itself is ever renamed, update this line --
+    # and know that the symptom will again be silence, not a failure.
+    if: endsWith(github.repository, '/ish-AOK-bind')
     runs-on: macos-15
     timeout-minutes: 90
     steps:

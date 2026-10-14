@@ -45,9 +45,29 @@ env:
 
 jobs:
   sync:
-    # Same reasoning as build-dev-ipa.yml: pinned to this repository so a fork
-    # of this fork does not start pushing to a repo it should not.
-    if: github.repository == 'DogeKingC/ish-AOK-bind'
+    # Matched on the repository NAME, and the history of this line is the reason.
+    #
+    # Upstream matches endsWith '/ish-AOK' so that forks still build their own
+    # dev IPAs. That skipped every run here, because this fork is called
+    # `ish-AOK-bind`. So it was pinned to the full owner/name instead, on the
+    # reasoning that this "no longer depends on what this fork happens to be
+    # called" -- which was half right. It did not depend on the repo's name any
+    # more; it depended on the OWNER's. The account was renamed
+    # DogeKingC -> Trlydev, github.repository became
+    # `Trlydev/ish-AOK-bind`, and this condition quietly stopped matching.
+    #
+    # The cost was five weeks of nothing. A guard that does not match does not
+    # fail -- the job reports `skipped`, the run is green, and no issue is
+    # filed, so the daily sync silently stopped landing and the fork drifted
+    # 1225 commits behind upstream before anyone looked. The dev IPA build and
+    # the release build stopped at the same moment for the same reason.
+    #
+    # The name is the part that is actually stable: an owner can be renamed
+    # without touching the repository, and the misplaced-tree case this guard
+    # exists to prevent involves a repo with a DIFFERENT name, which this still
+    # refuses. If the repository itself is ever renamed, update this line --
+    # and know that the symptom will again be silence, not a failure.
+    if: endsWith(github.repository, '/ish-AOK-bind')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
