@@ -14,7 +14,9 @@ translation scheme reaches.
 
 So compiling bash into the application looked like a project that could not
 work. This chapter is about why it did, and it opens with a measurement that
-inverted the plan.
+inverted the plan. (Native bash has been behind a build option that is off
+since 556, for the licensing reasons of Chapter 26; native zsh and dash are
+what ship, and the mechanism below is theirs too.)
 
 ## 24.1 The measurement that changed the design
 

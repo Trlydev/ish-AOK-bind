@@ -69,7 +69,8 @@ in the process table as a corpse. The group senders — `kill(-pgid)`, the
 terminal's `^C`, `^Z` and hangup, the orphaned-group `SIGHUP`, a resize's
 `SIGWINCH`, `pidfd_send_signal` — kept the leader model after `kill(pid)` had
 dropped it, and the terminal's never reached such a process at all. They all
-choose the thread as `kill(pid)` does now (`tgroup_signal_target_locked`).
+queue the signal on the process now, as `kill(pid)` does, and tell one thread
+that can take it (`send_signal_to_process`, `group_signal_pick_locked`).
 
 "Some thread" means exactly one. Linux's `complete_signal` tells the thread
 the signal was sent to (for a child's `SIGCHLD`, the thread that forked it) if

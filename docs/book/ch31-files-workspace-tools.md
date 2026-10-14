@@ -194,10 +194,11 @@ device, because that is what the code actually is, and the `(n)` says it runs
 natively.
 
 That column is only meaningful because of two facts established much earlier in
-this book: a task's guest ABI is a field on the task (Chapter 7), and there are
-no PID namespaces, so one process viewer sees every process in every root
-(Chapter 21). A tool that shows what this system uniquely is could not exist on
-a system that had isolation.
+this book: a task's guest ABI is a field on the task (Chapter 7), and a root is
+not a PID namespace — there are PID namespaces since 559, but only for a sandbox
+that asks for one (Chapter 10) — so one process viewer sees every process in
+every root (Chapter 21). A tool that shows what this system uniquely is could
+not exist on a system that had isolation.
 
 Two practical notes come with it. `/AOK` is read-only, so `ktop` cannot be built
 in place — `build.sh` copies the source out first, for whichever guest

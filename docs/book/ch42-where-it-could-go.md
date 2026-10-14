@@ -132,8 +132,9 @@ It is a **conformance report from outside the project**, produced by somebody
 with different requirements — and the two capabilities it identified as gaps
 were `bind_mount` and FUSE, both of which the kernel now carries. Namespaces
 were explicitly *not* the ask, which matters given Chapter 41: the thing this
-system architecturally cannot do turned out not to be what a multi-distribution
-tool actually needed.
+system architecturally cannot do — be several machines, which 559's namespaces
+made a sandbox but not a container — turned out not to be what a
+multi-distribution tool actually needed.
 
 And the honest status: the probe itself is still unverified from this side. The
 check comes when the tool's author runs the capability dialog against a release
@@ -174,9 +175,11 @@ document that says what happens next and in what order, and it names what is
 *not* being done as carefully as what is. Between them sat
 `docs/build_<N>_musts.md`, the single-release commitment, through 556; in the
 557 cycle that became the "Queued for a future release" list at the top of
-`docs/TODO.md` (Chapter 41). The release notes are a design record
-(Chapter 37). And the comments are unusually load-bearing, with the caveat of
-Chapter 40: they make checkable claims, and some of them are false.
+`docs/TODO.md`, and from 558 the two run together: the musts file is the short
+list a release is held for, and the queue the detail (Chapter 41). The release
+notes are a design record (Chapter 37). And the comments are unusually
+load-bearing, with the caveat of Chapter 40: they make checkable claims, and
+some of them are false.
 
 **The oracles, before writing any code.** Chapter 9's discipline is what
 separates a fix from a plausible change, and the most common expensive mistake

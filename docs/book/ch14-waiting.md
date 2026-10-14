@@ -400,7 +400,24 @@ overrun onto a waiting itimer SIGALRM, and taking an itimer SIGALRM reset timer
 0's count to zero. Linux sends every itimer's signal as `SI_KERNEL`, with no
 sender, and so does AOK now.
 
-## 14.8 The pattern
+## 14.8 Not sleeping yet
+
+Since 559 some waits do not sleep at first at all. A task that has just
+sent something and waits for the answer usually has it within microseconds,
+and being put to sleep and woken costs more than that: two native processes
+passing a byte each way over a pipe take 4.1 µs a round trip blocked in
+`read`, 2.1 µs retrying the read first, and 7.0 µs the way AOK used to wait.
+So a pipe or file read, a blocking socket call and a queued `FUTEX_WAIT`
+look again for up to 25 µs before they sleep (`util/wait_spin.h`) — bounded
+by time, because a fixed count was too short on one machine and long enough
+on another — and a wait that found nothing skips the looking for the next 1,
+3, 7 … 63 waits, so an idle connection does not pay for it. In the arm64
+guest on the Mac a pipe round trip went from 8.9 µs to 2.8, a unix socket's
+from 9.8 to 3.2. One version kept a wake pipe per task to save two `close`s a
+wait, and on a host allowing 256 descriptors ran the suite out of them; the
+pipe is made per wait again, on what is now the slow path.
+
+## 14.9 The pattern
 
 Every subsystem in this chapter is the same two-part construction: a thing to
 wait on, and a thing to wake it. In every single case, the bugs were in the
@@ -427,6 +444,7 @@ spends most of its time on threads that are asleep when they should not be.
 [kernel/sysvmsg.c](../../kernel/sysvmsg.c), [kernel/time.c](../../kernel/time.c),
 [kernel/signal.c](../../kernel/signal.c) (`signalfd_wakeup_task`),
 [util/sync.c](../../util/sync.c) (`wait_for_blocked`, `deadline_wake_arm`),
+[util/wait_spin.h](../../util/wait_spin.h),
 [util/timer.c](../../util/timer.c) (`host_nanosleep_precise`),
 [kernel/task.c](../../kernel/task.c) (`task_poke_shared_mem`, `guest_count_runnable`),
 [fs/fuse.c](../../fs/fuse.c),

@@ -314,15 +314,15 @@ is the most reliable way to introduce a bug.
 A book about a system should say early where the system is weak, so the reader
 can calibrate.
 
-**There is one machine.** There is exactly one Linux underneath everything,
-so `/proc`, `/sys` and `/dev` show the same true state no matter which root
-you booted or which chroot you are standing in. A process can ask for a
-mount table, a user namespace, a pid namespace and a network of its own (all
-four arrived in 559, and a sandbox like bubblewrap is built from them), but
-that network is a loopback interface with nothing behind it, there are no
-cgroup namespaces, and nothing container-shaped works. This is
-architectural, not a missing feature; Chapter 21 shows the one place it is an
-advantage, and Chapter 41 is honest about the rest.
+**There is one machine.** There is exactly one Linux underneath everything, so
+`/proc`, `/sys` and `/dev` show the same true state no matter which root you
+booted or which chroot you are standing in. A process can ask for a mount table,
+a user namespace, a pid namespace and a network of its own (all four arrived in
+559, and a sandbox like bubblewrap is built from them), but that network reaches
+no further than loopback and a veth pair to another sandbox, there are no cgroup
+namespaces, and nothing container-shaped works. This is architectural, not a
+missing feature; Chapter 21 shows the one place it is an advantage, and Chapter
+41 is honest about the rest.
 
 **Everything is one process, so everything is one blast radius.** An assertion
 failure in a routine `/proc/meminfo` read aborts the whole application, terminal

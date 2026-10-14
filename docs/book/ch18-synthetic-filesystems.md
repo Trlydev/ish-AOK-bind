@@ -156,12 +156,16 @@ present and none can be taken away, because guest memory is the application's
 address space — and now says it, in 128 MiB blocks counted from `MemTotal`.
 
 **`lsns`** is the interesting one, because the missing piece was not a file at
-all. AOK already published all ten `/proc/<pid>/ns/*` links; what it did not do
+all. AOK already published the `/proc/<pid>/ns/*` links; what it did not do
 was answer questions *about* them. `lsns` is built almost entirely out of four
 ioctls, and `ENOTTY` to the first one made it give up and print nothing. The
-answers are all constrained by a fact AOK cannot change — there is exactly one
-namespace of each kind — and that turns out to be enough, because it is also
-true of a Linux box that has never created one. The distinctions matter, though:
+answers were written when there was exactly one namespace of each kind, and
+that turned out to be enough, because it is also true of a Linux box that has
+never created one; since 559 there can be more than one of six kinds, and the
+same four answer for those as Linux does. The links changed with them: what is
+listed is what can be made, so there is a `net` link and no `cgroup` or `time`
+one (Chapter 41 has what a listed kind that could not be made cost systemd and
+bubblewrap). The distinctions matter, though:
 `NS_GET_PARENT` is `EINVAL` for a kind that does not nest and `EPERM` for one
 that does but whose parent you may not see, and `lsns` uses exactly that
 difference to decide what is a hierarchy root. Reporting one for the other would
@@ -208,6 +212,11 @@ one that only the host can answer: `host_vm` lists where the app's own memory
 is, by the host's region tags — the footprint jetsam kills on, then resident,
 dirty and compressed megabytes per tag — written when a game's race took the
 app from 1 GB to 3.9 GB and nothing inside the guest could say where it went.
+559 added three: `jit_cache`, the "Cache Translated Code" setting from inside
+the guest with the cache's counters (Chapter 15); `fault_reports`, which
+chooses which guest faults the kernel log reports (Chapter 28); and
+`host_fds`, the host descriptors every guest file, socket and pipe is made of,
+counted by kind against the limit.
 
 Both exist for the same reason, which is worth stating as a design principle. An
 app setting that can only be changed by tapping a switch cannot be scripted, and

@@ -164,8 +164,10 @@ rather than pretended:
   and then opens it in a second pass. On fakefs — every root — a guest
   symlink is a regular file to the host, so a component swapped for a link
   between the two passes fails the open rather than redirecting it. On a
-  host directory mounted in (realfs) the host follows it, for this as for a
-  chroot.
+  host directory mounted in (realfs) the host used to follow it, for this as
+  for a chroot; since 559 every realfs call uses Darwin's `NOFOLLOW_ANY`
+  forms, so a link anywhere in a host path is `ELOOP` and a final one is acted
+  on itself, never followed.
 - **`RESOLVE_BENEATH`** has `RESOLVE_IN_ROOT`'s bound and the other answer:
   what would leave the directory — an absolute path, an absolute link, a `..`
   at the top, a magic link — is `EXDEV` rather than turned back.

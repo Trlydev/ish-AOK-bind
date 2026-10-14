@@ -53,6 +53,20 @@ User" produces — takes libfuse's normal unprivileged path, and that path calls
 `fusermount3`. The helper has to be installed. `/dev/fuse` being
 world-accessible is not on its own enough.
 
+Since 559 there is a third way in, and it is Linux's: FUSE is one of the
+filesystems the root of a user namespace may mount over its own mount
+namespace (Chapter 10), with `nodev` forced, provided it opened `/dev/fuse`
+itself. That brought the access rule AOK had never had. A FUSE mount is for
+the uid and gid named in its `user_id=` and `group_id=` options, or, with
+`allow_other`, for anyone in its user namespace or below; everyone else, root
+included, gets `EACCES`, and `statfs` tells them the type and nothing more.
+And the daemon is spoken to in the connection's terms rather than the
+machine's: a request carries the caller's ids as the user namespace of
+whoever opened `/dev/fuse` has them (`EOVERFLOW` for one it cannot name) and
+its thread id as the mounter's pid namespace numbers it, and the ids in an
+attribute reply are read back through that user namespace.
+`tests/manual/fuse_userns.c` was run on Linux 6.12 as uid 1000 first.
+
 There is a second trap in the same area, and it is not AOK's at all:
 
 > A daemon that reports every file as owned by root, over a root-owned `0755`

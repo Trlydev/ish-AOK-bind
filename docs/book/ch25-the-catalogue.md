@@ -173,6 +173,15 @@ The per-process globals are the invocation-token problem of Chapter 22, which is
 why the project maintains forks of `tokio` and `signal-hook-registry` keyed on
 `nlibc_invocation_token()`.
 
+The front end met that problem itself in 559. Its queues were found by
+descriptor number, and every tokio program's queue has the same small number,
+so two at once waited on and woke each other's; a queue now belongs to the
+program run that made it. And a registration that had been reported stayed
+out of the wait until a later `kevent` saw it not ready, so a reactor that went
+back to sleep before its consumer had read never saw the next data: the
+shim's `read`, `write`, `send`, `recv` and `accept` now say when a descriptor
+has been drained, and the sleeper is woken to watch it again.
+
 Real Rust runs, async Rust included. `rust-probe` exists to exercise that path
 deliberately — it is not a tool anybody has a use for, and the registry entry
 says so.

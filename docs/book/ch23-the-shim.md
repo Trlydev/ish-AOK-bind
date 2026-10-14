@@ -282,6 +282,16 @@ locations.** All of them from the guest.
 > The fix in each case was `__thread`, and the lesson recorded alongside is that
 > they "were found one report at a time rather than by sweeping".
 
+The host's libc has the same kind of state, and 559 found it there. Darwin's
+`basename()` answers from one buffer for the whole process, and SmallCLUE
+picks its applet with `basename(argv[0])`, so an applet starting beside
+another could read the other's name: `cat … | sha256sum | cut -c1-32` printed
+"sha256sum: unsupported option '-c1-32'". With `rm` in the pair it would not
+have been a wrong message. The shim now routes `basename`, `dirname`,
+`strtok`, `gmtime` and `asctime` to versions whose state is the thread's, and
+its own `ttyname`, `ptsname`, `getmntinfo`, `getservent` and `getprotoent`
+buffers are per thread too.
+
 ## 23.9 Signals cannot be handled the ordinary way
 
 One routing problem has no clean answer, and the shape of the compromise is
@@ -307,6 +317,16 @@ says".
 The symptom when this was missing is the kind that gets reported as flakiness:
 `^C` during `sleep 30` under a native bash did nothing until the *next*
 keystroke — and the interrupted read then ate that keystroke too.
+
+The signal a program sends itself was the last to be routed. `abort()`, and
+Darwin's assert handler, went to the host until 559, on the grounds that it
+is a crash either way — and it is not the same crash: the host's `abort`
+takes the whole app with it. A Rust program built `panic=abort` made that
+build 558's one new crash signature, native `helix` on an iPad. Now the
+program dies of `SIGABRT` after a handler for it has had its turn, and the
+shell says "Aborted". The program's other threads share its task, so they
+then fail every call into the shim, and one that reaches `abort()` in its
+turn — Rust's `join()` does at once — ends only itself.
 
 ## 23.10 What the shim is
 

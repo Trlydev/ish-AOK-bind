@@ -133,6 +133,18 @@ switch, and `ISH_RANDOMIZE_VA_SPACE` in the host environment sets its starting
 value, for anyone who needs a build's addresses to repeat across runs while
 bisecting a bug.
 
+Since 559 one setting turns it off for everyone. "Cache Translated Code
+(arm64)", off by default, keeps translated blocks after the process that made
+them (Chapter 6), and a cached block is found by the address its code was at,
+so it only pays when every process is laid out the same way. Turning it on
+sets `randomize_va_space` to 0, and the setting's own text says that ASLR is
+then off in the Linux system and what that makes easier for an attacker;
+while it is on, a write of any other value is `EPERM` — a distribution's boot
+that runs `sysctl kernel.randomize_va_space=2` would otherwise leave the
+cache running and hitting nothing. Turning it off puts back what was there,
+unless something else has changed it since. iOS's own protection of the app
+is not involved either way.
+
 **Anything the guest has registered.** `binfmt_misc` is the third answer, and
 unlike the other two it is written by the guest at run time: a rule matches a
 file by a magic string at some offset or by its filename extension, and names an

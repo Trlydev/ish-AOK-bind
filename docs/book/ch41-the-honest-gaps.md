@@ -28,25 +28,27 @@ unmount from and `pivot_root` on without anyone else seeing — and a user
 namespace (559) is a process being root, with every capability, over a world
 of its own and nobody new over the machine; and a pid namespace (559) is a
 set of processes that see only each other, the first of them as pid 1; and a
-network namespace (559) is a loopback interface with nothing behind it.
+network namespace (559) is a loopback interface, and whatever veth pair or
+dummy link it is given, with nothing behind them.
 `setns(2)` joins any of those six — or one nothing is in any more — through
 its `/proc/<pid>/ns` file or a pidfd, which is `nsenter` into a sandbox.
-Cgroup and time namespaces are `ENOSYS` to `unshare`, and `setns` into one
-is the no-op of joining the only one there is.
+Cgroup and time namespaces are `ENOSYS` to `unshare`, have no
+`/proc/<pid>/ns` file, and `setns` into one is the no-op of joining the only
+one there is.
 
 A network namespace here is the network a sandbox is given so that it has
 none. AOK's sockets are the host's and the host has one network, so a
 private namespace cannot be a second network; it is "lo", which comes up
-and takes 127.0.0.1 when told to over rtnetlink, and sockets that never
-touch the host. A TCP or UDP socket there is not the host's TCP or UDP at
+and takes 127.0.0.1 when told to over rtnetlink, the veth and dummy links
+below, and sockets that never touch the host. A TCP or UDP socket there is
+not the host's TCP or UDP at
 all: underneath it is an `AF_UNIX` socket, a port is an entry in a table of
 the namespace's own, and loopback traffic goes from one such socket to
 another. So a server in a sandbox listens on 127.0.0.1 and its client
 connects, datagrams are answered, `accept` and `recvfrom` name the other end
 by address and port — and a destination anywhere else is `ENETUNREACH`,
 because there is nowhere for it to go. `ping 127.0.0.1` is answered by the
-kernel itself, to the raw socket that sent it, and there is no second
-interface to make. Abstract `AF_UNIX` names
+kernel itself, to the raw socket that sent it. Abstract `AF_UNIX` names
 are the namespace's own; pathname sockets are the filesystem's, as on Linux.
 A socket keeps the namespace it was made in wherever its descriptor goes.
 The native `curl` and `wget`, which fetch through the host rather than
@@ -61,23 +63,26 @@ own the System V objects of its IPC namespace, and give its own files
 capabilities — which are stored for that root, as Linux stores them, and
 are worth nothing to an exec outside. Ids are translated where a program
 looks (the `get*id` and `set*id` calls, `stat`, `chown`, signal senders,
-`/proc/<pid>/status`, socket peer credentials, System V `ipc_perm`) and not
-yet in process accounting or FUSE requests, which show the machine's ids. A
-mount namespace made in one has its inherited mounts locked, and takes only
-tmpfs, proc, sysfs and devpts as new filesystems. A session with a process
-in one is refused a save.
+`/proc/<pid>/status`, socket peer credentials, System V `ipc_perm`, and
+the ids a FUSE daemon is told and tells back). A mount namespace made in one
+has its inherited mounts locked, and takes only tmpfs, proc, sysfs, devpts
+and FUSE (Chapter 20) as new filesystems. A session with a process in one is
+refused a save.
 
 A pid namespace here numbers its processes from 1 as Linux does, and differs
-in two places. `/proc` shows what the *reader's* namespace holds whichever
-mount it is read through (Linux ties that to the mount). And a process
-group signalled from inside reaches only the members the caller has a
-number for, where Linux would also signal members outside that the caller's
-credentials allow. The rest is as Linux's: a pid outside the namespace is
+in one place: `/proc` shows what the *reader's* namespace holds whichever
+mount it is read through (Linux ties that to the mount). The rest is as
+Linux's: a process group signalled from inside reaches every member the
+caller's credentials allow, seen or not; a pid outside the namespace is
 `ESRCH` and absent from `/proc`, a parent, group or signal sender outside
 reads 0, `kill(-1)` reaches only the namespace, the init takes from inside
 only signals it handles, orphans go to it, and when it exits everything
-left inside is killed and nothing more can be forked in. `RLIMIT_NPROC` and
-the load average still count the machine.
+left inside is killed and nothing more can be forked in. Process accounting
+writes an exit to the file of every namespace from the process's own up
+that has one on, numbered as each has it, and taskstats answers in the
+requester's numbers. `RLIMIT_NPROC` is counted per user namespace and
+charged at every level above, as Linux's ucounts are (Chapter 10); the load
+average counts the machine, which on Linux it does too.
 
 A mount namespace here is not everything Linux's is. Propagation is real
 (559): peer groups, slaves, and mounts and unmounts repeated through them,
@@ -88,14 +93,16 @@ refused, and says which process). And on its own it confines nothing — a
 process in one is still root over the one machine, which is why a sandbox
 asks for a user namespace as well.
 
-Network is the one kind with no `/proc/<pid>/ns` file at all, as on a Linux
-kernel built without network namespaces. systemd decides whether a kind
-exists by checking for that file, and while `ns/net` was listed every unit
-with `PrivateNetwork=yes` went on to call `unshare(CLONE_NEWNET)`, got
-`ENOSYS`, and failed: on Arch that took `systemd-hostnamed`,
-`systemd-localed` and `shadow.service` with it, so `hostnamectl` and
-`localectl` could not start their daemons. With the file absent systemd says
-"proceeding without" and runs them.
+Cgroup and time are the kinds with no `/proc/<pid>/ns` file, as on a Linux
+kernel built without them: what is listed there can be made. systemd and
+bubblewrap decide whether a kind exists by checking for that file. Before
+559, while `ns/net` was listed and `unshare(CLONE_NEWNET)` was `ENOSYS`,
+every unit with `PrivateNetwork=yes` failed: on Arch that took
+`systemd-hostnamed`, `systemd-localed` and `shadow.service` with it, so
+`hostnamectl` and `localectl` could not start their daemons. And while
+`ns/cgroup` was listed, `bwrap --unshare-all` read it as support, asked for
+the namespace and stopped at "Creating new namespace failed"; without the
+file it runs.
 
 `clone` refuses the missing kind (`CLONE_NEWCGROUP`) too, but with `EINVAL`, the answer of a
 Linux kernel built without that namespace type. The two calls give different
@@ -517,7 +524,11 @@ the same place:
   so GL programs stay on llvmpipe unless told otherwise, and only the
   compositor is pointed at the GPU by default. Alpine's i386 and riscv64
   builds have no Venus driver either, so those guests stay on software
-  rendering.
+  rendering. And Mesa 25.2 and later will not start zink at all without
+  `robustness2`'s `nullDescriptor`, which MoltenVK reported as absent: until
+  559's MoltenVK fork reported it, a root with a current Mesa (Alpine 3.24,
+  Arch) had no GPU GL even for the compositor, and only Devuan 6's Mesa 25.0
+  did.
 
 ## 41.10 Structural ceilings
 
@@ -567,7 +578,10 @@ established, what the next step is, and how to prove it afterwards. During the
 `docs/TODO.md`, "Queued for a future release": every session that finds
 something adds a bullet with its evidence, marks the bullet before starting on
 it, and deletes it when the work lands, since the commit is then the record.
-This chapter's own revision went through that queue.
+This chapter's own revision went through that queue. The musts file came back
+for 558 and 559, as the short list of what a release is held for — 559's put a
+corruption, a kill and a crash first and the JIT's speed after them — with
+the queue still holding the detail behind each entry.
 
 The habit paid for itself immediately. `docs/historical/build_553_musts.md`'s entry on the
 amd64 locked-instruction path is what got that path opened up at all — and the
@@ -597,6 +611,7 @@ first.
 "Diagnosed, not fixed", "Deferred on purpose", "Native program candidates",
 "Reported issues"), [docs/roadmap.md](../../docs/roadmap.md) ("557 -- reach"),
 [docs/build_556_musts.md](../../docs/build_556_musts.md),
+[docs/build_559_musts.md](../../docs/build_559_musts.md),
 [docs/external_display_plan.md](../../docs/external_display_plan.md),
 [kernel/fork.c](../../kernel/fork.c) (`sys_unshare`, `sys_setns`),
 [kernel/getset.c](../../kernel/getset.c) (`current_capable`),

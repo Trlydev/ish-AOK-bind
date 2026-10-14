@@ -134,7 +134,8 @@ does, it has been seen to `SIGSEGV` on a bare `/bin/echo`, and it exists to run
 a targeted reproduction far enough to compare behavior at one point of interest.
 
 Now the disappointment. An arm64 guest on an arm64 host is **still one gadget
-dispatch per guest instruction**. There is no fast path where the host simply
+dispatch per guest instruction**, or per pair of them where fusion applies
+(Chapter 6). There is no fast path where the host simply
 executes the guest's own instructions, because that would require writing them
 into memory and executing them, which is the thing Chapter 6 exists to work
 around. What being the host's own ISA family buys is that each *gadget body* is

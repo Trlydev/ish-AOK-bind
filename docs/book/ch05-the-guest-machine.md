@@ -138,8 +138,8 @@ costs nothing.
 ## 5.4 The TLB, and an optimization that was measured and rejected
 
 Every guest load and store goes through a software TLB. It is per-thread, it
-lives on the task thread's stack (`struct tlb tlb = {}` in
-[kernel/task.c:817](../../kernel/task.c#L817)), it has 1024 entries, and an
+lives on the task thread's stack (`struct tlb tlb = {}` in `task_run_current`,
+[kernel/task.c](../../kernel/task.c)), it has 1024 entries, and an
 entry is three words:
 
 ```c
@@ -195,6 +195,27 @@ a series of ordinary misses.
 > while the whole 24 KB array is cache resident. Reverted, with the numbers
 > written into [emu/tlb.h](../../emu/tlb.h) so the next person to have the idea
 > gets the answer before spending the day.
+
+559 took the multiply out anyway, by a route that kept the 24 bytes: the
+arm64 and riscv64 guests' probe computes the index and the entry's address in
+four instructions with no multiply (times three is an add with a shift, times
+eight another shift), and folds the does-this-cross-a-page test into the tag
+compare, so an aligned 2-, 4- or 8-byte access hits in one compare. They were
+kept because the devices were faster with them, not because they were
+shorter: a fourth change in the same set, which cut another 1% of host
+instructions, made 7-Zip 4% and a Python dict benchmark 12% *slower* on the
+M4, and is not in.
+
+The same release gave a page evicted from its entry a second chance. Two pages
+a program uses in turn can share an index, and then each access evicts the
+other and goes all the way to `tlb_handle_miss` — about 420 host instructions
+where a hit is six — and which pages collide is decided by the guest's ASLR,
+so one Python start in five ran 7.5% more instructions and one in a dozen 26%
+more. The last two pages evicted now wait in a short list beside the table
+(`TLB_VICTIMS`), checked before a miss is taken for real and swapped back in
+from assembly on arm64 and riscv64. The first attempt kept them at a second
+index instead, cured the collisions, and made 7-Zip, whose 55 million misses
+are real, 1.6% slower by probing a cold line on every one.
 
 ## 5.5 Lazy anonymous mmap: reservations, not page tables
 

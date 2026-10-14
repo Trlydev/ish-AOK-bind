@@ -181,9 +181,9 @@ one trust domain, and one kernel, and the property that would be a container
 escape elsewhere is simply visibility.
 
 It is worth being precise that this is not a second design decision. It is the
-same absence of namespaces, seen from the other side, and the honest summary is
-that the project traded isolation it could not implement for a global view it
-did not have to build.
+same one machine, seen from the other side, and the honest summary is that the
+project traded isolation it could not implement — and since 559 implements
+only for a sandbox that asks — for a global view it did not have to build.
 
 ## 21.7 The pattern: making the app addressable
 

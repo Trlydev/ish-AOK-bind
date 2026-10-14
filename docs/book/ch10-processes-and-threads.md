@@ -151,8 +151,9 @@ number for. `ps` in one shows 1, 2, 3, and `/proc/<pid>/status` lists the
 whole column in `NSpid`. When that pid 1 exits, everything left inside is
 killed. `CLONE_NEWNET` completes what a sandbox asks for, and is the plainest
 case of all: guest sockets are host sockets and the host has one network, so
-a private network namespace is a loopback interface with nothing behind it,
-whose sockets are never allowed to touch the host (`kernel/net_ns.h`;
+a private network namespace is a loopback interface, and whatever veth pair
+or dummy link it is given, with nothing behind them, whose sockets are never
+allowed to touch the host (`kernel/net_ns.h`;
 Chapter 41 says exactly what that does and does not carry).
 `CLONE_NEWCGROUP` is refused.
 
@@ -425,11 +426,16 @@ consulted it.
   bytes at a time forever.
 - **`RLIMIT_NPROC`.** `fork` now refuses with `EAGAIN` once the calling user
   already has that many processes ([kernel/fork.c](../../kernel/fork.c)).
-  Threads are charged on neither side of the comparison, and `CAP_SYS_RESOURCE`
-  or `CAP_SYS_ADMIN` is exempt, as on Linux. Note the default is 1024
-  (`init_rlimits` in [kernel/init.c](../../kernel/init.c)), so a parallel build
-  that previously ran unbounded can now meet it without anyone having asked for
-  a limit.
+  Threads are charged on neither side of the comparison, and real uid 0,
+  `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN` is exempt, as on Linux. Since 559 the
+  count is per user namespace and charged at every level above, against the
+  limit the namespace's creator had when it was made, as Linux's ucounts are
+  (`task_nproc_exceeded`). Before, a process could make a user namespace, raise
+  its soft limit to the hard one inside and fork up to that: 199 in
+  `tests/manual/userns_nproc.c`, where Linux 6.12 allows 9. Note the default is
+  1024 (`init_rlimits` in [kernel/init.c](../../kernel/init.c)), so a parallel
+  build that previously ran unbounded can now meet it without anyone having
+  asked for a limit.
 
 `prlimit64` grew the matching reach. Any nonzero pid used to be `EINVAL`,
 *including the caller's own* — which is the form glibc's `prlimit(2)` wrapper
