@@ -262,9 +262,13 @@ static void test_nsfs_ioctls(void) {
         char path[64], label[128];
         snprintf(path, sizeof(path), "/proc/self/ns/%s", expect[i].name);
         int fd = open(path, O_RDONLY);
-        // A kernel built without network namespaces has no ns/net (AOK is
-        // one: fs/proc/pid.c); every other kind here exists on both.
-        if (fd < 0 && errno == ENOENT && expect[i].nstype == CLONE_NEWNET_)
+        // A kernel built without a kind has no file for it: AOK has no cgroup
+        // or time namespaces, and had no ns/net before network namespaces.
+        // namespace_errno.c holds each file to whether its kind can be made;
+        // uts_namespace.c holds the other five to being there.
+        if (fd < 0 && errno == ENOENT &&
+            (expect[i].nstype == CLONE_NEWNET_ || expect[i].nstype == CLONE_NEWCGROUP_ ||
+             expect[i].nstype == CLONE_NEWTIME_))
             continue;
         snprintf(label, sizeof(label), "ns.%s_opens", expect[i].name);
         if (!check(label, fd >= 0))

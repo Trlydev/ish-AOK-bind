@@ -112,9 +112,10 @@ static int child_shared_ns_writes_through(void) {
 // how UTS support stayed invisible to systemd even once it worked, with
 // every ProtectHostname= unit logging that the kernel has no UTS namespaces.
 static void check_ns_probe(void) {
-    // Not "net": that file must be ABSENT on AOK, which cannot make a network
-    // namespace (see namespace_errno.c) -- it is the same probe, answered no.
-    static const char *types[] = {"uts", "mnt", "pid", "ipc", "user", "cgroup", "time"};
+    // Not "net", "cgroup" or "time": each of those files exists exactly when
+    // its kind can be made, which namespace_errno.c checks -- it is the same
+    // probe, and AOK answers no for cgroup and time.
+    static const char *types[] = {"uts", "mnt", "pid", "ipc", "user"};
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/self/ns/%s", types[i]);
