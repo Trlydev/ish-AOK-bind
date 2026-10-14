@@ -14,7 +14,7 @@ show that architecture mix. `ktop`'s one real differentiator versus a
 normal `top` clone is an **ARCH** column, read directly from each
 process's ELF header via `/proc/<pid>/exe` — or, for a natively-dispatched
 program, from the host's own architecture, since that is what it was compiled
-for (see [below](#native-programs-and-the-arch-column)).
+for (see [below](#where-the-arch-column-actually-comes-from)).
 
 `ktop` is purely `/proc`-based — it doesn't use taskstats or netlink
 sockets (that's a separate mechanism, used by `iotop`-style tools; see the

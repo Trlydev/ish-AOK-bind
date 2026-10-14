@@ -183,6 +183,8 @@ stored name stayed put. A few notable ones:
 | `theme`, `font_family`, `font_size`, `line_height` | [Appearance](themes.md) |
 | `enable_hle`, `enable_crypto_accel`, `enable_pix_accel` | the accelerators — HLE on by default, the other two opt-in |
 | `enable_multicore`, `enable_extralocking` | emulator behaviour |
+| `enable_jit_cache` | Cache Translated Code — see [the JIT](#the-jit-from-the-guest) below |
+| `terminal_bottom_padding` | Appearance → Bottom Padding, in points — see [themes.md](themes.md) |
 | `launch_command`, `boot_command` | what a session starts |
 | `llm_*` | the [LLM client](llm-chat.md) |
 
@@ -213,7 +215,7 @@ Most of `/proc/ish` is read-only. The exceptions:
 | `snapshot` | `0644` | `echo <name>` clones the booted root to a sibling root; only with `ISH_GUEST_SNAPSHOT` set |
 | `swap`, `mem_compress` | `0644` | the pager and the compression estimate below |
 | `amd_jit`, `amd64_jit`, `<arch>_jit_fuse` | `0644` | JIT engine and instruction-fusion switches, per guest architecture |
-| `hle`, `jit_inherit`, `jit_timing`, `arm64_mops` | `0644` | the JIT switches and the translation-time counter below |
+| `hle`, `jit_inherit`, `jit_timing`, `arm64_mops`, `jit_cache` | `0644` | the JIT switches and the translation-time counter below |
 | `i386_no_cache_comm`, `i386_single_step_comm` | `0644` | i386 debugging aids, named for the process they apply to |
 
 The `*_jit_fuse` entries report which fusions are on and let you turn one off
@@ -223,13 +225,20 @@ while you are bisecting a suspected JIT bug:
 cat /proc/ish/arm64_jit_fuse
 # bcond on
 # ldst on
-# ldcmp on
-# retcache on
+# ...
+# pair on
+# fwd on
 ```
+
+The newest, from 559, are the fused pairs — two adjacent instructions that
+commonly go together run as one gadget with one dispatch (`pair` on arm64,
+`fuse2` on riscv64, where `pair` is the older fused load and store pair) — and
+`fwd` on both, which hands a pair's first result to its second half in a host
+register rather than through the guest's register file.
 
 ## The JIT, from the guest
 
-Four more files let you see and switch what the JIT does, live, without a
+Five more files let you see and switch what the JIT does, live, without a
 relaunch. Each takes `0` or `1`, and root may write it:
 
 ```sh
@@ -237,6 +246,7 @@ cat /proc/ish/hle                  # 1: hot libc functions run as host code (the
 echo 0 > /proc/ish/hle             # off, for blocks translated from now on
 cat /proc/ish/jit_inherit          # 1: a forked child reuses its parent's translations
 cat /proc/ish/arm64_mops           # 1: arm64 programs are told about FEAT_MOPS
+cat /proc/ish/jit_cache            # 0: translations are not kept across programs (the default)
 echo 1 > /proc/ish/jit_timing      # zero the counters and start counting
 make -j4                           # ...the workload you are asking about
 cat /proc/ish/jit_timing           # blocks, ns and bytes translated, per guest architecture
@@ -255,6 +265,18 @@ cat /proc/ish/jit_timing           # blocks, ns and bytes translated, per guest 
 - **`arm64_mops` changes what new programs see.** With it on, glibc's `memcpy`,
   `memmove` and `memset` use the FEAT_MOPS instructions, each one gadget.
   It takes effect at the next `exec`; `ISH_MOPS=0` starts it off.
+- **`jit_cache` is Settings → Translated Code → Cache Translated Code
+  (arm64).** With it on, code translated for one program is kept after it
+  exits, so the next program that loads the same library or binary starts
+  faster — about a fifth off scripts and builds that run many short programs,
+  little for one long-running one. arm64 roots only, up to 96 MB. **It turns
+  the guest's ASLR off**, because a cached translation is found by the address
+  its code was at: `/proc/sys/kernel/randomize_va_space` reads 0 and refuses
+  any other value while the cache is on, and gets its old value back when it
+  goes off. That makes a memory-corruption bug in a program you run here — a
+  network service above all — easier to exploit; iOS's protection of the app
+  itself is unaffected. Off by default. Reading the file also gives the cache's
+  `hits`, `misses`, `stored`, `refused` and `bytes`.
 - **`jit_timing` answers "is it translating or running?"** It counts time spent
   turning guest code into gadget blocks, across every process, with an
   `inherited` line for the blocks a fork copied instead. Counting costs two
@@ -357,9 +379,10 @@ hang is the signal worth chasing.
 
 ## Things worth knowing
 
-- **`/proc/ish` is the same in every root and every chroot.** AOK has no mount
-  or PID namespaces, so there is one true kernel underneath everything — see
-  [00-overview.md](00-overview.md).
+- **`/proc/ish` is the same in every root and every chroot.** There is one
+  true kernel underneath everything — see [00-overview.md](00-overview.md).
+  A process in a pid namespace of its own sees only that namespace's processes
+  in `/proc`, as on Linux ([namespaces.md](namespaces.md)).
 - **`documents` gives the app's Documents directory** as a host path, which is
   what the Files app and iTunes file sharing see.
 - **`colors` is a rendering test, not a list.** Reading it prints the sixteen

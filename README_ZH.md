@@ -24,7 +24,8 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
 - **挂起到磁盘**：把整个会话——进程、打开的文件、终端——保存下来，在应用被终止后再恢复。默认关闭。参见 `/AOK/docs/suspend.md`。
 - **中文及其他语言**：应用界面跟随设备语言，除英文外还提供简体中文、繁體中文、日语、韩语、西班牙语、法语、德语、巴西葡萄牙语和俄语。终端支持输入法输入：用中文拼音输入法和日文输入法时，正在组字的文本直接显示在光标处，候选窗口紧挨在旁边，软键盘和硬件键盘都能用；韩文则逐个音节就地输入。`/AOK/tools/setup-locale.sh` 还能让根文件系统也使用设备的语言（Devuan 自带各程序的翻译）。参见 `/AOK/docs/roots.md`。
 - 通过 iOS 系统 API 暴露客户机文件的 File Provider 支持。
-- **FUSE**：提供 `/dev/fuse` 与 `fuse` 文件系统类型（协议 7.31），因此客户机的 `libfuse2`/`libfuse3` 守护进程无需修改即可挂载并提供文件系统。由于客户机本身已是 fake-root，不涉及 setuid 的 `fusermount`，libfuse 会直接调用 `mount(2)`。参见 `/AOK/docs/fuse.md`。
+- **FUSE**：提供 `/dev/fuse` 与 `fuse` 文件系统类型（协议 7.31），因此客户机的 `libfuse2`/`libfuse3` 守护进程无需修改即可挂载并提供文件系统。以 root 身份时 libfuse 直接调用 `mount(2)`；普通用户则与 Linux 上一样，经由发行版的 `fusermount3`。参见 `/AOK/docs/fuse.md`。
+- **命名空间**（559，实验性）：user、mount、pid 与 network 命名空间，因此 `unshare`、bubblewrap 以及 Codex CLI 的命令沙箱（`codex sandbox`）能够启动并真正起到隔离作用，systemd 的 `PrivateTmp=` 等设置也是真实生效的。私有网络命名空间有自己的回环接口和 `veth`/`dummy` 链路，并且永远不会接触到宿主的网络。参见 `/AOK/docs/namespaces.md`。
 - **Apple 快捷指令（Shortcuts）操作**（iOS 16+）：无需打开应用即可通过原生 zsh 在客户机中执行命令并把输出返回给快捷指令的 "Run Command" 操作，以及带有 Siri 短语的 "Open iSH-AOK" 目标页面。参见 `/AOK/docs/shortcuts.md`。
 - **`/dev/url`**：一个字符设备，客户机往里写一个 URL，就把它交给 iOS 打开——包括 `shortcuts://` 链接，因此客户机脚本可以驱动一个快捷指令。参见 `app/URLDevice.m`。
 - **模拟交换空间**：可选的交换区，让大部分处于闲置状态的大型工作集无需占用真实内存即可存在——并带有 24 小时写入预算、抖动保护和挂起门控，因为它消耗的是设备的闪存。默认关闭；在 iOS“设置”App 中的 iSH-AOK → Simulated Swap 里开启（需要同时打开开关并选择大小，下次启动时生效）。客户机通过 `/proc/meminfo`、`free`、`vmstat`、`/proc/swaps` 和真实的 `/dev/aokswap0` 看到它。参见 `/AOK/docs/swap.md`。
@@ -61,8 +62,10 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
 
 ## 性能
 
-引擎受限于分派开销，约为每次 gadget 分派 6.8 ns，因此开销与客户机指令数成正比。测量
-方法与数据见 [docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md)。
+引擎受限于分派开销，因此开销与客户机指令数成正比。2026 年 8 月的测量得出每次 gadget
+分派约 6.8 ns；此后的分派优化已使其更快，但尚未用同样的方法重新测量。测量方法与数据见
+[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md)。从 559 起，arm64 与
+riscv64 客户机还会把常见的相邻指令对融合为一个 gadget、一次分派。
 
 指令融合与返回缓存可以在运行时按客户机切换，便于做 A/B 测量：
 
@@ -81,6 +84,11 @@ echo all=1 > /proc/ish/riscv64_jit_fuse
 由 [tools/jitprof-report.py](tools/jitprof-report.py) 汇总；`/proc/ish/jit_timing`
 测量翻译所花的时间，在应用内和 CLI 中都可用（`echo 1 > /proc/ish/jit_timing`，运行负载，
 再 `cat` 它）。`/proc/ish/host_vm` 则按类别列出应用自身的内存，包括 GPU。
+
+**缓存已翻译的代码 (arm64)**（559，默认关闭）在程序退出后保留其翻译结果，让下一个加载
+相同代码的程序启动得更快——对运行大量短小程序的脚本和构建，约快五分之一。由于缓存的
+代码块按地址查找，开启期间客户机的 ASLR 会被关闭。它是应用设置中的一个开关，在客户机中
+是 `/proc/ish/jit_cache`，在 CLI 中是 `ISH_JIT_XCACHE=1`（CLI 不改动 ASLR）。
 
 ## 可选加速器
 

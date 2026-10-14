@@ -244,12 +244,14 @@ mount -t tmpfs none /mnt/a        # /mnt/a/b is the new tmpfs's now (and not the
 umount /mnt/a                     # the first one is back
 ```
 
-That last point is the one real difference from a normal Linux box, and it is
-worth keeping in mind — **a bind mount you create is visible to everything**,
-including processes in other roots and other chroots, because there is a single
-mount table underneath all of them (see [00-overview.md](00-overview.md)). A
+One thing is worth keeping in mind — **a bind mount you create is visible to
+everything** in the machine's own mount namespace, including processes in other
+roots and other chroots, because a chroot shares its mount table with
+everything outside it, as on Linux (see [00-overview.md](00-overview.md)). A
 bind is a system-wide change, not a private one, so unmount what you no longer
-need.
+need. Only a process in a mount namespace of its own (`unshare -m`, a
+bubblewrap sandbox, a systemd service with private mounts) is spared it — see
+[namespaces.md](namespaces.md).
 
 ## The time zone: following the device
 
@@ -454,8 +456,9 @@ putting `sandbox_mode = "danger-full-access"` at the top of
 `~/.codex/config.toml`. The script now does the opposite: it takes that line
 out again (only the one it added), so that a root set up on an older build
 goes back to running Codex's commands confined. `README.txt` beside it says
-what the sandbox is here.
+what the sandbox is here, and [namespaces.md](namespaces.md) what it is made of.
 
 ```sh
-sh /AOK/fixes/codex/fix-codex.sh         # or, for one session: codex --sandbox danger-full-access
+sh /AOK/fixes/codex/fix-codex.sh         # take out the line an older build's copy added
+codex sandbox -- /bin/echo x             # prints x: the sandbox starts
 ```

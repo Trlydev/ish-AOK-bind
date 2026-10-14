@@ -302,9 +302,10 @@ Wayland window opens.
   settings window as arm64 through Debian multiarch, with arm64's GPU drivers,
   and iSH-AOK runs that arm64 Wayfire on the GPU there -- in a riscv64 or i386
   root, whose own Mesa has no GPU driver, as in an arm64 one. The terminal, the
-  VNC bridge and the X server stay the root's own. Arch packages Wayfire, but
-  Arch's Mesa is too new for OpenGL ES on the GPU (see [The GPU](#the-gpu)), so
-  `setup-wayfire.sh` refuses there; Alpine does not package it.
+  VNC bridge and the X server stay the root's own. Arch packages Wayfire, and
+  from build 559 its Mesa can use the GPU for OpenGL ES (see
+  [The GPU](#the-gpu)), so `setup-wayfire.sh` no longer refuses there -- but
+  nobody has run a Wayfire session on Arch yet. Alpine does not package it.
   Wayfire's panel is your choice, and `setup-wayfire.sh` asks (or takes
   `--panel fast|waybar|both|stock`): **fast** is wf-shell's panel with a
   menu that reopens at once -- the packaged one rebuilds every entry each time
@@ -377,12 +378,15 @@ one is tried first on any Devuan root that has arm64's libraries.
 uses Devuan's, and starts it again if it crashes. `ISH_DISPLAY_BUNDLED_WAYVNC=0`
 keeps Devuan's.
 
-**OpenGL on the GPU needs Mesa older than 25.2, which today means Devuan 6.**
-Mesa 25.2 and later -- Alpine 3.24's 26.1, and Arch's -- refuse to start zink
-without a Vulkan feature (robustness2's `nullDescriptor`) that iSH-AOK's GPU
-does not offer yet. On those roots Vulkan programs and the compositor still
-use the GPU, but every OpenGL program renders in software, and `setup-gpu.sh`
-says so rather than reporting a GL version from the software renderer.
+**From build 559 OpenGL can use the GPU with a current Mesa too.** Mesa 25.2
+and later -- Alpine 3.24's 26.1, and Arch's -- refuse to start zink without a
+Vulkan feature (robustness2's `nullDescriptor`) that iSH-AOK's GPU did not
+offer before 559, so on those roots every OpenGL program rendered in software
+and only Devuan 6's Mesa 25.0 reached the GPU. It is offered now, and
+`setup-gpu.sh --check` passes on Alpine 3.24; a full OpenGL program or
+compositor on such a root has had little testing yet. On an older app build
+the script still says that OpenGL is in software, rather than reporting a GL
+version from the software renderer.
 
 Where zink works, OpenGL programs still render in software by default: on this GPU zink offers
 only OpenGL 2.1 and OpenGL ES 2.0, where software rendering offers 4.5, so a

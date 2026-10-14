@@ -25,7 +25,8 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
 - **디스크로 서스펜드**: 프로세스, 열린 파일, 터미널까지 세션 전체를 저장했다가 앱이 종료된 뒤에도 이어서 재개합니다. 기본값은 꺼짐. `/AOK/docs/suspend.md` 참고.
 - **한국어와 다른 언어**: 앱 인터페이스가 기기 언어를 따르며, 영어 외에 한국어, 간체·번체 중국어, 일본어, 스페인어, 프랑스어, 독일어, 브라질 포르투갈어, 러시아어를 지원합니다. 터미널은 입력기 입력을 받습니다. 한글은 음절을 그 자리에서 조합해 입력하고, 중국어 병음과 일본어는 조합 중인 글자를 커서 위치에 표시하며 후보 창을 그 옆에 띄웁니다. 화상 키보드와 하드웨어 키보드 모두 해당됩니다. `/AOK/tools/setup-locale.sh` 는 루트 파일시스템에도 기기 언어를 설정합니다(프로그램 번역은 Devuan 에 들어 있습니다). `/AOK/docs/roots.md` 참고.
 - iOS를 통해 게스트 파일을 노출하는 File Provider 지원.
-- **FUSE**: `/dev/fuse` 와 `fuse` 파일시스템 타입(프로토콜 7.31)을 제공하므로, 게스트의 `libfuse2`/`libfuse3` 데몬이 수정 없이 파일시스템을 마운트하고 제공합니다. 게스트가 이미 fake-root 이므로 setuid `fusermount` 는 쓰이지 않고, libfuse 가 `mount(2)` 를 직접 호출합니다. `/AOK/docs/fuse.md` 참고.
+- **FUSE**: `/dev/fuse` 와 `fuse` 파일시스템 타입(프로토콜 7.31)을 제공하므로, 게스트의 `libfuse2`/`libfuse3` 데몬이 수정 없이 파일시스템을 마운트하고 제공합니다. root 일 때 libfuse 는 `mount(2)` 를 직접 호출하고, 일반 사용자는 리눅스와 마찬가지로 배포판의 `fusermount3` 를 거칩니다. `/AOK/docs/fuse.md` 참고.
+- **네임스페이스**(559, 실험적): user, mount, pid, network 네임스페이스. 그래서 `unshare`, bubblewrap, Codex CLI 의 명령 샌드박스(`codex sandbox`)가 시작되고 실제로 격리하며, systemd 의 `PrivateTmp=` 등도 실제로 동작합니다. 비공개 네트워크 네임스페이스는 자체 루프백과 `veth`/`dummy` 링크를 가지며, 호스트의 네트워크에는 절대 닿지 않습니다. `/AOK/docs/namespaces.md` 참고.
 - **Apple 단축어(Shortcuts) 액션** (iOS 16+): 앱을 열지 않고도 네이티브 zsh로 게스트에서 명령을 실행하고 그 출력을 단축어로 돌려주는 "Run Command" 액션과, Siri 문구가 지원되는 "Open iSH-AOK" 대상들. `/AOK/docs/shortcuts.md` 참고.
 - **`/dev/url`**: 게스트가 URL을 써 넣으면 그 URL을 iOS가 열도록 넘겨주는 문자 장치. `shortcuts://` 링크도 되므로 게스트 스크립트가 단축어를 실행할 수 있습니다. `app/URLDevice.m` 참고.
 - **시뮬레이션 스왑**: 대부분 유휴 상태인 큰 작업 집합이 실제 메모리를 쓰지 않고도 존재할 수 있도록 하는 선택적 스왑 영역 — 기기의 플래시를 소모하므로 24시간 쓰기 예산, 스래싱 가드, 일시 중단 게이트가 함께 있습니다. 기본값은 꺼짐이며, iOS 설정 앱의 iSH-AOK → Simulated Swap에서 켭니다(스위치와 크기를 모두 지정해야 하며 다음 실행 시 적용됩니다). 게스트는 `/proc/meminfo`, `free`, `vmstat`, `/proc/swaps` 및 실제 `/dev/aokswap0`을 통해 봅니다. `/AOK/docs/swap.md` 참고.
@@ -63,9 +64,12 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
 
 ## 성능
 
-엔진은 gadget 디스패치당 약 6.8 ns로 디스패치 바운드 상태이며, 따라서 비용은 게스트
-명령어 수에 비례합니다. 측정 방법과 수치는
-[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md)에 있습니다.
+엔진은 디스패치 바운드 상태이며, 따라서 비용은 게스트 명령어 수에 비례합니다. 2026년
+8월의 측정에서는 gadget 디스패치 하나가 약 6.8 ns였습니다. 그 뒤의 디스패치 작업으로
+더 저렴해졌지만, 같은 방법으로 다시 측정하지는 않았습니다. 측정 방법과 수치는
+[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md)에 있습니다. 559 부터는
+arm64 와 riscv64 게스트가 자주 함께 나오는 명령어 쌍을 gadget 하나, 디스패치 하나로
+융합하기도 합니다.
 
 명령어 퓨전과 리턴 캐시는 A/B 측정을 위해 게스트별로 런타임에 전환할 수 있습니다.
 
@@ -86,6 +90,13 @@ echo all=1 > /proc/ish/riscv64_jit_fuse
 `/proc/ish/jit_timing` 은 CLI 뿐 아니라 앱 안에서도 변환에 쓰인 시간을 잽니다
 (`echo 1 > /proc/ish/jit_timing`, 작업 실행, 그다음 `cat`). `/proc/ish/host_vm` 은
 GPU 를 포함해 앱 자신의 메모리를 분류해 보여 줍니다.
+
+**변환된 코드 캐시 (arm64)**(559, 기본값 꺼짐)는 프로그램이 끝난 뒤에도 변환 결과를
+남겨 두어, 같은 코드를 불러오는 다음 프로그램이 더 빨리 시작하게 합니다 — 짧은
+프로그램을 많이 실행하는 스크립트와 빌드에서 약 5분의 1 빨라집니다. 캐시된 블록은
+주소로 찾기 때문에, 켜져 있는 동안 게스트의 ASLR 은 꺼집니다. 앱 설정의 스위치이며,
+게스트에서는 `/proc/ish/jit_cache`, CLI 에서는 `ISH_JIT_XCACHE=1` 입니다(CLI 는 ASLR 을
+건드리지 않습니다).
 
 ## 선택적 가속기
 

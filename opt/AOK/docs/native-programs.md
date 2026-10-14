@@ -184,6 +184,22 @@ way the applet always did; the difference is that it can now actually reach
 root when a rule allows it. `$1$`, `$2b$` and Debian 12's default `$y$`
 (yescrypt) are not implemented and are refused rather than guessed at.
 
+`passwd` changes passwords from build 559; before that it printed "passwd: not
+supported on this platform" and changed nothing. Root may set any account's
+password; anyone else changes their own and is asked for the old one first.
+It rewrites only the account's line of `/etc/shadow`, keeping the file's mode
+and owner.
+
+## When a native program crashes
+
+A native program that calls `abort()` — a failed assertion, or a Rust program
+that panics — dies of `SIGABRT` like any other process, after its own handler
+for the signal has had its turn, and your shell says "Aborted". The app stays
+up. Before 559 such a call went to the host and took the whole app with it.
+
+A native program's threads share one task, so when one of them aborts, the
+program ends there, its other threads included.
+
 ## Where this is not the fast path
 
 The win is **interpretation**. A shell grinding through a long script — an

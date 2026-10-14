@@ -126,6 +126,11 @@ debugging.
 Whichever you choose, the other windows are still reachable once you are in;
 Startup Mode only picks the first one.
 
+To override it once, long-press the app's icon on the Home Screen (from build
+559): the menu offers **Workspace**, **Wayland Display**, **Session Shell** and
+**System Console**, and works whether or not the app is already running. The
+menu appears once the app has been opened at least once.
+
 ## The rest of this documentation set
 
 Everything under `/AOK/docs`, in the order most people want it. Two thirds of
@@ -139,6 +144,7 @@ six of them were not linked from anywhere at all.
 | [roots.md](roots.md) | installing, switching between and chrooting into several Linux root filesystems |
 | [persist.md](persist.md) | `/AOK/persist` and `/AOK/fakefs` — the two places that survive root switches, app updates and reinstalls |
 | [networking.md](networking.md) | reaching the device from another machine, what the guest can and cannot listen on, and the DNS relay |
+| [namespaces.md](namespaces.md) | sandboxes inside the guest — `unshare`, bubblewrap, Codex CLI's command sandbox — and what a private network is here |
 | [files-app-integration.md](files-app-integration.md) | the File Provider extension, and how iSH-AOK appears in the iOS Files app |
 | [shortcuts.md](shortcuts.md) | driving iSH-AOK from Apple's Shortcuts app |
 | [swap.md](swap.md) | the simulated swap area — turning it on, what it costs, and what it will not do |
@@ -152,6 +158,7 @@ six of them were not linked from anywhere at all.
 | [file-browser.md](file-browser.md) | the quick file picker on the keyboard bar (Cmd-B) |
 | [keyboard-shortcuts.md](keyboard-shortcuts.md) | every hardware-keyboard shortcut: desktops, windows, the terminal, MotePad, the Wayland desktop |
 | [keyboard-toolbar.md](keyboard-toolbar.md) | arranging the keys above the keyboard, and adding your own |
+| [snippets.md](snippets.md) | saved command lines you put on the prompt with one tap |
 | [motepad.md](motepad.md) | the built-in text editor |
 | [md.md](md.md) | the Markdown viewer |
 | [themes.md](themes.md) | the fourteen bundled themes and writing your own |

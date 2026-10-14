@@ -91,6 +91,32 @@ So a service you only talk to from inside the guest can use port 80 or 22
 quite happily, as long as it runs as root. The port ≥ 1024 rule only matters
 when you want the outside world to reach it.
 
+## When the screen locks: connections that drop
+
+iOS suspends the app when the screen locks or you switch away, and a locked
+device takes back a suspended app's network connections. An `ssh` session left
+idle across that comes back to a dead connection. Nothing in the guest can stop
+it; what keeps a session alive is keeping the app running, and the usual way is
+to keep it busy with location updates:
+
+```sh
+cat /dev/location > /dev/null &    # the first time, iOS asks for location permission
+```
+
+How long iOS honours that on a locked device has not been measured here.
+
+From build 559 such a connection reads as **reset** (`ECONNRESET`, "Connection
+reset by peer"), which is what Linux says of a connection the network took and
+what a client that reconnects is waiting for. Before, `ssh` and anything else
+that had been waiting in `poll` were told "Bad file descriptor".
+
+## Sandboxes: a network of their own
+
+A process in a private network namespace — `unshare -n`, a bubblewrap
+sandbox, Codex CLI's — reaches none of this: not the device's network, not the
+loopback NAT, not the DNS relay. It has its own `lo`, and links you make
+between sandboxes. See [namespaces.md](namespaces.md).
+
 ## The DNS relay at `127.0.0.53`
 
 The `/etc/resolv.conf` iSH-AOK writes lists `127.0.0.53` first, ahead of the

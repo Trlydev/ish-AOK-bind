@@ -32,7 +32,8 @@ like any other Files provider:
 1. Open the **Files** app.
 2. Tap **Browse**, then the **⋯** (more) button, or go to Locations at
    the top of the sidebar.
-3. Enable the **iSH** location (iSH-AOK's) if it isn't already checked.
+3. Enable the **iSH-AOK** location (**iSH** on builds before 559) if it isn't
+   already checked.
 
 Once enabled, it appears as a location you can browse, favorite, and use
 from any app's "Open"/"Save" document picker, exactly like iCloud Drive or
@@ -53,6 +54,15 @@ folder for the shared `/AOK/persist` directory every root sees (see
 Because the extension opens the same on-disk, SQLite-backed root your
 running guest uses, changes made from Files app are visible to the guest
 immediately (and vice versa) — there's no separate sync step.
+
+## A sideloaded copy has no Files location
+
+The extension reads your filesystems out of the app's shared App Group
+container. A copy of the app re-signed without that group — a sideloaded one,
+usually — has no such container, so there is nothing for Files to show. From
+build 559 a filesystem's **Browse Files** row says so in an alert ("Files
+Can't Show This Filesystem") instead of crashing the app, as it did before.
+**Export** on the same screen still works.
 
 ## Note on locking
 

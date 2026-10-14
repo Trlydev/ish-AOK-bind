@@ -60,6 +60,11 @@ program cannot inherit a debugger's disabled-ASLR setting.
 ISH_RANDOMIZE_VA_SPACE=0 ./ish -f build/alpine /bin/sh   # reproducible layouts, for A/B testing
 ```
 
+In the app, **Settings → Translated Code → Cache Translated Code (arm64)** sets
+it to `0` and holds it there — a write of any other value is `EPERM` — for as
+long as the switch is on, and puts the old value back when it goes off. See
+[proc-ish.md](proc-ish.md#the-jit-from-the-guest) for why.
+
 ## `ISH_VDSO`
 
 64-bit guests (`amd64`, `arm64`, `riscv64`) read the clock through a vDSO
@@ -133,6 +138,7 @@ the app has:
 | variable | the app's setting | what it does |
 | --- | --- | --- |
 | `ISH_CRYPTO_ACCEL=1` | **Crypto Accel** | host-native AEAD for arm64/riscv64 ssh — see [crypto-accel.md](crypto-accel.md); off by default |
+| `ISH_JIT_XCACHE=1` | **Cache Translated Code (arm64)** | keeps arm64 translations after a program exits, for the next one to reuse; off by default. Unlike the setting, it leaves ASLR as it finds it, so pair it with `ISH_RANDOMIZE_VA_SPACE=0` or it will rarely hit |
 | `ISH_PIX_ACCEL=1` | **Pixman Accel** | host-native fill/copy/composite for the guest's pixman shim; off by default, and on only once its self-test passes |
 | `ISH_FOREIGN_EXEC` | **Programs From Other Roots** | `root`, `libs` or `off`: how a program from another root runs when its loader is not here — see [roots.md](roots.md#running-another-roots-programs-by-path); the same as writing `/proc/ish/foreign_exec` at boot |
 | `ISH_NATIVE_ROOT=1` | a [native-mode](native-mode.md) root | treats the root as native mode, provisioning it as the app does at every boot of one |
@@ -360,6 +366,11 @@ way Linux enforces it:
   `mremap`, `brk` and `shmat` check them, from a page-table walk of the
   process. `mprotect` making private pages writable counts against
   `RLIMIT_DATA` too, because that is how glibc's thread arenas grow.
+- **`RLIMIT_NPROC`** (`ulimit -u`): counted per real uid, with root exempt.
+  AOK counts processes where Linux counts threads, so a heavily threaded
+  program gets further here before `fork` fails with `EAGAIN`. A process in a [user namespace](namespaces.md) counts
+  at every level up to the machine, against the limit its namespace's creator
+  had, so raising the limit inside a sandbox does not raise it.
 - A soft limit above the hard one is refused (`EINVAL`); raising a hard limit
   needs `CAP_SYS_RESOURCE`; changing another process's limits needs your
   real, effective and saved ids to all match its.
@@ -396,6 +407,10 @@ not seconds, and `ac_exitcode` is the wait-encoded status (so `false` records
 the same units, without walking the address space on every process exit for
 an advisory field. Off — which is every system that has never called
 `acct(2)` — costs one atomic read on process exit and nothing else.
+
+Accounting belongs to a [pid namespace](namespaces.md), as on Linux: a process
+that exits is written to its own namespace's file and to every one above it
+that has accounting on, with pids as each namespace numbers them.
 
 ## Other hardening worth knowing about
 

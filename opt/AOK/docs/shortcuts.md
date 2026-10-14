@@ -13,7 +13,7 @@ Going the other way, a guest program can open a URL, including a
 `shortcuts://` link that runs one of your shortcuts. See
 [/dev/url](#the-other-direction-devurl) below.
 
-This page is about Apple's Shortcuts app. Three other things in iSH-AOK
+This page is about Apple's Shortcuts app. Four other things in iSH-AOK
 have similar names:
 
 - hardware-keyboard shortcuts are in
@@ -22,6 +22,9 @@ have similar names:
   common tools (Layout Manager, Desktops, Session Shell, System Console,
   Sessions, Storage, Themes, Boot Images, Clock and, on iPad, New
   Workspace). `ws-quickactions` opens it. See [workspace.md](workspace.md);
+- the **Home Screen quick actions** (559) — long-press the app's icon — open
+  the app as Workspace, Wayland Display, Session Shell or System Console for
+  that one launch. See [00-overview.md](00-overview.md);
 - saved text you insert into a terminal is covered in
   [snippets.md](snippets.md).
 

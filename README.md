@@ -22,7 +22,8 @@ This fork is not just a rebrand. It carries fork-specific behavior, bundled root
 - **Suspend to disk**: the whole session — processes, open files, terminals — saved and resumed across the app being killed. Off by default. See `/AOK/docs/suspend.md`.
 - **Chinese and other languages**: the app's interface follows the device's language, in Simplified and Traditional Chinese, Japanese, Korean, Spanish, French, German, Brazilian Portuguese and Russian as well as English. The terminal takes input-method typing — Chinese Pinyin and Japanese draw the text being composed at the cursor, with the candidate window next to it, on the software or a hardware keyboard; Korean types each syllable in place. `/AOK/tools/setup-locale.sh` gives a root the device's language as well (Devuan carries the program translations). See `/AOK/docs/roots.md`.
 - File Provider support for exposing guest files through iOS.
-- **FUSE**: `/dev/fuse` and a `fuse` filesystem type (protocol 7.31), so guest `libfuse2`/`libfuse3` daemons mount and serve filesystems unmodified. No setuid `fusermount` is involved — the guest is already fake-root, so libfuse calls `mount(2)` directly. See `/AOK/docs/fuse.md`.
+- **FUSE**: `/dev/fuse` and a `fuse` filesystem type (protocol 7.31), so guest `libfuse2`/`libfuse3` daemons mount and serve filesystems unmodified — as root libfuse calls `mount(2)` directly, and an ordinary user goes through the distro's `fusermount3`, as on Linux. See `/AOK/docs/fuse.md`.
+- **Namespaces** (559, experimental): user, mount, pid and network namespaces, so `unshare`, bubblewrap and Codex CLI's command sandbox (`codex sandbox`) start and confine, and systemd's `PrivateTmp=` and friends are real. A private network namespace has its own loopback and `veth`/`dummy` links, and never reaches the host's network. See `/AOK/docs/namespaces.md`.
 - **Apple Shortcuts actions** (iOS 16+): a headless "Run Command" action that executes a command in the guest under the native zsh and returns its output to the shortcut — the app never has to come to the foreground — plus "Open iSH-AOK" destinations with Siri phrases. See `/AOK/docs/shortcuts.md`.
 - **`/dev/url`**: a character device the guest writes a URL to, handing it to iOS to open — including `shortcuts://` links, so a guest script can drive a Shortcut. See `app/URLDevice.m`.
 - **Simulated swap**: an opt-in swap area so a large, mostly idle guest working set can exist without spending real memory on it — with a 24-hour write budget, a thrash guard and a suspension gate, because it spends the device's flash. Off by default; turned on in the iOS Settings app, under iSH-AOK → Simulated Swap (both the switch and a size, effective at the next start). The guest sees it through `/proc/meminfo`, `free`, `vmstat`, `/proc/swaps` and a real `/dev/aokswap0`. See `/AOK/docs/swap.md`.
@@ -60,9 +61,13 @@ Relevant files:
 
 ## Performance
 
-The engine is dispatch-bound at roughly 6.8 ns per gadget dispatch, so cost
-tracks guest instruction count. Measured method and numbers are in
-[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md).
+The engine is dispatch-bound, so cost tracks guest instruction count. August
+2026's measurement put a gadget dispatch at roughly 6.8 ns; the dispatch work
+since then has made it cheaper, and it has not been re-measured on the same
+method. Method and numbers are in
+[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md). Since 559
+the arm64 and riscv64 guests also fuse common pairs of instructions into one
+gadget and one dispatch.
 
 Instruction fusion and the return caches can be toggled at runtime for A/B
 measurement, per guest:
@@ -84,6 +89,13 @@ dynamic instruction mix of any guest, which
 `/proc/ish/jit_timing` measures time spent translating, inside the app as well
 as the CLI (`echo 1 > /proc/ish/jit_timing`, run the workload, `cat` it).
 `/proc/ish/host_vm` breaks down the app's own memory, GPU included.
+
+**Cache Translated Code (arm64)** (559, off by default) keeps translations after
+a program exits, so the next one that loads the same code starts faster —
+about a fifth off scripts and builds that run many short programs. While it is
+on, the guest's ASLR is off, because a cached block is found by its address.
+It is a switch in the app's Settings, `/proc/ish/jit_cache` from the guest, and
+`ISH_JIT_XCACHE=1` for the CLI (which leaves ASLR alone).
 
 ## Optional Accelerators
 

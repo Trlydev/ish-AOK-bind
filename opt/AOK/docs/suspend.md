@@ -134,6 +134,14 @@ refusal names the process and the reason, in `/proc/ish/checkpoint`:
 - **A native program that is not making any system calls**, because there is
   nowhere to stop it. A shell at a prompt is waiting on a read and is fine; a
   native program in a tight compute loop is not.
+- **A process in a namespace of its own** (559) — a bubblewrap or `codex
+  sandbox` sandbox, anything under `unshare`, or a systemd service with
+  private mounts such as `PrivateTmp=`. Restored outside its namespaces it
+  would no longer be confined, so the save is refused instead, and so is one
+  while a mount has another mounted over it. **Save Anyway** does not leave
+  these out, and the automatic save refuses too, so on a root running systemd
+  with sandboxed services a session cannot be saved at all yet. See
+  [namespaces.md](namespaces.md).
 
 - **The Wayland desktop, or any program using the GPU.** What stands behind
   `/dev/dri/renderD128` and the Wayland view — Vulkan contexts, GPU memory, the
