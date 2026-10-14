@@ -1108,6 +1108,10 @@ int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf) {
 // is the rootfs outside every process's root.
 static int proc_mountinfo_parent_id(struct mount *target) {
     struct mount *mount;
+    // The old root after pivot_root(".", "."): stacked over the new root,
+    // which is what it is mounted on (fs/mount.c, mnt_ns_pivot_root).
+    if (target->pivot_over != 0 && !target->detached && !target->lazy_umount)
+        return target->pivot_over;
     // A covered mount sits on what it was mounted on, which was there before
     // what covers it: of the mounts whose place in the tree holds its own,
     // the longest, and of those at that place the newest older than the

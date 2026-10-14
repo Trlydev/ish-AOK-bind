@@ -277,6 +277,18 @@ struct mount {
     int covered_by;
     const char *covered_point;
 
+    // The old root after pivot_root(".", "."), and what is mounted in it. On
+    // Linux it is stacked over the new root at "/", where no lookup goes
+    // through it (a lookup starts at the root and never climbs onto what is
+    // mounted on top of it), until umount2(".", MNT_DETACH) takes it off. In a
+    // table of points the top of a stack is what lookups find, so it is put
+    // at a hidden point inside the namespace instead (mnt_ns_pivot_root) and
+    // listed at the point it is stacked at, `stacked_point`. pivot_over is
+    // the new root's ID, on the old root alone: an unmount of the new root's
+    // point takes the old root instead, as it does on Linux.
+    int pivot_over;
+    const char *stacked_point;
+
     // Copied into a mount namespace owned by a less privileged user
     // namespace than the one it came from (mnt_ns_copy): not to be unmounted
     // by itself there, nor to lose the restrictive flags it arrived with.
@@ -305,6 +317,9 @@ extern lock_t mounts_lock;
 // (N_DETACHED_OK, fs/path.h), `..` at a staging point stays there, and a
 // path shown to the guest is from the mount's own root, as Linux shows it.
 #define MOUNT_STAGING_DIR "/.ish-fsmount"
+// Where pivot_root(".", ".") keeps the old root, inside the new one, while it
+// is stacked over it (struct mount's stacked_point); the new root's ID follows.
+#define MOUNT_PIVOT_OLD "/.ish-pivot-old."
 
 // If the first `len` bytes of the real-root path `path` start with a staging
 // point -- MOUNT_STAGING_DIR, a slash, and one more component -- the length

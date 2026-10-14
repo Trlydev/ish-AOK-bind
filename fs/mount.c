@@ -211,6 +211,8 @@ static int mount_new_id(void) {
 const char *mount_listed_point(const struct mount *mount) {
     if (mount->covered_by != 0 && mount->covered_point != NULL && !mount->lazy_umount)
         return mount->covered_point;
+    if (mount->stacked_point != NULL && !mount->detached && !mount->lazy_umount)
+        return mount->stacked_point;
     return mount->point;
 }
 
@@ -520,6 +522,8 @@ static void mount_destroy(struct mount *mount) {
     }
     free((void *) mount->covered_point);
     mount->covered_point = NULL;
+    free((void *) mount->stacked_point);
+    mount->stacked_point = NULL;
     if (mount->attached_point != NULL) {
         free((void *) mount->point);
         mount->point = mount->attached_point;
@@ -1356,6 +1360,16 @@ static int do_umount_flags(const char *point, bool lazy) {
     }
     if (!found)
         return _EINVAL;
+    // The new root after pivot_root(".", "."), with the old root still
+    // stacked over it: what an unmount of that point takes is the old root,
+    // the mount on top there on Linux (see struct mount's pivot_over).
+    struct mount *stacked;
+    list_for_each_entry(&mounts, stacked, mounts) {
+        if (stacked->pivot_over == mount->id && !stacked->detached && !stacked->lazy_umount) {
+            mount = stacked;
+            break;
+        }
+    }
     // Not by itself, to show what it covers; it goes with the tree it came
     // in when the mount above it is unmounted (Linux's MNT_LOCKED).
     if (mount->locked && guest_umount)
@@ -1963,7 +1977,13 @@ int mnt_ns_move_fs(struct fs_info *fs, struct mnt_namespace *from, struct mnt_na
 // point plus the path inside it. put_old may be new_root itself --
 // pivot_root(".", "."), the form that needs no directory for the old root --
 // and then the old root is stacked on top of the new one at "/", where the
-// umount2(".", MNT_DETACH) that always follows takes it off.
+// umount2(".", MNT_DETACH) that always follows takes it off. On Linux nothing
+// looks up through it meanwhile: the caller's "/" and "." are the new root,
+// with its own mounts in it. So here the old root's tree goes to a hidden
+// point in the new root, MOUNT_PIVOT_OLD plus the new root's ID, and is listed
+// at "/" (struct mount's stacked_point and pivot_over, kernel/fs.h); runc's
+// fchdir to an old-root descriptor, and its MS_SLAVE|MS_REC on ".", find it
+// there.
 //
 // The caller's root and working directory move to the new root where they
 // were the old one, as Linux's chroot_fs_refs does for it. (Linux does that
@@ -2046,10 +2066,17 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
         fd_close(root_fd);
         return _EINVAL;
     }
+    // Where the old root's tree goes: put_old below the new root, or for
+    // pivot_root(".", ".") the hidden point the stacked old root is kept at.
+    char hidden[64];
+    snprintf(hidden, sizeof(hidden), MOUNT_PIVOT_OLD "%d", new_mount->id);
+    bool stacked = old_below_new[0] == '\0';
+    const char *old_prefix = stacked ? hidden : old_below_new;
     struct mount **moved = calloc(count, sizeof(*moved));
     char **points = calloc(count, sizeof(*points));
+    char **listed = calloc(count, sizeof(*listed));
     bool *under_new = calloc(count, sizeof(*under_new));
-    err = moved == NULL || points == NULL || under_new == NULL ? _ENOMEM : 0;
+    err = moved == NULL || points == NULL || listed == NULL || under_new == NULL ? _ENOMEM : 0;
     // Tail to head, as in mnt_ns_copy: reinserting in this order keeps each
     // stack of mounts on one point in the order it was.
     size_t n = 0;
@@ -2060,23 +2087,38 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
         bool under = strncmp(mount->point, new_root, new_len) == 0 &&
             (mount->point[new_len] == '/' || mount->point[new_len] == '\0');
         const char *rest = under ? mount->point + new_len : mount->point + ns->root_len;
-        size_t len = ns->root_len + (under ? 0 : strlen(old_below_new)) + strlen(rest);
+        size_t len = ns->root_len + (under ? 0 : strlen(old_prefix)) + strlen(rest);
         char *point = len < MAX_PATH ? malloc(len + 1) : NULL;
         if (point == NULL) {
             err = len < MAX_PATH ? _ENOMEM : _ENAMETOOLONG;
             break;
         }
-        snprintf(point, len + 1, "%s%s%s", ns->root, under ? "" : old_below_new, rest);
+        snprintf(point, len + 1, "%s%s%s", ns->root, under ? "" : old_prefix, rest);
+        // (A stacked old root's mounts are listed where they are stacked.)
+        if (stacked && !under) {
+            size_t listed_len = ns->root_len + strlen(rest);
+            listed[n] = malloc(listed_len + 1);
+            if (listed[n] == NULL) {
+                free(point);
+                err = _ENOMEM;
+                break;
+            }
+            snprintf(listed[n], listed_len + 1, "%s%s", ns->root, rest);
+        }
         moved[n] = mount;
         points[n] = point;
         under_new[n] = under;
         n++;
     }
     if (err < 0) {
-        for (size_t i = 0; i < n; i++)
+        for (size_t i = 0; i < n; i++) {
             free(points[i]);
+            if (listed != NULL)
+                free(listed[i]);
+        }
         free(moved);
         free(points);
+        free(listed);
         free(under_new);
         unlock(&mounts_lock);
         fd_close(root_fd);
@@ -2096,21 +2138,12 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
         const char *was = mount->covered_point;
         bool under = strncmp(was, new_root, new_len) == 0 && (was[new_len] == '/' || was[new_len] == '\0');
         const char *rest = under ? was + new_len : was + ns->root_len;
-        size_t len = ns->root_len + (under ? 0 : strlen(old_below_new)) + strlen(rest);
+        size_t len = ns->root_len + (under ? 0 : strlen(old_prefix)) + strlen(rest);
         char *point = len < MAX_PATH ? malloc(len + 1) : NULL;
         if (point != NULL)
-            snprintf(point, len + 1, "%s%s%s", ns->root, under ? "" : old_below_new, rest);
+            snprintf(point, len + 1, "%s%s%s", ns->root, under ? "" : old_prefix, rest);
         free((void *) was);
         mount->covered_point = point;
-    }
-    // The old root, for the stacked form below: the mount on top at the
-    // namespace's root before anything moves.
-    struct mount *old_root_mount = NULL;
-    list_for_each_entry(&mounts, mount, mounts) {
-        if (mount_in_ns_locked(mount, ns) && mount->point_len == ns->root_len) {
-            old_root_mount = mount;
-            break;
-        }
     }
     char **old_points = calloc(n, sizeof(*old_points));
     for (size_t i = 0; i < n; i++)
@@ -2125,33 +2158,16 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
                 free((void *) moved[i]->point);
             moved[i]->point = points[i];
             moved[i]->point_len = strlen(points[i]);
+            if (listed[i] != NULL) {
+                free((void *) moved[i]->stacked_point);
+                moved[i]->stacked_point = listed[i];
+                listed[i] = NULL;
+                // The old root itself: stacked over the new one.
+                if (moved[i]->point_len == ns->root_len + strlen(hidden))
+                    moved[i]->pivot_over = new_mount->id;
+            }
             mount_list_insert(moved[i]);
             moved[i]->refcount++; // for mount_notify_relocated, below
-        }
-    }
-    // pivot_root(".", "."): the old root is mounted over the new one, so what
-    // is mounted in the new one is underneath it until the old root is
-    // unmounted -- which then leaves exactly the new root's tree. Without
-    // this that unmount, of the mount at "/" and all below it, took the new
-    // root's mounts with it.
-    if (old_below_new[0] == '\0' && old_root_mount != NULL) {
-        for (size_t i = 0; i < n; i++) {
-            if (!under_new[i] || moved[i]->point_len == ns->root_len || moved[i]->detached)
-                continue;
-            char staging[MAX_PATH];
-            mount_staging_point(staging, sizeof(staging));
-            char *parked = strdup(staging);
-            if (parked == NULL)
-                continue;
-            // (Its old point is told to its filesystem below; the point it
-            // was just given is the one it comes back to.)
-            moved[i]->covered_point = moved[i]->point;
-            moved[i]->covered_by = old_root_mount->id;
-            moved[i]->point = parked;
-            moved[i]->point_len = strlen(parked);
-            moved[i]->detached = true;
-            list_remove(&moved[i]->mounts);
-            mount_list_insert(moved[i]);
         }
     }
     // Where each is now, as its filesystem is to hear it: for one just
@@ -2176,6 +2192,9 @@ int mnt_ns_pivot_root(const char *new_root, const char *put_old) {
     free(old_points);
     free(moved);
     free(points);
+    for (size_t i = 0; i < n; i++)
+        free(listed[i]);
+    free(listed);
     free(under_new);
     proc_mountinfo_notify_changed();
 

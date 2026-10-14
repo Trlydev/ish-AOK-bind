@@ -26,6 +26,12 @@
 //                while the directory it is a bind of still takes them
 //   pivot_root   onto a tmpfs: its files are at /, the old root is under the
 //                directory named for it, and is gone after a lazy unmount
+//   pivot .      pivot_root(".", "."), the form that needs no directory for
+//                the old root: until umount2(".", MNT_DETACH), "/" and "."
+//                are the new root with its own mounts in view (the old root,
+//                stacked on top, is where no lookup goes), getcwd says "/",
+//                and then the unmount takes the old root and leaves the new
+//                one's tree
 //   move         MS_MOVE takes what is mounted in a mount along with it, and
 //                a mount cannot be moved into its own tree (ELOOP)
 //   covered      mountinfo lists a mount that another covers; a namespace
@@ -427,6 +433,37 @@ static void case_pivot_root(void) {
     CHECK(exists("/etc"), "pivot_root: the parent's own root changed");
 }
 
+static void case_pivot_dot(void) {
+    char newroot[128];
+    path_in(newroot, sizeof(newroot), "dotroot");
+    mkdir(newroot, 0755);
+    pid_t pid = fork();
+    if (pid == 0) {
+        char path[200], cwd[64];
+        CHILD_CHECK(unshare(CLONE_NEWNS) == 0, "unshare(CLONE_NEWNS) failed");
+        private_tree();
+        CHILD_CHECK(mount("mntns", newroot, "tmpfs", 0, NULL) == 0, "mount tmpfs for the new root failed");
+        snprintf(path, sizeof(path), "%s/marker", newroot);
+        CHILD_CHECK(touch(path) == 0, "cannot create a file in the new root");
+        snprintf(path, sizeof(path), "%s/sub", newroot);
+        CHILD_CHECK(mkdir(path, 0755) == 0 && mount("mntns", path, "tmpfs", 0, NULL) == 0, "mount in the new root failed");
+        snprintf(path, sizeof(path), "%s/sub/insub", newroot);
+        CHILD_CHECK(touch(path) == 0, "cannot create a file in the new root's mount");
+        CHILD_CHECK(chdir(newroot) == 0, "chdir to the new root failed");
+        CHILD_CHECK(syscall(SYS_pivot_root, ".", ".") == 0, "pivot_root(\".\", \".\") failed");
+        // Between the pivot and the unmount.
+        CHILD_CHECK(exists("/marker") && exists("./marker"), "after pivot_root(\".\", \".\") \"/\" or \".\" is not the new root");
+        CHILD_CHECK(exists("/sub/insub"), "the new root's own mount is not in view under it");
+        CHILD_CHECK(!exists("/etc") && !exists("/proc/self"), "the old root shows through at \"/\"");
+        CHILD_CHECK(getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/") == 0, "getcwd after the pivot says %s", getcwd(cwd, sizeof(cwd)) ? cwd : strerror(errno));
+        CHILD_CHECK(umount2(".", MNT_DETACH) == 0, "umount2(\".\", MNT_DETACH) failed");
+        CHILD_CHECK(exists("/marker") && exists("/sub/insub"), "the unmount took the new root's tree");
+        CHILD_CHECK(chdir("/") == 0 && exists("marker"), "chdir(\"/\") after the unmount is not the new root");
+        _exit(0);
+    }
+    wait_ok(pid, "pivot_root(\".\", \".\")");
+}
+
 static int write_file(const char *path, const char *text) {
     int fd = open(path, O_WRONLY);
     if (fd < 0)
@@ -483,6 +520,7 @@ int main(void) {
     case_setns();
     case_readonly_bind();
     case_pivot_root();
+    case_pivot_dot();
     case_move();
     case_covered();
 
