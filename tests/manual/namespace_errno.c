@@ -17,7 +17,8 @@
 // EPERM would satisfy both, but says "you may not" to a root caller who may,
 // so it is refused too.
 //
-// And /proc/self/ns/net exists exactly when a network namespace can be made:
+// And /proc/self/ns/<kind> exists exactly when that kind can be made (net is
+// the case that taught it; cgroup and time were listed without being there):
 // systemd's ns_type_supported() reads that file, and when it existed while
 // unshare(CLONE_NEWNET) failed, every PrivateNetwork=yes unit (hostnamed,
 // localed, shadow) failed at step NETWORK. A kernel built without network
@@ -94,12 +95,27 @@ int main(int argc, char **argv) {
         }
         test_logf("%s: clone %s, unshare %s\n", ns[i].name, describe(c), describe(u));
     }
-    bool has_netns_file = access("/proc/self/ns/net", F_OK) == 0;
-    bool can_unshare_net = try_unshare(CLONE_NEWNET) == 0;
-    if (has_netns_file != can_unshare_net) {
-        printf("FAIL: /proc/self/ns/net %s, but unshare(CLONE_NEWNET) %s\n",
-               has_netns_file ? "exists" : "is absent", can_unshare_net ? "succeeds" : "fails");
-        fails++;
+    // Each kind's file exists exactly when the kind can be made: what
+    // systemd's ns_type_supported() and bubblewrap's --unshare-cgroup-try
+    // read to decide whether to ask.
+    static const struct { int flag; const char *file; } files[] = {
+        {CLONE_NEWNET, "net"}, {CLONE_NEWCGROUP, "cgroup"}, {CLONE_NEWUTS, "uts"},
+        {CLONE_NEWIPC, "ipc"}, {CLONE_NEWNS, "mnt"}, {CLONE_NEWPID, "pid"},
+        {CLONE_NEWUSER, "user"},
+#ifdef CLONE_NEWTIME
+        {CLONE_NEWTIME, "time"},
+#endif
+    };
+    for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/ns/%s", files[i].file);
+        bool has_file = access(path, F_OK) == 0;
+        bool can_unshare = try_unshare(files[i].flag) == 0;
+        if (has_file != can_unshare) {
+            printf("FAIL: %s %s, but unshare of it %s\n", path,
+                   has_file ? "exists" : "is absent", can_unshare ? "succeeds" : "fails");
+            fails++;
+        }
     }
     printf("namespace_errno: %s\n", fails ? "FAIL" : "PASS");
     return fails != 0;

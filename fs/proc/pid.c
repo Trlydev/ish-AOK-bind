@@ -1992,15 +1992,20 @@ struct proc_ns_type {
 // listed and unshare(CLONE_NEWNET) was ENOSYS, systemd-hostnamed, -localed,
 // shadow and coredump all failed at step NETWORK. The two change together;
 // tests/manual/namespace_errno.c holds them to it.
+//
+// The same goes for every other kind: what is listed here can be made. So
+// there is no "cgroup" and no "time" (nor "time_for_children") -- AOK has
+// neither kind, and a kernel built without them has no file for them. While
+// they were listed, bubblewrap's --unshare-cgroup-try (and so --unshare-all)
+// read ns/cgroup as "supported", asked for CLONE_NEWCGROUP and stopped at
+// "Creating new namespace failed"; systemd's ProtectControlGroups=private
+// reads it the same way.
 static const struct proc_ns_type proc_ns_types[] = {
-    {"cgroup", 4026531835, CLONE_NEWCGROUP_},
     {"ipc", 4026531839, CLONE_NEWIPC_},
     {"mnt", 4026531840, CLONE_NEWNS_},
     {"net", 4026531992, CLONE_NEWNET_},
     {"pid", 4026531836, CLONE_NEWPID_},
     {"pid_for_children", 4026531836, CLONE_NEWPID_},
-    {"time", 4026531834, CLONE_NEWTIME_},
-    {"time_for_children", 4026531834, CLONE_NEWTIME_},
     {"user", 4026531837, CLONE_NEWUSER_},
     {"uts", 4026531838, CLONE_NEWUTS_},
 };
