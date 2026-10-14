@@ -134,6 +134,7 @@ mntns_basic.c
 mount_propagation.c
 mount_cover_setattr.c
 userns_basic.c
+userns_nproc.c
 pidns_basic.c
 setns_sandbox.c
 netns_basic.c

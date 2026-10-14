@@ -753,12 +753,16 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
     // not count against it -- Linux charges the limit in copy_process, which
     // CLONE_THREAD reaches too, but the count it compares against is of
     // processes; keeping threads out of both sides is the same answer with
-    // less bookkeeping. root is exempt, as there.
+    // less bookkeeping. root is exempt, as there: real uid 0 (INIT_USER),
+    // or the capability in the initial user namespace.
+    //
+    // Counted per user namespace and charged at every level above, as Linux's
+    // ucounts do (task_nproc_exceeded): a namespace's processes count against
+    // its owner's limit outside, as that limit was when it was made.
     if (!(flags & CLONE_THREAD_)) {
-        rlim_t_ nproc = rlimit(RLIMIT_NPROC_);
-        if (nproc != RLIM_INFINITY_ && !current_capable(CAP_SYS_RESOURCE_) &&
+        if (current->uid != 0 && !current_capable(CAP_SYS_RESOURCE_) &&
                 !current_capable(CAP_SYS_ADMIN_) &&
-                task_count_for_uid(current->uid) >= nproc)
+                task_nproc_exceeded(current, rlimit(RLIMIT_NPROC_)))
             return _EAGAIN;
     }
 

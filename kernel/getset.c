@@ -208,6 +208,7 @@ struct user_namespace *user_ns_new(void) {
     ns->level = parent != NULL ? parent->level + 1 : 1;
     ns->owner = current->euid;
     ns->group = current->egid;
+    ns->nproc_max = current->uid == 0 && parent == NULL ? RLIM_INFINITY_ : rlimit(RLIMIT_NPROC_);
     // setgroups, once denied, is denied in every namespace made below.
     if (parent != NULL) {
         lock(&parent->lock, 0);

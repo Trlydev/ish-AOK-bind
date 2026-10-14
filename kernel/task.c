@@ -593,6 +593,65 @@ dword_t task_count_for_uid(uid_t_ uid) {
     return count;
 }
 
+// Would one more process for `task` take some user past RLIMIT_NPROC? Linux
+// counts processes per (user namespace, real uid), and charges each one at
+// every level up to the initial namespace: in its own namespace under its own
+// uid, and in each namespace above under the owner of the namespace below it
+// (inc_rlimit_ucounts). The limit at the first level is the task's own soft
+// limit; at each one above, the one the namespace below was made with
+// (user_namespace.nproc_max) -- so raising the soft limit inside a namespace
+// buys nothing past what its creator had (is_rlimit_overlimit). Processes,
+// not threads, as everywhere here.
+bool task_nproc_exceeded(struct task *task, rlim_t_ soft) {
+    struct user_namespace *chain_ns[USER_NS_MAX_LEVEL + 2];
+    uid_t_ chain_uid[USER_NS_MAX_LEVEL + 2];
+    rlim_t_ chain_max[USER_NS_MAX_LEVEL + 2];
+    dword_t count[USER_NS_MAX_LEVEL + 2] = {0};
+    int levels = 0;
+    struct user_namespace *ns = task->user_ns;
+    uid_t_ uid = task->uid;
+    rlim_t_ max = soft;
+    for (;;) {
+        chain_ns[levels] = ns;
+        chain_uid[levels] = uid;
+        chain_max[levels] = max;
+        levels++;
+        if (ns == NULL || levels == USER_NS_MAX_LEVEL + 2)
+            break;
+        uid = ns->owner;
+        max = ns->nproc_max;
+        ns = ns->parent;
+    }
+    bool limited = false;
+    for (int i = 0; i < levels; i++)
+        limited |= chain_max[i] != RLIM_INFINITY_;
+    if (!limited)
+        return false;
+    complex_lockt(&pids_lock, 0);
+    for (dword_t id = 1; id < MAX_PID; id++) {
+        struct task *other = pid_get_task_global(id);
+        if (other == NULL || other->pid != other->tgid)
+            continue;
+        // Up its chain, against ours.
+        struct user_namespace *at = other->user_ns;
+        uid_t_ as = other->uid;
+        for (int depth = 0; depth < USER_NS_MAX_LEVEL + 2; depth++) {
+            for (int i = 0; i < levels; i++)
+                if (chain_ns[i] == at && chain_uid[i] == as)
+                    count[i]++;
+            if (at == NULL)
+                break;
+            as = at->owner;
+            at = at->parent;
+        }
+    }
+    unlock(&pids_lock);
+    for (int i = 0; i < levels; i++)
+        if (chain_max[i] != RLIM_INFINITY_ && count[i] >= chain_max[i])
+            return true;
+    return false;
+}
+
 dword_t get_count_of_blocked_tasks(void) {
     // task_ref_cnt_mod(current, 1);  // Not needed?
     dword_t res = 0;

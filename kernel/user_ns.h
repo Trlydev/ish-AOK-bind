@@ -75,6 +75,11 @@ struct user_namespace {
     lock_t lock;
     struct id_map uid_map, gid_map;
     bool setgroups_denied;          // /proc/<pid>/setgroups; guarded by lock
+    // RLIMIT_NPROC for everything made in here, counted against its owner
+    // one level up: the creator's soft limit when it made the namespace, or
+    // none for root of the initial one (Linux's ucount_max[UCOUNT_RLIMIT_NPROC],
+    // enforced_nproc_rlimit). See task_nproc_exceeded.
+    qword_t nproc_max;              // (an rlim_t_)
 };
 
 // NULL-is-initial pointers throughout: retain and release accept NULL.

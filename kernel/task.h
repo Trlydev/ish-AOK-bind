@@ -1135,6 +1135,9 @@ dword_t get_count_of_blocked_tasks(void);
 // Live processes (thread group leaders) owned by one real uid, for
 // RLIMIT_NPROC.
 dword_t task_count_for_uid(uid_t_ uid);
+// Would one more process for `task`, whose own soft RLIMIT_NPROC is `soft`,
+// be over the limit at any level of its user namespaces? kernel/task.c.
+bool task_nproc_exceeded(struct task *task, rlim_t_ soft);
 // Count one minor fault against the running task, if there is one. Called from
 // the emulator's fault paths, which can also run with no current task.
 static inline void task_count_minflt(void) {
