@@ -1380,7 +1380,12 @@ that tree's `dev/__properties__`.
    `Thread::run()`'s `mHoldSelf` should both still hold it. The trace can
    answer it as it stands -- `incStrong`/`decStrong` are LSE LDADD, which
    resolve through `tlb_write_ptr_slow` and so are recorded; an earlier version
-   of this list said the opposite and was wrong. Watch the `weakref_impl`,
+   of this list said the opposite and was wrong. (Since the October 2026
+   upstream sync the C helpers this document names -- `arm64_lse_rmw`,
+   `arm64_cas`, `arm64_vldst_*` -- are gone: atomics are inline gadgets that
+   resolve through `a64_atomic_wptr`, which takes `tlb_write_ptr_slow` whenever
+   the trace is armed, so they are still recorded, with their ip. The trace
+   itself now lives in `emu/arm64_watch.c`.) Watch the `weakref_impl`,
    whose address is the `old=` value on the destructor's record, and read the
    `mStrong`/`mWeak` traffic against it. Confirm the mechanism actually ran
    before believing the result -- the HLE lesson, and this bug has now punished

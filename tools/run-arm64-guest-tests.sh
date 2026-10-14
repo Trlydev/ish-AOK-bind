@@ -258,14 +258,34 @@ for test_name in "${TESTS[@]}"; do
         continue
     fi
     out=$ROOTFS/$test_name
+    # Some tests deliberately execute CONSTRAINED UNPREDICTABLE encodings
+    # (ldst_lspec's `str x17, [x17, #8]!`: writeback base also the source) to
+    # pin what the emulator does with them. LLVM's assembler refuses those
+    # outright; GNU as only warns. So a test whose compile fails on exactly that
+    # is compiled to assembly by clang and assembled by aarch64-linux-gnu-as,
+    # and linked as usual.
+    obj=$src
+    if ! clang --target=aarch64-linux-musl -O2 -std=gnu11 -c \
+            -I"$SRC/tests/manual" -nostdlibinc -isystem "$SYSROOT/usr/include" \
+            -o "$WORK/$test_name.o" "$src" 2>"$WORK/$test_name.cc.log" &&
+            grep -q 'unpredictable' "$WORK/$test_name.cc.log" &&
+            command -v aarch64-linux-gnu-as >/dev/null 2>&1; then
+        if clang --target=aarch64-linux-musl -O2 -std=gnu11 -S \
+                -I"$SRC/tests/manual" -nostdlibinc -isystem "$SYSROOT/usr/include" \
+                -o "$WORK/$test_name.s" "$src" 2>>"$WORK/$test_name.cc.log" &&
+                aarch64-linux-gnu-as -o "$WORK/$test_name.o" "$WORK/$test_name.s" \
+                    2>>"$WORK/$test_name.cc.log"; then
+            obj=$WORK/$test_name.o
+        fi
+    fi
     if ! clang --target=aarch64-linux-musl -fuse-ld=lld -O2 -std=gnu11 \
             -I"$SRC/tests/manual" -nostdlibinc -isystem "$SYSROOT/usr/include" \
             -nostdlib -pie -Wl,-dynamic-linker,/lib/ld-musl-aarch64.so.1 \
             "$SYSROOT/usr/lib/Scrt1.o" "$SYSROOT/usr/lib/crti.o" \
-            -o "$out" "$src" \
+            -o "$out" "$obj" \
             "$SHIM_OBJ" \
             -L"$SYSROOT/usr/lib" -lc ${LIBGCC:+"$LIBGCC"} \
-            "$SYSROOT/usr/lib/crtn.o" 2>"$WORK/$test_name.cc.log"; then
+            "$SYSROOT/usr/lib/crtn.o" 2>>"$WORK/$test_name.cc.log"; then
         echo "FAIL $test_name (did not compile)"
         head -10 "$WORK/$test_name.cc.log" >&2
         fail=1

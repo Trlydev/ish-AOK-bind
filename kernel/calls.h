@@ -708,12 +708,19 @@ struct tgroup;
 struct ipc_namespace;
 void sysv_sem_exit(struct ipc_namespace *ns, struct tgroup *group);
 
-// Which registers an arm64 page fault dumps guest memory around, as a comma
-// separated list of register numbers ("19,20"). Backs /proc/ish/arm64_faultdump
-// so it can be set from a guest shell -- the ISH_ARM64_FAULT_MEMDUMP
-// environment variable it also reads is unreachable on iOS. Empty = off.
+// ish-AOK-bind: kernel/arm64_fault.c, called from kernel/calls.c's fault path.
+// arm64_faultdump_*: which registers an arm64 page fault dumps guest memory
+// around ("19,20"), backing /proc/ish/arm64_faultdump -- the
+// ISH_ARM64_FAULT_MEMDUMP environment variable is unreachable on iOS.
+struct cpu_state;
 void arm64_faultdump_set(const char *spec);
 void arm64_faultdump_show(char *out, size_t size);
+void arm64_faultdump_get(char *out, size_t size);
+guest_addr_t fork_fault_untag(struct cpu_state *cpu, guest_addr_t ip);
+bool fork_fault_spinning(struct cpu_state *cpu, guest_addr_t ip);
+void fork_arm64_fault_report(struct cpu_state *cpu, guest_addr_t fault_addr, bool looping, void *resolved);
+void fork_arm64_fault_detail(char *out, size_t size, const char *opcode, const struct cpu_state *cpu);
+void fork_note_interrupt(int interrupt);
 
 // Syscall dispatch is selected from current->abi. The i386 path is live today;
 // amd64 keeps a separate bring-up path because it needs different syscall

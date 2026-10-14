@@ -608,6 +608,12 @@ if jit_cpu_family == 'aarch64' and guest_archs.contains('riscv64')
     ]
 endif
 
+# ish-AOK-bind: this fork's emulator-side sources (see the src block below).
+emu_src += [
+    'emu/arm64_watch.c', # the arm64 store trace, /proc/ish/arm64_watch
+    'emu/tbi_probe.c',   # names whoever hands the TLB a tagged address
+]
+
 libish_emu = library('ish_emu', emu_src, include_directories: includes)
 
 libfakefs = library('fakefs',
@@ -674,11 +680,6 @@ src = [
     'kernel/sysvmsg.c',
     'kernel/sysvsem.c',
     'kernel/memfd.c',
-    'kernel/binder.c',
-    'kernel/ashmem.c',
-    'kernel/dma_heap.c',
-    'kernel/property_area.c',
-    'kernel/logd_sink.c',
     'kernel/ptrace.c',
 
     'kernel/fs.c',
@@ -710,8 +711,6 @@ src = [
     'fs/proc/pid.c',
 
     'fs/dyndev.c',
-    'fs/binderfs.c',
-    'fs/selinuxfs.c',
 
     'fs/adhoc.c',
     'fs/sock.c',
@@ -746,6 +745,27 @@ src = [
     'platform/standalone.c',
 
     'platform/' + host_machine.system() + '.c',
+]
+
+# ish-AOK-bind: this fork's own sources, in one block rather than threaded
+# through upstream's list above, so that upstream adding a file there and this
+# fork adding one here never touch the same lines. See docs/fork-maintenance.md.
+src += [
+    # Android: binder (+ binderfs), ashmem, DMA-BUF heaps, system properties,
+    # the logd sink, and the permissive SELinux stub.
+    'kernel/binder.c',
+    'kernel/ashmem.c',
+    'kernel/dma_heap.c',
+    'kernel/property_area.c',
+    'kernel/logd_sink.c',
+    'fs/binderfs.c',
+    'fs/selinuxfs.c',
+    # arm64 page-fault handling and diagnostics, out of kernel/calls.c.
+    'kernel/arm64_fault.c',
+    # /proc/ish entries, spliced into fs/proc/ish.c's table by one line.
+    'fs/proc/ish_fork.c',
+    # /proc/<pid>/attr (SELinux), hooked into fs/proc/pid.c by two lines.
+    'fs/proc/pid_attr.c',
 ]
 
 # SmallCLUE, compiled in as HOST code so its applets run without being

@@ -107,8 +107,8 @@ need_file kernel/property_area.h
 need_file tests/manual/property_area.c
 need_in app/AppDelegate.m property_area_create "builds /dev/__properties__ at boot"
 need_in xX_main_Xx.h      property_area_create "builds /dev/__properties__ at boot (CLI)"
-need_in fs/proc/ish.c     property_area_show   "/proc/ish/property_area, the chroot's only way in"
-need_in fs/proc/ish.c     property_area_update
+need_in fs/proc/ish_fork.h property_area_show   "/proc/ish/property_area, the chroot's only way in"
+need_in fs/proc/ish_fork.h property_area_update
 need_in meson.build       kernel/property_area.c
 
 # --- arm64 guest: tagged pointers -----------------------------------------
@@ -121,7 +121,7 @@ need_in kernel/user.c  guest_abi_untag_addr "syscall pointers are untagged"
 need_in emu/arm64_interp.c guest_abi_untag_addr "interpreter loads/stores are untagged"
 need_in fs/aok-tests.manifest             arm64/tagged_pointer.c
 need_in tests/manual/setup-regressions.sh tagged_pointer
-need_in kernel/calls.c guest_abi_untag_addr \
+need_in kernel/arm64_fault.c guest_abi_untag_addr \
     "the fault handler resolves arm64 faults untagged, as Linux's do_page_fault does"
 # The last and worst of the TBI leaks, and the one nothing else would catch:
 # jit/hle.c runs whole libc calls natively in C with pointers taken straight
@@ -132,14 +132,14 @@ need_in kernel/calls.c guest_abi_untag_addr \
 need_in jit/hle.c    guest_abi_untag_addr "HLE untags the guest pointer arguments"
 need_in jit/hle.c    hle_fn_returns_pointer \
     "and puts the tag back on pointer-valued results, as hardware does"
-need_in emu/tlb.c    guest_abi_untag_addr \
+need_in emu/fork_hooks.h guest_abi_untag_addr \
     "the arm64 C memory helpers that bypass the prep macros untag on entry"
-need_in kernel/calls.c SAME_FAULT_LIMIT \
+need_in kernel/arm64_fault.c SAME_FAULT_LIMIT \
     "a fault that resolves and re-faults is delivered, not spun on forever"
 # The tripwires that found the HLE leak, kept for the next one. They are the
 # difference between "a tagged address got in somewhere" and a week of
 # bisecting: they name the calling helper in the log the first time it happens.
-need_in emu/tlb.c    tlb_note_tagged_miss \
+need_in emu/tbi_probe.c tlb_note_tagged_miss \
     "the TBI tripwire that names whoever hands the TLB a tagged address"
 
 # The arm64 gadgets themselves. Upstream has no TBI handling at all, so every
@@ -175,6 +175,32 @@ need_in README.md "<!-- ish-AOK-bind: this fork's block" \
     "the fork's README block, under the title"
 need_in tests/manual/setup-regressions.sh "# ish-AOK-bind: this fork's tests" \
     "the fork's test list block"
+
+# --- The hooks: where this fork's own files meet upstream's -----------------
+# Most of this fork's code lives in files upstream does not have, reached from
+# upstream's files by a line or two each, so that a sync merges around those
+# lines instead of around hundreds (docs/fork-maintenance.md). A sync that
+# drops a hook drops the whole feature behind it and still builds -- the
+# moved files simply stop being called -- so each hook is checked here, and
+# so is the fork's block in meson.build that compiles them.
+need_in meson.build "# ish-AOK-bind: this fork's own sources" "the fork's src block"
+for f in kernel/arm64_fault.c fs/proc/ish_fork.c fs/proc/pid_attr.c \
+         emu/arm64_watch.c emu/tbi_probe.c; do
+    need_file "$f"
+    need_in meson.build "'$f'" "compiled by the fork's meson block"
+done
+need_in emu/tlb.c        '#include "emu/fork_hooks.h"' "tlb.c reaches the trace and the tripwire"
+need_count emu/tlb.c     "fork_tbi_untag(addr)" 3 "casp, ldxp and stxp untag on entry"
+need_in emu/tlb.c        "FORK_TBI_NOTE_MISS(addr, type, ptr)" "tlb_handle_miss calls the tripwire"
+need_in emu/tlb.c        "arm64_watch_record(tlb, addr, ptr)" "tlb_write_ptr_slow records into the trace"
+need_in kernel/calls.c   "fork_fault_untag(cpu" "the fault path resolves untagged"
+need_in kernel/calls.c   "fork_fault_spinning(cpu" "the fault path has the re-fault guard"
+need_in kernel/calls.c   "fork_arm64_fault_report(cpu" "the fault report has the TBI verdict and panel"
+need_in kernel/calls.c   "fork_arm64_fault_detail(detail" "the fault record has the arm64 registers"
+need_in kernel/calls.c   "fork_note_interrupt(interrupt)" "the guard's syscall count is kept"
+need_in kernel/calls.c   "mem_segv_reason(current->mem, fault_addr)" "si_code from the untagged address"
+need_in fs/proc/ish.c    "FORK_PROC_ISH_ENTRIES" "the fork's /proc/ish entries are in the table"
+need_in fs/proc/pid.c    "proc_pid_attr_init()" "/proc/<pid>/attr files find their directory"
 
 # --- arm64 guest: testable without a device ---------------------------------
 # The arm64 engine is aarch64-host-only, so on an x86_64 dev box every gadget
@@ -234,9 +260,9 @@ need_in tools/run-arm64-guest-tests.sh "ISH_HLE=1" \
 # environment, which no phone can set, so it was dev-machine-only.
 need_in kernel/calls.c "lr-backing" \
     "an arm64 fault names the caller, not just the faulting helper"
-need_in kernel/calls.c arm64_faultdump_set \
+need_in kernel/arm64_fault.c arm64_faultdump_set \
     "the fault memdump is settable at runtime, not only from the environment"
-need_in fs/proc/ish.c  arm64_faultdump \
+need_in fs/proc/ish_fork.h arm64_faultdump \
     "and is exposed at /proc/ish/arm64_faultdump"
 # "the page is there" is the emulator's conclusion; this prints what it is
 # actually looking at. amd64 always had it, arm64 never did.
@@ -244,20 +270,20 @@ need_in kernel/calls.c "dump_fault_pt_state(cpu->segfault_addr)" \
     "an arm64 fault prints the faulting page's table state"
 # The whole differential in one reproduction, printed on EVERY retry, rather
 # than one hypothesis per device round -- six were killed serially that way.
-need_in kernel/calls.c dump_arm64_fault_panel \
+need_in kernel/arm64_fault.c dump_arm64_fault_panel \
     "the arm64 re-fault loop prints the full page/config panel per retry"
 # The store trace, reachable from a phone. Its lo16/val filters key on things
 # that do not survive a re-run under ASLR, so "all" (record every store, dump
 # the last N on a fault) is the mode that answers "did THIS store happen".
-need_in emu/tlb.c arm64_watch_configure \
+need_in emu/arm64_watch.c arm64_watch_configure \
     "the store watchpoint is settable at runtime, not only from the environment"
-need_in fs/proc/ish.c arm64_watch \
+need_in fs/proc/ish_fork.h arm64_watch \
     "and is exposed at /proc/ish/arm64_watch"
 # The ring is shared by every guest thread in every process, so a global window
 # of N is not N stores of the crashing task's history -- a second process
 # storing in the background empties it. The whole point of the trace is reading
 # meaning into an ABSENT record, so the dump is scoped to the faulting task.
-need_in emu/tlb.c arm64_watch_dump_global \
+need_in emu/arm64_watch.c arm64_watch_dump_global \
     "the store trace's fault dump is scoped to the faulting task by default"
 
 # --- permissive SELinux stub ----------------------------------------------
@@ -304,7 +330,7 @@ need_in kernel/binder.c "off % 4 != 0" \
     "parcel object offsets are validated at 4-byte alignment, as Linux does"
 need_in tests/manual/binder_ipc.c align4_client_handler \
     "the phase that replays libbinder's checkService reply byte for byte"
-need_in fs/proc/ish.c   binder_show_state "state dump wired into /proc/ish"
+need_in fs/proc/ish_fork.h binder_show_state "state dump wired into /proc/ish"
 
 # --- writable /dev/kmsg ---------------------------------------------------
 # The premise here has changed and the note is worth keeping. Upstream's
@@ -321,7 +347,7 @@ need_in fs/proc/ish.c   binder_show_state "state dump wired into /proc/ish"
 # this fork's, and the only reason Android's logd output reaches dmesg at all --
 # is now its one caller.
 need_file tests/manual/kmsg.c
-need_in kernel/log.c ish_log_write_record "the logd sink's path into the log"
+need_in kernel/logd_sink.c ish_log_write_record "the logd sink's path into the log"
 need_in kernel/log.h ish_log_write_record
 need_in kernel/logd_sink.c ish_log_write_record \
     "the sink still writes records rather than being cut adrift"
@@ -359,7 +385,7 @@ need_file tests/manual/logd_sink.c
 need_in meson.build       kernel/logd_sink.c
 need_in app/AppDelegate.m logd_sink_start "starts the logd sink at boot"
 need_in xX_main_Xx.h      logd_sink_start "starts the logd sink at boot (CLI)"
-need_in fs/proc/ish.c     logd_sink_show  "/proc/ish/logd, which says whether the sink is up"
+need_in fs/proc/ish_fork.h logd_sink_show  "/proc/ish/logd, which says whether the sink is up"
 need_in fs/sock.c  unix_socket_host_path_for \
     "the host path behind a guest socket name, with the inode reference held"
 need_in fs/sock.c  unix_dgram_strip_cred \
@@ -419,7 +445,7 @@ need_in opt/AOK/tools/ish-remote.sh resume_from \
 # core do" is a runtime question. Losing this turns every ISA decision back
 # into a guess made at compile time for the oldest device.
 need_in kernel/hostinfo.h host_cpu_features "the runtime ARM feature query"
-need_in fs/proc/ish.c     cpu_features      "/proc/ish/cpu_features"
+need_in fs/proc/ish_fork.h cpu_features      "/proc/ish/cpu_features"
 need_in meson_options.txt ldapr             "the FEAT_LRCPC dispatch variant"
 
 # --- the arm64 harness's native-bash exclusion -----------------------------
