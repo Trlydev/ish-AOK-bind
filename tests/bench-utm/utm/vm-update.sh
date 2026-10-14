@@ -16,7 +16,9 @@ set -e
 base=${AOK_UPDATE_URL:-https://raw.githubusercontent.com/emkey1/ish-AOK/working}
 # The distribution's own provisioning script: Alpine's or Devuan's.
 os=devuan; [ -f /etc/alpine-release ] && os=alpine
-tools="start-wayland.sh setup-wayland.sh provision-ultimate-$os.sh setup-games.sh aok-sdl-game"
+# (setup-wayland.sh names setup-wayland-extras.sh, setup-xfce.sh and setup-wayfire.sh as what comes next)
+tools="start-wayland.sh setup-wayland.sh setup-wayland-extras.sh setup-xfce.sh setup-wayfire.sh select-desktop.sh
+       provision-ultimate-$os.sh setup-games.sh aok-sdl-game"
 t=$(mktemp -d)
 trap 'rm -rf "${t:?}"' EXIT
 for f in $tools vm-update.sh; do

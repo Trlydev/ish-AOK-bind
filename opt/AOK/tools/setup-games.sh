@@ -206,7 +206,13 @@ fi
 # ---- install --------------------------------------------------------------
 
 [ "$(id -u)" = 0 ] || die "must run as root:  sudo sh $0"
-command -v apt-get >/dev/null 2>&1 || die "only Devuan/Debian (apt) roots are supported so far"
+if ! command -v apt-get >/dev/null 2>&1; then
+    # Alpine and Arch package none of these but ScummVM and Freedoom's data; the
+    # card, board and puzzle games are another script's, and that one is theirs too.
+    die "these SDL games are packaged for Devuan/Debian (apt) only.
+  For card, board and puzzle games (solitaire, Mines, Chess, Sudoku, NetHack):
+    sudo sh /AOK/tools/setup-wayland-extras.sh games"
+fi
 [ -r "$WRAPPER_SRC" ] || die "$WRAPPER_SRC is missing -- update the app"
 
 if [ "$GL_CHOICE" = auto ]; then
