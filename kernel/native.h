@@ -114,6 +114,7 @@ const struct native_program *native_program_lookup(const char *name);
 // The native program this task is RUNNING, or NULL. Set when the program is
 // dispatched and cleared when it ends; kernel/checkpoint.c asks so it can find
 // the ckpt_dump above without re-deriving the program from argv[0].
+struct task;
 const struct native_program *native_program_running(struct task *task);
 
 // Enumerating what this build actually has, so /AOK/native (fs/aok.c) is served
