@@ -270,7 +270,7 @@ for test_name in "${TESTS[@]}"; do
             -o "$WORK/$test_name.o" "$src" 2>"$WORK/$test_name.cc.log" &&
             grep -q 'unpredictable' "$WORK/$test_name.cc.log" &&
             command -v aarch64-linux-gnu-as >/dev/null 2>&1; then
-        if clang --target=aarch64-linux-musl -O2 -std=gnu11 -S \
+        if clang --target=aarch64-linux-musl -O2 -std=gnu11 -S -fno-integrated-as \
                 -I"$SRC/tests/manual" -nostdlibinc -isystem "$SYSROOT/usr/include" \
                 -o "$WORK/$test_name.s" "$src" 2>>"$WORK/$test_name.cc.log" &&
                 aarch64-linux-gnu-as -o "$WORK/$test_name.o" "$WORK/$test_name.s" \
