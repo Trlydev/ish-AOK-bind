@@ -3793,12 +3793,6 @@ static int nlibc_family_to_guest(int host_family) {
             return nlibc_families[i].guest;
     return -1;
 }
-static int nlibc_family_to_host(int guest_family) {
-    for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_families); i++)
-        if (nlibc_families[i].guest == guest_family)
-            return nlibc_families[i].host;
-    return -1;
-}
 
 // SOCK_STREAM/DGRAM/RAW/SEQPACKET are 1/2/3/5 on both sides; only the two
 // flags ORed into the type differ.
