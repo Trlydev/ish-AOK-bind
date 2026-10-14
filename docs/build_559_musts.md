@@ -22,6 +22,32 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
 which share their measuring kit, then 6.
 
+**Release pass, 2026-10-14.**
+
+- *Decided (maintainer):* §4 ships as it is, a setting off by default.
+  External display (#540) is deferred again. Veth ends in the initial
+  namespace, forwarding and bridges are not in 559 -- creating such a link
+  is EOPNOTSUPP, and namespaces.md says what a private network reaches.
+- *Proposed, awaiting the maintainer:* §5 frozen at what has landed, its
+  four next steps to 560.
+- *Done:* Linux CI compiles again (256e1a363, `IFF_*` since a541ea3aa);
+  #643's Chinese "Build" (5d8bd130c); both Dependabot alerts (1824adf1e);
+  the four bot PRs, translated (e459ac19f); README, /AOK/docs, the book's
+  chapters and appendices (c08a10e04, 98581a4c0, de094082b).
+- *Suite, MBP5, 5d8bd130c:* five roots, 380-469 passes each, two failures
+  on every root -- uts_namespace and sysfs_dev_ns still required the
+  ns/cgroup and ns/time files efc529ba7 rightly removed. Tests fixed
+  (a03718b23); to run again on the candidate, with e2e and the device legs.
+- *Organizer, downloaded 2026-10-14:* two 558 signatures. The helix tokio
+  abort is "Done beside the musts". The other is RUNNINGBOARD 0xdead10cc on
+  an iPad17,4 (2026-10-12), a guest thread inside `fakefs_inode_orphaned`'s
+  transaction and the main thread idle -- 558 had no §2 fix, so likely that,
+  but the log does not show §2's moment (the main thread taking an
+  assertion). Watch for it on 559. TestFlight feedback: nothing after 556.
+- *Issues to close on release, each answered "fixed in 559":* #577, #616,
+  #620 (the two games), #625, #628, #631 (the misleading error), #639, #640,
+  #643.
+
 ---
 
 ## 1. Vector registers held across a call that can reach C
