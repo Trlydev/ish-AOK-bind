@@ -2150,9 +2150,10 @@ static ssize_t proc_ns_read(struct fd *UNUSED(fd), void *UNUSED(buf), size_t UNU
 // namespaces by owner. Answering ENOTTY made it give up with "Unsupported
 // ioctl NS_GET_USERNS" and print nothing at all.
 //
-// Every answer below is what Devuan gives for the INITIAL namespaces, which
-// is the situation AOK is permanently in -- one namespace of each kind, owned
-// by root, with no parent anybody may look at. Measured, not assumed:
+// For the INITIAL namespaces every answer below is what Devuan gives -- owned
+// by root, with no parent anybody may look at. A user or pid namespace made
+// since then answers for itself: its own owner, and its parent when the
+// caller may see it. Measured, not assumed:
 //
 //   NS_GET_USERNS     an fd for the owning user namespace; EPERM when asked
 //                     of a user namespace that is its own owner
