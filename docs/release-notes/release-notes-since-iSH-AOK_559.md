@@ -1,6 +1,6 @@
 # Release Notes Since `builds/iSH-AOK_558`
 
-173 commits. This build brings sandboxes to the guest: user, mount, pid and
+177 commits. This build brings sandboxes to the guest: user, mount, pid and
 network namespaces, so bubblewrap, `unshare` and Codex CLI's command sandbox
 start and confine. The arm64 and riscv64 guests run fused pairs of
 instructions as one gadget and are 10-45% faster than 558, and a new setting
@@ -226,12 +226,27 @@ them, so bubblewrap and systemd do not ask.
 
 ## Testing
 
-The full regression suite on the five release roots (Alpine 3.24 i386,
-amd64, arm64 and riscv64, and Devuan 6 arm64 with glibc) on an M5 Mac:
-380-469 passes per root. The one failure on every root was two tests that
-still expected the `/proc/<pid>/ns/cgroup` and `ns/time` files this build
-deliberately removed; they are corrected. Namespace and FUSE tests were
-checked against Linux 6.12 as an unprivileged user first.
+The full regression suite on the five release roots -- Alpine 3.24 i386,
+amd64, arm64 and riscv64, and Devuan 6 arm64 with glibc -- on this build:
+
+| root | M5 Mac | M4 iPad |
+|---|---|---|
+| i386 | 451 passed | 456 passed |
+| amd64 | 471 passed | 476 passed |
+| arm64 (musl) | 390 passed | 395 passed |
+| riscv64 | 382 passed | 387 passed |
+| arm64 (Devuan, glibc) | 390 passed | 395 passed |
+
+No failures on either host. On the iPad each root was booted as the
+running root, not reached through a chroot. The e2e suite passed 7 of 7
+from a freshly built test filesystem. The x86 guests run more tests than
+the others because of their instruction-set tests (153, against 28 for
+arm64 and 17 for riscv64). Namespace and FUSE tests were checked against
+Linux 6.12 as an unprivileged user first.
+
+The pass's own first suite run found two tests that still expected the
+`/proc/<pid>/ns/cgroup` and `ns/time` files this build deliberately removed;
+they were corrected.
 
 ## Known issues
 
