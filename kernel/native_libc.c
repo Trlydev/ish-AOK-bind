@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
