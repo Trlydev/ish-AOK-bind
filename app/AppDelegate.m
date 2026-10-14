@@ -4339,11 +4339,12 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                    withIntermediateDirectories:YES
                                                     attributes:nil
                                                          error:&documentsError]) {
-            // Same single-host-owner-shared-by-every-guest-uid situation as
-            // /AOK/persist above, and more acutely so: everything the user
-            // drops in from the Files app lands with host-default modes that
-            // no guest uid can write.
-            FixSharedDirectoryPermissions(documentsURL.fileSystemRepresentation);
+            // Everything the user drops in from the Files app is owned by the
+            // app's one host uid. MOUNT_ISH_SHARED_ is what makes that usable
+            // by every guest user: realfs reports a shared mount's files as
+            // owned by whoever asks (upstream be1444d), the same model as
+            // /AOK/persist. This used to chmod the whole tree 0666/0777 at
+            // every launch instead, which undid any chmod a guest made.
             // Bundled roots ship /mnt, but don't assume it.
             generic_mkdirat(AT_PWD, "/mnt", 0755);
             generic_mkdirat(AT_PWD, "/mnt/iphone", 0755);
