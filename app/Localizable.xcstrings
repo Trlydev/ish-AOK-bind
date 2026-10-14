@@ -2462,13 +2462,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@（由其他版本保存，无法恢复）"
+            "value" : "%@（由其他构建保存，无法恢复）"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%@（由其他版本儲存，無法恢復）"
+            "value" : "%@（由其他建置儲存，無法恢復）"
           }
         }
       }
@@ -40130,13 +40130,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "iSH-AOK %1$@（版本 %2$@）"
+            "value" : "iSH-AOK %1$@（构建 %2$@）"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "iSH-AOK %1$@（版本 %2$@）"
+            "value" : "iSH-AOK %1$@（建置 %2$@）"
           }
         }
       }

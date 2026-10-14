@@ -4020,13 +4020,13 @@
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "iSH-AOK 未知（版本 未知）"
+            "value" : "iSH-AOK 未知（构建 未知）"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "iSH-AOK 未知（版本 未知）"
+            "value" : "iSH-AOK 未知（建置 未知）"
           }
         }
       }
