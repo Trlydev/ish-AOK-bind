@@ -83,6 +83,21 @@ E
         install -m 755 "$t/rc.local" /etc/rc.local && echo "  /etc/rc.local: reads the engine's name at boot"
 fi
 echo "  this machine runs on: $(/usr/local/bin/aok-engine)"
+# iSH-AOK's /AOK/persist (2026-10-14): AOK VM gives a machine the app's shared directory when its Sharing
+# setting "Share /AOK/persist" is on, as the VirtFS tag aokpersist, its files reported as the user's own.
+# Mounted at boot from now on, and now if the machine has it; nofail, so a machine without it boots as before.
+if ! grep -q '[[:space:]]/AOK/persist[[:space:]]' /etc/fstab; then
+    printf 'aokpersist /AOK/persist 9p trans=virtio,version=9p2000.L,nofail 0 0\n' >> /etc/fstab &&
+        echo "  /etc/fstab: mounts iSH-AOK's /AOK/persist when the machine is given it"
+fi
+mkdir -p /AOK/persist
+if ! mountpoint -q /AOK/persist; then
+    if mount /AOK/persist 2> /dev/null; then
+        echo "  /AOK/persist: iSH-AOK's, mounted"
+    else
+        echo "  /AOK/persist: not given to this machine (AOK VM: the machine's settings, Sharing)"
+    fi
+fi
 # Vulkan: the engine offers it since 2026-10-13 (venus); the guest's half is Mesa's virtio driver, which
 # images before that did not carry.
 if ! dpkg -s mesa-vulkan-drivers vulkan-tools > /dev/null 2>&1; then
