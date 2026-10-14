@@ -1432,7 +1432,9 @@ static int netlink_append_route_routes(struct fd *sock, const struct nlmsghdr_ *
 #define NLM_F_EXCL_NET_NS_ 0x200
 #define NLM_F_CREATE_NET_NS_ 0x400
 #define IF_OPER_DOWN_NET_NS_ 2
-#define IF_OPER_LOWERLAYERDOWN_NET_NS_ 5
+#define IF_OPER_LOWERLAYERDOWN_NET_NS_ 3
+#define RTNH_F_DEAD_NET_NS_ 1
+#define RTNH_F_LINKDOWN_NET_NS_ 16
 #define NET_NS_MAX_VIFS 64
 #define NLM_F_REPLACE_NET_NS_ 0x100
 #define CLONE_NEWNET_SOCK_ 0x40000000
@@ -1496,7 +1498,7 @@ static int net_ns_append_vif_link(struct fd *sock, const struct net_vif_info *vi
         flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
     msg->ifi_flags = flags;
     msg->ifi_change = 0xffffffffu;
-    uint32_t mtu = vif->mtu, txqlen = vif->kind == NET_VIF_DUMMY ? 0 : 1000;
+    uint32_t mtu = vif->mtu, txqlen = 1000;
     uint8_t operstate = !vif->up ? IF_OPER_DOWN_NET_NS_ :
         vif->kind == NET_VIF_DUMMY ? IF_OPER_UNKNOWN_ :
         vif->lower_up ? IF_OPER_UP_ : IF_OPER_LOWERLAYERDOWN_NET_NS_;
@@ -1579,13 +1581,6 @@ static int net_ns_append_vif_addr(struct fd *sock, uint32_t seq, const struct ne
         err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LOCAL_, addr->addr, size);
     if (err >= 0)
         err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, addr->addr, size);
-    if (err >= 0 && !addr->v6 && addr->prefix < 31) {
-        uint32_t a;
-        memcpy(&a, addr->addr, 4);
-        uint32_t host = addr->prefix == 0 ? 0xffffffffu : (0xffffffffu >> addr->prefix);
-        uint32_t broadcast = htonl(ntohl(a) | host);
-        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_BROADCAST_, &broadcast, 4);
-    }
     if (err >= 0 && !addr->v6)
         err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LABEL_, vif->name, strlen(vif->name) + 1);
     uint32_t flags = IFA_F_PERMANENT_;
@@ -1608,6 +1603,11 @@ static int net_ns_append_vif_route(struct fd *sock, uint32_t seq, const struct n
     msg->rtm_protocol = route->connected ? RTPROT_KERNEL_ : RTPROT_BOOT_;
     msg->rtm_scope = route->connected || !route->has_gateway ? RT_SCOPE_LINK_ : RT_SCOPE_UNIVERSE_;
     msg->rtm_type = RTN_UNICAST_;
+    // A route out of a link with no carrier is there and unusable: "dead
+    // linkdown", as fib_sync_down_dev marks it.
+    struct net_vif_info out;
+    if (route->oif != 0 && net_vif_get(ns, route->oif, NULL, &out) == 0 && !out.lower_up)
+        msg->rtm_flags = RTNH_F_DEAD_NET_NS_ | RTNH_F_LINKDOWN_NET_NS_;
     size_t size = route->v6 ? 16 : 4;
     uint32_t table = RT_TABLE_MAIN_;
     int err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_TABLE_, &table, sizeof(table));
@@ -13281,7 +13281,7 @@ static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *h
                 struct net_vif_change change = {.up = (ifreq->ifr_ifru.flags & IFF_UP_LINUX_) != 0};
                 return net_vif_change(ns, vif->index, &change);
             }
-            case SIOCGIFTXQLEN_: ifreq->ifr_ifru.qlen = vif->kind == NET_VIF_DUMMY ? 0 : 1000; return 0;
+            case SIOCGIFTXQLEN_: ifreq->ifr_ifru.qlen = 1000; return 0;
             case SIOCGIFMTU_: ifreq->ifr_ifru.mtu = (int) vif->mtu; return 0;
             case SIOCGIFMETRIC_: ifreq->ifr_ifru.metric = 0; return 0;
             case SIOCGIFHWADDR_:

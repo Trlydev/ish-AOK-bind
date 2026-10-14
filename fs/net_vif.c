@@ -130,13 +130,18 @@ static void vif_free_locked(struct net_vif *vif) {
     free(vif);
 }
 
+// Up with a carrier: a veth's peer up too.
+static bool vif_lower_up(const struct net_vif *vif) {
+    return vif->up && (vif->kind != NET_VIF_VETH || (vif->peer != NULL && vif->peer->up));
+}
+
 static void vif_info(const struct net_vif *vif, struct net_vif_info *out) {
     memset(out, 0, sizeof(*out));
     out->index = vif->index;
     memcpy(out->name, vif->name, sizeof(out->name));
     out->kind = vif->kind;
     out->up = vif->up;
-    out->lower_up = vif->up && (vif->kind != NET_VIF_VETH || (vif->peer != NULL && vif->peer->up));
+    out->lower_up = vif_lower_up(vif);
     out->mtu = vif->mtu;
     memcpy(out->mac, vif->mac, sizeof(out->mac));
     if (vif->peer != NULL) {
@@ -274,18 +279,21 @@ int net_vif_create(struct net_namespace *ns, enum net_vif_kind kind, const char 
             return _EEXIST;
         }
     }
-    struct net_vif *vif = vif_new_locked(ns, kind, own);
-    if (vif == NULL) {
+    // A veth's peer first, as veth_newlink registers it (so in one
+    // namespace the peer has the lower index).
+    struct net_vif *peer = NULL;
+    if (kind == NET_VIF_VETH && (peer = vif_new_locked(peer_ns, kind, other)) == NULL) {
         unlock(&vif_lock);
         return _ENOMEM;
     }
-    if (kind == NET_VIF_VETH) {
-        struct net_vif *peer = vif_new_locked(peer_ns, kind, other);
-        if (peer == NULL) {
-            vif_free_locked(vif);
-            unlock(&vif_lock);
-            return _ENOMEM;
-        }
+    struct net_vif *vif = vif_new_locked(ns, kind, own);
+    if (vif == NULL) {
+        if (peer != NULL)
+            vif_free_locked(peer);
+        unlock(&vif_lock);
+        return _ENOMEM;
+    }
+    if (peer != NULL) {
         vif->peer = peer;
         peer->peer = vif;
     }
@@ -400,17 +408,20 @@ int net_vif_route_change(struct net_namespace *ns, bool add, const struct net_vi
         unlock(&vif_lock);
         return _ENODEV;
     }
+    // A gateway's: the link whose subnet has it, which the route then
+    // names (fib_check_nh).
+    int gateway_oif = 0;
     if (add && route->oif == 0) {
-        bool reached = false;
         struct net_vif *vif;
         list_for_each_entry(&vifs, vif, links) {
-            if (vif->ns != ns || !route->has_gateway)
+            if (vif->ns != ns || !route->has_gateway || gateway_oif != 0)
                 continue;
-            for (int i = 0; i < vif->n_addrs && !reached; i++)
-                reached = vif->addrs[i].v6 == route->v6 &&
-                    addr_in(route->v6, route->gateway, vif->addrs[i].addr, vif->addrs[i].prefix);
+            for (int i = 0; i < vif->n_addrs && gateway_oif == 0; i++)
+                if (vif->addrs[i].v6 == route->v6 &&
+                        addr_in(route->v6, route->gateway, vif->addrs[i].addr, vif->addrs[i].prefix))
+                    gateway_oif = vif->index;
         }
-        if (!reached) {
+        if (gateway_oif == 0) {
             unlock(&vif_lock);
             return _ENETUNREACH;
         }
@@ -432,6 +443,8 @@ int net_vif_route_change(struct net_namespace *ns, bool add, const struct net_vi
         } else {
             entry->ns = ns;
             entry->route = *route;
+            if (entry->route.oif == 0)
+                entry->route.oif = gateway_oif;
             addr_mask(route->v6, route->dst, route->prefix, entry->route.dst);
             entry->route.connected = false;
             list_add_tail(&vif_routes, &entry->links);
@@ -523,7 +536,8 @@ int net_vif_resolve(struct net_namespace *ns, bool v6, const uint8_t *dst,
     int best_prefix = -1;
     struct net_vif *vif;
     list_for_each_entry(&vifs, vif, links) {
-        if (vif->ns != ns || !vif->up)
+        // (A link with no carrier routes nothing: its routes are dead.)
+        if (vif->ns != ns || !vif_lower_up(vif))
             continue;
         for (int i = 0; i < vif->n_addrs; i++) {
             const struct net_vif_addr *a = &vif->addrs[i];
@@ -542,14 +556,14 @@ int net_vif_resolve(struct net_namespace *ns, bool v6, const uint8_t *dst,
         struct net_vif *through = route->oif != 0 ? vif_find_locked(ns, route->oif, NULL) : NULL;
         if (through == NULL && route->has_gateway) {
             list_for_each_entry(&vifs, vif, links) {
-                if (vif->ns != ns || !vif->up)
+                if (vif->ns != ns || !vif_lower_up(vif))
                     continue;
                 for (int i = 0; i < vif->n_addrs && through == NULL; i++)
                     if (vif->addrs[i].v6 == v6 && addr_in(v6, route->gateway, vif->addrs[i].addr, vif->addrs[i].prefix))
                         through = vif;
             }
         }
-        if (through != NULL && through->up) {
+        if (through != NULL && vif_lower_up(through)) {
             best = through;
             best_prefix = route->prefix;
         }
