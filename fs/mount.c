@@ -208,6 +208,12 @@ static int mount_new_id(void) {
 // No lock: a mount's ID is set before it is published in the list and never
 // changes after, and /proc/self/mountinfo asks for IDs from inside its own
 // walk of the list, under mounts_lock.
+const char *mount_listed_point(const struct mount *mount) {
+    if (mount->covered_by != 0 && mount->covered_point != NULL && !mount->lazy_umount)
+        return mount->covered_point;
+    return mount->point;
+}
+
 int mount_id(struct mount *mount) {
     return mount->id > 0 ? mount->id : MOUNT_ID_HIDDEN;
 }
@@ -295,17 +301,24 @@ static int mount_compare_id(const void *a, const void *b) {
 // for a point with two mounts on it, that named the one underneath.
 // Caller holds mounts_lock; free() the result. NULL only when out of memory.
 struct mount **mounts_listed_locked(size_t *count_out) {
+    return mounts_listed_locked_covered(count_out, false);
+}
+
+// With `covered`, the mounts that are covered too, as Linux lists them in
+// /proc/<pid>/mounts and mountinfo: mounted, and out of sight under another
+// (kernel/fs.h). mount_listed_point says where each is.
+struct mount **mounts_listed_locked_covered(size_t *count_out, bool covered) {
     size_t count = 0;
     struct mount *mount;
     list_for_each_entry(&mounts, mount, mounts)
-        if (!mount->detached)
+        if (!mount->detached || (covered && mount->covered_by != 0 && mount->covered_point != NULL && !mount->lazy_umount))
             count++;
     struct mount **listed = malloc((count > 0 ? count : 1) * sizeof(*listed));
     if (listed == NULL)
         return NULL;
     size_t i = 0;
     list_for_each_entry(&mounts, mount, mounts)
-        if (!mount->detached)
+        if (!mount->detached || (covered && mount->covered_by != 0 && mount->covered_point != NULL && !mount->lazy_umount))
             listed[i++] = mount;
     qsort(listed, count, sizeof(*listed), mount_compare_id);
     *count_out = count;
@@ -792,8 +805,10 @@ static void mount_subtree_notify(struct mount_subtree *tree) {
 // member of a group leaves it, its slaves pass to that member's own master,
 // as Linux hands them on.
 //
-// Not here: a mount that is covered (parked under the one mounted over it)
-// receives nothing while it is, and mountinfo has no propagate_from.
+// A mount that is covered (parked under the one mounted over it) receives
+// all the same, as on Linux: what arrives is parked with it, under the same
+// mount, and comes back into view when it does. Not here: mountinfo has no
+// propagate_from.
 
 static _Atomic int next_peer_group = 1;
 
@@ -807,6 +822,31 @@ static const char *mount_fs_prefix(const struct mount *mount) {
 }
 static bool mount_in_view(const struct mount *mount) {
     return !mount->detached && !mount->lazy_umount;
+}
+// Mounted, but under one mounted over it later (covered_by, kernel/fs.h):
+// parked at a staging point, and still in its tree at covered_point.
+static bool mount_is_covered(const struct mount *mount) {
+    return mount->covered_by != 0 && mount->covered_point != NULL && !mount->lazy_umount;
+}
+// Where a mount is in its tree, covered or not.
+static const char *mount_place(const struct mount *mount) {
+    return mount_is_covered(mount) ? mount->covered_point : mount->point;
+}
+
+// What a mount's tree is under, if anything: the ID of the mount covering
+// it, or for one in view the one stacked on top of it at its own point (the
+// table keeps both in view there, the newer answering). 0 for a mount that
+// is on top. What is mounted under one that is not on top is out of sight
+// as surely as under one that is parked.
+static int mount_under_locked(const struct mount *mount) {
+    if (mount_is_covered(mount))
+        return mount->covered_by;
+    struct mount *top;
+    list_for_each_entry(&mounts, top, mounts) {
+        if (mount_in_view(top) && strcmp(top->point, mount->point) == 0)
+            return top == mount ? 0 : top->id;
+    }
+    return 0;
 }
 
 // The namespace whose tree `point` is in: NULL for one in no tree.
@@ -942,7 +982,7 @@ static bool mount_propagated_point(struct mount *parent, const char *point, stru
     size_t shown_len = strlen(shown);
     if (strncmp(in_fs, shown, shown_len) != 0 || (in_fs[shown_len] != '/' && in_fs[shown_len] != '\0'))
         return false;
-    n = snprintf(out, size, "%s%s", receiver->point, in_fs + shown_len);
+    n = snprintf(out, size, "%s%s", mount_place(receiver), in_fs + shown_len);
     return n >= 0 && (size_t) n < size;
 }
 
@@ -971,7 +1011,7 @@ static struct propagation_target *mount_propagation_targets_locked(struct mount 
     for (size_t i = 0; i < n_levels; i++) {
         struct mount *mount;
         list_for_each_entry(&mounts, mount, mounts) {
-            if (mount == parent || !mount_in_view(mount))
+            if (mount == parent || (!mount_in_view(mount) && !mount_is_covered(mount)))
                 continue;
             int shared, master;
             if (mount->shared_id == levels[i].group) {
@@ -1065,9 +1105,21 @@ static void mount_propagate_locked(struct mount *parent, struct mount *mount) {
             continue;
         if (strcmp(point, mount->point) == 0)
             continue;
-        struct mount *copy = mount_clone_at_locked(mount, point);
+        // Under a covered receiver: the copy is covered too, by what covers
+        // the receiver, at the place it will have when that goes.
+        int under = mount_under_locked(targets[i].receiver);
+        bool covered = under != 0;
+        char staging[MAX_PATH];
+        if (covered)
+            mount_staging_point(staging, sizeof(staging));
+        struct mount *copy = mount_clone_at_locked(mount, covered ? staging : point);
         if (copy == NULL)
             continue;
+        if (covered) {
+            copy->covered_point = strdup(point);
+            copy->covered_by = under;
+            copy->detached = true;
+        }
         copy->shared_id = targets[i].shared;
         copy->master_id = targets[i].master;
         // In a tree that belongs to another user namespace it keeps the
@@ -1076,7 +1128,8 @@ static void mount_propagate_locked(struct mount *parent, struct mount *mount) {
         if (to_ns != NULL && from_ns != NULL && to_ns->user_ns != from_ns->user_ns)
             copy->locked_flags = mount->flags & (MS_READONLY_ | MS_NOSUID_ | MS_NODEV_ | MS_NOEXEC_);
         // It covers what was mounted below its point there.
-        mount_cover_below_locked(copy, MOUNT_COVER_ALL);
+        if (!covered)
+            mount_cover_below_locked(copy, MOUNT_COVER_ALL);
     }
     free(targets);
 }
@@ -1152,9 +1205,12 @@ static struct mount **mount_propagated_twins_locked(struct mount *mount, size_t 
         char point[MAX_PATH];
         if (!mount_propagated_point(parent, mount->point, targets[i].receiver, point, sizeof(point)))
             continue;
+        bool covered = mount_under_locked(targets[i].receiver) != 0;
         struct mount *other;
         list_for_each_entry(&mounts, other, mounts) {
-            if (!mount_in_view(other) || strcmp(other->point, point) != 0)
+            // (Under a covered receiver, the copy parked with it.)
+            if (covered ? !mount_is_covered(other) || strcmp(other->covered_point, point) != 0
+                        : !mount_in_view(other) || strcmp(other->point, point) != 0)
                 continue;
             // (The one on top there, and only if it is this mount again.)
             bool again = other != mount && mount_fs_origin(other) == mount_fs_origin(mount) &&
@@ -1633,9 +1689,12 @@ void mnt_ns_release(struct mnt_namespace *ns) {
 // `mount`, which is in `from`, as it appears in `to`: a bind of the same
 // filesystem at the same place in the tree. Caller holds mounts_lock.
 static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespace *from,
-        const struct mnt_namespace *to, bool locked) {
+        const struct mnt_namespace *to, bool locked, struct mount **copy_out) {
     struct mount *origin = mount->bind_origin != NULL ? mount->bind_origin : mount;
-    const char *rel = mount->point + from->root_len;
+    // A covered one is copied covered: parked, with the place it returns to
+    // in the new tree (the caller says by what).
+    bool covered = mount_is_covered(mount);
+    const char *rel = mount_place(mount) + from->root_len;
     // calloc for the same reason as do_mount: a field nobody names starts zero.
     struct mount *copy = calloc(1, sizeof(struct mount));
     if (copy == NULL)
@@ -1645,6 +1704,14 @@ static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespa
     if (point != NULL) {
         memcpy(point, to->root, to->root_len);
         strcpy(point + to->root_len, rel);
+    }
+    if (covered && point != NULL) {
+        char staging[MAX_PATH];
+        mount_staging_point(staging, sizeof(staging));
+        copy->covered_point = point;
+        point = strdup(staging);
+        point_len = point != NULL ? strlen(point) : 0;
+        copy->detached = true;
     }
     copy->point = point;
     copy->point_len = point_len;
@@ -1656,6 +1723,7 @@ static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespa
     if (copy->point == NULL || copy->source == NULL || copy->info == NULL || copy->bind_prefix == NULL ||
             (mount->display_source != NULL && copy->display_source == NULL)) {
         free((void *) copy->point);
+        free((void *) copy->covered_point);
         free((void *) copy->source);
         free((void *) copy->display_source);
         free((void *) copy->info);
@@ -1688,6 +1756,8 @@ static int mount_copy_to_ns_locked(struct mount *mount, const struct mnt_namespa
     }
     copy->unbindable = mount->unbindable;
     mount_list_insert(copy);
+    if (copy_out != NULL)
+        *copy_out = copy;
     return 0;
 }
 
@@ -1714,12 +1784,87 @@ struct mnt_namespace *mnt_ns_copy(struct mnt_namespace *from, struct user_namesp
         struct list *prev = item->prev;
         struct mount *mount = list_entry(item, struct mount, mounts);
         if (mount_in_ns_locked(mount, from)) {
-            err = mount_copy_to_ns_locked(mount, from, ns, locked);
+            err = mount_copy_to_ns_locked(mount, from, ns, locked, NULL);
             if (err < 0)
                 break;
         }
         item = prev;
     }
+    // And what is covered in `from`, covered the same way in the copy: by
+    // the copy of what covers it. That is found by place and ID -- the copy
+    // of the mount whose ID the original names, which is at the copy's place
+    // of the coverer -- so a coverer that is covered in turn is copied first.
+    size_t n_covered = 0;
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts)
+        if (mount_is_covered(mount) && mnt_ns_has_point(from, mount->covered_point))
+            n_covered++;
+    struct { struct mount *original, *copy; } *pairs = NULL;
+    size_t n_pairs = 0;
+    if (err >= 0 && n_covered != 0) {
+        pairs = calloc(n_covered, sizeof(*pairs));
+        if (pairs == NULL)
+            err = _ENOMEM;
+        list_for_each_entry(&mounts, mount, mounts) {
+            if (err < 0 || n_pairs == n_covered)
+                break;
+            if (!mount_is_covered(mount) || !mnt_ns_has_point(from, mount->covered_point))
+                continue;
+            struct mount *copy = NULL;
+            err = mount_copy_to_ns_locked(mount, from, ns, locked, &copy);
+            if (err >= 0) {
+                pairs[n_pairs].original = mount;
+                pairs[n_pairs].copy = copy;
+                n_pairs++;
+            }
+        }
+        // Each copy is covered by the copy of its original's coverer: the
+        // mount in the new tree made from the mount with that ID.
+        for (size_t i = 0; err >= 0 && i < n_pairs; i++) {
+            int by = pairs[i].original->covered_by;
+            struct mount *coverer = NULL, *other;
+            list_for_each_entry(&mounts, other, mounts) {
+                if (other->id == by) {
+                    coverer = other;
+                    break;
+                }
+            }
+            int copy_by = 0;
+            if (coverer != NULL) {
+                for (size_t k = 0; k < n_pairs && copy_by == 0; k++)
+                    if (pairs[k].original == coverer)
+                        copy_by = pairs[k].copy->id;
+                // In view: its copy is the bind of the same filesystem and
+                // part of it at the same place in the new tree.
+                char place[MAX_PATH];
+                if (copy_by == 0 && snprintf(place, sizeof(place), "%s%s", ns->root,
+                            coverer->point + from->root_len) < (int) sizeof(place)) {
+                    list_for_each_entry(&mounts, other, mounts) {
+                        if (mount_in_view(other) && strcmp(other->point, place) == 0 &&
+                                mount_fs_origin(other) == mount_fs_origin(coverer) &&
+                                strcmp(mount_fs_prefix(other), mount_fs_prefix(coverer)) == 0) {
+                            copy_by = other->id;
+                            break;
+                        }
+                    }
+                }
+            }
+            // (Nothing to come back under: in view.)
+            if (copy_by == 0) {
+                struct mount *copy = pairs[i].copy;
+                free((void *) copy->point);
+                copy->point = copy->covered_point;
+                copy->point_len = strlen(copy->point);
+                copy->covered_point = NULL;
+                copy->detached = false;
+                list_remove(&copy->mounts);
+                mount_list_insert(copy);
+                continue;
+            }
+            pairs[i].copy->covered_by = copy_by;
+        }
+    }
+    free(pairs);
     if (err >= 0) {
         ns->next_ns = mnt_namespaces;
         mnt_namespaces = ns;

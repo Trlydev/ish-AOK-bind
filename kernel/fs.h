@@ -328,6 +328,10 @@ static inline size_t mount_staging_point_len(const char *path, size_t len) {
 // The mounts a listing shows, in the order it shows them; see fs/mount.c.
 // Caller holds mounts_lock and frees the array.
 struct mount **mounts_listed_locked(size_t *count_out);
+struct mount **mounts_listed_locked_covered(size_t *count_out, bool covered);
+// Where a listed mount is in its tree: its point, or for a covered one the
+// point it is covered at.
+const char *mount_listed_point(const struct mount *mount);
 
 // returns a reference, which must be released
 struct mount *mount_find(char *path);

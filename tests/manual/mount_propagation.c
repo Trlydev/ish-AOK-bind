@@ -40,6 +40,10 @@
 //                their copies are a group of their own, slaves of the
 //                mount's
 //   setattr      mount_setattr changes propagation as mount(2) does
+//   covered      a slave or peer that has something mounted over it -- on
+//                its own point, or on a mount above it -- still receives: what
+//                arrives is out of sight (mountinfo lists it) and in view
+//                once the cover goes; an unmount reaches it there too
 //   namespaces   a mount namespace copied from a tree with a shared mount has
 //                a peer of it: a mount made in either appears in the other.
 //                Made slave there, it only receives. Copied into a new USER
@@ -386,6 +390,75 @@ static void case_chain(void) {
     umount(a);
 }
 
+static int count_at(const char *point) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (f == NULL)
+        return -1;
+    char line[2048], field[5][512];
+    int n = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (sscanf(line, "%511s %511s %511s %511s %511s", field[0], field[1], field[2], field[3], field[4]) == 5 &&
+                strcmp(field[4], point) == 0)
+            n++;
+    fclose(f);
+    return n;
+}
+
+static void case_covered(void) {
+    // Stacked: a lid on the peer's own point.
+    const char *a = in("cv-a"), *b = in("cv-b");
+    char a_x[200], a_y[200], b_x[200], b_y[200], a_file[220], b_file[220];
+    snprintf(a_x, sizeof(a_x), "%s/x", a);
+    snprintf(a_y, sizeof(a_y), "%s/y", a);
+    snprintf(b_x, sizeof(b_x), "%s/x", b);
+    snprintf(b_y, sizeof(b_y), "%s/y", b);
+    snprintf(a_file, sizeof(a_file), "%s/x/f", a);
+    snprintf(b_file, sizeof(b_file), "%s/x/f", b);
+    CHECK(tmpfs_at(a) == 0 && mount(NULL, a, NULL, MS_SHARED, NULL) == 0, "a shared mount failed");
+    mkdir(a_x, 0755);
+    mkdir(a_y, 0755);
+    mkdir(b, 0755);
+    // A slave: a lid on a peer would go onto the other peer as well.
+    CHECK(mount(a, b, NULL, MS_BIND, NULL) == 0 && mount(NULL, b, NULL, MS_SLAVE, NULL) == 0, "a slave bind failed");
+    CHECK(mount("lid", b, "tmpfs", 0, NULL) == 0, "the lid failed");
+    CHECK(mount("x", a_x, "tmpfs", 0, NULL) == 0 && touch(a_file) == 0, "mount under the peer failed");
+    CHECK(!exists(b_file), "what arrived under the covered peer shows through the lid");
+    CHECK(count_at(b_x) == 1, "mountinfo lists %d mounts at %s, wanted the copy under the lid", count_at(b_x), b_x);
+    CHECK(mount("y", a_y, "tmpfs", 0, NULL) == 0 && umount(a_y) == 0, "mount and unmount under the peer failed");
+    CHECK(count_at(b_y) == 0, "the unmount did not reach the covered peer's copy (%d left)", count_at(b_y));
+    CHECK(umount(b) == 0, "unmounting the lid failed");
+    CHECK(exists(b_file), "after the lid went, what arrived while it was on is not in view");
+
+    // Parked: a mount over the mount the peer sits in.
+    const char *t = in("cv-t"), *s1 = in("cv-s1");
+    char t_sub[200], s1_z[200], t_sub_z[220], z_file[240], t_z_file[260];
+    snprintf(t_sub, sizeof(t_sub), "%s/sub", t);
+    snprintf(s1_z, sizeof(s1_z), "%s/z", s1);
+    snprintf(t_sub_z, sizeof(t_sub_z), "%s/sub/z", t);
+    snprintf(z_file, sizeof(z_file), "%s/z/g", s1);
+    snprintf(t_z_file, sizeof(t_z_file), "%s/sub/z/g", t);
+    CHECK(tmpfs_at(s1) == 0 && mount(NULL, s1, NULL, MS_SHARED, NULL) == 0, "a shared mount failed");
+    mkdir(s1_z, 0755);
+    CHECK(tmpfs_at(t) == 0, "mount failed");
+    mkdir(t_sub, 0755);
+    CHECK(mount(s1, t_sub, NULL, MS_BIND, NULL) == 0, "bind into the outer mount failed");
+    CHECK(mount("over", t, "tmpfs", 0, NULL) == 0, "the mount over the outer mount failed");
+    CHECK(count_at(t_sub) == 1, "mountinfo lists %d mounts at the covered %s", count_at(t_sub), t_sub);
+    CHECK(mount("z", s1_z, "tmpfs", 0, NULL) == 0 && touch(z_file) == 0, "mount under the peer failed");
+    CHECK(count_at(t_sub_z) == 1, "mountinfo lists %d mounts at %s under the covered peer", count_at(t_sub_z), t_sub_z);
+    CHECK(umount(t) == 0, "unmounting the cover failed");
+    CHECK(exists(t_z_file), "after the cover went, what arrived under the peer is not in view");
+    umount(t_sub_z);
+    umount(t_sub);
+    umount(t);
+    umount(s1_z);
+    umount(s1);
+    umount(b_x);
+    umount(b);
+    umount(a_x);
+    umount(a);
+}
+
 // pivot_root moves mounts that propagation would have to follow, and refuses
 // to while it would.
 static void case_pivot(void) {
@@ -551,6 +624,7 @@ int main(void) {
     case_part();
     case_trees();
     case_chain();
+    case_covered();
     case_pivot();
     case_namespace_peer();
     case_namespace_user();

@@ -28,6 +28,9 @@
 //                directory named for it, and is gone after a lazy unmount
 //   move         MS_MOVE takes what is mounted in a mount along with it, and
 //                a mount cannot be moved into its own tree (ELOOP)
+//   covered      mountinfo lists a mount that another covers; a namespace
+//                copied while it is covered has it, under the copy of the
+//                cover, and in view once that is unmounted there
 //
 // Needs root. On Linux, run by an ordinary user, it first enters a user
 // namespace (where it is root over its own mounts): that is how it is run
@@ -346,6 +349,52 @@ static void case_move(void) {
     wait_ok(pid, "move");
 }
 
+static int count_at(const char *point) {
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (f == NULL)
+        return -1;
+    char line[1024], field[5][512];
+    int n = 0;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (sscanf(line, "%511s %511s %511s %511s %511s", field[0], field[1], field[2], field[3], field[4]) == 5 &&
+                strcmp(field[4], point) == 0)
+            n++;
+    fclose(f);
+    return n;
+}
+
+static void case_covered(void) {
+    char d[128], d_s[160], marker[200];
+    path_in(d, sizeof(d), "covered");
+    snprintf(d_s, sizeof(d_s), "%s/s", d);
+    snprintf(marker, sizeof(marker), "%s/s/marker", d);
+    mkdir(d, 0755);
+    pid_t pid = fork();
+    if (pid == 0) {
+        CHILD_CHECK(unshare(CLONE_NEWNS) == 0, "unshare(CLONE_NEWNS) failed");
+        private_tree();
+        CHILD_CHECK(mount("outer", d, "tmpfs", 0, NULL) == 0, "mount failed");
+        CHILD_CHECK(mkdir(d_s, 0755) == 0 && mount("inner", d_s, "tmpfs", 0, NULL) == 0 && touch(marker) == 0, "the inner mount failed");
+        CHILD_CHECK(mount("lid", d, "tmpfs", 0, NULL) == 0, "the lid failed");
+        CHILD_CHECK(!exists(marker), "the covered mount shows through the lid");
+        CHILD_CHECK(count_at(d) == 2 && count_at(d_s) == 1, "mountinfo lists %d mounts at %s and %d at %s; wanted 2 and the covered 1",
+                    count_at(d), d, count_at(d_s), d_s);
+        pid_t inner = fork();
+        if (inner == 0) {
+            CHILD_CHECK(unshare(CLONE_NEWNS) == 0, "the second unshare failed");
+            CHILD_CHECK(count_at(d_s) == 1, "the copy has %d mounts at the covered %s", count_at(d_s), d_s);
+            CHILD_CHECK(umount(d) == 0, "unmounting the lid in the copy failed");
+            CHILD_CHECK(exists(marker), "in the copy, the covered mount is not there once the lid is gone");
+            _exit(0);
+        }
+        int status = -1;
+        CHILD_CHECK(waitpid(inner, &status, 0) == inner && WIFEXITED(status) && WEXITSTATUS(status) == 0, "the copy's check failed: %#x", status);
+        CHILD_CHECK(!exists(marker) && count_at(d) == 2, "the copy's unmount reached the namespace it was copied from");
+        _exit(0);
+    }
+    wait_ok(pid, "covered");
+}
+
 static void case_pivot_root(void) {
     char newroot[128];
     path_in(newroot, sizeof(newroot), "newroot");
@@ -435,6 +484,7 @@ int main(void) {
     case_readonly_bind();
     case_pivot_root();
     case_move();
+    case_covered();
 
     umount2(base, MNT_DETACH);
     rmdir(base);

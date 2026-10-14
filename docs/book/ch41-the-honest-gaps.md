@@ -81,9 +81,8 @@ the load average still count the machine.
 
 A mount namespace here is not everything Linux's is. Propagation is real
 (559): peer groups, slaves, and mounts and unmounts repeated through them,
-across namespaces too — but a mount that is covered receives nothing while
-it is, and `mountinfo` has no `propagate_from`. A mount that is covered
-when the namespace is copied is not in the copy. A session
+across namespaces and into mounts that something else covers — but
+`mountinfo` has no `propagate_from`. A session
 with a process in a mount namespace of its own cannot be saved (the save is
 refused, and says which process). And on its own it confines nothing — a
 process in one is still root over the one machine, which is why a sandbox

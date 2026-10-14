@@ -1051,7 +1051,9 @@ int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf) {
     // mountpoint on Linux and appears in no listing until move_mount places
     // it. See mounts_listed_locked.
     size_t count = 0;
-    struct mount **listed = mounts_listed_locked(&count);
+    // A mount another was mounted over is listed too, as on Linux, at the
+    // point it is under (fs/mount.c).
+    struct mount **listed = mounts_listed_locked_covered(&count, true);
     if (listed == NULL) {
         unlock(&mounts_lock);
         return _ENOMEM;
@@ -1059,7 +1061,7 @@ int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf) {
     for (size_t i = 0; i < count; i++) {
         struct mount *mount = listed[i];
         char point[MAX_PATH + 1];
-        if (!proc_mount_point_in_root(mount->point, root_path, point))
+        if (!proc_mount_point_in_root(mount_listed_point(mount), root_path, point))
             continue;
 
         // An empty source would print as an empty field, and /proc/mounts is
@@ -1106,6 +1108,35 @@ int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf) {
 // is the rootfs outside every process's root.
 static int proc_mountinfo_parent_id(struct mount *target) {
     struct mount *mount;
+    // A covered mount sits on what it was mounted on, which was there before
+    // what covers it: of the mounts whose place in the tree holds its own,
+    // the longest, and of those at that place the newest older than the
+    // coverer. (A covered one's place is the point it is covered at.)
+    if (target->detached && target->covered_by != 0 && target->covered_point != NULL) {
+        const char *place = target->covered_point;
+        size_t place_len = strlen(place);
+        size_t tree = mount_staging_point_len(place, place_len);
+        struct mount *best = NULL;
+        size_t best_len = 0;
+        list_for_each_entry(&mounts, mount, mounts) {
+            if (mount == target || mount->lazy_umount || mount_id(mount) >= target->covered_by)
+                continue;
+            if (mount->detached && (mount->covered_by == 0 || mount->covered_point == NULL))
+                continue;
+            const char *theirs = mount_listed_point(mount);
+            size_t n = strlen(theirs);
+            if (n >= place_len || strncmp(place, theirs, n) != 0 || place[n] != '/')
+                continue;
+            if (mount_staging_point_len(theirs, n) != tree)
+                continue;
+            if (best == NULL || n > best_len || (n == best_len && mount_id(mount) > mount_id(best))) {
+                best = mount;
+                best_len = n;
+            }
+        }
+        if (best != NULL)
+            return mount_id(best);
+    }
     // The root of a mount namespace's tree sits on nothing a listing shows,
     // as the initial root does; its point has the initial root's "" for a
     // prefix like every other, which is not the same thing.
@@ -1152,7 +1183,9 @@ int proc_show_mountinfo(struct proc_entry *entry, struct proc_data *buf) {
     // must not lock.
     lock(&mounts_lock, 0);
     size_t count = 0;
-    struct mount **listed = mounts_listed_locked(&count);
+    // A mount another was mounted over is listed too, as on Linux, at the
+    // point it is under (fs/mount.c).
+    struct mount **listed = mounts_listed_locked_covered(&count, true);
     if (listed == NULL) {
         unlock(&mounts_lock);
         return _ENOMEM;
@@ -1160,7 +1193,7 @@ int proc_show_mountinfo(struct proc_entry *entry, struct proc_data *buf) {
     for (size_t i = 0; i < count; i++) {
         struct mount *mount = listed[i];
         char point[MAX_PATH + 1];
-        if (!proc_mount_point_in_root(mount->point, root_path, point))
+        if (!proc_mount_point_in_root(mount_listed_point(mount), root_path, point))
             continue;
 
         int id = mount_id(mount);
