@@ -16,7 +16,7 @@ in [docs/TODO.md](TODO.md)'s queue; this file is the list and its state.
 | 2 | RUNNINGBOARD 0xdead10cc under heavy fakefs writes | **DONE** (2026-10-11): the gate was lifted before the next assertion was taken; now only under one with time left. The kill itself did not reproduce on demand |
 | 3 | The 557 crash in `sockrestart_on_resume` | **DONE** (2026-10-11): poll_wait left a task listed after its exit; one registration per wait now, and a backstop where a task is freed |
 | 4 | Caching translated code across exec and across runs | **in as a setting, off by default** (2026-10-12): "Cache Translated Code (arm64)" in Settings; on turns the guest's ASLR off, and the setting says so. -21..-26% on short processes |
-| 5 | The RISC guests at the threaded-code floor | **in hand** (2026-10-11): arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has all three and forwarding too (M4: 7-Zip ~20%, Python 8-45% faster than 558; A10X timed for the pair pass and forwarding) |
+| 5 | The RISC guests at the threaded-code floor | **frozen for 559, rest to 560** (2026-10-14); in hand since 2026-10-11: arm64 on the M4 is ~18% faster on 7-Zip and 15-45% on Python than 558, the A10X ~9% and 15-25%; the dispatch, the memory probe and fused pairs are in; riscv64 has all three and forwarding too (M4: 7-Zip ~20%, Python 8-45% faster than 558; A10X timed for the pair pass and forwarding) |
 | 6 | `timer_thread_cpu_early` on the A10X and the A9 | **DONE on the A10X** (2026-10-11): a thread's reading of its own CPU time was stale there; the A9 is not to hand to confirm |
 
 Order: corruption and crashes first (1-3), then the two speed items (4, 5),
@@ -24,12 +24,11 @@ which share their measuring kit, then 6.
 
 **Release pass, 2026-10-14.**
 
-- *Decided (maintainer):* §4 ships as it is, a setting off by default.
+- *Decided (maintainer):* §5 is frozen at what has landed; its four next
+  steps go to 560. §4 ships as it is, a setting off by default.
   External display (#540) is deferred again. Veth ends in the initial
   namespace, forwarding and bridges are not in 559 -- creating such a link
   is EOPNOTSUPP, and namespaces.md says what a private network reaches.
-- *Proposed, awaiting the maintainer:* §5 frozen at what has landed, its
-  four next steps to 560.
 - *Done:* Linux CI compiles again (256e1a363, `IFF_*` since a541ea3aa);
   #643's Chinese "Build" (5d8bd130c); both Dependabot alerts (1824adf1e);
   the four bot PRs, translated (e459ac19f); README, /AOK/docs, the book's
