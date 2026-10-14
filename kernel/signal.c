@@ -4774,12 +4774,10 @@ bool may_signal_task(struct task *task, dword_t sig) {
 static int signal_send_checked(struct task *task, dword_t sig, struct siginfo_ info,
         bool process) {
     // FIXME: Need to check references to kernel here to be sure they are zero
-    // A task outside the sender's pid namespace is not there to be signalled
-    // (kernel/pid_ns.h). The lookups by number already say so; this is for
-    // what was reached some other way -- a member of a process group that
-    // spans namespaces.
-    if (!task_visible(task))
-        return _ESRCH;
+    // (Whether the sender's pid namespace can see the task is not asked: a
+    // lookup by number already confines that, and what is reached some other
+    // way -- a member outside of a process group that spans namespaces -- is
+    // signalled as the credentials allow, as group_send_sig_info does.)
     if (!may_signal_task(task, sig))
         return _EPERM;
     // The init of the sender's own pid namespace takes from inside only the
@@ -4797,11 +4795,14 @@ static int signal_send_checked(struct task *task, dword_t sig, struct siginfo_ i
         if (!handled)
             return 0;
     }
-    // The sender, as the receiver's pid namespace knows it: 0 for one that
-    // is outside it.
-    if (info.kill.pid == current->tgid && task->pid_ns != NULL)
-        info.kill.pid = pid_ns_in(current->pid_ns, task->pid_ns) ?
-            pid_ns_shown(task->pid_ns, current->tgid) : 0;
+    // The sender: its number in its own pid namespace (task_tgid_vnr, which
+    // prepare_kill_siginfo puts there), or 0 for a receiver that cannot see
+    // it -- the one change send_signal_locked makes. Not translated into the
+    // receiver's numbers: from a namespace below, Linux 6.12 delivers the
+    // sender's own number (tests/manual/pidns_basic.c, "a group signal").
+    if (info.kill.pid == current->tgid)
+        info.kill.pid = task->pid_ns == NULL || pid_ns_in(current->pid_ns, task->pid_ns) ?
+            current_pid_shown(current->tgid) : 0;
     if (process) {
         send_signal_to_process(task, (int) sig, info);
     } else {
@@ -4945,10 +4946,9 @@ retry:
     }
 
     // Done if any member took it, as Linux's __kill_pgrp_info has it. A
-    // member the caller's pid namespace has no number for is not signalled
-    // (signal_send_checked) and does not make the group one that is not
-    // there: a process's own group can be one from outside, with it the
-    // only member inside.
+    // member the caller's pid namespace has no number for is signalled all
+    // the same: a process's own group can be one from outside, with its
+    // leader and other members there.
     int err = skipped > 0 ? 0 : _ESRCH;
     for (size_t i = 0; i < target_count; i++) {
         int kill_err = signal_kill_process(targets[i].task, sig, si_code);

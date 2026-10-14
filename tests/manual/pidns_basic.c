@@ -99,7 +99,8 @@ static void run(const char *what, void (*body)(void)) {
     pid_t pid = fork();
     if (pid == 0) {
         body();
-        _exit(0);
+        // (A CHECK that failed in here counts too.)
+        _exit(failures != 0 ? 1 : 0);
     }
     int status = wait_status(pid);
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
@@ -594,6 +595,47 @@ static void case_nspid(void) {
     MUST(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the init: status %#x", status);
 }
 
+// A process group that spans the namespace: the leader and one member
+// outside, the init inside (in the group it was forked into). kill(0) from
+// inside reaches every member, as Linux's __kill_pgrp_info sends to each
+// member the credentials allow, seen or not. The si_pid it carries is the
+// sender's number in its OWN namespace, untranslated: send_signal_locked only
+// zeroes it for a receiver that cannot see the sender (Linux 6.12 says 1
+// here, not the init's number outside).
+static pid_t group_init;
+static void init_group_signal(void) {
+    _exit(kill(0, SIGUSR1) == 0 ? 0 : 4);
+}
+static void case_group_signal(void) {
+    MUST(setpgid(0, 0) == 0, "setpgid failed");
+    sigset_t usr1;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    MUST(sigprocmask(SIG_BLOCK, &usr1, NULL) == 0, "sigprocmask failed");
+    fflush(stdout);
+    pid_t member = fork();
+    MUST(member >= 0, "fork of the member outside failed");
+    if (member == 0) {
+        struct timespec wait = {.tv_sec = 10};
+        siginfo_t info;
+        _exit(sigtimedwait(&usr1, &info, &wait) == SIGUSR1 ? 0 : 3);
+    }
+    enter(CLONE_NEWPID);
+    fflush(stdout);
+    group_init = fork();
+    MUST(group_init >= 0, "fork into the new pid namespace failed");
+    if (group_init == 0)
+        init_group_signal();
+    int status = wait_status(group_init);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "kill(0) from inside failed: status %#x", status);
+    struct timespec wait = {.tv_sec = 5};
+    siginfo_t info = {0};
+    CHECK(sigtimedwait(&usr1, &info, &wait) == SIGUSR1, "the group's leader outside got nothing from kill(0) inside");
+    CHECK(info.si_pid == 1, "the leader outside saw the sender as %d, wanted 1 (its own number)", (int) info.si_pid);
+    status = wait_status(member);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "the group's member outside got nothing from kill(0) inside: status %#x", status);
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     if (geteuid() == 0) {
@@ -626,6 +668,7 @@ int main(void) {
     run("numbers", case_numbers);
     run("the numbers reported", case_reported);
     run("NSpid", case_nspid);
+    run("a group signal from inside", case_group_signal);
 
     if (failures != 0) {
         printf(NAME ": FAIL failures=%d\n", failures);
