@@ -16,8 +16,8 @@
 //   framing      one write is one record: an embedded newline cannot split it
 //                into two lines, because every reader of this buffer assumes
 //                one record per line.
-//   truncation   an oversized record reports the whole write consumed, so the
-//                caller does not retry a tail that would be dropped again.
+//   size limit   a record of up to 1024 bytes is accepted whole; a longer one
+//                is EINVAL and logs nothing, as on Linux.
 //   empty        a zero-length write is accepted and adds nothing.
 
 #define _GNU_SOURCE
@@ -227,9 +227,12 @@ static void test_one_write_is_one_record(void) {
 }
 
 static void test_truncation(void) {
-    // Linux consumes the whole write and truncates the record. Reporting a
-    // short write instead would send the caller into a retry loop over a tail
-    // that gets dropped every time.
+    // Linux caps one record at PRINTKRB_RECORD_MAX, 1024 bytes: devkmsg_write
+    // returns EINVAL for anything longer and logs nothing (measured on 6.12:
+    // 1024 returns 1024, 1025 is EINVAL). This test used to expect the whole
+    // write consumed and the record truncated, which is not what Linux does;
+    // upstream measured it, and android::base's KernelLogger formats into a
+    // 1024-byte buffer, so nothing Android writes is affected.
     size_t big = 8192;
     char *rec = malloc(big + 1);
     check(rec != NULL, "allocate an oversized record");
@@ -242,11 +245,17 @@ static void test_truncation(void) {
     int fd = open(kmsg_path, O_WRONLY);
     check(fd >= 0, "open for the oversized write");
     if (fd >= 0) {
+        errno = 0;
         ssize_t n = write(fd, rec, big);
-        check(n == (ssize_t) big, "an oversized write reports the whole record consumed");
+        check(n < 0 && errno == EINVAL, "an oversized write is EINVAL");
+        // The largest record Linux accepts goes in whole.
+        memcpy(rec, "ish-kmsg-max-marker", strlen("ish-kmsg-max-marker"));
+        n = write(fd, rec, 1024);
+        check(n == 1024, "a 1024-byte record is accepted whole");
         close(fd);
     }
-    check(log_contains("ish-kmsg-long-marker"), "and its beginning is logged");
+    check(!log_contains("ish-kmsg-long-marker"), "the rejected record is not logged");
+    check(log_contains("ish-kmsg-max-marker"), "the 1024-byte record is logged");
     free(rec);
 }
 

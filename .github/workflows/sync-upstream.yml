@@ -134,6 +134,25 @@ jobs:
         if: steps.merge.outputs.clean == 'true'
         run: sh tools/check-fork-additions.sh
 
+      # The checkout above fetched the submodules of `working` BEFORE the merge;
+      # upstream adds and moves them (deps/dash, deps/virglrenderer and
+      # deps/MoltenVK arrived in one sync), so bring them to the merged tree's
+      # commits. Then the two steps upstream's ci.yml runs before building:
+      # smallclue's own openssh/nextvi/libgit2 submodules, which
+      # `submodules: true` does not reach, and dash's config.h, which is not
+      # committed. Without these the build below fails on a merge that is
+      # perfectly fine, and the issue it files blames the merge.
+      - name: Prepare the merged tree's submodules
+        if: steps.merge.outputs.clean == 'true'
+        run: |
+          set -euo pipefail
+          git submodule sync --recursive
+          git submodule update --init
+          git -C deps/smallclue submodule update --init third-party/openssh third-party/nextvi third-party/libgit2
+          if [ -x tools/configure-dash.sh ] && [ -d deps/dash ]; then
+            (cd deps/dash && ../../tools/configure-dash.sh --quiet)
+          fi
+
       - name: Install build dependencies
         if: steps.merge.outputs.clean == 'true'
         run: |
@@ -300,6 +319,13 @@ jobs:
           set -uo pipefail
           git worktree add /tmp/upstream-baseline "upstream/$UPSTREAM_BRANCH"
           cd /tmp/upstream-baseline
+          # Same preparation as the merged tree got, or the verdict would be
+          # about a missing config.h rather than about upstream.
+          git submodule update --init || true
+          git -C deps/smallclue submodule update --init third-party/openssh third-party/nextvi third-party/libgit2 || true
+          if [ -x tools/configure-dash.sh ] && [ -d deps/dash ]; then
+            (cd deps/dash && ../../tools/configure-dash.sh --quiet) || true
+          fi
           # The arm64 harness is this fork's, so bring it: upstream has no
           # equivalent and cannot be asked about arm64 any other way. It needs
           # the cross file and the meson.build gate that builds a CLI

@@ -202,6 +202,15 @@ need_in kernel/calls.c   "mem_segv_reason(current->mem, fault_addr)" "si_code fr
 need_in fs/proc/ish.c    "FORK_PROC_ISH_ENTRIES" "the fork's /proc/ish entries are in the table"
 need_in fs/proc/pid.c    "proc_pid_attr_init()" "/proc/<pid>/attr files find their directory"
 
+# The logd sink binds its host socket where guest connect() looks, which only
+# holds while it asks fs/sock.c's own unix_host_sun_path rather than repeating
+# its format -- upstream changed that format once already, and the sink went
+# deaf with nothing failing but logd_sink.
+need_in fs/sock.c "err = unix_host_sun_path(socket_id, &addr, &len);" \
+    "unix_socket_host_path_for uses connect()'s own host path"
+need_in .github/workflows/sync-upstream.yml "configure-dash.sh" \
+    "the sync prepares the merged tree's submodules before building it"
+
 # --- arm64 guest: testable without a device ---------------------------------
 # The arm64 engine is aarch64-host-only, so on an x86_64 dev box every gadget
 # in it is unreachable and the only feedback loop is building an IPA. This

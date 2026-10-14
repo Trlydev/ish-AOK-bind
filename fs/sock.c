@@ -6205,11 +6205,21 @@ int unix_socket_host_path_for(const char *guest_path, char *out, size_t out_size
     unlock(&inode->lock);
     mount_release(mount);
 
-    int n = snprintf(out, out_size, "%s.%u", sock_tmp_prefix, socket_id);
-    if (n < 0 || (size_t) n >= out_size) {
+    // Through unix_host_sun_path, the function connect() and bind() use, never
+    // a copy of its format. Upstream moved unprefixed hosts (the CLI) from
+    // "<prefix>.<id>" to a private per-process directory, and a hand-written
+    // "%s.%u" kept formatting the NULL prefix -- the logd sink bound at a path
+    // no guest connect() would ever look at, and every Android log line was
+    // refused.
+    struct sockaddr_un addr;
+    size_t len;
+    err = unix_host_sun_path(socket_id, &addr, &len);
+    if (err < 0 || len >= out_size) {
         inode_release(inode);
-        return _ENAMETOOLONG;
+        return err < 0 ? err : _ENAMETOOLONG;
     }
+    memcpy(out, addr.sun_path, len);
+    out[len] = '\0';
     *hold = inode; // caller releases
     return 0;
 }
