@@ -35,8 +35,10 @@
 #include "fs/inode.h"
 #include "fs/net_route.h"
 #include "fs/path.h"
+#include "fs/proc.h"
 #include "fs/poll.h"
 #include "fs/real.h"
+#include "fs/net_vif.h"
 #include "fs/sock.h"
 #include "fs/sock_ckpt.h"
 #include "util/timer.h"
@@ -1408,14 +1410,32 @@ static int netlink_append_route_routes(struct fd *sock, const struct nlmsghdr_ *
 
 // ---- rtnetlink in a private network namespace (kernel/net_ns.h) -------------
 //
-// One interface, "lo", index 1: down and without an address until it is told
-// otherwise, which is the whole of what a sandbox does to its network before
-// it runs anything (bubblewrap: RTM_NEWADDR 127.0.0.1/8, then RTM_NEWLINK
-// IFF_UP; systemd for a PrivateNetwork= service: RTM_SETLINK up, and reads it
-// back).
+// "lo", index 1: down and without an address until it is told otherwise,
+// which is the whole of what a sandbox does to its network before it runs
+// anything (bubblewrap: RTM_NEWADDR 127.0.0.1/8, then RTM_NEWLINK IFF_UP;
+// systemd for a PrivateNetwork= service: RTM_SETLINK up, and reads it back).
+// Then whatever veth and dummy links it is given (fs/net_vif.h): made,
+// changed, moved, deleted and addressed here, and listed with "lo".
 
 #define NET_NS_LO_INDEX 1
 #define RTM_SETLINK_NET_NS_ 19
+#define RTM_DELROUTE_NET_NS_ 25
+#define IFLA_LINK_NET_NS_ 5
+#define IFLA_LINKINFO_NET_NS_ 18
+#define IFLA_NET_NS_PID_NET_NS_ 19
+#define IFLA_NET_NS_FD_NET_NS_ 28
+#define IFLA_INFO_KIND_NET_NS_ 1
+#define IFLA_INFO_DATA_NET_NS_ 2
+#define VETH_INFO_PEER_NET_NS_ 1
+#define RTPROT_STATIC_NET_NS_ 4
+#define RT_TABLE_UNSPEC_NET_NS_ 0
+#define NLM_F_EXCL_NET_NS_ 0x200
+#define NLM_F_CREATE_NET_NS_ 0x400
+#define IF_OPER_DOWN_NET_NS_ 2
+#define IF_OPER_LOWERLAYERDOWN_NET_NS_ 5
+#define NET_NS_MAX_VIFS 64
+#define NLM_F_REPLACE_NET_NS_ 0x100
+#define CLONE_NEWNET_SOCK_ 0x40000000
 
 static unsigned net_ns_lo_flags(struct net_namespace *ns) {
     unsigned flags = IFF_LOOPBACK_LINUX_;
@@ -1435,7 +1455,7 @@ static int net_ns_append_lo_link(struct fd *sock, struct net_namespace *ns, uint
     msg->ifi_flags = net_ns_lo_flags(ns);
     msg->ifi_change = 0xffffffffu;
     uint32_t mtu = 65536, txqlen = 1000;
-    uint8_t operstate = atomic_load(&ns->lo_up) ? IF_OPER_UNKNOWN_ : 2 /* IF_OPER_DOWN */;
+    uint8_t operstate = atomic_load(&ns->lo_up) ? IF_OPER_UNKNOWN_ : IF_OPER_DOWN_NET_NS_;
     uint8_t carrier = atomic_load(&ns->lo_up) ? 1 : 0;
     uint8_t hw[6] = {0};
     int err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_IFNAME_, "lo", 3);
@@ -1454,6 +1474,63 @@ static int net_ns_append_lo_link(struct fd *sock, struct net_namespace *ns, uint
     if (err < 0)
         return err;
     return netlink_append_nlmsg(sock, RTM_NEWLINK_, msg_flags, seq, payload, len);
+}
+
+// A veth or dummy link, as rtnl_fill_ifinfo puts one: the flags Linux's
+// drivers give them (ether_setup's BROADCAST|MULTICAST; a dummy's NOARP), the
+// carrier the far end gives a veth, and IFLA_LINKINFO naming the kind, which
+// is how `ip -d link` and networkd tell one from the other.
+static int net_ns_append_vif_link(struct fd *sock, const struct net_vif_info *vif,
+        uint16_t type, uint16_t msg_flags, uint32_t seq) {
+    char payload[320];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifinfomsg_);
+    struct ifinfomsg_ *msg = (struct ifinfomsg_ *) payload;
+    msg->ifi_family = AF_UNSPEC;
+    msg->ifi_type = ARPHRD_ETHER_;
+    msg->ifi_index = vif->index;
+    unsigned flags = IFF_BROADCAST_LINUX_ | (vif->kind == NET_VIF_DUMMY ? IFF_NOARP_LINUX_ : IFF_MULTICAST_LINUX_);
+    if (vif->up)
+        flags |= IFF_UP_LINUX_;
+    if (vif->lower_up)
+        flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
+    msg->ifi_flags = flags;
+    msg->ifi_change = 0xffffffffu;
+    uint32_t mtu = vif->mtu, txqlen = vif->kind == NET_VIF_DUMMY ? 0 : 1000;
+    uint8_t operstate = !vif->up ? IF_OPER_DOWN_NET_NS_ :
+        vif->kind == NET_VIF_DUMMY ? IF_OPER_UNKNOWN_ :
+        vif->lower_up ? IF_OPER_UP_ : IF_OPER_LOWERLAYERDOWN_NET_NS_;
+    uint8_t carrier = vif->lower_up ? 1 : 0;
+    uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_IFNAME_, vif->name, strlen(vif->name) + 1);
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_MTU_, &mtu, sizeof(mtu));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_ADDRESS_, vif->mac, sizeof(vif->mac));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_BROADCAST_, broadcast, sizeof(broadcast));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_TXQLEN_, &txqlen, sizeof(txqlen));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_OPERSTATE_, &operstate, sizeof(operstate));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_CARRIER_, &carrier, sizeof(carrier));
+    if (err >= 0 && vif->kind == NET_VIF_VETH && vif->peer_index != 0) {
+        int32_t peer = vif->peer_index;
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_LINK_NET_NS_, &peer, sizeof(peer));
+    }
+    if (err >= 0) {
+        // IFLA_LINKINFO { IFLA_INFO_KIND "veth" | "dummy" }
+        const char *kind = vif->kind == NET_VIF_VETH ? "veth" : "dummy";
+        char nested[32];
+        size_t nested_len = 0;
+        err = netlink_append_attr_raw(nested, sizeof(nested), &nested_len, IFLA_INFO_KIND_NET_NS_, kind, strlen(kind) + 1);
+        if (err >= 0)
+            err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_LINKINFO_NET_NS_, nested, nested_len);
+    }
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, type, msg_flags, seq, payload, len);
 }
 
 static int net_ns_append_lo_addr(struct fd *sock, uint32_t seq, bool v6) {
@@ -1483,11 +1560,472 @@ static int net_ns_append_lo_addr(struct fd *sock, uint32_t seq, bool v6) {
     return netlink_append_nlmsg(sock, RTM_NEWADDR_, NLM_F_MULTI_, seq, payload, len);
 }
 
+static int net_ns_append_vif_addr(struct fd *sock, uint32_t seq, const struct net_vif_info *vif,
+        const struct net_vif_addr *addr) {
+    char payload[160];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifaddrmsg_);
+    struct ifaddrmsg_ *msg = (struct ifaddrmsg_ *) payload;
+    msg->ifa_family = addr->v6 ? AF_INET6_ : AF_INET_;
+    msg->ifa_prefixlen = addr->prefix;
+    msg->ifa_flags = IFA_F_PERMANENT_;
+    bool link_local = addr->v6 ? (addr->addr[0] == 0xfe && (addr->addr[1] & 0xc0) == 0x80)
+                               : (addr->addr[0] == 169 && addr->addr[1] == 254);
+    msg->ifa_scope = link_local ? RT_SCOPE_LINK_ : RT_SCOPE_UNIVERSE_;
+    msg->ifa_index = (uint32_t) vif->index;
+    size_t size = addr->v6 ? 16 : 4;
+    int err = 0;
+    if (!addr->v6)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LOCAL_, addr->addr, size);
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, addr->addr, size);
+    if (err >= 0 && !addr->v6 && addr->prefix < 31) {
+        uint32_t a;
+        memcpy(&a, addr->addr, 4);
+        uint32_t host = addr->prefix == 0 ? 0xffffffffu : (0xffffffffu >> addr->prefix);
+        uint32_t broadcast = htonl(ntohl(a) | host);
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_BROADCAST_, &broadcast, 4);
+    }
+    if (err >= 0 && !addr->v6)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LABEL_, vif->name, strlen(vif->name) + 1);
+    uint32_t flags = IFA_F_PERMANENT_;
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_FLAGS_, &flags, sizeof(flags));
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWADDR_, NLM_F_MULTI_, seq, payload, len);
+}
+
+static int net_ns_append_vif_route(struct fd *sock, uint32_t seq, const struct net_vif_route *route,
+        struct net_namespace *ns) {
+    char payload[160];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct rtmsg_);
+    struct rtmsg_ *msg = (struct rtmsg_ *) payload;
+    msg->rtm_family = route->v6 ? AF_INET6_ : AF_INET_;
+    msg->rtm_dst_len = route->prefix;
+    msg->rtm_table = RT_TABLE_MAIN_;
+    msg->rtm_protocol = route->connected ? RTPROT_KERNEL_ : RTPROT_BOOT_;
+    msg->rtm_scope = route->connected || !route->has_gateway ? RT_SCOPE_LINK_ : RT_SCOPE_UNIVERSE_;
+    msg->rtm_type = RTN_UNICAST_;
+    size_t size = route->v6 ? 16 : 4;
+    uint32_t table = RT_TABLE_MAIN_;
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_TABLE_, &table, sizeof(table));
+    if (err >= 0 && route->prefix != 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_DST_, route->dst, size);
+    if (err >= 0 && route->connected && !route->v6) {
+        // The address that made it is its preferred source.
+        struct net_vif_info vif;
+        if (net_vif_get(ns, route->oif, NULL, &vif) == 0) {
+            for (int i = 0; i < vif.n_addrs; i++) {
+                if (!vif.addrs[i].v6 && vif.addrs[i].prefix == route->prefix) {
+                    err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_PREFSRC_, vif.addrs[i].addr, 4);
+                    break;
+                }
+            }
+        }
+    }
+    if (err >= 0 && route->has_gateway)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_GATEWAY_, route->gateway, size);
+    if (err >= 0 && route->oif != 0) {
+        int32_t oif = route->oif;
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_OIF_, &oif, sizeof(oif));
+    }
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWROUTE_, NLM_F_MULTI_, seq, payload, len);
+}
+
 // A reply to a request that changes something: only when it asked for one.
 static int net_ns_ack(struct fd *sock, const struct nlmsghdr_ *hdr, int err_code) {
     if (err_code != 0 || (hdr->nlmsg_flags & NLM_F_ACK_))
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, err_code);
     return 0;
+}
+
+// The namespace IFLA_NET_NS_PID or IFLA_NET_NS_FD names, retained into *out
+// (NULL there is the initial one); *named false when the request names none.
+static int net_ns_named(const void *attrs, size_t len, bool *named, struct net_namespace **out) {
+    *named = false;
+    *out = NULL;
+    const struct nlattr_ *pid_attr = netlink_attr_find(attrs, len, IFLA_NET_NS_PID_NET_NS_);
+    const struct nlattr_ *fd_attr = netlink_attr_find(attrs, len, IFLA_NET_NS_FD_NET_NS_);
+    if (pid_attr != NULL && pid_attr->nla_len >= sizeof(*pid_attr) + 4) {
+        uint32_t pid;
+        memcpy(&pid, pid_attr + 1, 4);
+        struct task *task = pid_get_task_ref(pid);
+        if (task == NULL)
+            return _ESRCH;
+        bool gone = true;
+        if (task_lock_unless_exiting(task)) {
+            if (!task->exiting) {
+                gone = false;
+                *out = net_ns_retain(task->net_ns);
+            }
+            unlock(&task->general_lock);
+        }
+        task_ref_cnt_mod(task, -1);
+        if (gone)
+            return _ESRCH;
+        *named = true;
+        return 0;
+    }
+    if (fd_attr != NULL && fd_attr->nla_len >= sizeof(*fd_attr) + 4) {
+        int32_t fd_no;
+        memcpy(&fd_no, fd_attr + 1, 4);
+        struct fd *fd = f_get(fd_no);
+        unsigned nstype;
+        void *ns;
+        if (fd == NULL)
+            return _EBADF;
+        if (!proc_ns_fd_info(fd, &nstype, &ns) || nstype != CLONE_NEWNET_SOCK_)
+            return _EINVAL;
+        *out = net_ns_retain(ns);
+        *named = true;
+        return 0;
+    }
+    return 0;
+}
+
+// May the caller administer `ns`'s network? The initial one is the host's,
+// and nothing here makes links in it.
+static bool net_ns_admin(struct net_namespace *ns) {
+    return ns != NULL && ns_capable(ns->user_ns, CAP_NET_ADMIN_);
+}
+
+// The link a request names: by ifi_index, or by IFLA_IFNAME when that is 0.
+// 0 for "lo", the vif's index, -1 for none, or -2 when it names nothing.
+static int net_ns_request_link(struct net_namespace *ns, const struct ifinfomsg_ *req,
+        const void *attrs, size_t attrs_len, struct net_vif_info *vif) {
+    if (req->ifi_index == NET_NS_LO_INDEX)
+        return 0;
+    if (req->ifi_index != 0)
+        return net_vif_get(ns, req->ifi_index, NULL, vif) == 0 ? req->ifi_index : -1;
+    const struct nlattr_ *name = netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_);
+    if (name == NULL)
+        return -2;
+    if (netlink_attr_streq(name, "lo"))
+        return 0;
+    char text[NET_VIF_NAME_MAX] = "";
+    size_t n = name->nla_len - sizeof(*name);
+    if (n >= sizeof(text))
+        return -1;
+    memcpy(text, name + 1, n);
+    return net_vif_get(ns, 0, text, vif) == 0 ? vif->index : -1;
+}
+
+// A string attribute, copied out NUL-terminated; false when it does not fit.
+static bool net_ns_attr_name(const struct nlattr_ *attr, char *out, size_t size) {
+    out[0] = '\0';
+    if (attr == NULL)
+        return true;
+    size_t n = attr->nla_len - sizeof(*attr);
+    while (n > 0 && ((const char *) (attr + 1))[n - 1] == '\0')
+        n--;
+    if (n >= size)
+        return false;
+    memcpy(out, attr + 1, n);
+    out[n] = '\0';
+    return true;
+}
+
+// rtnl_dev_combine_flags: what an ifinfomsg makes of IFF_UP. -1: as it is.
+static int net_ns_request_up(const struct ifinfomsg_ *req) {
+    if (req->ifi_change == 0 && req->ifi_flags == 0)
+        return -1;
+    if (req->ifi_change != 0 && !(req->ifi_change & IFF_UP_LINUX_))
+        return -1;
+    return (req->ifi_flags & IFF_UP_LINUX_) != 0;
+}
+
+// do_setlink, for a vif: name, MTU, MAC, up, and a move to another namespace.
+static int net_ns_set_vif(struct net_namespace *ns, int index, const struct ifinfomsg_ *req,
+        const void *attrs, size_t attrs_len, bool rename) {
+    struct net_vif_change change = {.up = net_ns_request_up(req)};
+    char name[NET_VIF_NAME_MAX];
+    const struct nlattr_ *name_attr = rename ? netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_) : NULL;
+    if (!net_ns_attr_name(name_attr, name, sizeof(name)))
+        return _EINVAL;
+    if (name[0] != '\0')
+        change.name = name;
+    const struct nlattr_ *mtu = netlink_attr_find(attrs, attrs_len, IFLA_MTU_);
+    if (mtu != NULL && mtu->nla_len >= sizeof(*mtu) + 4)
+        memcpy(&change.mtu, mtu + 1, 4);
+    const struct nlattr_ *mac = netlink_attr_find(attrs, attrs_len, IFLA_ADDRESS_);
+    if (mac != NULL) {
+        if (mac->nla_len != sizeof(*mac) + 6)
+            return _EINVAL;
+        change.mac = (const uint8_t *) (mac + 1);
+    }
+    bool named;
+    struct net_namespace *to;
+    int err = net_ns_named(attrs, attrs_len, &named, &to);
+    if (err < 0)
+        return err;
+    if (named && to != ns) {
+        // Linux takes CAP_NET_ADMIN over both. There are no links in the
+        // initial namespace to move one to (fs/net_vif.h).
+        if (to == NULL)
+            err = _EOPNOTSUPP;
+        else if (!net_ns_admin(to))
+            err = _EPERM;
+        change.move = true;
+        change.to_ns = to;
+    }
+    if (err == 0)
+        err = net_vif_change(ns, index, &change);
+    // A move leaves the link down; the flags in the same request are not
+    // applied to it there (do_setlink moves it first and finds it gone).
+    net_ns_release(to);
+    return err;
+}
+
+// RTM_NEWLINK with a kind, for a link that does not exist yet.
+static int net_ns_new_vif(struct net_namespace *ns, const struct nlmsghdr_ *hdr, const struct ifinfomsg_ *req,
+        const void *attrs, size_t attrs_len, const struct nlattr_ *linkinfo) {
+    const void *info = linkinfo + 1;
+    size_t info_len = linkinfo->nla_len - sizeof(*linkinfo);
+    const struct nlattr_ *kind_attr = netlink_attr_find(info, info_len, IFLA_INFO_KIND_NET_NS_);
+    enum net_vif_kind kind;
+    if (kind_attr != NULL && netlink_attr_streq(kind_attr, "veth"))
+        kind = NET_VIF_VETH;
+    else if (kind_attr != NULL && netlink_attr_streq(kind_attr, "dummy"))
+        kind = NET_VIF_DUMMY;
+    else
+        return _EOPNOTSUPP;
+    if (!(hdr->nlmsg_flags & NLM_F_CREATE_NET_NS_))
+        return _ENODEV;
+
+    char name[NET_VIF_NAME_MAX], peer_name[NET_VIF_NAME_MAX];
+    if (!net_ns_attr_name(netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_), name, sizeof(name)))
+        return _EINVAL;
+    // The peer: VETH_INFO_PEER in IFLA_INFO_DATA, an ifinfomsg and its own
+    // attributes.
+    const struct ifinfomsg_ *peer_req = NULL;
+    const void *peer_attrs = NULL;
+    size_t peer_attrs_len = 0;
+    peer_name[0] = '\0';
+    if (kind == NET_VIF_VETH) {
+        const struct nlattr_ *data = netlink_attr_find(info, info_len, IFLA_INFO_DATA_NET_NS_);
+        const struct nlattr_ *peer = data != NULL
+            ? netlink_attr_find(data + 1, data->nla_len - sizeof(*data), VETH_INFO_PEER_NET_NS_) : NULL;
+        if (peer != NULL) {
+            size_t peer_len = peer->nla_len - sizeof(*peer);
+            if (peer_len < sizeof(struct ifinfomsg_))
+                return _EINVAL;
+            peer_req = (const struct ifinfomsg_ *) (peer + 1);
+            peer_attrs = (const char *) peer_req + NLMSG_ALIGN(sizeof(*peer_req));
+            peer_attrs_len = peer_len > NLMSG_ALIGN(sizeof(*peer_req)) ? peer_len - NLMSG_ALIGN(sizeof(*peer_req)) : 0;
+            if (!net_ns_attr_name(netlink_attr_find(peer_attrs, peer_attrs_len, IFLA_IFNAME_), peer_name, sizeof(peer_name)))
+                return _EINVAL;
+        }
+    }
+
+    // Where each end goes: the request's namespace attribute moves the link
+    // itself, the peer's its peer (which is otherwise where the link is).
+    bool named;
+    struct net_namespace *where, *peer_where = NULL;
+    int err = net_ns_named(attrs, attrs_len, &named, &where);
+    if (err < 0)
+        return err;
+    if (!named)
+        where = net_ns_retain(ns);
+    if (err == 0 && peer_req != NULL) {
+        err = net_ns_named(peer_attrs, peer_attrs_len, &named, &peer_where);
+        if (err == 0 && !named)
+            peer_where = net_ns_retain(where);
+    } else if (err == 0) {
+        peer_where = net_ns_retain(where);
+    }
+    if (err == 0 && (where == NULL || (kind == NET_VIF_VETH && peer_where == NULL)))
+        err = _EOPNOTSUPP;
+    else if (err == 0 && (!net_ns_admin(where) || (kind == NET_VIF_VETH && !net_ns_admin(peer_where))))
+        err = _EPERM;
+    if (err == 0)
+        err = net_vif_create(where, kind, name[0] != '\0' ? name : NULL,
+                peer_name[0] != '\0' ? peer_name : NULL, peer_where);
+    if (err == 0) {
+        // Then the flags and attributes each end was given, as
+        // rtnl_configure_link applies them.
+        struct net_vif_info made;
+        if (name[0] == '\0' || net_vif_get(where, 0, name, &made) != 0) {
+            // (An unnamed link: the newest of the kind.)
+            struct net_vif_info all[NET_NS_MAX_VIFS];
+            int n = net_vif_list(where, all, NET_NS_MAX_VIFS);
+            made = all[n > NET_NS_MAX_VIFS ? NET_NS_MAX_VIFS - 1 : n - 1];
+        }
+        // MTU and MAC from the request's own attributes, but not its namespace
+        // (it is already there) or its name (it has it).
+        struct net_vif_change change = {.up = net_ns_request_up(req)};
+        const struct nlattr_ *mtu = netlink_attr_find(attrs, attrs_len, IFLA_MTU_);
+        if (mtu != NULL && mtu->nla_len >= sizeof(*mtu) + 4)
+            memcpy(&change.mtu, mtu + 1, 4);
+        const struct nlattr_ *mac = netlink_attr_find(attrs, attrs_len, IFLA_ADDRESS_);
+        if (mac != NULL && mac->nla_len == sizeof(*mac) + 6)
+            change.mac = (const uint8_t *) (mac + 1);
+        net_vif_change(where, made.index, &change);
+        if (peer_req != NULL && made.peer_index != 0) {
+            struct net_vif_change peer_change = {.up = net_ns_request_up(peer_req)};
+            mtu = netlink_attr_find(peer_attrs, peer_attrs_len, IFLA_MTU_);
+            if (mtu != NULL && mtu->nla_len >= sizeof(*mtu) + 4)
+                memcpy(&peer_change.mtu, mtu + 1, 4);
+            mac = netlink_attr_find(peer_attrs, peer_attrs_len, IFLA_ADDRESS_);
+            if (mac != NULL && mac->nla_len == sizeof(*mac) + 6)
+                peer_change.mac = (const uint8_t *) (mac + 1);
+            net_vif_change(peer_where, made.peer_index, &peer_change);
+        }
+    }
+    net_ns_release(where);
+    net_ns_release(peer_where);
+    return err;
+}
+
+static int net_ns_link_request(struct net_namespace *ns, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct ifinfomsg_))
+        return _EINVAL;
+    const struct ifinfomsg_ *req = payload;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+        return _EPERM;
+    struct net_vif_info vif;
+    int which = net_ns_request_link(ns, req, attrs, attrs_len, &vif);
+    const struct nlattr_ *linkinfo = netlink_attr_find(attrs, attrs_len, IFLA_LINKINFO_NET_NS_);
+
+    if (hdr->nlmsg_type == RTM_DELLINK_) {
+        if (which == 0)
+            return _EOPNOTSUPP;     // the loopback cannot go
+        if (which < 0)
+            return which == -2 ? _EINVAL : _ENODEV;
+        return net_vif_delete(ns, which);
+    }
+    if (which < 0) {
+        // Nothing by that name or number: a new link, if the request says
+        // what kind (RTM_SETLINK never makes one).
+        if (hdr->nlmsg_type != RTM_NEWLINK_ || linkinfo == NULL)
+            return which == -2 && hdr->nlmsg_type != RTM_NEWLINK_ ? _EINVAL :
+                   hdr->nlmsg_type == RTM_NEWLINK_ && which == -2 ? _EOPNOTSUPP : _ENODEV;
+        return net_ns_new_vif(ns, hdr, req, attrs, attrs_len, linkinfo);
+    }
+    if (hdr->nlmsg_type == RTM_NEWLINK_ && (hdr->nlmsg_flags & NLM_F_EXCL_NET_NS_))
+        return _EEXIST;
+    if (linkinfo != NULL) {
+        // A kind that is not the link's own.
+        const struct nlattr_ *kind = netlink_attr_find(linkinfo + 1, linkinfo->nla_len - sizeof(*linkinfo), IFLA_INFO_KIND_NET_NS_);
+        const char *own = which == 0 ? NULL : vif.kind == NET_VIF_VETH ? "veth" : "dummy";
+        if (kind != NULL && (own == NULL || !netlink_attr_streq(kind, own)))
+            return _EOPNOTSUPP;
+    }
+    if (which == 0) {
+        // "lo": up or down, and nowhere else.
+        bool named;
+        struct net_namespace *to;
+        int err = net_ns_named(attrs, attrs_len, &named, &to);
+        net_ns_release(to);
+        if (err < 0)
+            return err;
+        if (named && to != ns)
+            return _EINVAL;     // NETIF_F_NETNS_LOCAL
+        int up = net_ns_request_up(req);
+        if (up >= 0) {
+            atomic_store(&ns->lo_up, up != 0);
+            // Up, the loopback has its addresses, as Linux gives them.
+            if (up) {
+                atomic_store(&ns->lo_addr4, true);
+                atomic_store(&ns->lo_addr6, true);
+            }
+        }
+        return 0;
+    }
+    return net_ns_set_vif(ns, which, req, attrs, attrs_len, req->ifi_index != 0);
+}
+
+static int net_ns_addr_request(struct net_namespace *ns, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct ifaddrmsg_))
+        return _EINVAL;
+    const struct ifaddrmsg_ *req = payload;
+    if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+        return _EPERM;
+    bool add = hdr->nlmsg_type == RTM_NEWADDR_;
+    if (req->ifa_index == NET_NS_LO_INDEX) {
+        if (req->ifa_family == AF_INET_)
+            atomic_store(&ns->lo_addr4, add);
+        else if (req->ifa_family == AF_INET6_)
+            atomic_store(&ns->lo_addr6, add);
+        else
+            return _EAFNOSUPPORT;
+        return 0;
+    }
+    if (req->ifa_family != AF_INET_ && req->ifa_family != AF_INET6_)
+        return _EAFNOSUPPORT;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    struct net_vif_addr addr = {.v6 = req->ifa_family == AF_INET6_, .prefix = req->ifa_prefixlen};
+    size_t size = addr.v6 ? 16 : 4;
+    // IFA_LOCAL is the address; IFA_ADDRESS is it too unless the link is
+    // point-to-point (where it is the far end), which none here is.
+    const struct nlattr_ *local = netlink_attr_find(attrs, attrs_len, IFA_LOCAL_);
+    if (local == NULL)
+        local = netlink_attr_find(attrs, attrs_len, IFA_ADDRESS_);
+    if (local == NULL || local->nla_len < sizeof(*local) + size)
+        return _EINVAL;
+    memcpy(addr.addr, local + 1, size);
+    if (req->ifa_index == 0)
+        return _ENODEV;
+    if (add && (hdr->nlmsg_flags & NLM_F_REPLACE_NET_NS_)) {
+        int err = net_vif_address(ns, (int) req->ifa_index, true, &addr);
+        return err == _EEXIST ? 0 : err;
+    }
+    return net_vif_address(ns, (int) req->ifa_index, add, &addr);
+}
+
+static int net_ns_route_change(struct net_namespace *ns, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct rtmsg_))
+        return _EINVAL;
+    const struct rtmsg_ *req = payload;
+    if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+        return _EPERM;
+    if (req->rtm_family != AF_INET_ && req->rtm_family != AF_INET6_)
+        return _EAFNOSUPPORT;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    uint32_t table = req->rtm_table;
+    const struct nlattr_ *table_attr = netlink_attr_find(attrs, attrs_len, RTA_TABLE_);
+    if (table_attr != NULL && table_attr->nla_len >= sizeof(*table_attr) + 4)
+        memcpy(&table, table_attr + 1, 4);
+    // The main table alone: policy routing has nothing to choose between.
+    if (table != RT_TABLE_MAIN_ && table != RT_TABLE_UNSPEC_NET_NS_)
+        return _EOPNOTSUPP;
+    struct net_vif_route route = {.v6 = req->rtm_family == AF_INET6_, .prefix = req->rtm_dst_len};
+    size_t size = route.v6 ? 16 : 4;
+    const struct nlattr_ *dst = netlink_attr_find(attrs, attrs_len, RTA_DST_);
+    if (dst != NULL) {
+        if (dst->nla_len < sizeof(*dst) + size)
+            return _EINVAL;
+        memcpy(route.dst, dst + 1, size);
+    }
+    const struct nlattr_ *gateway = netlink_attr_find(attrs, attrs_len, RTA_GATEWAY_);
+    if (gateway != NULL) {
+        if (gateway->nla_len < sizeof(*gateway) + size)
+            return _EINVAL;
+        memcpy(route.gateway, gateway + 1, size);
+        route.has_gateway = true;
+    }
+    const struct nlattr_ *oif = netlink_attr_find(attrs, attrs_len, RTA_OIF_);
+    if (oif != NULL && oif->nla_len >= sizeof(*oif) + 4)
+        memcpy(&route.oif, oif + 1, 4);
+    bool add = hdr->nlmsg_type == RTM_NEWROUTE_;
+    if (add && route.oif == 0 && !route.has_gateway)
+        return _EINVAL;
+    int err = net_vif_route_change(ns, add, &route);
+    if (add && err == _EEXIST && (hdr->nlmsg_flags & NLM_F_REPLACE_NET_NS_)) {
+        net_vif_route_change(ns, false, &route);
+        err = net_vif_route_change(ns, true, &route);
+    }
+    return err;
 }
 
 // true when the request was one of this namespace's own to answer (*result
@@ -1498,21 +2036,37 @@ static bool net_ns_route_request(struct fd *sock, const struct nlmsghdr_ *hdr,
     uint8_t family = payload_len >= 1 ? *(const uint8_t *) payload : AF_UNSPEC;
     switch (hdr->nlmsg_type) {
         case RTM_GETLINK_: {
+            struct net_vif_info vifs[NET_NS_MAX_VIFS];
             if (hdr->nlmsg_flags & NLM_F_DUMP_) {
-                int err = family == AF_BRIDGE_ ? 0 : net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, NLM_F_MULTI_);
+                int err = 0;
+                if (family != AF_BRIDGE_) {
+                    err = net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, NLM_F_MULTI_);
+                    int n = net_vif_list(ns, vifs, NET_NS_MAX_VIFS);
+                    for (int i = 0; err >= 0 && i < n && i < NET_NS_MAX_VIFS; i++)
+                        err = net_ns_append_vif_link(sock, &vifs[i], RTM_NEWLINK_, NLM_F_MULTI_, hdr->nlmsg_seq);
+                }
                 *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
                 return true;
             }
             // One link, by index or by name.
-            const struct ifinfomsg_ *req = payload_len >= sizeof(*req) ? payload : NULL;
-            bool is_lo = req != NULL && req->ifi_index == NET_NS_LO_INDEX;
-            if (req != NULL && req->ifi_index == 0) {
-                const struct nlattr_ *name = netlink_attr_find((const char *) payload + sizeof(*req),
-                        payload_len - sizeof(*req), IFLA_IFNAME_);
-                is_lo = name != NULL && netlink_attr_streq(name, "lo");
+            if (payload_len < sizeof(struct ifinfomsg_)) {
+                *result = netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EINVAL);
+                return true;
             }
-            *result = is_lo ? net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, 0)
-                            : netlink_append_error(sock, hdr->nlmsg_seq, hdr, _ENODEV);
+            const struct ifinfomsg_ *req = payload;
+            const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+            size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+            int which = net_ns_request_link(ns, req, attrs, attrs_len, &vifs[0]);
+            int err;
+            if (which == 0)
+                err = net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, 0);
+            else if (which > 0)
+                err = net_ns_append_vif_link(sock, &vifs[0], RTM_NEWLINK_, 0, hdr->nlmsg_seq);
+            else
+                err = netlink_append_error(sock, hdr->nlmsg_seq, hdr, which == -2 ? _EINVAL : _ENODEV);
+            if (err >= 0 && which >= 0 && (hdr->nlmsg_flags & NLM_F_ACK_))
+                err = netlink_append_error(sock, hdr->nlmsg_seq, hdr, 0);
+            *result = err;
             return true;
         }
         case RTM_GETADDR_: {
@@ -1521,61 +2075,44 @@ static bool net_ns_route_request(struct fd *sock, const struct nlmsghdr_ *hdr,
                 err = net_ns_append_lo_addr(sock, hdr->nlmsg_seq, false);
             if (err >= 0 && atomic_load(&ns->lo_addr6) && (family == AF_UNSPEC || family == AF_INET6_))
                 err = net_ns_append_lo_addr(sock, hdr->nlmsg_seq, true);
+            struct net_vif_info vifs[NET_NS_MAX_VIFS];
+            int n = net_vif_list(ns, vifs, NET_NS_MAX_VIFS);
+            for (int i = 0; err >= 0 && i < n && i < NET_NS_MAX_VIFS; i++) {
+                for (int j = 0; err >= 0 && j < vifs[i].n_addrs; j++) {
+                    const struct net_vif_addr *addr = &vifs[i].addrs[j];
+                    if (family == AF_UNSPEC || family == (addr->v6 ? AF_INET6_ : AF_INET_))
+                        err = net_ns_append_vif_addr(sock, hdr->nlmsg_seq, &vifs[i], addr);
+                }
+            }
             *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
             return true;
         }
-        case RTM_GETROUTE_:
-            // No routes: the loopback's own are not listed here either.
-            *result = netlink_append_done(sock, hdr->nlmsg_seq);
+        case RTM_GETROUTE_: {
+            // The main table: what the links' addresses connect, and the
+            // routes added. (The loopback's own are in the local table, which
+            // is not listed here.)
+            struct net_vif_route routes[NET_NS_MAX_VIFS * 2];
+            int n = net_vif_routes(ns, routes, NET_NS_MAX_VIFS * 2);
+            int err = 0;
+            for (int i = 0; err >= 0 && i < n && i < NET_NS_MAX_VIFS * 2; i++)
+                if (family == AF_UNSPEC || family == (routes[i].v6 ? AF_INET6_ : AF_INET_))
+                    err = net_ns_append_vif_route(sock, hdr->nlmsg_seq, &routes[i], ns);
+            *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
             return true;
+        }
         case RTM_NEWADDR_:
-        case RTM_DELADDR_: {
-            const struct ifaddrmsg_ *req = payload_len >= sizeof(*req) ? payload : NULL;
-            int err = 0;
-            if (req == NULL)
-                err = _EINVAL;
-            else if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
-                err = _EPERM;
-            else if (req->ifa_index != NET_NS_LO_INDEX)
-                err = _ENODEV;
-            else if (req->ifa_family == AF_INET_)
-                atomic_store(&ns->lo_addr4, hdr->nlmsg_type == RTM_NEWADDR_);
-            else if (req->ifa_family == AF_INET6_)
-                atomic_store(&ns->lo_addr6, hdr->nlmsg_type == RTM_NEWADDR_);
-            else
-                err = _EAFNOSUPPORT;
-            *result = net_ns_ack(sock, hdr, err);
+        case RTM_DELADDR_:
+            *result = net_ns_ack(sock, hdr, net_ns_addr_request(ns, hdr, payload, payload_len));
             return true;
-        }
         case RTM_NEWLINK_:
-        case RTM_SETLINK_NET_NS_: {
-            const struct ifinfomsg_ *req = payload_len >= sizeof(*req) ? payload : NULL;
-            int err = 0;
-            bool is_lo = req != NULL && req->ifi_index == NET_NS_LO_INDEX;
-            if (req != NULL && req->ifi_index == 0) {
-                const struct nlattr_ *name = netlink_attr_find((const char *) payload + sizeof(*req),
-                        payload_len - sizeof(*req), IFLA_IFNAME_);
-                is_lo = name != NULL && netlink_attr_streq(name, "lo");
-            }
-            if (req == NULL)
-                err = _EINVAL;
-            else if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
-                err = _EPERM;
-            else if (!is_lo)
-                // Nothing but "lo" is here, and no other kind can be made.
-                err = req->ifi_index != 0 ? _ENODEV : _EOPNOTSUPP;
-            else if (req->ifi_change == 0 || (req->ifi_change & IFF_UP_LINUX_)) {
-                bool up = (req->ifi_flags & IFF_UP_LINUX_) != 0;
-                atomic_store(&ns->lo_up, up);
-                // Up, the loopback has its addresses, as Linux gives them.
-                if (up) {
-                    atomic_store(&ns->lo_addr4, true);
-                    atomic_store(&ns->lo_addr6, true);
-                }
-            }
-            *result = net_ns_ack(sock, hdr, err);
+        case RTM_SETLINK_NET_NS_:
+        case RTM_DELLINK_:
+            *result = net_ns_ack(sock, hdr, net_ns_link_request(ns, hdr, payload, payload_len));
             return true;
-        }
+        case RTM_NEWROUTE_:
+        case RTM_DELROUTE_NET_NS_:
+            *result = net_ns_ack(sock, hdr, net_ns_route_change(ns, hdr, payload, payload_len));
+            return true;
     }
     return false;
 }
@@ -1586,6 +2123,24 @@ static int netlink_handle_route_request(struct fd *sock, const struct nlmsghdr_ 
         int result;
         if (net_ns_route_request(sock, hdr, payload, payload_len, &result))
             return result;
+    }
+    // A request to make a link -- one with a kind (IFLA_LINKINFO), naming
+    // none the machine has. The initial namespace's links are the host's, and
+    // nothing makes one there (fs/net_vif.h): EOPNOTSUPP, what Linux says for
+    // a kind it has no driver for. The accepting ack below would leave `ip
+    // link add` reporting success and the caller waiting on an interface that
+    // never appears.
+    if (hdr->nlmsg_type == RTM_NEWLINK_ && payload_len >= sizeof(struct ifinfomsg_)) {
+        const struct ifinfomsg_ *req = payload;
+        const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+        size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+        const struct nlattr_ *linkinfo = netlink_attr_find(attrs, attrs_len, IFLA_LINKINFO_NET_NS_);
+        char name[IFNAMSIZ_ + 1];
+        if (linkinfo != NULL && req->ifi_index == 0 &&
+                netlink_attr_find(linkinfo + 1, linkinfo->nla_len - sizeof(*linkinfo), IFLA_INFO_KIND_NET_NS_) != NULL &&
+                net_ns_attr_name(netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_), name, sizeof(name)) &&
+                (name[0] == '\0' || if_nametoindex(name) == 0))
+            return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
     }
     switch (hdr->nlmsg_type) {
         case RTM_GETLINK_:
@@ -2877,6 +3432,8 @@ struct net_namespace *net_ns_retain(struct net_namespace *ns) {
 
 void net_ns_release(struct net_namespace *ns) {
     if (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
+        // Its interfaces go with it, and a veth's far end too (fs/net_vif.h).
+        net_vif_namespace_gone(ns);
         user_ns_release(ns->user_ns);
         free(ns);
     }
@@ -2944,6 +3501,62 @@ static int sock_net_dest_gate(const struct fd *sock, const void *addr) {
 // loopback address the namespace's "lo" has been given.
 static _Atomic unsigned net_ns_next_port = 0;
 static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard);
+
+// A host-format inet address as its family and bytes: IPv4 in the first
+// four, and an IPv4-mapped IPv6 address as the IPv4 one it is. true for IPv6.
+static bool net_emul_addr_bytes(const void *addr, uint8_t out[16]) {
+    const struct sockaddr *sa = addr;
+    memset(out, 0, 16);
+    if (sa->sa_family == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *) addr)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(a6)) {
+            memcpy(out, &a6->s6_addr[12], 4);
+            return false;
+        }
+        memcpy(out, a6->s6_addr, 16);
+        return true;
+    }
+    memcpy(out, &((const struct sockaddr_in *) addr)->sin_addr, 4);
+    return false;
+}
+
+static bool net_emul_bytes_loopback(bool v6, const uint8_t *bytes) {
+    static const uint8_t lo6[16] = {[15] = 1};
+    return v6 ? memcmp(bytes, lo6, 16) == 0 : bytes[0] == 127;
+}
+
+// The other way: family and bytes (and a port, network order) as a host
+// address in `sock`'s own family -- an IPv4 one IPv4-mapped for an IPv6
+// socket.
+static void net_emul_write_addr(const struct fd *sock, void *addr, uint_t *addr_len,
+        bool v6, const uint8_t *bytes, uint16_t port) {
+    memset(addr, 0, sizeof(struct sockaddr_in6));
+    if (sock->socket.domain == AF_INET6_) {
+        struct sockaddr_in6 *in6 = addr;
+#ifdef __APPLE__
+        in6->sin6_len = sizeof(*in6);
+#endif
+        in6->sin6_family = AF_INET6;
+        in6->sin6_port = port;
+        if (v6) {
+            memcpy(in6->sin6_addr.s6_addr, bytes, 16);
+        } else {
+            in6->sin6_addr.s6_addr[10] = in6->sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&in6->sin6_addr.s6_addr[12], bytes, 4);
+        }
+        *addr_len = sizeof(*in6);
+    } else {
+        struct sockaddr_in *in = addr;
+#ifdef __APPLE__
+        in->sin_len = sizeof(*in);
+#endif
+        in->sin_family = AF_INET;
+        in->sin_port = port;
+        if (!v6)
+            memcpy(&in->sin_addr, bytes, 4);
+        *addr_len = sizeof(*in);
+    }
+}
 static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
     struct net_namespace *ns = sock->socket.net_ns;
     struct sockaddr *sa = addr;
@@ -2955,11 +3568,16 @@ static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
         ? ((struct sockaddr_in *) sa)->sin_addr.s_addr == htonl(INADDR_ANY)
         : IN6_IS_ADDR_UNSPECIFIED(&((struct sockaddr_in6 *) sa)->sin6_addr);
     if (!wildcard) {
-        if (!host_sockaddr_is_loopback(addr))
+        uint8_t bytes[16];
+        bool v6 = net_emul_addr_bytes(addr, bytes);
+        if (host_sockaddr_is_loopback(addr)) {
+            bool assigned = !v6 ? atomic_load(&ns->lo_addr4) : atomic_load(&ns->lo_addr6);
+            if (!assigned)
+                return _EADDRNOTAVAIL;
+        } else if (!net_vif_local(ns, v6, bytes)) {
+            // (An address of one of its veth or dummy links, fs/net_vif.h.)
             return _EADDRNOTAVAIL;
-        bool assigned = sa->sa_family == AF_INET ? atomic_load(&ns->lo_addr4) : atomic_load(&ns->lo_addr6);
-        if (!assigned)
-            return _EADDRNOTAVAIL;
+        }
     }
     in_port_t *port = sa->sa_family == AF_INET ? &((struct sockaddr_in *) sa)->sin_port
                                                : &((struct sockaddr_in6 *) sa)->sin6_port;
@@ -3027,8 +3645,16 @@ struct net_emul_bind {
     bool dgram;
     bool v6;                        // an AF_INET6 socket's
     bool dual;                      // ...that takes IPv4's traffic too
+    bool wildcard;                  // bound to any address, or else to `addr`
+    uint8_t addr[16];               // (an IPv4 one in the first four bytes)
     uint16_t port;                  // network order
     uint32_t id;                    // unix_socket_next_id(): names the host path
+    // Where its traffic last went, and from which address: what the far end
+    // reads back as this socket's address (a sender's, a connecting client's)
+    // and as its own (an accepted connection's). Loopback until it is sent
+    // across a veth (fs/net_vif.h).
+    bool route_set, route_v6;
+    uint8_t src[16], dst[16];
     struct list links;
 };
 static lock_t net_emul_lock = LOCK_INITIALIZER;
@@ -3036,17 +3662,34 @@ static struct list net_emul_binds;
 static uint32_t unix_socket_next_id(void);
 static int unix_host_sun_path(uint32_t socket_id, struct sockaddr_un *addr, size_t *len_out);
 
-// The binding a destination of the given family finds, or with `any` the
-// first one of either family (is the port free for anyone?).
+// Does a binding's address take traffic for `dst` (NULL: for any)? The
+// wildcard does; so does one loopback address for another, as it always has
+// here; any other address only for itself.
+static bool net_emul_bind_takes(const struct net_emul_bind *bind, bool v6, const uint8_t *dst) {
+    if (bind->wildcard || dst == NULL)
+        return true;
+    bool bind_v6 = bind->v6 && !bind->dual;
+    if (bind_v6 != v6)
+        return false;
+    if (net_emul_bytes_loopback(v6, bind->addr) && net_emul_bytes_loopback(v6, dst))
+        return true;
+    return memcmp(bind->addr, dst, v6 ? 16 : 4) == 0;
+}
+
+// The binding a destination of the given family (and address, or NULL)
+// finds, or with `any` the first one of either family (is the port free for
+// anyone?).
 static struct net_emul_bind *net_emul_find_locked(const struct net_namespace *ns, bool dgram,
-        uint16_t port, bool v6, bool any) {
+        uint16_t port, bool v6, bool any, const uint8_t *dst) {
     if (list_null(&net_emul_binds))
         list_init(&net_emul_binds);
     struct net_emul_bind *bind, *dual = NULL;
     list_for_each_entry(&net_emul_binds, bind, links) {
         if (bind->ns != ns || bind->dgram != dgram || bind->port != port)
             continue;
-        if (any || bind->v6 == v6)
+        if (any)
+            return bind;
+        if (bind->v6 == v6 && net_emul_bind_takes(bind, v6, dst))
             return bind;
         if (!v6 && bind->dual)
             dual = bind;
@@ -3055,16 +3698,19 @@ static struct net_emul_bind *net_emul_find_locked(const struct net_namespace *ns
 }
 
 // Would a new binding of the port collide with one that is there? Its own
-// family's always; the other family's when either of the two is dual.
+// family's always, unless the two name different addresses and neither is
+// the wildcard; the other family's when either of the two is dual.
 static bool net_emul_conflict_locked(const struct net_namespace *ns, bool dgram, uint16_t port,
-        bool v6, bool dual) {
+        bool v6, bool dual, bool wildcard, const uint8_t *addr) {
     if (list_null(&net_emul_binds))
         list_init(&net_emul_binds);
     struct net_emul_bind *bind;
     list_for_each_entry(&net_emul_binds, bind, links) {
         if (bind->ns != ns || bind->dgram != dgram || bind->port != port)
             continue;
-        if (bind->v6 == v6 || bind->dual || dual)
+        if (bind->dual || dual)
+            return true;
+        if (bind->v6 == v6 && net_emul_bind_takes(bind, v6, wildcard ? NULL : addr))
             return true;
     }
     return false;
@@ -3101,6 +3747,14 @@ static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard) {
     bool dgram = sock_net_emul_dgram(sock);
     bool v6 = sock->socket.domain == AF_INET6_;
     bool dual = v6 && wildcard && !sock->socket.net_emul_v6only;
+    // The address bind() named, recorded before this was called; none for a
+    // socket bound because it connected or sent.
+    uint8_t addr[16] = {0};
+    bool addr_v6 = v6;
+    if (!wildcard && sock->socket.bind_deferred)
+        addr_v6 = net_emul_addr_bytes(sock->socket.deferred_addr, addr);
+    else
+        wildcard = true;
     struct net_emul_bind *entry = calloc(1, sizeof(*entry));
     if (entry == NULL)
         return _ENOMEM;
@@ -3109,10 +3763,10 @@ static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard) {
         for (int tries = 0; tries < 28000 && port == 0; tries++) {
             uint16_t candidate = htons((uint16_t) (32768 + atomic_fetch_add(&net_emul_next_port, 1) % 28000));
             // (A port nobody has in either family: what Linux hands out.)
-            if (net_emul_find_locked(sock->socket.net_ns, dgram, candidate, false, true) == NULL)
+            if (net_emul_find_locked(sock->socket.net_ns, dgram, candidate, false, true, NULL) == NULL)
                 port = candidate;
         }
-    } else if (net_emul_conflict_locked(sock->socket.net_ns, dgram, port, v6, dual)) {
+    } else if (net_emul_conflict_locked(sock->socket.net_ns, dgram, port, addr_v6, dual, wildcard, addr)) {
         port = 0;
     }
     if (port == 0) {
@@ -3121,7 +3775,8 @@ static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard) {
         return _EADDRINUSE;
     }
     *entry = (struct net_emul_bind) {.ns = sock->socket.net_ns, .dgram = dgram, .v6 = v6, .dual = dual,
-                                     .port = port, .id = unix_socket_next_id()};
+                                     .wildcard = wildcard, .port = port, .id = unix_socket_next_id()};
+    memcpy(entry->addr, addr, sizeof(addr));
     list_add(&net_emul_binds, &entry->links);
     unlock(&net_emul_lock);
 
@@ -3142,27 +3797,14 @@ static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard) {
     }
     sock->socket.net_emul_bound = true;
     sock->socket.net_emul_id = entry->id;
-    // What getsockname reports: the address bind() was given, or loopback
-    // for a socket bound because it connected or sent.
+    // What getsockname reports: the address bind() was given, or the
+    // wildcard for a socket bound because it sent (a connect then names the
+    // address it leaves from: net_emul_dest).
     if (!sock->socket.bind_deferred) {
-        memset(sock->socket.deferred_addr, 0, sizeof(sock->socket.deferred_addr));
-        if (sock->socket.domain == AF_INET6_) {
-            struct sockaddr_in6 *in6 = (struct sockaddr_in6 *) sock->socket.deferred_addr;
-#ifdef __APPLE__
-            in6->sin6_len = sizeof(*in6);
-#endif
-            in6->sin6_family = AF_INET6;
-            in6->sin6_addr = (struct in6_addr) IN6ADDR_LOOPBACK_INIT;
-            sock->socket.deferred_addr_len = sizeof(*in6);
-        } else {
-            struct sockaddr_in *in = (struct sockaddr_in *) sock->socket.deferred_addr;
-#ifdef __APPLE__
-            in->sin_len = sizeof(*in);
-#endif
-            in->sin_family = AF_INET;
-            in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            sock->socket.deferred_addr_len = sizeof(*in);
-        }
+        uint8_t none[16] = {0};
+        uint_t len = 0;
+        net_emul_write_addr(sock, sock->socket.deferred_addr, &len, sock->socket.domain == AF_INET6_, none, 0);
+        sock->socket.deferred_addr_len = (socklen_t) len;
         sock->socket.bind_deferred = true;
     }
     // (sin_port and sin6_port are at the same place.)
@@ -3202,24 +3844,99 @@ static void net_emul_release(struct fd *sock) {
 // address that is not the namespace's loopback (or while "lo" is down);
 // ECONNREFUSED when nothing in the namespace is bound to the port. A socket
 // that has no port of its own yet is given one first.
-static int net_emul_dest(struct fd *sock, void *addr, uint_t *addr_len) {
+// Where traffic from `sock` to `dest` (host format) goes: *to the
+// namespace whose address it is, with `src` the address it leaves from and
+// `dst` the one it is for. Its own loopback, once "lo" is up; an address of
+// its own links; or across a veth (net_vif_resolve). ENETUNREACH with no
+// route; EHOSTUNREACH when the route reaches nobody who has it.
+static int net_emul_route(const struct fd *sock, const void *dest, struct net_namespace **to,
+        bool *v6, uint8_t src[16], uint8_t dst[16]) {
+    struct net_namespace *ns = sock->socket.net_ns;
+    *v6 = net_emul_addr_bytes(dest, dst);
+    if (net_emul_bytes_loopback(*v6, dst)) {
+        if (!atomic_load(&ns->lo_up))
+            return _ENETUNREACH;
+        *to = ns;
+        memset(src, 0, 16);
+        if (*v6)
+            src[15] = 1;
+        else
+            src[0] = 127, src[3] = 1;
+        return 0;
+    }
+    int err = net_vif_resolve(ns, *v6, dst, to, src);
+    if (err < 0)
+        return err;
+    // A socket bound to one of its addresses sends from that one.
+    if (sock->socket.bind_deferred) {
+        uint8_t bound[16];
+        bool bound_v6 = net_emul_addr_bytes(sock->socket.deferred_addr, bound);
+        static const uint8_t zero[16];
+        if (bound_v6 == *v6 && memcmp(bound, zero, 16) != 0 && !net_emul_bytes_loopback(bound_v6, bound))
+            memcpy(src, bound, 16);
+    }
+    return 0;
+}
+
+// A connect: the far end is `dst` (with the port connect named), and the
+// socket's own address, if it was bound to the wildcard, is the one it
+// leaves from -- what getsockname says after a connect on Linux.
+static void net_emul_connected(struct fd *sock, bool v6, const uint8_t *src, const uint8_t *dst) {
+    sock->socket.net_emul_peer_set = true;
+    sock->socket.net_emul_peer_v6 = v6;
+    memcpy(sock->socket.net_emul_peer_addr, dst, 16);
+    uint8_t bound[16];
+    static const uint8_t zero[16];
+    if (sock->socket.bind_deferred) {
+        net_emul_addr_bytes(sock->socket.deferred_addr, bound);
+        if (memcmp(bound, zero, 16) != 0)
+            return;
+        uint16_t port = ((struct sockaddr_in *) sock->socket.deferred_addr)->sin_port;
+        uint_t len = 0;
+        net_emul_write_addr(sock, sock->socket.deferred_addr, &len, v6, src, port);
+        sock->socket.deferred_addr_len = (socklen_t) len;
+    }
+}
+
+// Record on `sock`'s own binding where its traffic is going.
+static void net_emul_note_route(const struct fd *sock, bool v6, const uint8_t *src, const uint8_t *dst) {
+    struct net_emul_bind *entry;
+    lock(&net_emul_lock, 0);
+    if (!list_null(&net_emul_binds)) {
+        list_for_each_entry(&net_emul_binds, entry, links) {
+            if (entry->id == sock->socket.net_emul_id) {
+                entry->route_set = true;
+                entry->route_v6 = v6;
+                memcpy(entry->src, src, 16);
+                memcpy(entry->dst, dst, 16);
+                break;
+            }
+        }
+    }
+    unlock(&net_emul_lock);
+}
+
+static int net_emul_dest(struct fd *sock, void *addr, uint_t *addr_len, bool connecting) {
     const struct sockaddr *sa = addr;
     if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
         return _EAFNOSUPPORT;
-    if (!host_sockaddr_is_loopback(addr) || !atomic_load(&sock->socket.net_ns->lo_up))
-        return _ENETUNREACH;
+    struct net_namespace *to;
+    bool v6;
+    uint8_t src[16], dst[16];
+    int err = net_emul_route(sock, addr, &to, &v6, src, dst);
+    if (err < 0)
+        return err;
     uint16_t port = ((const struct sockaddr_in *) sa)->sin_port;
     if (!sock->socket.net_emul_bound) {
-        int err = net_emul_bind_port(sock, 0, true);
+        err = net_emul_bind_port(sock, 0, true);
         if (err < 0)
             return err;
     }
-    // (An IPv4 address written as an IPv6 one is IPv4's.)
-    bool dest_v6 = sa->sa_family == AF_INET6 &&
-        !IN6_IS_ADDR_V4MAPPED(&((const struct sockaddr_in6 *) sa)->sin6_addr);
+    net_emul_note_route(sock, v6, src, dst);
+    if (connecting)
+        net_emul_connected(sock, v6, src, dst);
     lock(&net_emul_lock, 0);
-    struct net_emul_bind *entry = net_emul_find_locked(sock->socket.net_ns, sock_net_emul_dgram(sock),
-            port, dest_v6, false);
+    struct net_emul_bind *entry = net_emul_find_locked(to, sock_net_emul_dgram(sock), port, v6, false, dst);
     uint32_t id = entry != NULL ? entry->id : 0;
     unlock(&net_emul_lock);
     if (entry == NULL)
@@ -3232,6 +3949,8 @@ static int net_emul_dest(struct fd *sock, void *addr, uint_t *addr_len) {
 // is in the namespace, in host format and in `sock`'s own family.
 static void net_emul_from_host(const struct fd *sock, void *addr, uint_t *addr_len) {
     uint16_t port = 0;
+    bool route_set = false, route_v6 = false;
+    uint8_t src[16];
     const struct sockaddr_un *un = addr;
     if (*addr_len > offsetof(struct sockaddr_un, sun_path) && un->sun_family == AF_UNIX) {
         char path[sizeof(un->sun_path) + 1];
@@ -3252,6 +3971,9 @@ static void net_emul_from_host(const struct fd *sock, void *addr, uint_t *addr_l
                 list_for_each_entry(&net_emul_binds, entry, links) {
                     if (entry->id == id) {
                         port = entry->port;
+                        route_set = entry->route_set;
+                        route_v6 = entry->route_v6;
+                        memcpy(src, entry->src, 16);
                         break;
                     }
                 }
@@ -3259,26 +3981,52 @@ static void net_emul_from_host(const struct fd *sock, void *addr, uint_t *addr_l
             unlock(&net_emul_lock);
         }
     }
-    memset(addr, 0, sizeof(struct sockaddr_in6));
-    if (sock->socket.domain == AF_INET6_) {
-        struct sockaddr_in6 *in6 = addr;
-#ifdef __APPLE__
-        in6->sin6_len = sizeof(*in6);
-#endif
-        in6->sin6_family = AF_INET6;
-        in6->sin6_port = port;
-        in6->sin6_addr = (struct in6_addr) IN6ADDR_LOOPBACK_INIT;
-        *addr_len = sizeof(*in6);
-    } else {
-        struct sockaddr_in *in = addr;
-#ifdef __APPLE__
-        in->sin_len = sizeof(*in);
-#endif
-        in->sin_family = AF_INET;
-        in->sin_port = port;
-        in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        *addr_len = sizeof(*in);
+    // Where it sent from: loopback in the socket's family, until it is known
+    // to have come across a veth.
+    if (!route_set || net_emul_bytes_loopback(route_v6, src)) {
+        route_v6 = sock->socket.domain == AF_INET6_;
+        memset(src, 0, 16);
+        if (route_v6)
+            src[15] = 1;
+        else
+            src[0] = 127, src[3] = 1;
     }
+    net_emul_write_addr(sock, addr, addr_len, route_v6, src, port);
+}
+
+// The address the far end (named by the host address the host gave) last
+// sent to: an accepted connection's own address. false when it is not known.
+static bool net_emul_peer_dst(const void *addr, uint_t addr_len, bool *v6, uint8_t dst[16]) {
+    const struct sockaddr_un *un = addr;
+    if (addr_len <= offsetof(struct sockaddr_un, sun_path) || un->sun_family != AF_UNIX)
+        return false;
+    char path[sizeof(un->sun_path) + 1];
+    size_t path_len = addr_len - offsetof(struct sockaddr_un, sun_path);
+    if (path_len > sizeof(un->sun_path))
+        path_len = sizeof(un->sun_path);
+    memcpy(path, un->sun_path, path_len);
+    path[path_len] = '\0';
+    size_t end = strlen(path), start = end;
+    while (start > 0 && path[start - 1] >= '0' && path[start - 1] <= '9')
+        start--;
+    if (start == end)
+        return false;
+    uint32_t id = (uint32_t) strtoul(path + start, NULL, 10);
+    bool found = false;
+    struct net_emul_bind *entry;
+    lock(&net_emul_lock, 0);
+    if (!list_null(&net_emul_binds)) {
+        list_for_each_entry(&net_emul_binds, entry, links) {
+            if (entry->id == id) {
+                found = entry->route_set;
+                *v6 = entry->route_v6;
+                memcpy(dst, entry->dst, 16);
+                break;
+            }
+        }
+    }
+    unlock(&net_emul_lock);
+    return found;
 }
 
 // Where a send on such a socket goes. `addr` holds the destination the
@@ -3295,18 +4043,15 @@ static int net_emul_send_dest(struct fd *sock, bool have_addr, void *addr, uint_
     if (!have_addr) {
         if (sock->socket.net_emul_dest_port == 0)
             return _EDESTADDRREQ;
-        struct sockaddr_in *in = addr;
-        memset(in, 0, sizeof(*in));
-#ifdef __APPLE__
-        in->sin_len = sizeof(*in);
-#endif
-        in->sin_family = AF_INET;
-        in->sin_port = sock->socket.net_emul_dest_port;
-        in->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        *addr_len = sizeof(*in);
+        uint8_t lo4[16] = {127, 0, 0, 1};
+        bool v6 = sock->socket.net_emul_peer_set && sock->socket.net_emul_peer_v6;
+        net_emul_write_addr(sock, addr, addr_len, v6,
+                sock->socket.net_emul_peer_set ? sock->socket.net_emul_peer_addr : lo4,
+                sock->socket.net_emul_dest_port);
     }
-    int err = net_emul_dest(sock, addr, addr_len);
-    if (err == _ECONNREFUSED) {
+    int err = net_emul_dest(sock, addr, addr_len, false);
+    // (Nobody with the address, across a veth: gone, as UDP's are.)
+    if (err == _ECONNREFUSED || err == _EHOSTUNREACH) {
         *drop = true;
         return 0;
     }
@@ -3340,12 +4085,15 @@ static uint16_t net_emul_checksum(const uint8_t *data, size_t len, uint32_t sum)
     return (uint16_t) ~sum;
 }
 
-static void net_emul_icmp_set_checksum(uint8_t *msg, size_t len, bool v6) {
+// (An ICMPv6 checksum covers the addresses it goes between: `src` and `dst`.)
+static void net_emul_icmp_set_checksum(uint8_t *msg, size_t len, bool v6, const uint8_t *src, const uint8_t *dst) {
     msg[2] = msg[3] = 0;
     uint32_t pseudo = 0;
     if (v6) {
-        // ::1 to ::1, the length, and the next header (58).
-        pseudo = 1 + 1 + (uint32_t) (len >> 16) + (uint32_t) (len & 0xffff) + IPPROTO_ICMPV6;
+        // The addresses, the length, and the next header (58).
+        for (int i = 0; i < 16; i += 2)
+            pseudo += ((uint32_t) src[i] << 8 | src[i + 1]) + ((uint32_t) dst[i] << 8 | dst[i + 1]);
+        pseudo += (uint32_t) (len >> 16) + (uint32_t) (len & 0xffff) + IPPROTO_ICMPV6;
     }
     uint16_t sum = net_emul_checksum(msg, len, pseudo);
     msg[2] = (uint8_t) (sum >> 8);
@@ -3359,12 +4107,91 @@ static bool net_emul_icmp_unwanted(const struct fd *sock, uint8_t type) {
     return type < 32 && (sock->socket.net_emul_icmp_filter & (1u << type)) != 0;
 }
 
+// Where each message queued to a raw ICMP socket came from, in the order
+// they are queued: what a receive reports as the sender, which the host pair
+// cannot say (its other end is always the one sender). A message for which
+// there is no room here is not queued either, so the two stay in step.
+#define NET_EMUL_ICMP_FROM_MAX 1024
+struct net_emul_icmp_from {
+    lock_t lock;
+    unsigned head, count;
+    struct {
+        bool v6;
+        uint8_t addr[16];
+    } from[NET_EMUL_ICMP_FROM_MAX];
+};
+
+static bool net_emul_icmp_from_push(struct fd *sock, bool v6, const uint8_t *addr) {
+    struct net_emul_icmp_from *ring = sock->socket.net_emul_icmp_from;
+    if (ring == NULL)
+        return true;
+    lock(&ring->lock, 0);
+    bool room = ring->count < NET_EMUL_ICMP_FROM_MAX;
+    if (room) {
+        unsigned at = (ring->head + ring->count++) % NET_EMUL_ICMP_FROM_MAX;
+        ring->from[at].v6 = v6;
+        memcpy(ring->from[at].addr, addr, 16);
+    }
+    unlock(&ring->lock);
+    return room;
+}
+
+// (The newest one back off, when the message it was for was not queued.)
+static void net_emul_icmp_from_unpush(struct fd *sock) {
+    struct net_emul_icmp_from *ring = sock->socket.net_emul_icmp_from;
+    if (ring == NULL)
+        return;
+    lock(&ring->lock, 0);
+    if (ring->count > 0)
+        ring->count--;
+    unlock(&ring->lock);
+}
+
+// The sender of the message just received (or, peeking, of the one at the
+// front): false when none is known.
+static bool net_emul_icmp_from_take(struct fd *sock, bool peek, bool *v6, uint8_t addr[16]) {
+    struct net_emul_icmp_from *ring = sock->socket.net_emul_icmp_from;
+    if (ring == NULL)
+        return false;
+    lock(&ring->lock, 0);
+    bool have = ring->count > 0;
+    if (have) {
+        *v6 = ring->from[ring->head].v6;
+        memcpy(addr, ring->from[ring->head].addr, 16);
+        if (!peek) {
+            ring->head = (ring->head + 1) % NET_EMUL_ICMP_FROM_MAX;
+            ring->count--;
+        }
+    }
+    unlock(&ring->lock);
+    return have;
+}
+
+// What a receive on such a socket reports as its sender: the message's
+// source, port 0.
+static void net_emul_icmp_from_report(struct fd *sock, bool have, bool v6, const uint8_t *addr,
+        void *out, uint_t *out_len) {
+    uint8_t lo[16] = {0};
+    if (!have) {
+        v6 = sock->socket.domain == AF_INET6_;
+        if (v6)
+            lo[15] = 1;
+        else
+            lo[0] = 127, lo[3] = 1;
+        addr = lo;
+    }
+    net_emul_write_addr(sock, out, out_len, v6, addr, 0);
+}
+
 // One message arriving at the socket: under an IP header for IPv4, from
-// `from` to `to` (both loopback addresses, network order).
+// `from` to `to` (16 bytes each; an IPv4 address in the first four).
 static void net_emul_icmp_deliver(struct fd *sock, const uint8_t *msg, size_t len,
-        uint32_t from, uint32_t to, bool request) {
+        const uint8_t *from_addr, const uint8_t *to_addr, bool request) {
     if (net_emul_icmp_unwanted(sock, msg[0]))
         return;
+    uint32_t from, to;
+    memcpy(&from, from_addr, 4);
+    memcpy(&to, to_addr, 4);
     static _Atomic unsigned next_ip_id = 1;
     size_t header = sock->socket.domain == AF_INET6_ ? 0 : 20;
     uint8_t *packet = malloc(header + len);
@@ -3387,38 +4214,64 @@ static void net_emul_icmp_deliver(struct fd *sock, const uint8_t *msg, size_t le
     }
     memcpy(packet + header, msg, len);
     // (A full queue drops it, as a full receive buffer drops a packet.)
-    (void) send(sock->socket.net_emul_icmp_fd, packet, header + len, MSG_DONTWAIT);
+    if (net_emul_icmp_from_push(sock, sock->socket.domain == AF_INET6_, from_addr) &&
+            send(sock->socket.net_emul_icmp_fd, packet, header + len, MSG_DONTWAIT) < 0)
+        net_emul_icmp_from_unpush(sock);
     free(packet);
 }
 
 // A send on such a socket: `dest` is the host-format address given, or NULL
 // for a connected socket's. The length sent, or an error.
+//
+// Across a veth (fs/net_vif.h) the far namespace answers an echo request to
+// an address it has, and only the reply comes back: the request went out on
+// the link, where this socket does not hear it. To an address of its own
+// links a namespace answers itself, as on its loopback. To one on a link
+// where nobody has it, the request is sent and nothing comes back.
 static ssize_t net_emul_icmp_send(struct fd *sock, const void *data, size_t len, const void *dest) {
     if (dest == NULL && sock->socket.net_emul_dest_port == 0)
         return _EDESTADDRREQ;
-    if (!atomic_load(&sock->socket.net_ns->lo_up) || (dest != NULL && !host_sockaddr_is_loopback(dest)))
-        return _ENETUNREACH;
+    bool v6 = sock->socket.domain == AF_INET6_;
+    struct sockaddr_in6 connected;
+    if (dest == NULL) {
+        uint8_t lo[16] = {0};
+        if (v6)
+            lo[15] = 1;
+        else
+            lo[0] = 127, lo[3] = 1;
+        uint_t connected_len;
+        net_emul_write_addr(sock, &connected, &connected_len,
+                sock->socket.net_emul_peer_set ? sock->socket.net_emul_peer_v6 : v6,
+                sock->socket.net_emul_peer_set ? sock->socket.net_emul_peer_addr : lo, 0);
+        dest = &connected;
+    }
+    struct net_namespace *to = NULL;
+    bool dest_v6;
+    uint8_t src[16], dst[16];
+    int err = net_emul_route(sock, dest, &to, &dest_v6, src, dst);
+    if (err == _ENETUNREACH)
+        return err;
     if (len < 8)
         return _EINVAL;
     if (len > 65507)
         return _EMSGSIZE;
-    bool v6 = sock->socket.domain == AF_INET6_;
-    uint32_t local = htonl(INADDR_LOOPBACK), remote = local;
-    if (!v6 && dest != NULL)
-        remote = ((const struct sockaddr_in *) dest)->sin_addr.s_addr;
+    if (err < 0)
+        return (ssize_t) len;
     uint8_t *msg = malloc(len);
     if (msg == NULL)
         return _ENOMEM;
     memcpy(msg, data, len);
     // (The kernel fills an ICMPv6 checksum; an IPv4 one is the sender's.)
     if (v6)
-        net_emul_icmp_set_checksum(msg, len, true);
-    net_emul_icmp_deliver(sock, msg, len, local, remote, true);
+        net_emul_icmp_set_checksum(msg, len, true, src, dst);
+    bool here = to == sock->socket.net_ns;
+    if (here)
+        net_emul_icmp_deliver(sock, msg, len, src, dst, true);
     uint8_t echo = v6 ? 128 : 8, reply = v6 ? 129 : 0;
     if (msg[0] == echo) {
         msg[0] = reply;
-        net_emul_icmp_set_checksum(msg, len, v6);
-        net_emul_icmp_deliver(sock, msg, len, remote, local, false);
+        net_emul_icmp_set_checksum(msg, len, v6, dst, src);
+        net_emul_icmp_deliver(sock, msg, len, dst, src, false);
     }
     free(msg);
     return (ssize_t) len;
@@ -3668,6 +4521,9 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         fd->socket.net_emul = true;
         fd->socket.net_emul_icmp = true;
         fd->socket.net_emul_icmp_fd = pair[1];
+        fd->socket.net_emul_icmp_from = calloc(1, sizeof(*fd->socket.net_emul_icmp_from));
+        if (fd->socket.net_emul_icmp_from != NULL)
+            lock_init(&fd->socket.net_emul_icmp_from->lock, "icmp_from\0");
         return f_install(fd, type & ~SOCKET_TYPE_MASK);
     }
     int sock;
@@ -7188,11 +8044,17 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
                 sock->socket.net_emul_dest_port = 0;
                 return 0;
             }
-            if (!host_sockaddr_is_loopback(dest) || !atomic_load(&sock->socket.net_ns->lo_up))
-                return _ENETUNREACH;
+            // Somewhere it can go: its loopback, or across a veth.
+            struct net_namespace *to;
+            bool dest_v6;
+            uint8_t src[16], dst[16];
+            int route_err = net_emul_route(sock, dest, &to, &dest_v6, src, dst);
+            if (route_err == _ENETUNREACH)
+                return route_err;
             if (sock->socket.net_emul_icmp) {
                 // (No port to remember: only that there is a destination.)
                 sock->socket.net_emul_dest_port = 1;
+                net_emul_connected(sock, dest_v6, src, dst);
                 return 0;
             }
             if (!sock->socket.net_emul_bound) {
@@ -7201,11 +8063,14 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
                     return bind_err;
             }
             sock->socket.net_emul_dest_port = ((const struct sockaddr_in *) dest)->sin_port;
+            // (On a link, to an address nobody there has, too: a destination
+            // all the same, as Linux's UDP connect leaves it.)
+            net_emul_connected(sock, dest_v6, src, dst);
             return 0;
         }
         // A stream: to the listener's binding, from a port of its own.
         net_emul_stream_port = ((const struct sockaddr_in *) dest)->sin_port;
-        int emul_err = net_emul_dest(sock, &sockaddr, &sockaddr_len);
+        int emul_err = net_emul_dest(sock, &sockaddr, &sockaddr_len, true);
         if (emul_err < 0)
             return emul_err;
     }
@@ -7736,13 +8601,18 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
     char emul_peer[128];
     uint_t emul_peer_len = 0;
     uint16_t emul_peer_port = 0;
+    // ...and what it connected to, which is this end's own address.
+    bool emul_local_known = false, emul_local_v6 = false, emul_peer_v6 = false;
+    uint8_t emul_local[16], emul_peer_bytes[16];
     if (sock->socket.net_emul) {
         socklen_t host_len = sizeof(emul_peer);
         memset(emul_peer, 0, sizeof(emul_peer));
         if (getpeername(client, (struct sockaddr *) emul_peer, &host_len) == 0)
             emul_peer_len = host_len;
+        emul_local_known = net_emul_peer_dst(emul_peer, emul_peer_len, &emul_local_v6, emul_local);
         net_emul_from_host(sock, emul_peer, &emul_peer_len);
         emul_peer_port = ((struct sockaddr_in *) emul_peer)->sin_port;
+        emul_peer_v6 = net_emul_addr_bytes(emul_peer, emul_peer_bytes);
     }
     if (sockaddr_addr != 0) {
         int err;
@@ -7782,6 +8652,13 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
         client_fd->socket.deferred_addr_len = sock->socket.deferred_addr_len;
         client_fd->socket.bind_deferred = sock->socket.bind_deferred;
         client_fd->socket.net_emul_dest_port = emul_peer_port;
+        // A listener on the wildcard: this connection's own address is the
+        // one the client connected to.
+        if (emul_local_known)
+            net_emul_connected(client_fd, emul_local_v6, emul_local, emul_peer_bytes);
+        client_fd->socket.net_emul_peer_set = true;
+        client_fd->socket.net_emul_peer_v6 = emul_peer_v6;
+        memcpy(client_fd->socket.net_emul_peer_addr, emul_peer_bytes, 16);
     }
     if (client_fd == NULL) {
         close(client);
@@ -8057,9 +8934,13 @@ static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
         struct sockaddr_un none = {0};
         dword_t real_len = 0;
         memcpy(sockaddr, &none, sizeof(none));
-        net_emul_from_host(sock, sockaddr, &real_len);
-        ((struct sockaddr_in *) sockaddr)->sin_port =
-            sock->socket.net_emul_icmp ? 0 : sock->socket.net_emul_dest_port;
+        uint16_t port = sock->socket.net_emul_icmp ? 0 : sock->socket.net_emul_dest_port;
+        if (sock->socket.net_emul_peer_set)
+            net_emul_write_addr(sock, sockaddr, &real_len, sock->socket.net_emul_peer_v6,
+                    sock->socket.net_emul_peer_addr, port);
+        else
+            net_emul_from_host(sock, sockaddr, &real_len);
+        ((struct sockaddr_in *) sockaddr)->sin_port = port;
         int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
         if (err < 0)
             return err;
@@ -8718,8 +9599,14 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
         return _EFAULT;
     }
     free(buffer);
+    bool icmp_have = false, icmp_v6 = false;
+    uint8_t icmp_from[16];
+    if (sock->socket.net_emul_icmp && res > 0)
+        icmp_have = net_emul_icmp_from_take(sock, (real_flags & MSG_PEEK) != 0, &icmp_v6, icmp_from);
     if (sockaddr_addr != 0) {
-        if (sock->socket.net_emul)
+        if (sock->socket.net_emul_icmp)
+            net_emul_icmp_from_report(sock, icmp_have, icmp_v6, icmp_from, &sockaddr, &sockaddr_len);
+        else if (sock->socket.net_emul)
             net_emul_from_host(sock, &sockaddr, &sockaddr_len);
         else if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_src(sock, &sockaddr);
@@ -11634,9 +12521,15 @@ out_recvmsg_done:
         return err;
     }
 
+    bool icmp_have = false, icmp_v6 = false;
+    uint8_t icmp_from[16];
+    if (sock->socket.net_emul_icmp && res > 0)
+        icmp_have = net_emul_icmp_from_take(sock, (real_flags & MSG_PEEK) != 0, &icmp_v6, icmp_from);
     // msg_name (changed)
     if (msg.msg_name != 0) {
-        if (sock->socket.net_emul)
+        if (sock->socket.net_emul_icmp)
+            net_emul_icmp_from_report(sock, icmp_have, icmp_v6, icmp_from, msg.msg_name, &msg.msg_namelen);
+        else if (sock->socket.net_emul)
             net_emul_from_host(sock, msg.msg_name, &msg.msg_namelen);
         else if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_src(sock, msg.msg_name);
@@ -12097,6 +12990,12 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
             break;
         }
     }
+    if (fd->socket.net_emul_icmp && res > 0) {
+        // (A read reports no sender, but takes the message's all the same.)
+        bool v6;
+        uint8_t from[16];
+        net_emul_icmp_from_take(fd, false, &v6, from);
+    }
     if (res <= 0) {
         // A pending socket error outranks both EOF and EAGAIN, and AOK's own
         // poll probe may already have taken it off the host. See
@@ -12295,11 +13194,12 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
 }
 
 // The interface ioctls for a socket of a private network namespace
-// (kernel/net_ns.h): "lo", index 1, and nothing else. *handled is false for
-// a command that is not one of them.
+// (kernel/net_ns.h): "lo", index 1, and the namespace's veth and dummy links
+// (fs/net_vif.h). *handled is false for a command that is not one of them.
 static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *handled) {
     *handled = true;
     struct ifreq_ *ifreq = arg;
+    struct net_vif_info vifs[NET_NS_MAX_VIFS];
     if (cmd == SIOCGIFCONF_) {
         bool is_64bit = task_is_64bit(current);
         struct guest_ifconf32_ *ifconf32 = arg;
@@ -12307,15 +13207,35 @@ static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *h
         int32_t guest_len = is_64bit ? ifconf64->guest_len : ifconf32->guest_len;
         guest_addr_t guest_buf = is_64bit ? ifconf64->guest_buf : ifconf32->guest_buf;
         size_t entry_size = is_64bit ? sizeof(struct guest_ifreq_addr64_) : sizeof(struct guest_ifreq_addr32_);
-        size_t total = atomic_load(&ns->lo_addr4) ? entry_size : 0, used = 0;
-        if (total != 0 && guest_buf != 0 && guest_len > 0 && (size_t) guest_len >= entry_size) {
-            struct guest_ifreq_addr64_ entry = {};
-            strcpy(entry.ifr_name, "lo");
-            entry.guest_addr.sin_family = AF_INET_;
-            entry.guest_addr.sin_addr = htonl(INADDR_LOOPBACK);
-            if (user_write(guest_buf, &entry, entry_size))
-                return _EFAULT;
-            used = entry_size;
+        // One entry an IPv4 address of an up link, as inet_gifconf makes them.
+        int n = net_vif_list(ns, vifs, NET_NS_MAX_VIFS);
+        if (n > NET_NS_MAX_VIFS)
+            n = NET_NS_MAX_VIFS;
+        size_t total = 0, used = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = -1; i < n; i++) {
+                int count = i < 0 ? (atomic_load(&ns->lo_addr4) ? 1 : 0) : vifs[i].n_addrs;
+                for (int j = 0; j < count; j++) {
+                    if (i >= 0 && (vifs[i].addrs[j].v6 || !vifs[i].up))
+                        continue;
+                    if (pass == 0) {
+                        total += entry_size;
+                        continue;
+                    }
+                    if (guest_buf == 0 || guest_len <= 0 || used + entry_size > (size_t) guest_len)
+                        continue;
+                    struct guest_ifreq_addr64_ entry = {};
+                    strcpy(entry.ifr_name, i < 0 ? "lo" : vifs[i].name);
+                    entry.guest_addr.sin_family = AF_INET_;
+                    if (i < 0)
+                        entry.guest_addr.sin_addr = htonl(INADDR_LOOPBACK);
+                    else
+                        memcpy(&entry.guest_addr.sin_addr, vifs[i].addrs[j].addr, 4);
+                    if (user_write(guest_buf + used, &entry, entry_size))
+                        return _EFAULT;
+                    used += entry_size;
+                }
+            }
         }
         int32_t result_len = guest_buf == 0 ? (int32_t) total : (int32_t) used;
         if (is_64bit)
@@ -12325,10 +13245,11 @@ static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *h
         return 0;
     }
     if (cmd == SIOCGIFNAME_) {
-        if (ifreq->ifr_ifru.ifindex != NET_NS_LO_INDEX)
+        int index = ifreq->ifr_ifru.ifindex;
+        if (index != NET_NS_LO_INDEX && net_vif_get(ns, index, NULL, &vifs[0]) != 0)
             return _ENODEV;
         memset(ifreq->ifr_name, 0, sizeof(ifreq->ifr_name));
-        strcpy(ifreq->ifr_name, "lo");
+        strcpy(ifreq->ifr_name, index == NET_NS_LO_INDEX ? "lo" : vifs[0].name);
         return 0;
     }
     if (cmd != SIOCGIFINDEX_ && cmd != SIOCGIFFLAGS_ && cmd != SIOCSIFFLAGS_ && cmd != SIOCGIFTXQLEN_ && cmd != SIOCGIFMTU_ &&
@@ -12337,8 +13258,53 @@ static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *h
         *handled = false;
         return 0;
     }
-    if (strncmp(ifreq->ifr_name, "lo", sizeof(ifreq->ifr_name)) != 0)
-        return _ENODEV;
+    char name[IFNAMSIZ_ + 1] = "";
+    memcpy(name, ifreq->ifr_name, IFNAMSIZ_);
+    if (strcmp(name, "lo") != 0) {
+        struct net_vif_info *vif = &vifs[0];
+        if (net_vif_get(ns, 0, name, vif) != 0)
+            return _ENODEV;
+        switch (cmd) {
+            case SIOCGIFINDEX_: ifreq->ifr_ifru.ifindex = vif->index; return 0;
+            case SIOCGIFFLAGS_: {
+                unsigned flags = IFF_BROADCAST_LINUX_ | (vif->kind == NET_VIF_DUMMY ? IFF_NOARP_LINUX_ : IFF_MULTICAST_LINUX_);
+                if (vif->up)
+                    flags |= IFF_UP_LINUX_;
+                if (vif->lower_up)
+                    flags |= IFF_RUNNING_LINUX_;
+                ifreq->ifr_ifru.flags = (int16_t) flags;
+                return 0;
+            }
+            case SIOCSIFFLAGS_: {
+                if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+                    return _EPERM;
+                struct net_vif_change change = {.up = (ifreq->ifr_ifru.flags & IFF_UP_LINUX_) != 0};
+                return net_vif_change(ns, vif->index, &change);
+            }
+            case SIOCGIFTXQLEN_: ifreq->ifr_ifru.qlen = vif->kind == NET_VIF_DUMMY ? 0 : 1000; return 0;
+            case SIOCGIFMTU_: ifreq->ifr_ifru.mtu = (int) vif->mtu; return 0;
+            case SIOCGIFMETRIC_: ifreq->ifr_ifru.metric = 0; return 0;
+            case SIOCGIFHWADDR_:
+                memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+                ifreq->ifr_ifru.addr.family = ARPHRD_ETHER_;
+                memcpy(ifreq->ifr_ifru.addr.data, vif->mac, 6);
+                return 0;
+        }
+        // Its first IPv4 address (the primary, as devinet_ioctl finds it).
+        const struct net_vif_addr *addr = NULL;
+        for (int i = 0; i < vif->n_addrs && addr == NULL; i++)
+            if (!vif->addrs[i].v6)
+                addr = &vif->addrs[i];
+        if (addr == NULL)
+            return _EADDRNOTAVAIL;
+        uint32_t a, mask = addr->prefix == 0 ? 0 : htonl(0xffffffffu << (32 - addr->prefix));
+        memcpy(&a, addr->addr, 4);
+        struct sockaddr_in_ *in = (struct sockaddr_in_ *) &ifreq->ifr_ifru.addr;
+        memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+        in->sin_family = AF_INET_;
+        in->sin_addr = cmd == SIOCGIFNETMASK_ ? mask : cmd == SIOCGIFBRDADDR_ ? (a | ~mask) : a;
+        return 0;
+    }
     switch (cmd) {
         case SIOCGIFINDEX_: ifreq->ifr_ifru.ifindex = NET_NS_LO_INDEX; return 0;
         case SIOCGIFFLAGS_: ifreq->ifr_ifru.flags = (int16_t) net_ns_lo_flags(ns); return 0;
@@ -12570,6 +13536,8 @@ static int sock_close(struct fd *fd) {
         net_emul_release(fd);
     if (fd->socket.net_emul_icmp) {
         close(fd->socket.net_emul_icmp_fd);
+        free(fd->socket.net_emul_icmp_from);
+        fd->socket.net_emul_icmp_from = NULL;
         fd->socket.net_emul_icmp = false;
     }
     net_ns_release(fd->socket.net_ns);

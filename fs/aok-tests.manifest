@@ -137,6 +137,7 @@ userns_basic.c
 pidns_basic.c
 setns_sandbox.c
 netns_basic.c
+netns_veth.c
 connect_refused_adjacent.c
 exec_link_by_fd.c
 exec_fd_pathless.c

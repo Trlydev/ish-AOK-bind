@@ -131,6 +131,15 @@ struct fd {
             bool net_emul_icmp;
             int net_emul_icmp_fd;
             uint32_t net_emul_icmp_filter;
+            // The far end's address once connected or accepted (its port is
+            // net_emul_dest_port): loopback, or across a veth (fs/net_vif.h).
+            // IPv4 in the first four bytes.
+            bool net_emul_peer_set;
+            bool net_emul_peer_v6;
+            uint8_t net_emul_peer_addr[16];
+            // A raw ICMP socket's: where each message queued to it came from,
+            // in order, for the address a receive reports (fs/sock.c).
+            struct net_emul_icmp_from *net_emul_icmp_from;
             int domain;
             int type;
             int protocol;

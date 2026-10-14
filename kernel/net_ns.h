@@ -27,18 +27,27 @@ struct fd;
 //     traffic between the namespace's sockets goes from one such socket to
 //     another (fs/sock.c, "Loopback in a private network namespace"). So a
 //     server there listens, a client connects to it, datagrams are answered
-//     -- and a destination that is not the namespace's loopback is
-//     ENETUNREACH, because there is nowhere for it to go. A raw ICMP
+//     -- and a destination that is neither the namespace's loopback nor
+//     reached through one of its links is ENETUNREACH, because there is
+//     nowhere for it to go. A raw ICMP
 //     socket's echo requests to the loopback are answered by the kernel,
 //     so `ping 127.0.0.1` works; any other raw socket can send nothing.
 //   - an abstract AF_UNIX name is the namespace's own: it neither finds nor
 //     collides with one bound outside. Pathname sockets are the
 //     filesystem's, as on Linux.
-//   - netlink: the route family answers for "lo" alone and takes RTM_NEWADDR
-//     and RTM_NEWLINK/SETLINK for it from whoever has CAP_NET_ADMIN over the
-//     namespace; nothing is pushed to it about the host's interfaces; the
-//     socket-diag family lists nothing.
-//   - the interface ioctls know "lo" and nothing else.
+//   - netlink: the route family answers for "lo" and the namespace's veth
+//     and dummy links (fs/net_vif.h), and takes RTM_NEWLINK/SETLINK/DELLINK,
+//     RTM_NEWADDR/DELADDR and RTM_NEWROUTE/DELROUTE for them from whoever has
+//     CAP_NET_ADMIN over the namespace; nothing is pushed to it, about the
+//     host's interfaces or its own; the socket-diag family lists nothing.
+//   - the interface ioctls know "lo" and those links.
+//
+// A veth's two ends may be in two private namespaces (never the initial
+// one), and then a TCP or UDP socket in one reaches a listener in the other
+// at an address the far end has, and ping is answered from there: the
+// emulated sockets above, with each binding knowing its address and the
+// namespace a destination resolves to (net_vif_resolve). Nothing is
+// forwarded beyond the far end of one veth.
 //
 // /proc/net and /sys/class/net describe the reader's own namespace, like
 // everything else here that lists interfaces.

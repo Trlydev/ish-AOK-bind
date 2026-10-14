@@ -694,6 +694,7 @@ src = [
 
     'fs/adhoc.c',
     'fs/sock.c',
+    'fs/net_vif.c',
     'fs/pipe.c',
     'fs/fifo.c',
     'fs/host_fifo.c',

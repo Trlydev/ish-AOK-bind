@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <utmpx.h>
 
+#include "fs/net_vif.h"
 #include "kernel/net_ns.h"
 #include "kernel/user_ns.h"
 #include "kernel/calls.h"
@@ -5373,51 +5374,116 @@ int nlibc_getifaddrs(struct ifaddrs **ifap) {
     }
     *ifap = NULL;
     // A program in a private network namespace has that namespace's
-    // interfaces, which is "lo" (kernel/net_ns.h), and not the host's. One
-    // block, as the host's own list is, so that freeifaddrs frees it.
+    // interfaces, which is "lo" (kernel/net_ns.h) and its veth and dummy
+    // links (fs/net_vif.h), and not the host's. One block, as the host's own
+    // list is, so that freeifaddrs frees it.
     struct net_namespace *net_ns = current_net_ns();
     if (net_ns != NULL) {
-        struct {
-            struct ifaddrs link, v4;
-            struct sockaddr_in addr, mask;
+        struct nlibc_ifaddr_entry {
+            struct ifaddrs ifa;
+            struct sockaddr_storage addr, mask, broadcast;
 #ifdef __APPLE__
             struct sockaddr_dl dl;
 #endif
-            char name[4];
-        } *lo = calloc(1, sizeof(*lo));
-        if (lo == NULL) {
+            char name[NET_VIF_NAME_MAX];
+        };
+        struct net_vif_info vifs[64];
+        int n_vifs = net_vif_list(net_ns, vifs, 64);
+        if (n_vifs > 64)
+            n_vifs = 64;
+        // A link entry an interface, and one an address.
+        int total = 1 + (atomic_load(&net_ns->lo_addr4) ? 1 : 0) + (atomic_load(&net_ns->lo_addr6) ? 1 : 0);
+        for (int i = 0; i < n_vifs; i++)
+            total += 1 + vifs[i].n_addrs;
+        struct nlibc_ifaddr_entry *entries = calloc((size_t) total, sizeof(*entries));
+        if (entries == NULL) {
             errno = ENOMEM;
             return -1;
         }
-        strcpy(lo->name, "lo");
-        unsigned flags = IFF_LOOPBACK | (atomic_load(&net_ns->lo_up) ? IFF_UP | IFF_RUNNING : 0);
-        lo->link.ifa_name = lo->name;
-        lo->link.ifa_flags = flags;
+        int used = 0;
+        for (int i = -1; i < n_vifs; i++) {
+            const char *name = i < 0 ? "lo" : vifs[i].name;
+            unsigned flags = i < 0
+                ? IFF_LOOPBACK | (atomic_load(&net_ns->lo_up) ? IFF_UP | IFF_RUNNING : 0)
+                : IFF_BROADCAST | (vifs[i].kind == NET_VIF_DUMMY ? IFF_NOARP : IFF_MULTICAST) |
+                  (vifs[i].up ? IFF_UP : 0) | (vifs[i].lower_up ? IFF_RUNNING : 0);
+            struct nlibc_ifaddr_entry *link = &entries[used++];
+            snprintf(link->name, sizeof(link->name), "%s", name);
+            link->ifa.ifa_name = link->name;
+            link->ifa.ifa_flags = flags;
 #ifdef __APPLE__
-        // The link-level entry every interface has on this host: callers
-        // written against it read ifa_addr without asking whether it is there.
-        lo->dl.sdl_len = sizeof(lo->dl);
-        lo->dl.sdl_family = AF_LINK;
-        lo->dl.sdl_index = 1;
-        lo->dl.sdl_type = 24; // IFT_LOOP
-        lo->dl.sdl_nlen = 2;
-        memcpy(lo->dl.sdl_data, "lo", 2);
-        lo->link.ifa_addr = (struct sockaddr *) &lo->dl;
+            // The link-level entry every interface has on this host: callers
+            // written against it read ifa_addr without asking whether it is there.
+            size_t nlen = strlen(name);
+            link->dl.sdl_len = sizeof(link->dl);
+            link->dl.sdl_family = AF_LINK;
+            link->dl.sdl_index = (u_short) (i < 0 ? 1 : vifs[i].index);
+            link->dl.sdl_type = i < 0 ? 24 /* IFT_LOOP */ : 6 /* IFT_ETHER */;
+            link->dl.sdl_nlen = (u_char) nlen;
+            memcpy(link->dl.sdl_data, name, nlen);
+            if (i >= 0 && nlen + 6 <= sizeof(link->dl.sdl_data)) {
+                link->dl.sdl_alen = 6;
+                memcpy(link->dl.sdl_data + nlen, vifs[i].mac, 6);
+            }
+            link->ifa.ifa_addr = (struct sockaddr *) &link->dl;
 #endif
-        if (atomic_load(&net_ns->lo_addr4)) {
-            lo->link.ifa_next = &lo->v4;
-            lo->v4.ifa_name = lo->name;
-            lo->v4.ifa_flags = flags;
-            lo->addr.sin_family = lo->mask.sin_family = AF_INET;
+            int n_addrs = i < 0 ? 2 : vifs[i].n_addrs;
+            for (int j = 0; j < n_addrs; j++) {
+                bool v6;
+                uint8_t prefix, bytes[16] = {0};
+                if (i < 0) {
+                    v6 = j == 1;
+                    if (!(v6 ? atomic_load(&net_ns->lo_addr6) : atomic_load(&net_ns->lo_addr4)))
+                        continue;
+                    prefix = v6 ? 128 : 8;
+                    if (v6)
+                        bytes[15] = 1;
+                    else
+                        bytes[0] = 127, bytes[3] = 1;
+                } else {
+                    v6 = vifs[i].addrs[j].v6;
+                    prefix = vifs[i].addrs[j].prefix;
+                    memcpy(bytes, vifs[i].addrs[j].addr, 16);
+                }
+                struct nlibc_ifaddr_entry *e = &entries[used++];
+                snprintf(e->name, sizeof(e->name), "%s", name);
+                e->ifa.ifa_name = e->name;
+                e->ifa.ifa_flags = flags;
+                uint8_t mask[16] = {0};
+                for (int k = 0; k < 16; k++) {
+                    int bits = (int) prefix - k * 8;
+                    mask[k] = bits >= 8 ? 0xff : bits <= 0 ? 0 : (uint8_t) (0xff << (8 - bits));
+                }
+                if (v6) {
+                    struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &e->addr, *m = (struct sockaddr_in6 *) &e->mask;
+                    addr->sin6_family = m->sin6_family = AF_INET6;
 #ifdef __APPLE__
-            lo->addr.sin_len = lo->mask.sin_len = sizeof(struct sockaddr_in);
+                    addr->sin6_len = m->sin6_len = sizeof(struct sockaddr_in6);
 #endif
-            lo->addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            lo->mask.sin_addr.s_addr = htonl(0xff000000u);
-            lo->v4.ifa_addr = (struct sockaddr *) &lo->addr;
-            lo->v4.ifa_netmask = (struct sockaddr *) &lo->mask;
+                    memcpy(&addr->sin6_addr, bytes, 16);
+                    memcpy(&m->sin6_addr, mask, 16);
+                } else {
+                    struct sockaddr_in *addr = (struct sockaddr_in *) &e->addr, *m = (struct sockaddr_in *) &e->mask;
+                    addr->sin_family = m->sin_family = AF_INET;
+#ifdef __APPLE__
+                    addr->sin_len = m->sin_len = sizeof(struct sockaddr_in);
+#endif
+                    memcpy(&addr->sin_addr, bytes, 4);
+                    memcpy(&m->sin_addr, mask, 4);
+                    if (i >= 0 && prefix < 31) {
+                        struct sockaddr_in *b = (struct sockaddr_in *) &e->broadcast;
+                        *b = *addr;
+                        b->sin_addr.s_addr |= ~m->sin_addr.s_addr;
+                        e->ifa.ifa_broadaddr = (struct sockaddr *) b;
+                    }
+                }
+                e->ifa.ifa_addr = (struct sockaddr *) &e->addr;
+                e->ifa.ifa_netmask = (struct sockaddr *) &e->mask;
+            }
         }
-        *ifap = &lo->link;
+        for (int i = 0; i + 1 < used; i++)
+            entries[i].ifa.ifa_next = &entries[i + 1].ifa;
+        *ifap = &entries[0].ifa;
         return 0;
     }
     // The real one: this file is built with NATIVE_LIBC_NO_REDIRECT, so the

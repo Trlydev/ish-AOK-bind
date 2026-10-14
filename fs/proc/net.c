@@ -12,6 +12,7 @@
 #include "fs/proc.h"
 #include "fs/fd.h"
 #include "fs/net_route.h"
+#include "fs/net_vif.h"
 #include "fs/sock.h"
 #include "platform/platform.h"
 #include "fs/proc/net.h"
@@ -57,8 +58,9 @@
 
 int net_iface_snapshot(struct net_iface_stats *out, int max) {
     // The reader's network: in a private network namespace that is "lo" and
-    // nothing of the host's (kernel/net_ns.h). Up or down as the namespace
-    // has it; no counters, since nothing counts what crosses it.
+    // nothing of the host's (kernel/net_ns.h), then its veth and dummy links
+    // (fs/net_vif.h). Up or down as the namespace has them; a veth counts
+    // what crosses it, the loopback nothing.
     struct net_namespace *net_ns = current_net_ns();
     if (net_ns != NULL) {
         if (out != NULL && max >= 1) {
@@ -69,7 +71,24 @@ int net_iface_snapshot(struct net_iface_stats *out, int max) {
             out[0].has_mac = true;      // all zero, as a loopback's is
             out[0].has_stats = true;
         }
-        return 1;
+        struct net_vif_info vifs[PROC_NET_DEV_MAX_IFACES];
+        int n = net_vif_list(net_ns, vifs, PROC_NET_DEV_MAX_IFACES);
+        for (int i = 0; out != NULL && i < n && i < PROC_NET_DEV_MAX_IFACES && 1 + i < max; i++) {
+            struct net_iface_stats *iface = &out[1 + i];
+            memset(iface, 0, sizeof(*iface));
+            snprintf(iface->name, sizeof(iface->name), "%s", vifs[i].name);
+            iface->flags = IFF_BROADCAST | (vifs[i].kind == NET_VIF_DUMMY ? IFF_NOARP : IFF_MULTICAST) |
+                (vifs[i].up ? IFF_UP : 0) | (vifs[i].lower_up ? IFF_RUNNING : 0);
+            iface->mtu = vifs[i].mtu;
+            memcpy(iface->mac, vifs[i].mac, sizeof(iface->mac));
+            iface->has_mac = true;
+            iface->has_stats = true;
+            iface->rx_bytes = vifs[i].rx_bytes;
+            iface->rx_packets = vifs[i].rx_packets;
+            iface->tx_bytes = vifs[i].tx_bytes;
+            iface->tx_packets = vifs[i].tx_packets;
+        }
+        return 1 + n;
     }
     struct ifaddrs *addrs;
     if (getifaddrs(&addrs) != 0)
@@ -154,6 +173,21 @@ static int proc_show_if_inet6(struct proc_entry * UNUSED(entry), struct proc_dat
     if (net_ns != NULL) {
         if (atomic_load(&net_ns->lo_addr6))
             proc_printf(buf, "00000000000000000000000000000001 01 80 10 80       lo\n");
+        // Then the IPv6 addresses of its own links.
+        struct net_vif_info vifs[PROC_NET_DEV_MAX_IFACES];
+        int n = net_vif_list(net_ns, vifs, PROC_NET_DEV_MAX_IFACES);
+        for (int i = 0; i < n && i < PROC_NET_DEV_MAX_IFACES; i++) {
+            for (int j = 0; j < vifs[i].n_addrs; j++) {
+                const struct net_vif_addr *a = &vifs[i].addrs[j];
+                if (!a->v6)
+                    continue;
+                char hex[33];
+                for (int k = 0; k < 16; k++)
+                    snprintf(hex + k * 2, 3, "%02x", a->addr[k]);
+                uint8_t scope = a->addr[0] == 0xfe && (a->addr[1] & 0xc0) == 0x80 ? 0x20 : 0x00;
+                proc_printf(buf, "%s %02x %02x %02x 80 %8s\n", hex, vifs[i].index, a->prefix, scope, vifs[i].name);
+            }
+        }
         return 0;
     }
     struct ifaddrs *addrs;
@@ -441,9 +475,27 @@ static int proc_show_unix(struct proc_entry *UNUSED(entry), struct proc_data *bu
 static int proc_show_route(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "Iface    Destination    Gateway     Flags    RefCnt    Use    Metric    Mask        MTU    Window    IRTT \n");
     struct host_route_table routes = {};
-    // (A private network namespace has no routes this file lists: the
-    // loopback's own are in the local table, which it never shows.)
-    if (current_net_ns() == NULL && host_route_table_collect(&routes) == 0) {
+    // A private network namespace lists the routes of its own links (the
+    // loopback's own are in the local table, which this never shows).
+    struct net_namespace *net_ns = current_net_ns();
+    if (net_ns != NULL) {
+        struct net_vif_route vroutes[PROC_NET_DEV_MAX_IFACES * 2];
+        int n = net_vif_routes(net_ns, vroutes, PROC_NET_DEV_MAX_IFACES * 2);
+        for (int i = 0; i < n && i < PROC_NET_DEV_MAX_IFACES * 2; i++) {
+            const struct net_vif_route *r = &vroutes[i];
+            struct net_vif_info vif;
+            if (r->v6 || net_vif_get(net_ns, r->oif, NULL, &vif) != 0)
+                continue;
+            uint32_t dst, gateway = 0, mask = r->prefix == 0 ? 0 : htonl(0xffffffffu << (32 - r->prefix));
+            memcpy(&dst, r->dst, 4);
+            if (r->has_gateway)
+                memcpy(&gateway, r->gateway, 4);
+            unsigned flags = 0x1 | (r->has_gateway ? 0x2 : 0);     // RTF_UP, RTF_GATEWAY
+            proc_printf(buf, "%-6s  %08X  %08X  %04X  %d  %d  %d  %08X  %u  %d  %d\n",
+                    vif.name, dst, gateway, flags, 0, 0, 0, mask, 0u, 0, 0);
+        }
+    }
+    if (net_ns == NULL && host_route_table_collect(&routes) == 0) {
         for (size_t i = 0; i < routes.count; i++) {
             const struct host_route_entry *route = &routes.entries[i];
             // The whole name, as Linux prints it: a precision here cut

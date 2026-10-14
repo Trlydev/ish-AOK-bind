@@ -118,9 +118,12 @@ logind, resolved, networkd, udevd and userdbd run inside one on Arch.
 So sandboxes run, and containers do not. `unshare -m`, `-U`, `-r`, `-p` and
 `-n` work, for an ordinary user too; so does `bwrap` with everything Codex
 asks of it, and `codex sandbox -- /bin/echo x` prints `x`. No Docker and no
-rootless podman: those want a network namespace that is a network (veth
-pairs, bridges, NAT), control groups of their own, and overlay mounts, and
-none of that is here.
+rootless podman: those want a network namespace that reaches the world
+(bridges, NAT, a tap device for slirp4netns or pasta), control groups of
+their own, and overlay mounts, and none of that is here. What a namespace can
+be given is a veth pair to another namespace, or a dummy link: two sandboxes
+talk to each other over 10.0.0.1 and 10.0.0.2, and nothing goes further than
+the far end of the pair.
 
 This is not a missing feature with a ticket. The absence runs through the design
 — Chapter 10's task model, Chapter 16's global mount table, Chapter 21's
