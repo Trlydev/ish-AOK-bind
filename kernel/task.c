@@ -1,9 +1,12 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include "kernel/user_ns.h"
+#include "kernel/acct.h"
 #include "kernel/pid_ns.h"
 #include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
@@ -209,6 +212,7 @@ struct pid_namespace *pid_ns_retain(struct pid_namespace *ns) {
 void pid_ns_release(struct pid_namespace *ns) {
     while (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
         struct pid_namespace *parent = ns->parent;
+        acct_pid_ns_gone(ns);
         user_ns_release(ns->user_ns);
         free(ns->nr_of);
         free(ns->by_nr);
@@ -1652,7 +1656,7 @@ static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
         // another number is not the process that was saved, and everything
         // holding its old pid -- its parent's wait, a shell's $!, a pidfile --
         // is then wrong in a way nothing would report.
-        if (want_pid >= task_pid_wrap() || !pid_empty(&pids[want_pid]) ||
+        if ((dword_t) want_pid >= task_pid_wrap() || !pid_empty(&pids[want_pid]) ||
                 pid_is_kthread(want_pid, NULL)) {
             unlock(&pids_lock);
             free(task);

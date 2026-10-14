@@ -15,9 +15,11 @@
  * and the only way to be sure of it is to make the same assertions against a
  * real kernel. Needs root (CAP_SYS_PACCT); skips cleanly without it.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -227,6 +229,74 @@ int main(void) {
     }
 
     unlink(path);
+
+    /* Accounting is the caller's pid namespace's -- Linux's acct_on takes
+     * task_active_pid_ns(current) -- and a process's exit is recorded in each
+     * namespace from its own up that has accounting on, its pid and its
+     * parent's numbered as that namespace numbers them. The init of a new pid
+     * namespace turns it on there and forks a child that exits 7: the
+     * namespace's file has it as 2, child of 1; the outside's, on meanwhile,
+     * has it by its machine pid, child of the init's. */
+    char *ns_path = path + 2048;
+    strcpy(ns_path, "/tmp/aok-acct-test-ns");
+    strcpy(path, "/tmp/aok-acct-test-out");
+    unlink(path);
+    unlink(ns_path);
+    int ok_files = 1;
+    for (int i = 0; i < 2; i++) {
+        int one = open(i ? ns_path : path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        ok_files &= one >= 0;
+        if (one >= 0)
+            close(one);
+    }
+    if (check("acct.ns.files", ok_files) && check("acct.ns.outside_on", do_acct(path) == 0)) {
+        pid_t ns_init = -1;
+        if (unshare(CLONE_NEWPID) != 0) {
+            check("acct.ns.unshare", 0);
+        } else {
+            fflush(stdout);
+            ns_init = fork();
+            if (ns_init == 0) {
+                if (do_acct(ns_path) != 0)
+                    _exit(10);
+                pid_t g = fork();
+                if (g == 0)
+                    _exit(7);
+                int gs = 0;
+                waitpid(g, &gs, 0);
+                // (Off before its own exit, which this namespace's file then
+                // does not have.)
+                if (do_acct(NULL) != 0)
+                    _exit(11);
+                _exit(g == 2 ? 0 : 12);
+            }
+            int st = -1;
+            waitpid(ns_init, &st, 0);
+            check("acct.ns.init_ok", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        }
+        check("acct.ns.outside_off", do_acct(NULL) == 0);
+        struct acct_v3_t inside[16], outside[64];
+        size_t n_in = 0, n_out = 0;
+        FILE *fi = fopen(ns_path, "rb");
+        if (fi != NULL) { n_in = fread(inside, sizeof(inside[0]), 16, fi); fclose(fi); }
+        FILE *fo = fopen(path, "rb");
+        if (fo != NULL) { n_out = fread(outside, sizeof(outside[0]), 64, fo); fclose(fo); }
+        const struct acct_v3_t *g_in = NULL, *g_out = NULL;
+        for (size_t i = 0; i < n_in; i++)
+            if (inside[i].ac_exitcode == 7 << 8) g_in = &inside[i];
+        for (size_t i = 0; i < n_out; i++)
+            if (outside[i].ac_exitcode == 7 << 8 && outside[i].ac_ppid == (uint32_t) ns_init) g_out = &outside[i];
+        check("acct.ns.inside_only_child", n_in == 1 && g_in != NULL);
+        if (g_in != NULL) {
+            check("acct.ns.inside_pid", g_in->ac_pid == 2);
+            check("acct.ns.inside_ppid", g_in->ac_ppid == 1);
+            test_log_if(1, "  inside: pid %u ppid %u\n", g_in->ac_pid, g_in->ac_ppid);
+        }
+        if (check("acct.ns.outside_child", g_out != NULL))
+            check("acct.ns.outside_pid_is_machine", g_out->ac_pid != 2 && g_out->ac_pid != 0);
+    }
+    unlink(path);
+    unlink(ns_path);
     if (failures_total) {
         printf("acct_records: %d FAILURES\n", failures_total);
         return 1;

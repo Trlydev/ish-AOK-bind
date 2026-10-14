@@ -5410,15 +5410,24 @@ static int netlink_taskstats_fill(pid_t_ id, bool tgid, struct taskstats_ *ts) {
     // Parent PROCESS: Linux's bacct_add_tsk uses task_tgid_nr_ns(real_parent),
     // which every thread shares. See sys_getppid() for why ->pid is wrong here,
     // and task_process_parent for why a thread's own ->parent is.
+    //
+    // As the requester has them, numbers and ids alike: bacct_add_tsk's pid
+    // namespace and user namespace are the caller's (fill_stats_for_pid), so
+    // a parent its pid namespace has no number for is 0. (The records sent
+    // to exit listeners are the initial namespace's: taskstats_exit fills
+    // them with init_pid_ns and init_user_ns, as below.)
+    // (Translated once pids_lock is let go: the namespace lookups take it.)
     struct task *parent = task_process_parent(task);
-    ts->ac_ppid = parent != NULL ? parent->tgid : 0;
-    ts->ac_uid = task->uid;
-    ts->ac_gid = task->gid;
+    pid_t_ machine_ppid = parent != NULL ? parent->tgid : 0;
+    ts->ac_uid = current_uid_shown(task->uid);
+    ts->ac_gid = current_gid_shown(task->gid);
     // comm changes only at exec/prctl and is fixed-size; an unlocked copy can
     // at worst be torn between two names, never overrun (ac_comm is larger
     // and pre-zeroed).
     memcpy(ts->ac_comm, task->comm, sizeof(task->comm));
     unlock(&pids_lock);
+    ts->ac_pid = (uint32_t) current_pid_shown_or_zero((pid_t_) ts->ac_pid);
+    ts->ac_ppid = machine_ppid != 0 ? (uint32_t) current_pid_shown_or_zero(machine_ppid) : 0;
     netlink_taskstats_from_io(ts, &io);
     return 0;
 }

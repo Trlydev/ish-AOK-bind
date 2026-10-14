@@ -5,6 +5,7 @@
 #include "kernel/acct.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
+#include "kernel/pid_ns.h"
 #include "kernel/resource.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
@@ -55,11 +56,38 @@ static_assert(sizeof(struct acct_v3_) == 64, "acct_v3 is 64 bytes on the wire");
 // process exit would put a process-wide lock in the exit path for a feature
 // nobody has turned on.
 static lock_t acct_lock = LOCK_INITIALIZER;
+// The initial pid namespace's; another namespace's is its acct_file.
 static struct fd *acct_file = NULL;
-static atomic_bool acct_on = false;
+// How many namespaces have one open.
+static atomic_int acct_on = 0;
 
 bool acct_is_on(void) {
-    return atomic_load_explicit(&acct_on, memory_order_relaxed);
+    return atomic_load_explicit(&acct_on, memory_order_relaxed) != 0;
+}
+
+// Where a namespace's file is kept. Caller holds acct_lock.
+static struct fd **acct_slot(struct pid_namespace *ns) {
+    return ns != NULL ? &ns->acct_file : &acct_file;
+}
+
+// Put `fd` (or nothing) in a namespace's place, and hand back what was there.
+// Caller holds acct_lock.
+static struct fd *acct_swap_locked(struct pid_namespace *ns, struct fd *fd) {
+    struct fd **slot = acct_slot(ns);
+    struct fd *old = *slot;
+    *slot = fd;
+    atomic_fetch_add_explicit(&acct_on, (fd != NULL) - (old != NULL), memory_order_release);
+    return old;
+}
+
+void acct_pid_ns_gone(struct pid_namespace *ns) {
+    if (ns == NULL || ns->acct_file == NULL)
+        return;
+    lock(&acct_lock, 0);
+    struct fd *old = acct_swap_locked(ns, NULL);
+    unlock(&acct_lock);
+    if (old != NULL)
+        fd_close(old);
 }
 
 // comp_t: 3-bit exponent, 13-bit mantissa, base 8. Transcribed from
@@ -109,9 +137,7 @@ static dword_t acct_common(guest_addr_t path_addr) {
     if (path_addr == 0) {
         STRACE("acct(NULL)");
         lock(&acct_lock, 0);
-        struct fd *old = acct_file;
-        acct_file = NULL;
-        atomic_store_explicit(&acct_on, false, memory_order_release);
+        struct fd *old = acct_swap_locked(current->pid_ns, NULL);
         unlock(&acct_lock);
         // Closed outside the lock: fd_close does filesystem work, and holding
         // a lock across that is the rule this file already has to respect on
@@ -145,10 +171,10 @@ static dword_t acct_common(guest_addr_t path_addr) {
         return _EACCES;
     }
 
+    // The caller's own pid namespace's accounting (acct_on: Linux's
+    // task_active_pid_ns(current)).
     lock(&acct_lock, 0);
-    struct fd *old = acct_file;
-    acct_file = fd;
-    atomic_store_explicit(&acct_on, true, memory_order_release);
+    struct fd *old = acct_swap_locked(current->pid_ns, fd);
     unlock(&acct_lock);
     if (old != NULL)
         fd_close(old);
@@ -178,13 +204,16 @@ bool acct_collect(struct task *leader, const struct rusage_ *group_rusage,
     rec.ac_btime = (uint32_t) (now.tv_sec - (long) (elapsed / ACCT_AHZ));
 
     rec.ac_exitcode = status;
-    rec.ac_pid = leader->pid;
-    // 0 rather than 1 when the parent is gone: a reparented process has no
-    // honest ppid to report by the time its record is written.
-    // The parent PROCESS, as Linux's task_tgid_nr_ns(real_parent): ->pid is
-    // the thread that forked it, which is not a process id at all when that
-    // was not its process's first thread.
-    rec.ac_ppid = leader->parent != NULL ? (uint32_t) leader->parent->tgid : 0;
+    // The numbers each namespace's record carries are filled in by
+    // acct_write, one namespace at a time. 0 rather than 1 when the parent
+    // is gone: a reparented process has no honest ppid to report by the
+    // time its record is written. The parent PROCESS, as Linux's
+    // task_tgid_nr_ns(real_parent): ->pid is the thread that forked it, which
+    // is not a process id at all when that was not its process's first
+    // thread.
+    out->tgid = leader->pid;
+    out->ppid = leader->parent != NULL ? leader->parent->tgid : 0;
+    out->ns = pid_ns_retain(leader->pid_ns);
     rec.ac_uid = leader->uid;
     rec.ac_gid = leader->gid;
 
@@ -234,17 +263,31 @@ dword_t sys_acct_guest(guest_addr_t path_addr) {
 }
 
 void acct_write(const struct acct_record *rec) {
-    lock(&acct_lock, 0);
-    struct fd *fd = acct_file;
-    if (fd != NULL)
-        fd_retain(fd);
-    unlock(&acct_lock);
-    if (fd == NULL)
-        return;   // turned off between the collect and here
-
-    // A short or failed write is dropped rather than retried: this runs inside
-    // a process's exit and has nothing to report an error to. A full disk
-    // silently stops the accounting file growing, which is what Linux does too.
-    fd->ops->write(fd, rec->bytes, sizeof(rec->bytes));
-    fd_close(fd);
+    // Its own namespace's file first, then each one above it (Linux's
+    // slow_acct_process), every one with the numbers that namespace has.
+    struct pid_namespace *ns = rec->ns;
+    for (;;) {
+        lock(&acct_lock, 0);
+        struct fd *fd = *acct_slot(ns);
+        if (fd != NULL)
+            fd_retain(fd);
+        unlock(&acct_lock);
+        // (Turned off between the collect and here: nothing.)
+        if (fd != NULL) {
+            struct acct_v3_ one;
+            memcpy(&one, rec->bytes, sizeof(one));
+            one.ac_pid = (uint32_t) pid_ns_shown(ns, rec->tgid);
+            one.ac_ppid = rec->ppid != 0 ? (uint32_t) pid_ns_shown(ns, rec->ppid) : 0;
+            // A short or failed write is dropped rather than retried: this
+            // runs inside a process's exit and has nothing to report an
+            // error to. A full disk silently stops the accounting file
+            // growing, which is what Linux does too.
+            fd->ops->write(fd, &one, sizeof(one));
+            fd_close(fd);
+        }
+        if (ns == NULL)
+            break;
+        ns = ns->parent;
+    }
+    pid_ns_release(rec->ns);
 }

@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -471,6 +472,40 @@ int main(int argc, char **argv) {
         int nl_errno = 0;
         int r = taskstats_get(fd, family, 0, 999999, 5, &ts, &out_id, &nl_errno);
         check("get.badpid.esrch", r == 1 && nl_errno == ESRCH);
+    }
+
+    /* Asked from inside a pid namespace, a GET answers in its numbers:
+     * fill_stats_for_pid looks the pid up as the caller sees it, and
+     * bacct_add_tsk numbers it and its parent in the caller's namespace --
+     * the init there is 1, and its parent outside is 0. (Root only; on a
+     * kernel without pid namespaces this is skipped.) */
+    if (geteuid() == 0) {
+        int pipefd[2];
+        if (pipe(pipefd) == 0 && unshare(CLONE_NEWPID) == 0) {
+            fflush(stdout);
+            pid_t init = fork();
+            if (init == 0) {
+                struct taskstats_v8 ts;
+                uint32_t out_id = 0, got[3] = {0};
+                int nl_errno = 0;
+                int r = taskstats_get(fd, family, 0, 1, 6, &ts, &out_id, &nl_errno);
+                got[0] = (uint32_t) r;
+                got[1] = ts.ac_pid;
+                got[2] = ts.ac_ppid;
+                if (write(pipefd[1], got, sizeof(got)) != sizeof(got))
+                    _exit(1);
+                _exit(0);
+            }
+            uint32_t got[3] = {1, 0, 0};
+            if (read(pipefd[0], got, sizeof(got)) != sizeof(got))
+                got[0] = 1;
+            waitpid(init, NULL, 0);
+            if (check("get.pidns.ok", got[0] == 0)) {
+                check("get.pidns.ac_pid", got[1] == 1);
+                check("get.pidns.ac_ppid", got[2] == 0);
+                test_logf("     in a pid namespace: ac_pid=%u ac_ppid=%u\n", got[1], got[2]);
+            }
+        }
     }
 
 done:

@@ -56,6 +56,8 @@ struct pid_namespace {
     // without it, an int at a time, by whoever holds the namespace.
     pid_t_ *nr_of, *by_nr;
     pid_t_ last_nr;                 // the last one handed out; guarded by pids_lock
+    // Its acct(2) file, or NULL (kernel/acct.c; guarded by acct_lock there).
+    struct fd *acct_file;
 };
 
 #define PID_NS_MAX_LEVEL 32

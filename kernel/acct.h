@@ -15,9 +15,17 @@
 
 struct task;
 struct rusage_;
+struct pid_namespace;
 
 // acct(2). A NULL path turns accounting off; anything else opens that file for
 // append and turns it on. Needs CAP_SYS_PACCT.
+//
+// For the caller's own pid namespace, as on Linux: each namespace has its
+// own accounting file, and a process's exit is recorded in every one from
+// its namespace up to the initial one that has accounting on, its pid and
+// its parent's numbered as that namespace numbers them (0 for a parent it
+// cannot see). The uid and gid are kernel ids: only the initial namespace's
+// root can turn accounting on, and the ids are the file opener's view.
 //
 // Two entry points, as open/swapon have: addr_t is a DWORD, so the table
 // version can only carry an i386 pointer. Every 64-bit ABI must reach the
@@ -33,7 +41,11 @@ bool acct_is_on(void);
 
 // One record, opaque here so do_exit can hold it on its stack without this
 // file's layout leaking into exit.c.
-struct acct_record { char bytes[64]; };
+struct acct_record {
+    char bytes[64];
+    pid_t_ tgid, ppid;              // machine numbers
+    struct pid_namespace *ns;       // the process's own; a reference
+};
 
 // Split in two because of WHERE each half can run.
 //
@@ -53,5 +65,8 @@ struct acct_record { char bytes[64]; };
 bool acct_collect(struct task *leader, const struct rusage_ *group_rusage,
                   dword_t status, struct acct_record *out);
 void acct_write(const struct acct_record *rec);
+
+// A pid namespace is going: its accounting file, if it has one, closes.
+void acct_pid_ns_gone(struct pid_namespace *ns);
 
 #endif
