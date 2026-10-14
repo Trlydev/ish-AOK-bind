@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -15,11 +16,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include "kernel/ipc_ns.h"
+#include "kernel/net_ns.h"
+#include "kernel/pid_ns.h"
+#include "util/wait_spin.h"
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "kernel/native.h"
 #include "kernel/inotify.h"
 #include "kernel/task.h"
@@ -27,9 +35,12 @@
 #include "fs/inode.h"
 #include "fs/net_route.h"
 #include "fs/path.h"
+#include "fs/proc.h"
 #include "fs/poll.h"
 #include "fs/real.h"
+#include "fs/net_vif.h"
 #include "fs/sock.h"
+#include "fs/sock_ckpt.h"
 #include "util/timer.h"
 #include "debug.h"
 
@@ -112,6 +123,7 @@ struct audit_features_ {
 #define SIOCGIFNAME_ 0x8910
 #define SIOCGIFCONF_ 0x8912
 #define SIOCGIFFLAGS_ 0x8913
+#define SIOCSIFFLAGS_ 0x8914
 #define SIOCGIFADDR_ 0x8915
 #define SIOCGIFDSTADDR_ 0x8917
 #define SIOCGIFBRDADDR_ 0x8919
@@ -143,6 +155,8 @@ struct audit_features_ {
 #define IFLA_MTU_ 4
 #define IFLA_TXQLEN_ 13
 #define IFLA_OPERSTATE_ 16
+#define IFLA_CARRIER_ 33
+#define IFLA_ALT_IFNAME_ 53
 
 #define IFA_ADDRESS_ 1
 #define IFA_LOCAL_ 2
@@ -155,6 +169,7 @@ struct audit_features_ {
 #define RTA_OIF_ 4
 #define RTA_GATEWAY_ 5
 #define RTA_PREFSRC_ 7
+#define RTA_TABLE_ 15
 
 #define RT_SCOPE_UNIVERSE_ 0
 #define RT_SCOPE_LINK_ 253
@@ -330,6 +345,8 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
 static int netlink_append_error(struct fd *sock, uint32_t seq,
         const struct nlmsghdr_ *req, int err_code);
 static int netlink_append_done(struct fd *sock, uint32_t seq);
+static const struct nlattr_ *netlink_attr_find(const void *attrs, size_t len, uint16_t type);
+static bool netlink_attr_streq(const struct nlattr_ *attr, const char *str);
 static void netlink_notify_register(struct fd *sock);
 static void netlink_notify_unregister(struct fd *sock);
 
@@ -407,6 +424,11 @@ struct unix_diag_msg_ {
 #define TASKSTATS_CMD_NEW_ 2
 #define TASKSTATS_CMD_ATTR_PID_ 1
 #define TASKSTATS_CMD_ATTR_TGID_ 2
+// Registering a cpumask asks the kernel to push a record for every process
+// that exits, instead of answering one query at a time. It is how atopacctd
+// (and anything else wanting exit accounting without BSD acct) listens.
+#define TASKSTATS_CMD_ATTR_REGISTER_CPUMASK_ 3
+#define TASKSTATS_CMD_ATTR_DEREGISTER_CPUMASK_ 4
 #define TASKSTATS_TYPE_PID_ 1
 #define TASKSTATS_TYPE_TGID_ 2
 #define TASKSTATS_TYPE_STATS_ 3
@@ -495,6 +517,7 @@ struct netlink_link_info {
     uint32_t mtu;
     uint32_t txqlen;
     uint8_t operstate;
+    uint8_t carrier;
     uint8_t address[16];
     uint8_t broadcast[16];
     size_t address_len;
@@ -506,6 +529,9 @@ static void netlink_fill_link_info(const struct ifaddrs *addrs, const struct ifa
     info->mtu = 1500;
     info->txqlen = 1000;
     info->operstate = (cursor->ifa_flags & IFF_RUNNING) ? IF_OPER_UP_ : IF_OPER_UNKNOWN_;
+    // Carrier is what IFF_LOWER_UP reports for a link that is up, and Darwin's
+    // IFF_RUNNING is where both come from (netlink_linux_if_flags).
+    info->carrier = (cursor->ifa_flags & IFF_RUNNING) ? 1 : 0;
 #if defined(__APPLE__)
     if (cursor->ifa_data != NULL) {
         const struct if_data *stats = (const struct if_data *) cursor->ifa_data;
@@ -584,7 +610,19 @@ static uint32_t netlink_linux_if_flags(unsigned host_flags) {
         // upstream servers and UDP path never even get tried), which turned
         // all hostname resolution off for the whole Arch guest via
         // nsswitch's "resolve [!UNAVAIL=return]" hard stop.
-        linux_flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
+        //
+        // Only when the link is administratively UP, though. Darwin sets
+        // IFF_RUNNING on a utun device that is not IFF_UP, and carrier without
+        // "up" is not a state Linux produces: every interface on a Linux 6.12
+        // box reports UP and LOWER_UP together, never one without the other.
+        // wicked rejects the combination outright -- "utun5: unexpected
+        // combination of interface flags 0x10040", once per link per scan, in
+        // an openSUSE guest. A link left with no flags by this falls through
+        // to the IFF_NOARP default below, which is what Linux reports for its
+        // own flagless device (sit0), so it stays a link systemd-networkd will
+        // accept.
+        if (host_flags & IFF_UP)
+            linux_flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
     }
 #ifdef IFF_NOARP
     if (host_flags & IFF_NOARP)
@@ -703,6 +741,14 @@ static int netlink_build_link_payload(char *payload, size_t cap, size_t *payload
             IFLA_OPERSTATE_, &info->operstate, sizeof(info->operstate));
     if (err < 0)
         return err;
+    // Linux puts IFLA_CARRIER in every link message (rtnl_fill_ifinfo), so a
+    // reader may take its absence as no carrier. waybar's network module does:
+    // it starts a link at carrier=false and only this attribute raises it, so
+    // without it a working interface showed "Disconnected".
+    err = netlink_append_attr_raw(payload, cap, &payload_len,
+            IFLA_CARRIER_, &info->carrier, sizeof(info->carrier));
+    if (err < 0)
+        return err;
     *payload_len_out = payload_len;
     return 0;
 }
@@ -764,6 +810,65 @@ static int netlink_append_route_links(struct fd *sock, const struct nlmsghdr_ *r
     freeifaddrs(addrs);
     if (err >= 0)
         err = netlink_append_done(sock, req_hdr->nlmsg_seq);
+    return err;
+}
+
+// RTM_GETLINK without NLM_F_DUMP asks for one link: by ifi_index, or when that
+// is not positive, by IFLA_IFNAME or IFLA_ALT_IFNAME (rtnl_getlink). Linux
+// answers with that link alone -- no NLM_F_MULTI, no NLMSG_DONE -- and then the
+// ACK if the request asked for one; ENODEV when nothing matches, EINVAL when
+// the request names no link. waybar's network module asks this way for the
+// link its default route leaves by, and `ip link show dev X` does too. This
+// used to answer with the whole link dump, so iproute2 printed the first link,
+// lo0, for any name, including one that does not exist.
+static int netlink_append_route_link_get(struct fd *sock, const struct nlmsghdr_ *req_hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct ifinfomsg_))
+        return netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _EINVAL);
+    const struct ifinfomsg_ *req = (const struct ifinfomsg_ *) payload;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req))
+        ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    const struct nlattr_ *name = NULL;
+    if (req->ifi_index <= 0) {
+        name = netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_);
+        if (name == NULL)
+            name = netlink_attr_find(attrs, attrs_len, IFLA_ALT_IFNAME_);
+        if (name == NULL)
+            return netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _EINVAL);
+    }
+
+    struct ifaddrs *addrs = NULL;
+    if (getifaddrs(&addrs) != 0)
+        return _EIO;
+    // The first entry for a name, as the dump uses.
+    const struct ifaddrs *match = NULL;
+    for (const struct ifaddrs *cursor = addrs; cursor != NULL; cursor = cursor->ifa_next) {
+        if (cursor->ifa_name == NULL)
+            continue;
+        if (name != NULL ? netlink_attr_streq(name, cursor->ifa_name)
+                : (int32_t) if_nametoindex(cursor->ifa_name) == req->ifi_index) {
+            match = cursor;
+            break;
+        }
+    }
+
+    int err;
+    if (match == NULL) {
+        err = netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _ENODEV);
+    } else {
+        struct netlink_link_info info = {};
+        netlink_fill_link_info(addrs, match, &info);
+        char reply[256];
+        size_t reply_len;
+        err = netlink_build_link_payload(reply, sizeof(reply), &reply_len,
+                match->ifa_name, match->ifa_flags, &info);
+        if (err >= 0)
+            err = netlink_append_nlmsg(sock, RTM_NEWLINK_, 0, req_hdr->nlmsg_seq, reply, reply_len);
+        if (err >= 0 && (req_hdr->nlmsg_flags & NLM_F_ACK_))
+            err = netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, 0);
+    }
+    freeifaddrs(addrs);
     return err;
 }
 
@@ -1245,20 +1350,18 @@ static int netlink_append_route_route(struct fd *sock, const struct nlmsghdr_ *r
     msg->rtm_type = RTN_UNICAST_;
     msg->rtm_flags = 0;
 
-    int err = 0;
+    // Attributes in fib_dump_info's order. RTA_TABLE is in every route Linux
+    // reports (rtm_table alone cannot name a table above 255), and a route
+    // through a router carries RTA_GATEWAY: waybar's network module takes the
+    // default route to be the one with a gateway.
+    uint32_t table = RT_TABLE_MAIN_;
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
+            RTA_TABLE_, &table, sizeof(table));
+    if (err < 0)
+        return err;
     if (route->prefix_len != 0) {
         err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
                 RTA_DST_, &route->destination_be, sizeof(route->destination_be));
-        if (err < 0)
-            return err;
-    }
-    err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
-            RTA_OIF_, &route->ifindex, sizeof(route->ifindex));
-    if (err < 0)
-        return err;
-    if (route->gateway_be != 0) {
-        err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
-                RTA_GATEWAY_, &route->gateway_be, sizeof(route->gateway_be));
         if (err < 0)
             return err;
     }
@@ -1268,6 +1371,16 @@ static int netlink_append_route_route(struct fd *sock, const struct nlmsghdr_ *r
         if (err < 0)
             return err;
     }
+    if (route->gateway_be != 0) {
+        err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
+                RTA_GATEWAY_, &route->gateway_be, sizeof(route->gateway_be));
+        if (err < 0)
+            return err;
+    }
+    err = netlink_append_attr_raw(payload, sizeof(payload), &payload_len,
+            RTA_OIF_, &route->ifindex, sizeof(route->ifindex));
+    if (err < 0)
+        return err;
 
     return netlink_append_nlmsg(sock, RTM_NEWROUTE_, NLM_F_MULTI_,
             req_hdr->nlmsg_seq, payload, payload_len);
@@ -1295,11 +1408,747 @@ static int netlink_append_route_routes(struct fd *sock, const struct nlmsghdr_ *
     return err;
 }
 
+// ---- rtnetlink in a private network namespace (kernel/net_ns.h) -------------
+//
+// "lo", index 1: down and without an address until it is told otherwise,
+// which is the whole of what a sandbox does to its network before it runs
+// anything (bubblewrap: RTM_NEWADDR 127.0.0.1/8, then RTM_NEWLINK IFF_UP;
+// systemd for a PrivateNetwork= service: RTM_SETLINK up, and reads it back).
+// Then whatever veth and dummy links it is given (fs/net_vif.h): made,
+// changed, moved, deleted and addressed here, and listed with "lo".
+
+#define NET_NS_LO_INDEX 1
+#define RTM_SETLINK_NET_NS_ 19
+#define RTM_DELROUTE_NET_NS_ 25
+#define IFLA_LINK_NET_NS_ 5
+#define IFLA_LINKINFO_NET_NS_ 18
+#define IFLA_NET_NS_PID_NET_NS_ 19
+#define IFLA_NET_NS_FD_NET_NS_ 28
+#define IFLA_INFO_KIND_NET_NS_ 1
+#define IFLA_INFO_DATA_NET_NS_ 2
+#define VETH_INFO_PEER_NET_NS_ 1
+#define RTPROT_STATIC_NET_NS_ 4
+#define RT_TABLE_UNSPEC_NET_NS_ 0
+#define NLM_F_EXCL_NET_NS_ 0x200
+#define NLM_F_CREATE_NET_NS_ 0x400
+#define IF_OPER_DOWN_NET_NS_ 2
+#define IF_OPER_LOWERLAYERDOWN_NET_NS_ 3
+#define RTNH_F_DEAD_NET_NS_ 1
+#define RTNH_F_LINKDOWN_NET_NS_ 16
+#define NET_NS_MAX_VIFS 64
+#define NLM_F_REPLACE_NET_NS_ 0x100
+#define CLONE_NEWNET_SOCK_ 0x40000000
+
+static unsigned net_ns_lo_flags(struct net_namespace *ns) {
+    unsigned flags = IFF_LOOPBACK_LINUX_;
+    if (atomic_load(&ns->lo_up))
+        flags |= IFF_UP_LINUX_ | IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
+    return flags;
+}
+
+static int net_ns_append_lo_link(struct fd *sock, struct net_namespace *ns, uint32_t seq, uint16_t msg_flags) {
+    char payload[256];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifinfomsg_);
+    struct ifinfomsg_ *msg = (struct ifinfomsg_ *) payload;
+    msg->ifi_family = AF_UNSPEC;
+    msg->ifi_type = ARPHRD_LOOPBACK_;
+    msg->ifi_index = NET_NS_LO_INDEX;
+    msg->ifi_flags = net_ns_lo_flags(ns);
+    msg->ifi_change = 0xffffffffu;
+    uint32_t mtu = 65536, txqlen = 1000;
+    uint8_t operstate = atomic_load(&ns->lo_up) ? IF_OPER_UNKNOWN_ : IF_OPER_DOWN_NET_NS_;
+    uint8_t carrier = atomic_load(&ns->lo_up) ? 1 : 0;
+    uint8_t hw[6] = {0};
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_IFNAME_, "lo", 3);
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_MTU_, &mtu, sizeof(mtu));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_ADDRESS_, hw, sizeof(hw));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_BROADCAST_, hw, sizeof(hw));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_TXQLEN_, &txqlen, sizeof(txqlen));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_OPERSTATE_, &operstate, sizeof(operstate));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_CARRIER_, &carrier, sizeof(carrier));
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWLINK_, msg_flags, seq, payload, len);
+}
+
+// A veth or dummy link, as rtnl_fill_ifinfo puts one: the flags Linux's
+// drivers give them (ether_setup's BROADCAST|MULTICAST; a dummy's NOARP), the
+// carrier the far end gives a veth, and IFLA_LINKINFO naming the kind, which
+// is how `ip -d link` and networkd tell one from the other.
+static int net_ns_append_vif_link(struct fd *sock, const struct net_vif_info *vif,
+        uint16_t type, uint16_t msg_flags, uint32_t seq) {
+    char payload[320];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifinfomsg_);
+    struct ifinfomsg_ *msg = (struct ifinfomsg_ *) payload;
+    msg->ifi_family = AF_UNSPEC;
+    msg->ifi_type = ARPHRD_ETHER_;
+    msg->ifi_index = vif->index;
+    unsigned flags = IFF_BROADCAST_LINUX_ | (vif->kind == NET_VIF_DUMMY ? IFF_NOARP_LINUX_ : IFF_MULTICAST_LINUX_);
+    if (vif->up)
+        flags |= IFF_UP_LINUX_;
+    if (vif->lower_up)
+        flags |= IFF_RUNNING_LINUX_ | IFF_LOWER_UP_LINUX_;
+    msg->ifi_flags = flags;
+    msg->ifi_change = 0xffffffffu;
+    uint32_t mtu = vif->mtu, txqlen = 1000;
+    uint8_t operstate = !vif->up ? IF_OPER_DOWN_NET_NS_ :
+        vif->kind == NET_VIF_DUMMY ? IF_OPER_UNKNOWN_ :
+        vif->lower_up ? IF_OPER_UP_ : IF_OPER_LOWERLAYERDOWN_NET_NS_;
+    uint8_t carrier = vif->lower_up ? 1 : 0;
+    uint8_t broadcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_IFNAME_, vif->name, strlen(vif->name) + 1);
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_MTU_, &mtu, sizeof(mtu));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_ADDRESS_, vif->mac, sizeof(vif->mac));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_BROADCAST_, broadcast, sizeof(broadcast));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_TXQLEN_, &txqlen, sizeof(txqlen));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_OPERSTATE_, &operstate, sizeof(operstate));
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_CARRIER_, &carrier, sizeof(carrier));
+    if (err >= 0 && vif->kind == NET_VIF_VETH && vif->peer_index != 0) {
+        int32_t peer = vif->peer_index;
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_LINK_NET_NS_, &peer, sizeof(peer));
+    }
+    if (err >= 0) {
+        // IFLA_LINKINFO { IFLA_INFO_KIND "veth" | "dummy" }
+        const char *kind = vif->kind == NET_VIF_VETH ? "veth" : "dummy";
+        char nested[32];
+        size_t nested_len = 0;
+        err = netlink_append_attr_raw(nested, sizeof(nested), &nested_len, IFLA_INFO_KIND_NET_NS_, kind, strlen(kind) + 1);
+        if (err >= 0)
+            err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFLA_LINKINFO_NET_NS_, nested, nested_len);
+    }
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, type, msg_flags, seq, payload, len);
+}
+
+static int net_ns_append_lo_addr(struct fd *sock, uint32_t seq, bool v6) {
+    char payload[128];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifaddrmsg_);
+    struct ifaddrmsg_ *msg = (struct ifaddrmsg_ *) payload;
+    msg->ifa_family = v6 ? AF_INET6_ : AF_INET_;
+    msg->ifa_prefixlen = v6 ? 128 : 8;
+    msg->ifa_flags = 0x80; // IFA_F_PERMANENT
+    msg->ifa_scope = RT_SCOPE_HOST_;
+    msg->ifa_index = NET_NS_LO_INDEX;
+    int err;
+    if (v6) {
+        struct in6_addr addr = IN6ADDR_LOOPBACK_INIT;
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, &addr, sizeof(addr));
+    } else {
+        struct in_addr addr = {.s_addr = htonl(INADDR_LOOPBACK)};
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LOCAL_, &addr, sizeof(addr));
+        if (err >= 0)
+            err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, &addr, sizeof(addr));
+        if (err >= 0)
+            err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LABEL_, "lo", 3);
+    }
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWADDR_, NLM_F_MULTI_, seq, payload, len);
+}
+
+static int net_ns_append_vif_addr(struct fd *sock, uint32_t seq, const struct net_vif_info *vif,
+        const struct net_vif_addr *addr) {
+    char payload[160];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct ifaddrmsg_);
+    struct ifaddrmsg_ *msg = (struct ifaddrmsg_ *) payload;
+    msg->ifa_family = addr->v6 ? AF_INET6_ : AF_INET_;
+    msg->ifa_prefixlen = addr->prefix;
+    msg->ifa_flags = IFA_F_PERMANENT_;
+    bool link_local = addr->v6 ? (addr->addr[0] == 0xfe && (addr->addr[1] & 0xc0) == 0x80)
+                               : (addr->addr[0] == 169 && addr->addr[1] == 254);
+    msg->ifa_scope = link_local ? RT_SCOPE_LINK_ : RT_SCOPE_UNIVERSE_;
+    msg->ifa_index = (uint32_t) vif->index;
+    size_t size = addr->v6 ? 16 : 4;
+    int err = 0;
+    if (!addr->v6)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LOCAL_, addr->addr, size);
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_ADDRESS_, addr->addr, size);
+    if (err >= 0 && !addr->v6)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_LABEL_, vif->name, strlen(vif->name) + 1);
+    uint32_t flags = IFA_F_PERMANENT_;
+    if (err >= 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, IFA_FLAGS_, &flags, sizeof(flags));
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWADDR_, NLM_F_MULTI_, seq, payload, len);
+}
+
+static int net_ns_append_vif_route(struct fd *sock, uint32_t seq, const struct net_vif_route *route,
+        struct net_namespace *ns) {
+    char payload[160];
+    memset(payload, 0, sizeof(payload));
+    size_t len = sizeof(struct rtmsg_);
+    struct rtmsg_ *msg = (struct rtmsg_ *) payload;
+    msg->rtm_family = route->v6 ? AF_INET6_ : AF_INET_;
+    msg->rtm_dst_len = route->prefix;
+    msg->rtm_table = RT_TABLE_MAIN_;
+    msg->rtm_protocol = route->connected ? RTPROT_KERNEL_ : RTPROT_BOOT_;
+    msg->rtm_scope = route->connected || !route->has_gateway ? RT_SCOPE_LINK_ : RT_SCOPE_UNIVERSE_;
+    msg->rtm_type = RTN_UNICAST_;
+    // A route out of a link with no carrier is there and unusable: "dead
+    // linkdown", as fib_sync_down_dev marks it.
+    struct net_vif_info out;
+    if (route->oif != 0 && net_vif_get(ns, route->oif, NULL, &out) == 0 && !out.lower_up)
+        msg->rtm_flags = RTNH_F_DEAD_NET_NS_ | RTNH_F_LINKDOWN_NET_NS_;
+    size_t size = route->v6 ? 16 : 4;
+    uint32_t table = RT_TABLE_MAIN_;
+    int err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_TABLE_, &table, sizeof(table));
+    if (err >= 0 && route->prefix != 0)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_DST_, route->dst, size);
+    if (err >= 0 && route->connected && !route->v6) {
+        // The address that made it is its preferred source.
+        struct net_vif_info vif;
+        if (net_vif_get(ns, route->oif, NULL, &vif) == 0) {
+            for (int i = 0; i < vif.n_addrs; i++) {
+                if (!vif.addrs[i].v6 && vif.addrs[i].prefix == route->prefix) {
+                    err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_PREFSRC_, vif.addrs[i].addr, 4);
+                    break;
+                }
+            }
+        }
+    }
+    if (err >= 0 && route->has_gateway)
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_GATEWAY_, route->gateway, size);
+    if (err >= 0 && route->oif != 0) {
+        int32_t oif = route->oif;
+        err = netlink_append_attr_raw(payload, sizeof(payload), &len, RTA_OIF_, &oif, sizeof(oif));
+    }
+    if (err < 0)
+        return err;
+    return netlink_append_nlmsg(sock, RTM_NEWROUTE_, NLM_F_MULTI_, seq, payload, len);
+}
+
+// A reply to a request that changes something: only when it asked for one.
+static int net_ns_ack(struct fd *sock, const struct nlmsghdr_ *hdr, int err_code) {
+    if (err_code != 0 || (hdr->nlmsg_flags & NLM_F_ACK_))
+        return netlink_append_error(sock, hdr->nlmsg_seq, hdr, err_code);
+    return 0;
+}
+
+// The namespace IFLA_NET_NS_PID or IFLA_NET_NS_FD names, retained into *out
+// (NULL there is the initial one); *named false when the request names none.
+static int net_ns_named(const void *attrs, size_t len, bool *named, struct net_namespace **out) {
+    *named = false;
+    *out = NULL;
+    const struct nlattr_ *pid_attr = netlink_attr_find(attrs, len, IFLA_NET_NS_PID_NET_NS_);
+    const struct nlattr_ *fd_attr = netlink_attr_find(attrs, len, IFLA_NET_NS_FD_NET_NS_);
+    if (pid_attr != NULL && pid_attr->nla_len >= sizeof(*pid_attr) + 4) {
+        uint32_t pid;
+        memcpy(&pid, pid_attr + 1, 4);
+        struct task *task = pid_get_task_ref(pid);
+        if (task == NULL)
+            return _ESRCH;
+        bool gone = true;
+        if (task_lock_unless_exiting(task)) {
+            if (!task->exiting) {
+                gone = false;
+                *out = net_ns_retain(task->net_ns);
+            }
+            unlock(&task->general_lock);
+        }
+        task_ref_cnt_mod(task, -1);
+        if (gone)
+            return _ESRCH;
+        *named = true;
+        return 0;
+    }
+    if (fd_attr != NULL && fd_attr->nla_len >= sizeof(*fd_attr) + 4) {
+        int32_t fd_no;
+        memcpy(&fd_no, fd_attr + 1, 4);
+        struct fd *fd = f_get(fd_no);
+        unsigned nstype;
+        void *ns;
+        if (fd == NULL)
+            return _EBADF;
+        if (!proc_ns_fd_info(fd, &nstype, &ns) || nstype != CLONE_NEWNET_SOCK_)
+            return _EINVAL;
+        *out = net_ns_retain(ns);
+        *named = true;
+        return 0;
+    }
+    return 0;
+}
+
+// May the caller administer `ns`'s network? The initial one is the host's,
+// and nothing here makes links in it.
+static bool net_ns_admin(struct net_namespace *ns) {
+    return ns != NULL && ns_capable(ns->user_ns, CAP_NET_ADMIN_);
+}
+
+// The link a request names: by ifi_index, or by IFLA_IFNAME when that is 0.
+// 0 for "lo", the vif's index, -1 for none, or -2 when it names nothing.
+static int net_ns_request_link(struct net_namespace *ns, const struct ifinfomsg_ *req,
+        const void *attrs, size_t attrs_len, struct net_vif_info *vif) {
+    if (req->ifi_index == NET_NS_LO_INDEX)
+        return 0;
+    if (req->ifi_index != 0)
+        return net_vif_get(ns, req->ifi_index, NULL, vif) == 0 ? req->ifi_index : -1;
+    const struct nlattr_ *name = netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_);
+    if (name == NULL)
+        return -2;
+    if (netlink_attr_streq(name, "lo"))
+        return 0;
+    char text[NET_VIF_NAME_MAX] = "";
+    size_t n = name->nla_len - sizeof(*name);
+    if (n >= sizeof(text))
+        return -1;
+    memcpy(text, name + 1, n);
+    return net_vif_get(ns, 0, text, vif) == 0 ? vif->index : -1;
+}
+
+// A string attribute, copied out NUL-terminated; false when it does not fit.
+static bool net_ns_attr_name(const struct nlattr_ *attr, char *out, size_t size) {
+    out[0] = '\0';
+    if (attr == NULL)
+        return true;
+    size_t n = attr->nla_len - sizeof(*attr);
+    while (n > 0 && ((const char *) (attr + 1))[n - 1] == '\0')
+        n--;
+    if (n >= size)
+        return false;
+    memcpy(out, attr + 1, n);
+    out[n] = '\0';
+    return true;
+}
+
+// rtnl_dev_combine_flags: what an ifinfomsg makes of IFF_UP. -1: as it is.
+static int net_ns_request_up(const struct ifinfomsg_ *req) {
+    if (req->ifi_change == 0 && req->ifi_flags == 0)
+        return -1;
+    if (req->ifi_change != 0 && !(req->ifi_change & IFF_UP_LINUX_))
+        return -1;
+    return (req->ifi_flags & IFF_UP_LINUX_) != 0;
+}
+
+// do_setlink, for a vif: name, MTU, MAC, up, and a move to another namespace.
+static int net_ns_set_vif(struct net_namespace *ns, int index, const struct ifinfomsg_ *req,
+        const void *attrs, size_t attrs_len, bool rename) {
+    struct net_vif_change change = {.up = net_ns_request_up(req)};
+    char name[NET_VIF_NAME_MAX];
+    const struct nlattr_ *name_attr = rename ? netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_) : NULL;
+    if (!net_ns_attr_name(name_attr, name, sizeof(name)))
+        return _EINVAL;
+    if (name[0] != '\0')
+        change.name = name;
+    const struct nlattr_ *mtu = netlink_attr_find(attrs, attrs_len, IFLA_MTU_);
+    if (mtu != NULL && mtu->nla_len >= sizeof(*mtu) + 4)
+        memcpy(&change.mtu, mtu + 1, 4);
+    const struct nlattr_ *mac = netlink_attr_find(attrs, attrs_len, IFLA_ADDRESS_);
+    if (mac != NULL) {
+        if (mac->nla_len != sizeof(*mac) + 6)
+            return _EINVAL;
+        change.mac = (const uint8_t *) (mac + 1);
+    }
+    bool named;
+    struct net_namespace *to;
+    int err = net_ns_named(attrs, attrs_len, &named, &to);
+    if (err < 0)
+        return err;
+    if (named && to != ns) {
+        // Linux takes CAP_NET_ADMIN over both. There are no links in the
+        // initial namespace to move one to (fs/net_vif.h).
+        if (to == NULL)
+            err = _EOPNOTSUPP;
+        else if (!net_ns_admin(to))
+            err = _EPERM;
+        change.move = true;
+        change.to_ns = to;
+    }
+    if (err == 0)
+        err = net_vif_change(ns, index, &change);
+    // A move leaves the link down; the flags in the same request are not
+    // applied to it there (do_setlink moves it first and finds it gone).
+    net_ns_release(to);
+    return err;
+}
+
+// RTM_NEWLINK with a kind, for a link that does not exist yet.
+static int net_ns_new_vif(struct net_namespace *ns, const struct nlmsghdr_ *hdr, const struct ifinfomsg_ *req,
+        const void *attrs, size_t attrs_len, const struct nlattr_ *linkinfo) {
+    const void *info = linkinfo + 1;
+    size_t info_len = linkinfo->nla_len - sizeof(*linkinfo);
+    const struct nlattr_ *kind_attr = netlink_attr_find(info, info_len, IFLA_INFO_KIND_NET_NS_);
+    enum net_vif_kind kind;
+    if (kind_attr != NULL && netlink_attr_streq(kind_attr, "veth"))
+        kind = NET_VIF_VETH;
+    else if (kind_attr != NULL && netlink_attr_streq(kind_attr, "dummy"))
+        kind = NET_VIF_DUMMY;
+    else
+        return _EOPNOTSUPP;
+    if (!(hdr->nlmsg_flags & NLM_F_CREATE_NET_NS_))
+        return _ENODEV;
+
+    char name[NET_VIF_NAME_MAX], peer_name[NET_VIF_NAME_MAX];
+    if (!net_ns_attr_name(netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_), name, sizeof(name)))
+        return _EINVAL;
+    // The peer: VETH_INFO_PEER in IFLA_INFO_DATA, an ifinfomsg and its own
+    // attributes.
+    const struct ifinfomsg_ *peer_req = NULL;
+    const void *peer_attrs = NULL;
+    size_t peer_attrs_len = 0;
+    peer_name[0] = '\0';
+    if (kind == NET_VIF_VETH) {
+        const struct nlattr_ *data = netlink_attr_find(info, info_len, IFLA_INFO_DATA_NET_NS_);
+        const struct nlattr_ *peer = data != NULL
+            ? netlink_attr_find(data + 1, data->nla_len - sizeof(*data), VETH_INFO_PEER_NET_NS_) : NULL;
+        if (peer != NULL) {
+            size_t peer_len = peer->nla_len - sizeof(*peer);
+            if (peer_len < sizeof(struct ifinfomsg_))
+                return _EINVAL;
+            peer_req = (const struct ifinfomsg_ *) (peer + 1);
+            peer_attrs = (const char *) peer_req + NLMSG_ALIGN(sizeof(*peer_req));
+            peer_attrs_len = peer_len > NLMSG_ALIGN(sizeof(*peer_req)) ? peer_len - NLMSG_ALIGN(sizeof(*peer_req)) : 0;
+            if (!net_ns_attr_name(netlink_attr_find(peer_attrs, peer_attrs_len, IFLA_IFNAME_), peer_name, sizeof(peer_name)))
+                return _EINVAL;
+        }
+    }
+
+    // Where each end goes: the request's namespace attribute moves the link
+    // itself, the peer's its peer (which is otherwise where the link is).
+    bool named;
+    struct net_namespace *where, *peer_where = NULL;
+    int err = net_ns_named(attrs, attrs_len, &named, &where);
+    if (err < 0)
+        return err;
+    if (!named)
+        where = net_ns_retain(ns);
+    if (err == 0 && peer_req != NULL) {
+        err = net_ns_named(peer_attrs, peer_attrs_len, &named, &peer_where);
+        if (err == 0 && !named)
+            peer_where = net_ns_retain(where);
+    } else if (err == 0) {
+        peer_where = net_ns_retain(where);
+    }
+    if (err == 0 && (where == NULL || (kind == NET_VIF_VETH && peer_where == NULL)))
+        err = _EOPNOTSUPP;
+    else if (err == 0 && (!net_ns_admin(where) || (kind == NET_VIF_VETH && !net_ns_admin(peer_where))))
+        err = _EPERM;
+    if (err == 0)
+        err = net_vif_create(where, kind, name[0] != '\0' ? name : NULL,
+                peer_name[0] != '\0' ? peer_name : NULL, peer_where);
+    if (err == 0) {
+        // Then the flags and attributes each end was given, as
+        // rtnl_configure_link applies them.
+        struct net_vif_info made;
+        if (name[0] == '\0' || net_vif_get(where, 0, name, &made) != 0) {
+            // (An unnamed link: the newest of the kind.)
+            struct net_vif_info all[NET_NS_MAX_VIFS];
+            int n = net_vif_list(where, all, NET_NS_MAX_VIFS);
+            made = all[n > NET_NS_MAX_VIFS ? NET_NS_MAX_VIFS - 1 : n - 1];
+        }
+        // MTU and MAC from the request's own attributes, but not its namespace
+        // (it is already there) or its name (it has it).
+        struct net_vif_change change = {.up = net_ns_request_up(req)};
+        const struct nlattr_ *mtu = netlink_attr_find(attrs, attrs_len, IFLA_MTU_);
+        if (mtu != NULL && mtu->nla_len >= sizeof(*mtu) + 4)
+            memcpy(&change.mtu, mtu + 1, 4);
+        const struct nlattr_ *mac = netlink_attr_find(attrs, attrs_len, IFLA_ADDRESS_);
+        if (mac != NULL && mac->nla_len == sizeof(*mac) + 6)
+            change.mac = (const uint8_t *) (mac + 1);
+        net_vif_change(where, made.index, &change);
+        if (peer_req != NULL && made.peer_index != 0) {
+            struct net_vif_change peer_change = {.up = net_ns_request_up(peer_req)};
+            mtu = netlink_attr_find(peer_attrs, peer_attrs_len, IFLA_MTU_);
+            if (mtu != NULL && mtu->nla_len >= sizeof(*mtu) + 4)
+                memcpy(&peer_change.mtu, mtu + 1, 4);
+            mac = netlink_attr_find(peer_attrs, peer_attrs_len, IFLA_ADDRESS_);
+            if (mac != NULL && mac->nla_len == sizeof(*mac) + 6)
+                peer_change.mac = (const uint8_t *) (mac + 1);
+            net_vif_change(peer_where, made.peer_index, &peer_change);
+        }
+    }
+    net_ns_release(where);
+    net_ns_release(peer_where);
+    return err;
+}
+
+static int net_ns_link_request(struct net_namespace *ns, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct ifinfomsg_))
+        return _EINVAL;
+    const struct ifinfomsg_ *req = payload;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+        return _EPERM;
+    struct net_vif_info vif;
+    int which = net_ns_request_link(ns, req, attrs, attrs_len, &vif);
+    const struct nlattr_ *linkinfo = netlink_attr_find(attrs, attrs_len, IFLA_LINKINFO_NET_NS_);
+
+    if (hdr->nlmsg_type == RTM_DELLINK_) {
+        if (which == 0)
+            return _EOPNOTSUPP;     // the loopback cannot go
+        if (which < 0)
+            return which == -2 ? _EINVAL : _ENODEV;
+        return net_vif_delete(ns, which);
+    }
+    if (which < 0) {
+        // Nothing by that name or number: a new link, if the request says
+        // what kind (RTM_SETLINK never makes one).
+        if (hdr->nlmsg_type != RTM_NEWLINK_ || linkinfo == NULL)
+            return which == -2 && hdr->nlmsg_type != RTM_NEWLINK_ ? _EINVAL :
+                   hdr->nlmsg_type == RTM_NEWLINK_ && which == -2 ? _EOPNOTSUPP : _ENODEV;
+        return net_ns_new_vif(ns, hdr, req, attrs, attrs_len, linkinfo);
+    }
+    if (hdr->nlmsg_type == RTM_NEWLINK_ && (hdr->nlmsg_flags & NLM_F_EXCL_NET_NS_))
+        return _EEXIST;
+    if (linkinfo != NULL) {
+        // A kind that is not the link's own.
+        const struct nlattr_ *kind = netlink_attr_find(linkinfo + 1, linkinfo->nla_len - sizeof(*linkinfo), IFLA_INFO_KIND_NET_NS_);
+        const char *own = which == 0 ? NULL : vif.kind == NET_VIF_VETH ? "veth" : "dummy";
+        if (kind != NULL && (own == NULL || !netlink_attr_streq(kind, own)))
+            return _EOPNOTSUPP;
+    }
+    if (which == 0) {
+        // "lo": up or down, and nowhere else.
+        bool named;
+        struct net_namespace *to;
+        int err = net_ns_named(attrs, attrs_len, &named, &to);
+        net_ns_release(to);
+        if (err < 0)
+            return err;
+        if (named && to != ns)
+            return _EINVAL;     // NETIF_F_NETNS_LOCAL
+        int up = net_ns_request_up(req);
+        if (up >= 0) {
+            atomic_store(&ns->lo_up, up != 0);
+            // Up, the loopback has its addresses, as Linux gives them.
+            if (up) {
+                atomic_store(&ns->lo_addr4, true);
+                atomic_store(&ns->lo_addr6, true);
+            }
+        }
+        return 0;
+    }
+    return net_ns_set_vif(ns, which, req, attrs, attrs_len, req->ifi_index != 0);
+}
+
+static int net_ns_addr_request(struct net_namespace *ns, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct ifaddrmsg_))
+        return _EINVAL;
+    const struct ifaddrmsg_ *req = payload;
+    if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+        return _EPERM;
+    bool add = hdr->nlmsg_type == RTM_NEWADDR_;
+    if (req->ifa_index == NET_NS_LO_INDEX) {
+        if (req->ifa_family == AF_INET_)
+            atomic_store(&ns->lo_addr4, add);
+        else if (req->ifa_family == AF_INET6_)
+            atomic_store(&ns->lo_addr6, add);
+        else
+            return _EAFNOSUPPORT;
+        return 0;
+    }
+    if (req->ifa_family != AF_INET_ && req->ifa_family != AF_INET6_)
+        return _EAFNOSUPPORT;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    struct net_vif_addr addr = {.v6 = req->ifa_family == AF_INET6_, .prefix = req->ifa_prefixlen};
+    size_t size = addr.v6 ? 16 : 4;
+    // IFA_LOCAL is the address; IFA_ADDRESS is it too unless the link is
+    // point-to-point (where it is the far end), which none here is.
+    const struct nlattr_ *local = netlink_attr_find(attrs, attrs_len, IFA_LOCAL_);
+    if (local == NULL)
+        local = netlink_attr_find(attrs, attrs_len, IFA_ADDRESS_);
+    if (local == NULL || local->nla_len < sizeof(*local) + size)
+        return _EINVAL;
+    memcpy(addr.addr, local + 1, size);
+    if (req->ifa_index == 0)
+        return _ENODEV;
+    if (add && (hdr->nlmsg_flags & NLM_F_REPLACE_NET_NS_)) {
+        int err = net_vif_address(ns, (int) req->ifa_index, true, &addr);
+        return err == _EEXIST ? 0 : err;
+    }
+    return net_vif_address(ns, (int) req->ifa_index, add, &addr);
+}
+
+static int net_ns_route_change(struct net_namespace *ns, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len) {
+    if (payload_len < sizeof(struct rtmsg_))
+        return _EINVAL;
+    const struct rtmsg_ *req = payload;
+    if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+        return _EPERM;
+    if (req->rtm_family != AF_INET_ && req->rtm_family != AF_INET6_)
+        return _EAFNOSUPPORT;
+    const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+    size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+    uint32_t table = req->rtm_table;
+    const struct nlattr_ *table_attr = netlink_attr_find(attrs, attrs_len, RTA_TABLE_);
+    if (table_attr != NULL && table_attr->nla_len >= sizeof(*table_attr) + 4)
+        memcpy(&table, table_attr + 1, 4);
+    // The main table alone: policy routing has nothing to choose between.
+    if (table != RT_TABLE_MAIN_ && table != RT_TABLE_UNSPEC_NET_NS_)
+        return _EOPNOTSUPP;
+    struct net_vif_route route = {.v6 = req->rtm_family == AF_INET6_, .prefix = req->rtm_dst_len};
+    size_t size = route.v6 ? 16 : 4;
+    const struct nlattr_ *dst = netlink_attr_find(attrs, attrs_len, RTA_DST_);
+    if (dst != NULL) {
+        if (dst->nla_len < sizeof(*dst) + size)
+            return _EINVAL;
+        memcpy(route.dst, dst + 1, size);
+    }
+    const struct nlattr_ *gateway = netlink_attr_find(attrs, attrs_len, RTA_GATEWAY_);
+    if (gateway != NULL) {
+        if (gateway->nla_len < sizeof(*gateway) + size)
+            return _EINVAL;
+        memcpy(route.gateway, gateway + 1, size);
+        route.has_gateway = true;
+    }
+    const struct nlattr_ *oif = netlink_attr_find(attrs, attrs_len, RTA_OIF_);
+    if (oif != NULL && oif->nla_len >= sizeof(*oif) + 4)
+        memcpy(&route.oif, oif + 1, 4);
+    bool add = hdr->nlmsg_type == RTM_NEWROUTE_;
+    if (add && route.oif == 0 && !route.has_gateway)
+        return _EINVAL;
+    int err = net_vif_route_change(ns, add, &route);
+    if (add && err == _EEXIST && (hdr->nlmsg_flags & NLM_F_REPLACE_NET_NS_)) {
+        net_vif_route_change(ns, false, &route);
+        err = net_vif_route_change(ns, true, &route);
+    }
+    return err;
+}
+
+// true when the request was one of this namespace's own to answer (*result
+// is then what netlink_handle_route_request returns).
+static bool net_ns_route_request(struct fd *sock, const struct nlmsghdr_ *hdr,
+        const void *payload, size_t payload_len, int *result) {
+    struct net_namespace *ns = sock->socket.net_ns;
+    uint8_t family = payload_len >= 1 ? *(const uint8_t *) payload : AF_UNSPEC;
+    switch (hdr->nlmsg_type) {
+        case RTM_GETLINK_: {
+            struct net_vif_info vifs[NET_NS_MAX_VIFS];
+            if (hdr->nlmsg_flags & NLM_F_DUMP_) {
+                int err = 0;
+                if (family != AF_BRIDGE_) {
+                    err = net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, NLM_F_MULTI_);
+                    int n = net_vif_list(ns, vifs, NET_NS_MAX_VIFS);
+                    for (int i = 0; err >= 0 && i < n && i < NET_NS_MAX_VIFS; i++)
+                        err = net_ns_append_vif_link(sock, &vifs[i], RTM_NEWLINK_, NLM_F_MULTI_, hdr->nlmsg_seq);
+                }
+                *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
+                return true;
+            }
+            // One link, by index or by name.
+            if (payload_len < sizeof(struct ifinfomsg_)) {
+                *result = netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EINVAL);
+                return true;
+            }
+            const struct ifinfomsg_ *req = payload;
+            const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+            size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+            int which = net_ns_request_link(ns, req, attrs, attrs_len, &vifs[0]);
+            int err;
+            if (which == 0)
+                err = net_ns_append_lo_link(sock, ns, hdr->nlmsg_seq, 0);
+            else if (which > 0)
+                err = net_ns_append_vif_link(sock, &vifs[0], RTM_NEWLINK_, 0, hdr->nlmsg_seq);
+            else
+                err = netlink_append_error(sock, hdr->nlmsg_seq, hdr, which == -2 ? _EINVAL : _ENODEV);
+            if (err >= 0 && which >= 0 && (hdr->nlmsg_flags & NLM_F_ACK_))
+                err = netlink_append_error(sock, hdr->nlmsg_seq, hdr, 0);
+            *result = err;
+            return true;
+        }
+        case RTM_GETADDR_: {
+            int err = 0;
+            if (atomic_load(&ns->lo_addr4) && (family == AF_UNSPEC || family == AF_INET_))
+                err = net_ns_append_lo_addr(sock, hdr->nlmsg_seq, false);
+            if (err >= 0 && atomic_load(&ns->lo_addr6) && (family == AF_UNSPEC || family == AF_INET6_))
+                err = net_ns_append_lo_addr(sock, hdr->nlmsg_seq, true);
+            struct net_vif_info vifs[NET_NS_MAX_VIFS];
+            int n = net_vif_list(ns, vifs, NET_NS_MAX_VIFS);
+            for (int i = 0; err >= 0 && i < n && i < NET_NS_MAX_VIFS; i++) {
+                for (int j = 0; err >= 0 && j < vifs[i].n_addrs; j++) {
+                    const struct net_vif_addr *addr = &vifs[i].addrs[j];
+                    if (family == AF_UNSPEC || family == (addr->v6 ? AF_INET6_ : AF_INET_))
+                        err = net_ns_append_vif_addr(sock, hdr->nlmsg_seq, &vifs[i], addr);
+                }
+            }
+            *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
+            return true;
+        }
+        case RTM_GETROUTE_: {
+            // The main table: what the links' addresses connect, and the
+            // routes added. (The loopback's own are in the local table, which
+            // is not listed here.)
+            struct net_vif_route routes[NET_NS_MAX_VIFS * 2];
+            int n = net_vif_routes(ns, routes, NET_NS_MAX_VIFS * 2);
+            int err = 0;
+            for (int i = 0; err >= 0 && i < n && i < NET_NS_MAX_VIFS * 2; i++)
+                if (family == AF_UNSPEC || family == (routes[i].v6 ? AF_INET6_ : AF_INET_))
+                    err = net_ns_append_vif_route(sock, hdr->nlmsg_seq, &routes[i], ns);
+            *result = err < 0 ? err : netlink_append_done(sock, hdr->nlmsg_seq);
+            return true;
+        }
+        case RTM_NEWADDR_:
+        case RTM_DELADDR_:
+            *result = net_ns_ack(sock, hdr, net_ns_addr_request(ns, hdr, payload, payload_len));
+            return true;
+        case RTM_NEWLINK_:
+        case RTM_SETLINK_NET_NS_:
+        case RTM_DELLINK_:
+            *result = net_ns_ack(sock, hdr, net_ns_link_request(ns, hdr, payload, payload_len));
+            return true;
+        case RTM_NEWROUTE_:
+        case RTM_DELROUTE_NET_NS_:
+            *result = net_ns_ack(sock, hdr, net_ns_route_change(ns, hdr, payload, payload_len));
+            return true;
+    }
+    return false;
+}
+
 static int netlink_handle_route_request(struct fd *sock, const struct nlmsghdr_ *hdr,
         const void *payload, size_t payload_len) {
+    if (sock->socket.net_ns != NULL) {
+        int result;
+        if (net_ns_route_request(sock, hdr, payload, payload_len, &result))
+            return result;
+    }
+    // A request to make a link -- one with a kind (IFLA_LINKINFO), naming
+    // none the machine has. The initial namespace's links are the host's, and
+    // nothing makes one there (fs/net_vif.h): EOPNOTSUPP, what Linux says for
+    // a kind it has no driver for. The accepting ack below would leave `ip
+    // link add` reporting success and the caller waiting on an interface that
+    // never appears.
+    if (hdr->nlmsg_type == RTM_NEWLINK_ && payload_len >= sizeof(struct ifinfomsg_)) {
+        const struct ifinfomsg_ *req = payload;
+        const void *attrs = (const char *) payload + NLMSG_ALIGN(sizeof(*req));
+        size_t attrs_len = payload_len > NLMSG_ALIGN(sizeof(*req)) ? payload_len - NLMSG_ALIGN(sizeof(*req)) : 0;
+        const struct nlattr_ *linkinfo = netlink_attr_find(attrs, attrs_len, IFLA_LINKINFO_NET_NS_);
+        char name[IFNAMSIZ_ + 1];
+        if (linkinfo != NULL && req->ifi_index == 0 &&
+                netlink_attr_find(linkinfo + 1, linkinfo->nla_len - sizeof(*linkinfo), IFLA_INFO_KIND_NET_NS_) != NULL &&
+                net_ns_attr_name(netlink_attr_find(attrs, attrs_len, IFLA_IFNAME_), name, sizeof(name)) &&
+                (name[0] == '\0' || if_nametoindex(name) == 0))
+            return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
+    }
     switch (hdr->nlmsg_type) {
         case RTM_GETLINK_:
-            return netlink_append_route_links(sock, hdr, payload, payload_len);
+            // Either bit of NLM_F_DUMP makes it a dump, as rtnetlink_rcv_msg
+            // tests it.
+            if (hdr->nlmsg_flags & NLM_F_DUMP_)
+                return netlink_append_route_links(sock, hdr, payload, payload_len);
+            return netlink_append_route_link_get(sock, hdr, payload, payload_len);
         case RTM_GETADDR_:
             return netlink_append_route_addrs(sock, hdr, payload, payload_len);
         case RTM_GETROUTE_:
@@ -1318,17 +2167,30 @@ static int netlink_handle_route_request(struct fd *sock, const struct nlmsghdr_ 
             // hard failure here would make callers that treat "the kernel
             // rejected my request" as fatal (as opposed to "iSH silently
             // no-ops it") abort setup entirely.
+            //
+            // Except a GET, which Linux always answers, whether or not the
+            // request asked for an ack: with the table, or with EOPNOTSUPP
+            // from rtnetlink_rcv_msg when nothing handles the type. Answering
+            // nothing was survivable while a receive on an empty queue failed
+            // at once with EAGAIN; now that it waits, it was a hang. `ip
+            // neigh` and `ip rule` (RTM_GETNEIGH, RTM_GETRULE), busybox and
+            // iproute2 alike, and iproute2's `ip netconf` (RTM_GETNETCONF)
+            // sat for ever, where before they had spun at 100% CPU. A dump
+            // gets the empty table, which is the table AOK has; a get of one
+            // object, EOPNOTSUPP. A GET is a type whose kind bits,
+            // (type - RTM_BASE) & 3, read 2 (rtnl_msgtype_kind), and only a
+            // real request is one.
+            if ((hdr->nlmsg_flags & NLM_F_REQUEST_) && hdr->nlmsg_type >= RTM_NEWLINK_ &&
+                    ((hdr->nlmsg_type - RTM_NEWLINK_) & 3) == 2) {
+                if (hdr->nlmsg_flags & NLM_F_DUMP_)
+                    return netlink_append_done(sock, hdr->nlmsg_seq);
+                return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
+            }
             if (hdr->nlmsg_flags & NLM_F_ACK_)
                 return netlink_append_error(sock, hdr->nlmsg_seq, hdr, 0);
             return 0;
     }
 }
-
-struct diag_socket_entry {
-    struct fd **fds;
-    unsigned count;
-    unsigned cap;
-};
 
 static uint32_t netlink_next_port_id(void);
 // on iOS, when the device goes to sleep, all connected sockets are killed;
@@ -1337,6 +2199,8 @@ static uint32_t netlink_next_port_id(void);
 // recvfrom/sendto/recvmsg/sendmsg paths above them can use it too.
 static void sock_translate_err(struct fd *fd, int *err);
 static int sock_take_pending_error(struct fd *fd);
+static bool sock_io_drop_peer_gone(struct fd *fd, bool *dropped);
+static int unix_send_unconnected_err(struct fd *sock, int err);
 
 const struct fd_ops socket_fdops;
 
@@ -1752,14 +2616,16 @@ static int sock_ifconf(void *arg) {
     int32_t guest_len = is_64bit ? ifconf64->guest_len : ifconf32->guest_len;
     guest_addr_t guest_buf = is_64bit ? ifconf64->guest_buf : ifconf32->guest_buf;
 
-    if (guest_len < 0)
-        return _EINVAL;
-
     struct ifaddrs *addrs = NULL;
     if (getifaddrs(&addrs) != 0)
         return _EIO;
 
-    size_t capacity = (size_t) guest_len;
+    // As Linux dev_ifconf(): a NULL ifc_buf is a size query and ifc_len is
+    // ignored, and with a buffer a negative ifc_len just fits nothing. OpenJDK
+    // makes the size query without setting ifc_len, so refusing a negative
+    // one made NetworkInterface.getNetworkInterfaces() throw (Gradle's "Could
+    // not determine a usable wildcard IP", #572).
+    size_t capacity = guest_len > 0 ? (size_t) guest_len : 0;
     size_t used = 0;
     size_t total = 0;
     size_t entry_size = is_64bit ? sizeof(struct guest_ifreq_addr64_) : sizeof(struct guest_ifreq_addr32_);
@@ -1791,7 +2657,7 @@ static int sock_ifconf(void *arg) {
     if (err < 0)
         return err;
 
-    int32_t result_len = (size_t) guest_len >= total ? (int32_t) total : (int32_t) used;
+    int32_t result_len = guest_buf == 0 ? (int32_t) total : (int32_t) used;
     if (is_64bit)
         ifconf64->guest_len = result_len;
     else
@@ -1868,6 +2734,28 @@ static bool guest_sockaddr_is_abstract_local(guest_addr_t sockaddr_addr, uint_t 
     return path_size != 0 && fake_addr.data[0] == '\0';
 }
 
+// The host's pending error for a socket (SO_ERROR, read and cleared), as the
+// guest is to hear it. Every such read goes through here.
+//
+// One value needs changing. iOS takes a suspended app's connections away
+// once the device locks -- it "defuncts" them -- and XNU leaves EBADF as the
+// pending error of a defunct socket, on a descriptor that is as good as it
+// ever was. AOK reads the pending error itself whenever the guest polls a
+// stream socket (socket_tcp_connect_write_ready) and keeps it for the guest's
+// next call, so a client that sat in poll() across the suspension -- every
+// ssh session there is -- came back to "Read from remote host: Bad file
+// descriptor" (GH #631). No Linux socket reports EBADF for a connection the
+// network took away; it says the connection was reset, and that is the word
+// a program that reconnects is waiting for. A plain recv() on such a socket
+// already said so (sock_translate_err); this is the same answer for the
+// error that was read ahead of it.
+static int sock_host_so_error(int real_fd, int *so_error, socklen_t *len) {
+    int res = getsockopt(real_fd, SOL_SOCKET, SO_ERROR, so_error, len);
+    if (res == 0 && *len == sizeof(*so_error) && *so_error == EBADF)
+        *so_error = ECONNRESET;
+    return res;
+}
+
 #if defined(__APPLE__)
 static void sock_trace_tcp_info(const char *label, struct fd *sock) {
     if (!sock_trace_enabled() || sock == NULL || sock->real_fd < 0)
@@ -1884,7 +2772,7 @@ static void sock_trace_tcp_info(const char *label, struct fd *sock) {
 
     int so_error = 0;
     socklen_t so_error_len = sizeof(so_error);
-    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0)
+    if (sock_host_so_error(sock->real_fd, &so_error, &so_error_len) < 0)
         so_error = -1;
     // This read-and-clears the host's SO_ERROR same as socket_tcp_connect_
     // write_ready; cache it too so an strace-enabled run doesn't itself steal
@@ -1922,8 +2810,26 @@ static void sock_trace_tcp_info(const char *label, struct fd *sock) {
 // so the "a transfer that could not block was failed anyway" half of that bug
 // never existed here.
 static bool socket_guest_signal_pending(void) {
+    // A CHECKPOINT FREEZE ends a socket wait as a signal does, for the reason
+    // fs/poll.c spells out where it made the same change: every caller of this
+    // exists to IGNORE a bare poke (a TLB shootdown, a notify for a signal the
+    // task has blocked), which is right for those and wrong for a freeze -- a
+    // freeze needs the syscall to RETURN so the dispatcher can rewind over it
+    // and the task can park. The EINTR never reaches the guest: while the
+    // freeze is on, syscall_result_should_restart turns it into a restart.
+    //
+    // Without this a process blocked in recv() was woken by every freeze poke,
+    // found no signal, and went straight back to sleep, so the checkpoint
+    // refused on "did not reach a syscall boundary". Measured on the CLI
+    // 2026-09-11: a child blocked in recv() on a UDP socket refused the save
+    // before this change and parks after it.
+    //
+    // A PTRACE_EVENT_STOP the task owes its tracer ends a socket wait for the
+    // same reason, and is no more a signal than the freeze.
+    if (checkpoint_freeze_pending() || task_trap_stop_pending(current))
+        return true;
     lock(&current->sighand->lock, 0);
-    sigset_t_ pending = (current->pending | current->sighand->pending) &
+    sigset_t_ pending = (current->pending | task_group_pending(current)) &
             ~task_wake_blocked(current);
     if (native_delivery_deferred())
         pending &= ~__atomic_load_n(&current->native_restart, __ATOMIC_ACQUIRE);
@@ -1931,14 +2837,21 @@ static bool socket_guest_signal_pending(void) {
     return !!pending;
 }
 
+// A host call interrupted by a signal (a guest signal's poke, or AOK's own) is
+// retried unless a guest signal is waiting for the blocking call it belongs to.
+// A non-blocking call is always retried: Linux never answers one with EINTR --
+// it transfers or says EAGAIN, and nothing in it sleeps for a signal to cut
+// short -- so programs treat EINTR there as a dead peer. Xwayland's recvmsg on
+// its window-manager socket got EINTR this way, closed the compositor's
+// connection, and labwc crashed on the end-of-file.
 static bool socket_should_retry_io_eintr(struct fd *sock, int real_flags) {
     if (errno != EINTR)
         return false;
     if (fd_getflags(sock) & O_NONBLOCK_)
-        return false;
+        return true;
 #ifdef MSG_DONTWAIT
     if (real_flags & MSG_DONTWAIT)
-        return false;
+        return true;
 #endif
     return !socket_guest_signal_pending();
 }
@@ -2045,7 +2958,15 @@ struct socket_io_wait {
     bool resolved;
     bool has_deadline;
     struct timespec deadline;
+    // The call's turn at trying again before it sleeps (socket_wait_ready):
+    // 0 not begun, 1 trying, 2 over.
+    int spin_state;
+    struct wait_spin spin;
 };
+
+// A call that began trying again and has not been seen to give up: it got
+// its data, which is how the next call learns the last one's trying paid.
+static __thread bool socket_spin_open;
 
 static void socket_io_wait_resolve(struct socket_io_wait *wait, struct fd *sock, short events) {
     wait->resolved = true;
@@ -2070,6 +2991,23 @@ static void socket_io_wait_resolve(struct socket_io_wait *wait, struct fd *sock,
     wait->has_deadline = true;
 }
 
+// Linux's sock_intr_errno(timeo): what a guest socket call answers when a
+// signal cuts it short. SA_RESTART may restart it only while no SO_RCVTIMEO/
+// SO_SNDTIMEO is armed -- signal(7) puts a timed socket wait in the
+// never-restarted list, because a restart would silently extend a timeout the
+// guest asked for.
+//
+// This is the whole decision, not a first opinion. socket_fdops sets
+// decides_restart, so the read/write dispatchers take a socket's _EINTR as
+// final (kernel/fs.c); every _EINTR sock_read and sock_write return has to have
+// been decided by now, here or by an equivalent that knows the timeout (the
+// netlink receive's).
+static int socket_intr_errno(struct fd *sock, short events, struct socket_io_wait *wait) {
+    if (!wait->resolved)
+        socket_io_wait_resolve(wait, sock, events);
+    return wait->has_deadline ? signal_eintr_no_restart(_EINTR) : signal_restart_or_eintr(_EINTR);
+}
+
 // The one place a guest socket call sleeps. `wait` carries the SO_RCVTIMEO/
 // SO_SNDTIMEO budget for the whole syscall; pass NULL from iSH's own internal
 // handshakes, which must not inherit a guest's timeout.
@@ -2091,6 +3029,32 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
     if (wait != NULL && !wait->resolved)
         socket_io_wait_resolve(wait, sock, events);
 
+    // Try again for a little while before sleeping (util/wait_spin.h). A
+    // client and its server on a unix socket is the case. The trying is the
+    // caller's own recv or send: returning "ready" sends it round its loop to
+    // make the call again, and it comes back here if that would still block.
+    // (Asking poll() instead does not work: natively, two processes passing a
+    // byte over a socket pair take 5.2us a round trip blocked in read(), 6.5us
+    // looking with poll(0) before sleeping, and 1.4us retrying the read.)
+    if (wait != NULL && wait->spin_state != 2) {
+        if (wait->spin_state == 0) {
+            if (socket_spin_open)
+                wait_spin_end(true);
+            socket_spin_open = false;
+            wait->spin_state = wait_spin_begin(&wait->spin) ? 1 : 2;
+            socket_spin_open = wait->spin_state == 1;
+        }
+        if (wait->spin_state == 1) {
+            if (wait_spin_more(&wait->spin)) {
+                errno = 0;
+                return 0;
+            }
+            wait_spin_end(false);
+            socket_spin_open = false;
+            wait->spin_state = 2;
+        }
+    }
+
     // Created lazily, and only here: a call that never has to sleep must not
     // pay for a pipe it will never wait on.
     int notify_pipe[2] = {-1, -1};
@@ -2108,6 +3072,31 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
             }
             timeout = remaining_ms > INT_MAX ? INT_MAX : (int) remaining_ms;
         }
+        // No unbounded host wait, for the reason fs/poll.c spells out at its
+        // own cap: the wake poke that ends a wait like this is lost
+        // permanently often enough to matter (util/sync.c
+        // signal_thread_unwedge_wake_sigs), and a wait with no bound never
+        // recovers from that. The socket's own readiness still ends this wait
+        // the instant it arrives -- there is a real fd in the set here, unlike
+        // the no-fd case that wedged every shell on a device -- so the cap only
+        // ever costs a re-poll on a connection that is genuinely idle.
+        // Bounded the same way fs/poll.c bounds its wait, and for the same
+        // reason: a long guest timeout is as unbounded as none when the poke
+        // that would end it early can be lost. `capped` keeps the guest's own
+        // deadline honest -- without it the arm below reads this cap expiring
+        // as the guest's timeout expiring and returns EAGAIN early.
+        bool capped = false;
+        int cap_ms = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
+        if (timeout < 0 || timeout > cap_ms) {
+            timeout = cap_ms;
+            capped = true;
+        }
+        // Made for this wait and closed after it. (A pipe kept per task was
+        // tried, to save the pipe() and two close(): every task that had ever
+        // waited then held two host descriptors until it was freed, and a
+        // host that allows 256 ran out -- thirteen suite tests failed on one.
+        // Since a wait now tries again before it sleeps, this is the slow
+        // path anyway.)
         if (notify_pipe[0] < 0 && pipe(notify_pipe) == 0) {
             fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
             fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
@@ -2151,11 +3140,14 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
         if (wait_res > 0 && pfd[0].revents != 0)
             break; // ready (or error/hangup): the caller retries the I/O
         if (wait_res == 0) {
-            if (wait != NULL && wait->has_deadline) {
+            if (wait != NULL && wait->has_deadline && !capped) {
                 err = _EAGAIN;
                 break;
             }
-            continue; // no deadline was armed, so this cannot happen; re-poll
+            // The cap above expired, not a deadline the caller asked for. Going
+            // round is what makes the cap invisible to the guest: re-poll, and
+            // the pending check below gets its chance at a wake that was lost.
+            continue;
         }
         if (wait_res < 0 && wait_errno != EINTR) {
             errno = wait_errno;
@@ -2167,14 +3159,10 @@ static int socket_wait_ready(struct fd *sock, short events, struct socket_io_wai
         // purely spurious poke (a TLB-shootdown SIGUSR1, or a notify for a
         // signal this task has blocked) just re-enters the wait.
         if (socket_guest_signal_pending()) {
-            // SA_RESTART: the blocking socket calls are restartable, EXCEPT
-            // when SO_RCVTIMEO/SO_SNDTIMEO is armed -- signal(7) puts a
-            // timed socket wait in the never-restarted list, because a
-            // restart would silently extend a timeout the guest asked for.
             // A NULL `wait` is one of iSH's own internal handshakes, which
-            // has no guest syscall to restart.
-            err = (wait != NULL && !wait->has_deadline)
-                    ? signal_restart_or_eintr(_EINTR) : _EINTR;
+            // has no timeout of the guest's and leaves the decision to the
+            // call it runs inside.
+            err = wait != NULL ? socket_intr_errno(sock, events, wait) : _EINTR;
             break;
         }
     }
@@ -2252,7 +3240,7 @@ static bool socket_tcp_connect_write_ready(struct fd *sock) {
 
     int so_error = 0;
     socklen_t so_error_len = sizeof(so_error);
-    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) < 0)
+    if (sock_host_so_error(sock->real_fd, &so_error, &so_error_len) < 0)
         return true;
     if (so_error != 0) {
         // This read just cleared the host's SO_ERROR (read-and-clear
@@ -2286,7 +3274,7 @@ static int socket_finish_blocking_connect(struct fd *sock) {
 
         int real_error = 0;
         socklen_t real_error_len = sizeof(real_error);
-        if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len) < 0)
+        if (sock_host_so_error(sock->real_fd, &real_error, &real_error_len) < 0)
             return errno_map();
 #if defined(__APPLE__)
         // A concurrent poll/epoll scan on another thread (socket_tcp_connect_
@@ -2428,10 +3416,873 @@ static void sock_trace_iov_preview(struct fd *sock, const struct iovec *iov, siz
 
 static int unix_socket_finish_peer(struct fd *sock);
 
-static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
+// Build the struct fd for a host socket WITHOUT installing it anywhere.
+// Split out of sock_fd_create so a checkpoint restore can build one and put
+// it at a particular number in a particular process (fdtable_install_at)
+// rather than at the next free number in the current one.
+static void unix_seqpacket_host_init(struct fd *sock);
+
+// ---- Network namespaces (kernel/net_ns.h) ----------------------------------
+
+struct net_namespace *net_ns_retain(struct net_namespace *ns) {
+    if (ns != NULL)
+        atomic_fetch_add(&ns->refcount, 1);
+    return ns;
+}
+
+void net_ns_release(struct net_namespace *ns) {
+    if (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
+        // Its interfaces go with it, and a veth's far end too (fs/net_vif.h).
+        net_vif_namespace_gone(ns);
+        user_ns_release(ns->user_ns);
+        free(ns);
+    }
+}
+
+struct net_namespace *net_ns_new(struct user_namespace *owner) {
+    struct net_namespace *ns = calloc(1, sizeof(*ns));
+    if (ns == NULL)
+        return NULL;
+    atomic_init(&ns->refcount, 1);
+    ns->inode = ns_alloc_inum();
+    ns->user_ns = user_ns_retain(owner);
+    return ns;
+}
+
+struct net_namespace *current_net_ns(void) {
+    return current != NULL ? current->net_ns : NULL;
+}
+
+bool current_net_is_host(void) {
+    return current_net_ns() == NULL;
+}
+
+// Is this an inet socket of a private network namespace: one that must never
+// reach the host's network?
+static bool sock_net_private_inet(const struct fd *sock) {
+    return sock->socket.net_ns != NULL &&
+        (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_);
+}
+
+// A host-format address: loopback (127/8, ::1, or 127/8 mapped into IPv6)?
+static bool host_sockaddr_is_loopback(const void *addr) {
+    const struct sockaddr *sa = addr;
+    if (sa->sa_family == AF_INET)
+        return (ntohl(((const struct sockaddr_in *) sa)->sin_addr.s_addr) >> 24) == 127;
+    if (sa->sa_family == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *) sa)->sin6_addr;
+        if (IN6_IS_ADDR_LOOPBACK(a6))
+            return true;
+        return IN6_IS_ADDR_V4MAPPED(a6) && a6->s6_addr[12] == 127;
+    }
+    return false;
+}
+
+// What a destination gets from a socket of a private network namespace, where
+// nothing is carried anywhere: ECONNREFUSED on loopback -- nothing can be
+// listening, since listen() is refused there -- and ENETUNREACH beyond it.
+// 0 for a socket this does not concern, and for AF_UNSPEC (a disconnect).
+static int sock_net_dest_gate(const struct fd *sock, const void *addr) {
+    // (A TCP or UDP socket there is translated instead: net_emul_dest.)
+    if (!sock_net_private_inet(sock) || sock->socket.net_emul)
+        return 0;
+    const struct sockaddr *sa = addr;
+    if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
+        return 0;
+    // (Loopback too, until "lo" is up: there is no route to it.)
+    return host_sockaddr_is_loopback(addr) && atomic_load(&sock->socket.net_ns->lo_up)
+        ? _ECONNREFUSED : _ENETUNREACH;
+}
+
+// bind() for an inet socket of a private network namespace: recorded, and
+// reported back by getsockname, with nothing bound on the host -- a host bind
+// would be a door onto the machine's network (a UDP socket bound there
+// receives whatever the LAN sends it). To the wildcard address, or to a
+// loopback address the namespace's "lo" has been given.
+static _Atomic unsigned net_ns_next_port = 0;
+static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard);
+
+// A host-format inet address as its family and bytes: IPv4 in the first
+// four, and an IPv4-mapped IPv6 address as the IPv4 one it is. true for IPv6.
+static bool net_emul_addr_bytes(const void *addr, uint8_t out[16]) {
+    const struct sockaddr *sa = addr;
+    memset(out, 0, 16);
+    if (sa->sa_family == AF_INET6) {
+        const struct in6_addr *a6 = &((const struct sockaddr_in6 *) addr)->sin6_addr;
+        if (IN6_IS_ADDR_V4MAPPED(a6)) {
+            memcpy(out, &a6->s6_addr[12], 4);
+            return false;
+        }
+        memcpy(out, a6->s6_addr, 16);
+        return true;
+    }
+    memcpy(out, &((const struct sockaddr_in *) addr)->sin_addr, 4);
+    return false;
+}
+
+static bool net_emul_bytes_loopback(bool v6, const uint8_t *bytes) {
+    static const uint8_t lo6[16] = {[15] = 1};
+    return v6 ? memcmp(bytes, lo6, 16) == 0 : bytes[0] == 127;
+}
+
+// The other way: family and bytes (and a port, network order) as a host
+// address in `sock`'s own family -- an IPv4 one IPv4-mapped for an IPv6
+// socket.
+static void net_emul_write_addr(const struct fd *sock, void *addr, uint_t *addr_len,
+        bool v6, const uint8_t *bytes, uint16_t port) {
+    memset(addr, 0, sizeof(struct sockaddr_in6));
+    if (sock->socket.domain == AF_INET6_) {
+        struct sockaddr_in6 *in6 = addr;
+#ifdef __APPLE__
+        in6->sin6_len = sizeof(*in6);
+#endif
+        in6->sin6_family = AF_INET6;
+        in6->sin6_port = port;
+        if (v6) {
+            memcpy(in6->sin6_addr.s6_addr, bytes, 16);
+        } else {
+            in6->sin6_addr.s6_addr[10] = in6->sin6_addr.s6_addr[11] = 0xff;
+            memcpy(&in6->sin6_addr.s6_addr[12], bytes, 4);
+        }
+        *addr_len = sizeof(*in6);
+    } else {
+        struct sockaddr_in *in = addr;
+#ifdef __APPLE__
+        in->sin_len = sizeof(*in);
+#endif
+        in->sin_family = AF_INET;
+        in->sin_port = port;
+        if (!v6)
+            memcpy(&in->sin_addr, bytes, 4);
+        *addr_len = sizeof(*in);
+    }
+}
+static int sock_net_private_bind(struct fd *sock, void *addr, size_t addr_len) {
+    struct net_namespace *ns = sock->socket.net_ns;
+    struct sockaddr *sa = addr;
+    if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
+        return _EAFNOSUPPORT;
+    if (sock->socket.bind_deferred || sock->socket.net_emul_bound)
+        return _EINVAL;     // bound already
+    bool wildcard = sa->sa_family == AF_INET
+        ? ((struct sockaddr_in *) sa)->sin_addr.s_addr == htonl(INADDR_ANY)
+        : IN6_IS_ADDR_UNSPECIFIED(&((struct sockaddr_in6 *) sa)->sin6_addr);
+    if (!wildcard) {
+        uint8_t bytes[16];
+        bool v6 = net_emul_addr_bytes(addr, bytes);
+        if (host_sockaddr_is_loopback(addr)) {
+            bool assigned = !v6 ? atomic_load(&ns->lo_addr4) : atomic_load(&ns->lo_addr6);
+            if (!assigned)
+                return _EADDRNOTAVAIL;
+        } else if (!net_vif_local(ns, v6, bytes)) {
+            // (An address of one of its veth or dummy links, fs/net_vif.h.)
+            return _EADDRNOTAVAIL;
+        }
+    }
+    in_port_t *port = sa->sa_family == AF_INET ? &((struct sockaddr_in *) sa)->sin_port
+                                               : &((struct sockaddr_in6 *) sa)->sin6_port;
+    if (*port != 0 && ntohs(*port) < 1024 && !ns_capable(ns->user_ns, CAP_NET_BIND_SERVICE_))
+        return _EACCES;
+    if (sock->socket.net_emul_icmp) {
+        // A raw socket's bind names an address and no port: recorded.
+        memcpy(sock->socket.deferred_addr, addr,
+               addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
+        sock->socket.deferred_addr_len = (socklen_t) addr_len;
+        sock->socket.bind_deferred = true;
+        return 0;
+    }
+    if (sock->socket.net_emul) {
+        // Recorded first, so that the binding fills the port into it.
+        memcpy(sock->socket.deferred_addr, addr,
+               addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
+        sock->socket.deferred_addr_len = (socklen_t) addr_len;
+        sock->socket.bind_deferred = true;
+        int err = net_emul_bind_port(sock, *port, wildcard);
+        if (err < 0)
+            sock->socket.bind_deferred = false;
+        return err;
+    }
+    // A port of the socket's own when it asked for any.
+    if (*port == 0)
+        *port = htons((uint16_t) (32768 + atomic_fetch_add(&net_ns_next_port, 1) % 28000));
+    memcpy(sock->socket.deferred_addr, addr,
+           addr_len < sizeof(sock->socket.deferred_addr) ? addr_len : sizeof(sock->socket.deferred_addr));
+    sock->socket.deferred_addr_len = (socklen_t) addr_len;
+    sock->socket.bind_deferred = true;
+    return 0;
+}
+
+// ---- Loopback in a private network namespace --------------------------------
+//
+// The namespace's own traffic: a TCP or UDP socket there talking to another
+// one there, over 127.0.0.1 or ::1. None of it may touch the host's network,
+// so none of it is the host's TCP or UDP: such a socket's host socket is an
+// AF_UNIX one of the matching kind (stream for TCP, datagram for UDP), and a
+// port is a binding in the table below, each with a host path of its own.
+//
+//   bind(127.0.0.1:P)     the table gains (namespace, kind, P), and the host
+//                         socket is bound to that entry's path
+//   connect / sendto      the destination port is looked up in the caller's
+//                         namespace and the host call goes to its path;
+//                         nobody bound there is ECONNREFUSED for TCP and a
+//                         datagram dropped for UDP, as on Linux
+//   accept / recvfrom     the host hands back the other end's path, which is
+//                         a binding too (a socket that connects or sends is
+//                         bound first, to a port of its own, as Linux binds
+//                         it), and that is read back as 127.0.0.1:port
+//
+// IPv4 and IPv6 each have their ports, as on Linux: a server binds
+// 0.0.0.0:P and [::]:P both (nginx and sshd do, with IPV6_V6ONLY on the
+// second), and a listener on [::1]:P is not reached at 127.0.0.1:P. The one
+// place they meet is Linux's too: an IPv6 socket bound to the wildcard
+// WITHOUT IPV6_V6ONLY is "dual", takes IPv4's port with it, and is what an
+// IPv4 destination finds when no IPv4 socket has the port. Within a family
+// one port is one binding, whatever address it named. The socket stays
+// AF_INET or AF_INET6 to everything the guest can ask of it.
+
+struct net_emul_bind {
+    const struct net_namespace *ns; // compared, never followed
+    bool dgram;
+    bool v6;                        // an AF_INET6 socket's
+    bool dual;                      // ...that takes IPv4's traffic too
+    bool wildcard;                  // bound to any address, or else to `addr`
+    uint8_t addr[16];               // (an IPv4 one in the first four bytes)
+    uint16_t port;                  // network order
+    uint32_t id;                    // unix_socket_next_id(): names the host path
+    // Where its traffic last went, and from which address: what the far end
+    // reads back as this socket's address (a sender's, a connecting client's)
+    // and as its own (an accepted connection's). Loopback until it is sent
+    // across a veth (fs/net_vif.h).
+    bool route_set, route_v6;
+    uint8_t src[16], dst[16];
+    struct list links;
+};
+static lock_t net_emul_lock = LOCK_INITIALIZER;
+static struct list net_emul_binds;
+static uint32_t unix_socket_next_id(void);
+static int unix_host_sun_path(uint32_t socket_id, struct sockaddr_un *addr, size_t *len_out);
+
+// Does a binding's address take traffic for `dst` (NULL: for any)? The
+// wildcard does; so does one loopback address for another, as it always has
+// here; any other address only for itself.
+static bool net_emul_bind_takes(const struct net_emul_bind *bind, bool v6, const uint8_t *dst) {
+    if (bind->wildcard || dst == NULL)
+        return true;
+    bool bind_v6 = bind->v6 && !bind->dual;
+    if (bind_v6 != v6)
+        return false;
+    if (net_emul_bytes_loopback(v6, bind->addr) && net_emul_bytes_loopback(v6, dst))
+        return true;
+    return memcmp(bind->addr, dst, v6 ? 16 : 4) == 0;
+}
+
+// The binding a destination of the given family (and address, or NULL)
+// finds, or with `any` the first one of either family (is the port free for
+// anyone?).
+static struct net_emul_bind *net_emul_find_locked(const struct net_namespace *ns, bool dgram,
+        uint16_t port, bool v6, bool any, const uint8_t *dst) {
+    if (list_null(&net_emul_binds))
+        list_init(&net_emul_binds);
+    struct net_emul_bind *bind, *dual = NULL;
+    list_for_each_entry(&net_emul_binds, bind, links) {
+        if (bind->ns != ns || bind->dgram != dgram || bind->port != port)
+            continue;
+        if (any)
+            return bind;
+        if (bind->v6 == v6 && net_emul_bind_takes(bind, v6, dst))
+            return bind;
+        if (!v6 && bind->dual)
+            dual = bind;
+    }
+    return dual;
+}
+
+// Would a new binding of the port collide with one that is there? Its own
+// family's always, unless the two name different addresses and neither is
+// the wildcard; the other family's when either of the two is dual.
+static bool net_emul_conflict_locked(const struct net_namespace *ns, bool dgram, uint16_t port,
+        bool v6, bool dual, bool wildcard, const uint8_t *addr) {
+    if (list_null(&net_emul_binds))
+        list_init(&net_emul_binds);
+    struct net_emul_bind *bind;
+    list_for_each_entry(&net_emul_binds, bind, links) {
+        if (bind->ns != ns || bind->dgram != dgram || bind->port != port)
+            continue;
+        if (bind->dual || dual)
+            return true;
+        if (bind->v6 == v6 && net_emul_bind_takes(bind, v6, wildcard ? NULL : addr))
+            return true;
+    }
+    return false;
+}
+
+static bool sock_net_emul_dgram(const struct fd *sock) {
+    // (Everything but a stream: a raw ICMP socket is connectionless too,
+    // though nothing of its is ever looked up in the table.)
+    return (sock->socket.type & SOCKET_TYPE_MASK) != SOCK_STREAM_;
+}
+
+// The host address of binding `id`.
+static int net_emul_host_addr(uint32_t id, struct sockaddr_un *un, uint_t *len) {
+    memset(un, 0, sizeof(*un));
+    size_t path_len = 0;
+    int err = unix_host_sun_path(id, un, &path_len);
+    if (err < 0)
+        return err;
+    un->sun_family = AF_UNIX;
+#ifdef __APPLE__
+    un->sun_len = (unsigned char) (offsetof(struct sockaddr_un, sun_path) + path_len);
+#endif
+    *len = (uint_t) (offsetof(struct sockaddr_un, sun_path) + path_len);
+    return 0;
+}
+
+// Bind `sock` to `port` (network order; 0 for a free one of the kernel's
+// choosing), on the wildcard address or a loopback one. EADDRINUSE for a
+// port something in the namespace has.
+static _Atomic unsigned net_emul_next_port = 0;
+static int net_emul_bind_port(struct fd *sock, uint16_t port, bool wildcard) {
+    if (sock->socket.net_emul_bound)
+        return _EINVAL;
+    bool dgram = sock_net_emul_dgram(sock);
+    bool v6 = sock->socket.domain == AF_INET6_;
+    bool dual = v6 && wildcard && !sock->socket.net_emul_v6only;
+    // The address bind() named, recorded before this was called; none for a
+    // socket bound because it connected or sent.
+    uint8_t addr[16] = {0};
+    bool addr_v6 = v6;
+    if (!wildcard && sock->socket.bind_deferred)
+        addr_v6 = net_emul_addr_bytes(sock->socket.deferred_addr, addr);
+    else
+        wildcard = true;
+    struct net_emul_bind *entry = calloc(1, sizeof(*entry));
+    if (entry == NULL)
+        return _ENOMEM;
+    lock(&net_emul_lock, 0);
+    if (port == 0) {
+        for (int tries = 0; tries < 28000 && port == 0; tries++) {
+            uint16_t candidate = htons((uint16_t) (32768 + atomic_fetch_add(&net_emul_next_port, 1) % 28000));
+            // (A port nobody has in either family: what Linux hands out.)
+            if (net_emul_find_locked(sock->socket.net_ns, dgram, candidate, false, true, NULL) == NULL)
+                port = candidate;
+        }
+    } else if (net_emul_conflict_locked(sock->socket.net_ns, dgram, port, addr_v6, dual, wildcard, addr)) {
+        port = 0;
+    }
+    if (port == 0) {
+        unlock(&net_emul_lock);
+        free(entry);
+        return _EADDRINUSE;
+    }
+    *entry = (struct net_emul_bind) {.ns = sock->socket.net_ns, .dgram = dgram, .v6 = v6, .dual = dual,
+                                     .wildcard = wildcard, .port = port, .id = unix_socket_next_id()};
+    memcpy(entry->addr, addr, sizeof(addr));
+    list_add(&net_emul_binds, &entry->links);
+    unlock(&net_emul_lock);
+
+    struct sockaddr_un un;
+    uint_t len;
+    int err = net_emul_host_addr(entry->id, &un, &len);
+    if (err >= 0) {
+        unlink(un.sun_path);
+        if (bind(sock->real_fd, (struct sockaddr *) &un, len) < 0)
+            err = errno_map();
+    }
+    if (err < 0) {
+        lock(&net_emul_lock, 0);
+        list_remove(&entry->links);
+        unlock(&net_emul_lock);
+        free(entry);
+        return err;
+    }
+    sock->socket.net_emul_bound = true;
+    sock->socket.net_emul_id = entry->id;
+    // What getsockname reports: the address bind() was given, or the
+    // wildcard for a socket bound because it sent (a connect then names the
+    // address it leaves from: net_emul_dest).
+    if (!sock->socket.bind_deferred) {
+        uint8_t none[16] = {0};
+        uint_t len = 0;
+        net_emul_write_addr(sock, sock->socket.deferred_addr, &len, sock->socket.domain == AF_INET6_, none, 0);
+        sock->socket.deferred_addr_len = (socklen_t) len;
+        sock->socket.bind_deferred = true;
+    }
+    // (sin_port and sin6_port are at the same place.)
+    ((struct sockaddr_in *) sock->socket.deferred_addr)->sin_port = port;
+    return 0;
+}
+
+// The socket is closing: its port is free again.
+static void net_emul_release(struct fd *sock) {
+    if (!sock->socket.net_emul_bound)
+        return;
+    struct net_emul_bind *entry, *found = NULL;
+    lock(&net_emul_lock, 0);
+    if (!list_null(&net_emul_binds)) {
+        list_for_each_entry(&net_emul_binds, entry, links) {
+            if (entry->id == sock->socket.net_emul_id) {
+                found = entry;
+                break;
+            }
+        }
+    }
+    if (found != NULL)
+        list_remove(&found->links);
+    unlock(&net_emul_lock);
+    if (found != NULL) {
+        struct sockaddr_un un;
+        uint_t len;
+        if (net_emul_host_addr(found->id, &un, &len) >= 0)
+            unlink(un.sun_path);
+        free(found);
+    }
+    sock->socket.net_emul_bound = false;
+}
+
+// A destination, given as a host-format inet address, as the host address
+// of the binding it names: `addr` is rewritten in place. ENETUNREACH for an
+// address that is not the namespace's loopback (or while "lo" is down);
+// ECONNREFUSED when nothing in the namespace is bound to the port. A socket
+// that has no port of its own yet is given one first.
+// Where traffic from `sock` to `dest` (host format) goes: *to the
+// namespace whose address it is, with `src` the address it leaves from and
+// `dst` the one it is for. Its own loopback, once "lo" is up; an address of
+// its own links; or across a veth (net_vif_resolve). ENETUNREACH with no
+// route; EHOSTUNREACH when the route reaches nobody who has it.
+static int net_emul_route(const struct fd *sock, const void *dest, struct net_namespace **to,
+        bool *v6, uint8_t src[16], uint8_t dst[16]) {
+    struct net_namespace *ns = sock->socket.net_ns;
+    *v6 = net_emul_addr_bytes(dest, dst);
+    if (net_emul_bytes_loopback(*v6, dst)) {
+        if (!atomic_load(&ns->lo_up))
+            return _ENETUNREACH;
+        *to = ns;
+        memset(src, 0, 16);
+        if (*v6)
+            src[15] = 1;
+        else
+            src[0] = 127, src[3] = 1;
+        return 0;
+    }
+    int err = net_vif_resolve(ns, *v6, dst, to, src);
+    if (err < 0)
+        return err;
+    // A socket bound to one of its addresses sends from that one.
+    if (sock->socket.bind_deferred) {
+        uint8_t bound[16];
+        bool bound_v6 = net_emul_addr_bytes(sock->socket.deferred_addr, bound);
+        static const uint8_t zero[16];
+        if (bound_v6 == *v6 && memcmp(bound, zero, 16) != 0 && !net_emul_bytes_loopback(bound_v6, bound))
+            memcpy(src, bound, 16);
+    }
+    return 0;
+}
+
+// A connect: the far end is `dst` (with the port connect named), and the
+// socket's own address, if it was bound to the wildcard, is the one it
+// leaves from -- what getsockname says after a connect on Linux.
+static void net_emul_connected(struct fd *sock, bool v6, const uint8_t *src, const uint8_t *dst) {
+    sock->socket.net_emul_peer_set = true;
+    sock->socket.net_emul_peer_v6 = v6;
+    memcpy(sock->socket.net_emul_peer_addr, dst, 16);
+    uint8_t bound[16];
+    static const uint8_t zero[16];
+    if (sock->socket.bind_deferred) {
+        net_emul_addr_bytes(sock->socket.deferred_addr, bound);
+        if (memcmp(bound, zero, 16) != 0)
+            return;
+        uint16_t port = ((struct sockaddr_in *) sock->socket.deferred_addr)->sin_port;
+        uint_t len = 0;
+        net_emul_write_addr(sock, sock->socket.deferred_addr, &len, v6, src, port);
+        sock->socket.deferred_addr_len = (socklen_t) len;
+    }
+}
+
+// Record on `sock`'s own binding where its traffic is going.
+static void net_emul_note_route(const struct fd *sock, bool v6, const uint8_t *src, const uint8_t *dst) {
+    struct net_emul_bind *entry;
+    lock(&net_emul_lock, 0);
+    if (!list_null(&net_emul_binds)) {
+        list_for_each_entry(&net_emul_binds, entry, links) {
+            if (entry->id == sock->socket.net_emul_id) {
+                entry->route_set = true;
+                entry->route_v6 = v6;
+                memcpy(entry->src, src, 16);
+                memcpy(entry->dst, dst, 16);
+                break;
+            }
+        }
+    }
+    unlock(&net_emul_lock);
+}
+
+static int net_emul_dest(struct fd *sock, void *addr, uint_t *addr_len, bool connecting) {
+    const struct sockaddr *sa = addr;
+    if (sa->sa_family != AF_INET && sa->sa_family != AF_INET6)
+        return _EAFNOSUPPORT;
+    struct net_namespace *to;
+    bool v6;
+    uint8_t src[16], dst[16];
+    int err = net_emul_route(sock, addr, &to, &v6, src, dst);
+    if (err < 0)
+        return err;
+    uint16_t port = ((const struct sockaddr_in *) sa)->sin_port;
+    if (!sock->socket.net_emul_bound) {
+        err = net_emul_bind_port(sock, 0, true);
+        if (err < 0)
+            return err;
+    }
+    net_emul_note_route(sock, v6, src, dst);
+    if (connecting)
+        net_emul_connected(sock, v6, src, dst);
+    lock(&net_emul_lock, 0);
+    struct net_emul_bind *entry = net_emul_find_locked(to, sock_net_emul_dgram(sock), port, v6, false, dst);
+    uint32_t id = entry != NULL ? entry->id : 0;
+    unlock(&net_emul_lock);
+    if (entry == NULL)
+        return _ECONNREFUSED;
+    return net_emul_host_addr(id, addr, addr_len);
+}
+
+// The other way: an address the host reported for the far end (its binding's
+// path, or nothing for one with no name) as the loopback address and port it
+// is in the namespace, in host format and in `sock`'s own family.
+static void net_emul_from_host(const struct fd *sock, void *addr, uint_t *addr_len) {
+    uint16_t port = 0;
+    bool route_set = false, route_v6 = false;
+    uint8_t src[16];
+    const struct sockaddr_un *un = addr;
+    if (*addr_len > offsetof(struct sockaddr_un, sun_path) && un->sun_family == AF_UNIX) {
+        char path[sizeof(un->sun_path) + 1];
+        size_t path_len = *addr_len - offsetof(struct sockaddr_un, sun_path);
+        if (path_len > sizeof(un->sun_path))
+            path_len = sizeof(un->sun_path);
+        memcpy(path, un->sun_path, path_len);
+        path[path_len] = '\0';
+        // The id is the path's last run of digits (unix_host_sun_path).
+        size_t end = strlen(path), start = end;
+        while (start > 0 && path[start - 1] >= '0' && path[start - 1] <= '9')
+            start--;
+        if (start < end) {
+            uint32_t id = (uint32_t) strtoul(path + start, NULL, 10);
+            struct net_emul_bind *entry;
+            lock(&net_emul_lock, 0);
+            if (!list_null(&net_emul_binds)) {
+                list_for_each_entry(&net_emul_binds, entry, links) {
+                    if (entry->id == id) {
+                        port = entry->port;
+                        route_set = entry->route_set;
+                        route_v6 = entry->route_v6;
+                        memcpy(src, entry->src, 16);
+                        break;
+                    }
+                }
+            }
+            unlock(&net_emul_lock);
+        }
+    }
+    // Where it sent from: loopback in the socket's family, until it is known
+    // to have come across a veth.
+    if (!route_set || net_emul_bytes_loopback(route_v6, src)) {
+        route_v6 = sock->socket.domain == AF_INET6_;
+        memset(src, 0, 16);
+        if (route_v6)
+            src[15] = 1;
+        else
+            src[0] = 127, src[3] = 1;
+    }
+    net_emul_write_addr(sock, addr, addr_len, route_v6, src, port);
+}
+
+// The address the far end (named by the host address the host gave) last
+// sent to: an accepted connection's own address. false when it is not known.
+static bool net_emul_peer_dst(const void *addr, uint_t addr_len, bool *v6, uint8_t dst[16]) {
+    const struct sockaddr_un *un = addr;
+    if (addr_len <= offsetof(struct sockaddr_un, sun_path) || un->sun_family != AF_UNIX)
+        return false;
+    char path[sizeof(un->sun_path) + 1];
+    size_t path_len = addr_len - offsetof(struct sockaddr_un, sun_path);
+    if (path_len > sizeof(un->sun_path))
+        path_len = sizeof(un->sun_path);
+    memcpy(path, un->sun_path, path_len);
+    path[path_len] = '\0';
+    size_t end = strlen(path), start = end;
+    while (start > 0 && path[start - 1] >= '0' && path[start - 1] <= '9')
+        start--;
+    if (start == end)
+        return false;
+    uint32_t id = (uint32_t) strtoul(path + start, NULL, 10);
+    bool found = false;
+    struct net_emul_bind *entry;
+    lock(&net_emul_lock, 0);
+    if (!list_null(&net_emul_binds)) {
+        list_for_each_entry(&net_emul_binds, entry, links) {
+            if (entry->id == id) {
+                found = entry->route_set;
+                *v6 = entry->route_v6;
+                memcpy(dst, entry->dst, 16);
+                break;
+            }
+        }
+    }
+    unlock(&net_emul_lock);
+    return found;
+}
+
+// Where a send on such a socket goes. `addr` holds the destination the
+// caller gave (host-format inet) when `have_addr`, and is where the host
+// destination is left when *use_addr comes back true. A stream ignores an
+// address: it is connected. A datagram goes to the address given, or to the
+// one connect() recorded; one for a port nobody in the namespace is bound to
+// is *drop: reported sent and gone, as UDP's are.
+static int net_emul_send_dest(struct fd *sock, bool have_addr, void *addr, uint_t *addr_len,
+        bool *use_addr, bool *drop) {
+    *use_addr = *drop = false;
+    if (!sock_net_emul_dgram(sock))
+        return 0;
+    if (!have_addr) {
+        if (sock->socket.net_emul_dest_port == 0)
+            return _EDESTADDRREQ;
+        uint8_t lo4[16] = {127, 0, 0, 1};
+        bool v6 = sock->socket.net_emul_peer_set && sock->socket.net_emul_peer_v6;
+        net_emul_write_addr(sock, addr, addr_len, v6,
+                sock->socket.net_emul_peer_set ? sock->socket.net_emul_peer_addr : lo4,
+                sock->socket.net_emul_dest_port);
+    }
+    int err = net_emul_dest(sock, addr, addr_len, false);
+    // (Nobody with the address, across a veth: gone, as UDP's are.)
+    if (err == _ECONNREFUSED || err == _EHOSTUNREACH) {
+        *drop = true;
+        return 0;
+    }
+    if (err < 0)
+        return err;
+    *use_addr = true;
+    return 0;
+}
+
+// ---- ICMP on a private network namespace's loopback -------------------------
+//
+// `ping 127.0.0.1` in a sandbox. A raw ICMP (or ICMPv6) socket there is a
+// host AF_UNIX datagram pair: the guest reads one end, and what it sends is
+// answered here into the other. An echo request to a loopback address, once
+// "lo" is up, comes back twice, as it does on Linux, where a raw socket hears
+// everything its protocol carries on the interface: the request itself, and
+// the reply to it. IPv4 arrives under an IP header, IPv6 without one, and an
+// ICMPv6 message leaves with the checksum the kernel fills in. Anything else
+// sent is carried nowhere. Measured on Linux 6.12 in `unshare -r -n`.
+//
+// A datagram ICMP socket ("ping socket") is EACCES there: a new network
+// namespace's ping_group_range admits nobody, on Linux too.
+
+static uint16_t net_emul_checksum(const uint8_t *data, size_t len, uint32_t sum) {
+    for (size_t i = 0; i + 1 < len; i += 2)
+        sum += (uint32_t) data[i] << 8 | data[i + 1];
+    if (len & 1)
+        sum += (uint32_t) data[len - 1] << 8;
+    while (sum >> 16)
+        sum = (sum & 0xffff) + (sum >> 16);
+    return (uint16_t) ~sum;
+}
+
+// (An ICMPv6 checksum covers the addresses it goes between: `src` and `dst`.)
+static void net_emul_icmp_set_checksum(uint8_t *msg, size_t len, bool v6, const uint8_t *src, const uint8_t *dst) {
+    msg[2] = msg[3] = 0;
+    uint32_t pseudo = 0;
+    if (v6) {
+        // The addresses, the length, and the next header (58).
+        for (int i = 0; i < 16; i += 2)
+            pseudo += ((uint32_t) src[i] << 8 | src[i + 1]) + ((uint32_t) dst[i] << 8 | dst[i + 1]);
+        pseudo += (uint32_t) (len >> 16) + (uint32_t) (len & 0xffff) + IPPROTO_ICMPV6;
+    }
+    uint16_t sum = net_emul_checksum(msg, len, pseudo);
+    msg[2] = (uint8_t) (sum >> 8);
+    msg[3] = (uint8_t) sum;
+}
+
+static bool net_emul_icmp_unwanted(const struct fd *sock, uint8_t type) {
+    if (sock->socket.domain == AF_INET6_)
+        return sock->socket.icmp6_filter_valid &&
+            (sock->socket.icmp6_filter[type >> 5] & (1u << (type & 31))) != 0;
+    return type < 32 && (sock->socket.net_emul_icmp_filter & (1u << type)) != 0;
+}
+
+// Where each message queued to a raw ICMP socket came from, in the order
+// they are queued: what a receive reports as the sender, which the host pair
+// cannot say (its other end is always the one sender). A message for which
+// there is no room here is not queued either, so the two stay in step.
+#define NET_EMUL_ICMP_FROM_MAX 1024
+struct net_emul_icmp_from {
+    lock_t lock;
+    unsigned head, count;
+    struct {
+        bool v6;
+        uint8_t addr[16];
+    } from[NET_EMUL_ICMP_FROM_MAX];
+};
+
+static bool net_emul_icmp_from_push(struct fd *sock, bool v6, const uint8_t *addr) {
+    struct net_emul_icmp_from *ring = sock->socket.net_emul_icmp_from;
+    if (ring == NULL)
+        return true;
+    lock(&ring->lock, 0);
+    bool room = ring->count < NET_EMUL_ICMP_FROM_MAX;
+    if (room) {
+        unsigned at = (ring->head + ring->count++) % NET_EMUL_ICMP_FROM_MAX;
+        ring->from[at].v6 = v6;
+        memcpy(ring->from[at].addr, addr, 16);
+    }
+    unlock(&ring->lock);
+    return room;
+}
+
+// (The newest one back off, when the message it was for was not queued.)
+static void net_emul_icmp_from_unpush(struct fd *sock) {
+    struct net_emul_icmp_from *ring = sock->socket.net_emul_icmp_from;
+    if (ring == NULL)
+        return;
+    lock(&ring->lock, 0);
+    if (ring->count > 0)
+        ring->count--;
+    unlock(&ring->lock);
+}
+
+// The sender of the message just received (or, peeking, of the one at the
+// front): false when none is known.
+static bool net_emul_icmp_from_take(struct fd *sock, bool peek, bool *v6, uint8_t addr[16]) {
+    struct net_emul_icmp_from *ring = sock->socket.net_emul_icmp_from;
+    if (ring == NULL)
+        return false;
+    lock(&ring->lock, 0);
+    bool have = ring->count > 0;
+    if (have) {
+        *v6 = ring->from[ring->head].v6;
+        memcpy(addr, ring->from[ring->head].addr, 16);
+        if (!peek) {
+            ring->head = (ring->head + 1) % NET_EMUL_ICMP_FROM_MAX;
+            ring->count--;
+        }
+    }
+    unlock(&ring->lock);
+    return have;
+}
+
+// What a receive on such a socket reports as its sender: the message's
+// source, port 0.
+static void net_emul_icmp_from_report(struct fd *sock, bool have, bool v6, const uint8_t *addr,
+        void *out, uint_t *out_len) {
+    uint8_t lo[16] = {0};
+    if (!have) {
+        v6 = sock->socket.domain == AF_INET6_;
+        if (v6)
+            lo[15] = 1;
+        else
+            lo[0] = 127, lo[3] = 1;
+        addr = lo;
+    }
+    net_emul_write_addr(sock, out, out_len, v6, addr, 0);
+}
+
+// One message arriving at the socket: under an IP header for IPv4, from
+// `from` to `to` (16 bytes each; an IPv4 address in the first four).
+static void net_emul_icmp_deliver(struct fd *sock, const uint8_t *msg, size_t len,
+        const uint8_t *from_addr, const uint8_t *to_addr, bool request) {
+    if (net_emul_icmp_unwanted(sock, msg[0]))
+        return;
+    uint32_t from, to;
+    memcpy(&from, from_addr, 4);
+    memcpy(&to, to_addr, 4);
+    static _Atomic unsigned next_ip_id = 1;
+    size_t header = sock->socket.domain == AF_INET6_ ? 0 : 20;
+    uint8_t *packet = malloc(header + len);
+    if (packet == NULL)
+        return;
+    if (header != 0) {
+        unsigned id = atomic_fetch_add(&next_ip_id, 1);
+        size_t total = header + len;
+        uint8_t ip[20] = {
+            0x45, 0, (uint8_t) (total >> 8), (uint8_t) total,
+            (uint8_t) (id >> 8), (uint8_t) id, request ? 0x40 : 0, 0,   // DF on what was sent
+            64, IPPROTO_ICMP, 0, 0,
+        };
+        memcpy(ip + 12, &from, 4);
+        memcpy(ip + 16, &to, 4);
+        uint16_t sum = net_emul_checksum(ip, sizeof(ip), 0);
+        ip[10] = (uint8_t) (sum >> 8);
+        ip[11] = (uint8_t) sum;
+        memcpy(packet, ip, sizeof(ip));
+    }
+    memcpy(packet + header, msg, len);
+    // (A full queue drops it, as a full receive buffer drops a packet.)
+    if (net_emul_icmp_from_push(sock, sock->socket.domain == AF_INET6_, from_addr) &&
+            send(sock->socket.net_emul_icmp_fd, packet, header + len, MSG_DONTWAIT) < 0)
+        net_emul_icmp_from_unpush(sock);
+    free(packet);
+}
+
+// A send on such a socket: `dest` is the host-format address given, or NULL
+// for a connected socket's. The length sent, or an error.
+//
+// Across a veth (fs/net_vif.h) the far namespace answers an echo request to
+// an address it has, and only the reply comes back: the request went out on
+// the link, where this socket does not hear it. To an address of its own
+// links a namespace answers itself, as on its loopback. To one on a link
+// where nobody has it, the request is sent and nothing comes back.
+static ssize_t net_emul_icmp_send(struct fd *sock, const void *data, size_t len, const void *dest) {
+    if (dest == NULL && sock->socket.net_emul_dest_port == 0)
+        return _EDESTADDRREQ;
+    bool v6 = sock->socket.domain == AF_INET6_;
+    struct sockaddr_in6 connected;
+    if (dest == NULL) {
+        uint8_t lo[16] = {0};
+        if (v6)
+            lo[15] = 1;
+        else
+            lo[0] = 127, lo[3] = 1;
+        uint_t connected_len;
+        net_emul_write_addr(sock, &connected, &connected_len,
+                sock->socket.net_emul_peer_set ? sock->socket.net_emul_peer_v6 : v6,
+                sock->socket.net_emul_peer_set ? sock->socket.net_emul_peer_addr : lo, 0);
+        dest = &connected;
+    }
+    struct net_namespace *to = NULL;
+    bool dest_v6;
+    uint8_t src[16], dst[16];
+    int err = net_emul_route(sock, dest, &to, &dest_v6, src, dst);
+    if (err == _ENETUNREACH)
+        return err;
+    if (len < 8)
+        return _EINVAL;
+    if (len > 65507)
+        return _EMSGSIZE;
+    if (err < 0)
+        return (ssize_t) len;
+    uint8_t *msg = malloc(len);
+    if (msg == NULL)
+        return _ENOMEM;
+    memcpy(msg, data, len);
+    // (The kernel fills an ICMPv6 checksum; an IPv4 one is the sender's.)
+    if (v6)
+        net_emul_icmp_set_checksum(msg, len, true, src, dst);
+    bool here = to == sock->socket.net_ns;
+    if (here)
+        net_emul_icmp_deliver(sock, msg, len, src, dst, true);
+    uint8_t echo = v6 ? 128 : 8, reply = v6 ? 129 : 0;
+    if (msg[0] == echo) {
+        msg[0] = reply;
+        net_emul_icmp_set_checksum(msg, len, v6, dst, src);
+        net_emul_icmp_deliver(sock, msg, len, dst, src, false);
+    }
+    free(msg);
+    return (ssize_t) len;
+}
+
+struct fd *sock_fd_adopt(int sock_fd, int domain, int type, int protocol) {
     struct fd *fd = adhoc_fd_create(&socket_fdops);
     if (fd == NULL)
-        return _ENOMEM;
+        return NULL;
+    // The namespace of whoever is making it (kernel/net_ns.h).
+    fd->socket.net_ns = net_ns_retain(current_net_ns());
     fd->stat.mode = S_IFSOCK | 0666;
     // A socket's inode belongs to whoever created it. adhoc_fd_create zeroes
     // the whole statbuf, so this was uid 0 -- every socket in the system
@@ -2441,8 +4292,14 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     // uid while the anon_inode family -- eventfd, epoll, timerfd, signalfd --
     // really is root-owned and really does answer EPERM). fs/pipe.c has always
     // done this; sockets were simply missed.
-    fd->stat.uid = current->uid;
-    fd->stat.gid = current->gid;
+    //
+    // The FILESYSTEM ids, as sock_alloc takes them (current_fsuid()), not the
+    // real ones: a setuid program's socket is its effective user's, and that
+    // owner is the uid column of /proc/net/tcp and ss (sock_uid). Measured on
+    // 6.12 as root after setresuid(-1, 65534, -1): st_uid 65534, and 65534 in
+    // /proc/net/tcp.
+    fd->stat.uid = current->fsuid;
+    fd->stat.gid = current->fsgid;
     // fd->type is set by generic_open for path-opened files; a socket() fd
     // never goes through that, so it was left 0 and every S_ISSOCK(fd->type)
     // test in the tree read false for an actual socket -- including the poll
@@ -2469,14 +4326,31 @@ static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
     if (domain == AF_LOCAL_) {
         cond_init(&fd->socket.unix_got_peer);
         list_init(&fd->socket.unix_scm);
+        unix_seqpacket_host_init(fd);
     }
     sock_debug_event("fd-create", fd, 0, 0);
+    return fd;
+}
+
+// Consumes SOCK_FD, the host socket, whatever happens: on success it belongs
+// to the new descriptor, and on failure it is closed here. A failed f_install
+// (EMFILE: the process is at RLIMIT_NOFILE) already closes it -- fd_close runs
+// sock_close -- and every caller used to close it again, so a second close hit
+// a host descriptor number another thread may already have been given.
+static fd_t sock_fd_create(int sock_fd, int domain, int type, int protocol) {
+    struct fd *fd = sock_fd_adopt(sock_fd, domain, type, protocol);
+    if (fd == NULL) {
+        close(sock_fd);
+        return _ENOMEM;
+    }
     return f_install(fd, type & ~SOCKET_TYPE_MASK);
 }
 
 // Test hook: pretend the host denied AF_UNIX SOCK_SEQPACKET the way the iOS
-// app sandbox does (EPERM), so the STREAM-fallback path can be exercised on
-// the CLI where the native type otherwise succeeds. Set
+// app sandbox does (EPERM), so that refusal's path through the STREAM
+// fallback can be exercised on the CLI. (macOS itself refuses the type with
+// EPROTONOSUPPORT -- measured -- so the fallback runs there regardless; this
+// only changes which errno it falls back from.) Set
 // ISH_FORCE_SEQPACKET_EPERM=1 in the environment to enable.
 static bool seqpacket_denied_by_host(int domain, int type, int protocol) {
     static int forced = -1;
@@ -2484,6 +4358,28 @@ static bool seqpacket_denied_by_host(int domain, int type, int protocol) {
         forced = getenv("ISH_FORCE_SEQPACKET_EPERM") != NULL;
     return forced && domain == AF_LOCAL_ &&
         (type & SOCKET_TYPE_MASK) == SOCK_SEQPACKET_ && protocol == 0;
+}
+
+static bool unix_seqpacket_fallback_needed(int domain, int type, int protocol, int err);
+
+// socket() for a guest (domain, type, protocol), with the SEQPACKET-over-STREAM
+// fallback socket() itself uses. A checkpoint's rebuild used to call socket()
+// bare, so on iOS -- whose sandbox refuses AF_UNIX SOCK_SEQPACKET with EPERM --
+// udevd's control socket could not be made again and came back hung up.
+static int sock_host_socket(int domain, int type, int protocol,
+                            int real_domain, int real_type) {
+    int sock;
+    if (seqpacket_denied_by_host(domain, type, protocol)) {
+        sock = -1;
+        errno = EPERM;
+    } else {
+        sock = socket(real_domain, real_type, protocol);
+    }
+#if defined(__APPLE__)
+    if (sock < 0 && unix_seqpacket_fallback_needed(domain, type, protocol, errno))
+        sock = socket(real_domain, SOCK_STREAM, protocol);
+#endif
+    return sock;
 }
 
 static bool unix_seqpacket_fallback_needed(int domain, int type, int protocol, int err) {
@@ -2498,12 +4394,14 @@ static bool unix_seqpacket_fallback_needed(int domain, int type, int protocol, i
         case EPROTOTYPE:
         case ESOCKTNOSUPPORT:
         case EOPNOTSUPP:
-        // iOS's app sandbox (unlike an unsandboxed macOS process) denies
-        // AF_UNIX SOCK_SEQPACKET creation outright with EPERM, even though
-        // the Darwin kernel itself supports the socket type -- seen as
+        // iOS's app sandbox denies AF_UNIX SOCK_SEQPACKET creation outright
+        // with EPERM, where macOS answers EPROTONOSUPPORT -- seen as
         // systemd-udevd fatally failing to create /run/udev/control on
         // device ("Failed to create socket: Operation not permitted"),
         // never hitting this fallback since EPERM wasn't in the allowlist.
+        // Either way the socket is a host stream, and the message
+        // boundaries SEQPACKET promises are ours to keep: see
+        // struct unix_seqpacket_hdr.
         case EPERM:
             return true;
         default:
@@ -2529,8 +4427,8 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
             return _ENOMEM;
         fd->stat.mode = S_IFSOCK | 0666;
         // Same ownership as the socket() path above: the creator's, not root's.
-        fd->stat.uid = current->uid;
-        fd->stat.gid = current->gid;
+        fd->stat.uid = current->fsuid;
+        fd->stat.gid = current->fsgid;
     // fd->type is set by generic_open for path-opened files; a socket() fd
     // never goes through that, so it was left 0 and every S_ISSOCK(fd->type)
     // test in the tree read false for an actual socket -- including the poll
@@ -2543,8 +4441,11 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
         fd->socket.protocol = protocol;
         sock_init_emulation_defaults(fd);
         fd->socket.netlink_port_id = netlink_next_port_id();
-        fd->fake_inode = fd->socket.netlink_port_id;
-        netlink_notify_register(fd);
+        fd->socket.net_ns = net_ns_retain(current_net_ns());
+        // What the host's interfaces do is no news in a private network
+        // namespace, which has none of them.
+        if (fd->socket.net_ns == NULL)
+            netlink_notify_register(fd);
         return f_install(fd, type & ~SOCKET_TYPE_MASK);
     }
     // Three different failures were all reported as EINVAL, and a program
@@ -2588,8 +4489,55 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     if (type == SOCK_RAW_ && protocol == IPPROTO_RAW)
         protocol = IPPROTO_ICMP;
 
+    // In a private network namespace a TCP or UDP socket carries the
+    // namespace's own loopback traffic and nothing else, over a host socket
+    // that is not the host's network at all (see "Loopback in a private
+    // network namespace"). Raw and ICMP sockets stay what they are, and stay
+    // shut in by the gates.
+    int plain_type = type & SOCKET_TYPE_MASK;
+    bool net_emul = current_net_ns() != NULL && (domain == AF_INET_ || domain == AF_INET6_) &&
+        ((plain_type == SOCK_STREAM_ && (protocol == 0 || protocol == IPPROTO_TCP)) ||
+         (plain_type == SOCK_DGRAM_ && (protocol == 0 || protocol == IPPROTO_UDP)));
+    // An ICMP socket there: answered by the kernel, for the loopback alone
+    // (see "ICMP on a private network namespace's loopback").
+    bool net_icmp = current_net_ns() != NULL &&
+        ((domain == AF_INET_ && protocol == IPPROTO_ICMP) || (domain == AF_INET6_ && protocol == IPPROTO_ICMPV6));
+    if (net_icmp && plain_type == SOCK_DGRAM_)
+        return _EACCES;
+    if (net_icmp && plain_type == SOCK_RAW_) {
+        if (!ns_capable(current_net_ns()->user_ns, CAP_NET_RAW_))
+            return _EPERM;
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) < 0)
+            return errno_map();
+        int size = 262144;
+        (void) setsockopt(pair[1], SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+        (void) setsockopt(pair[0], SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+        struct fd *fd = sock_fd_adopt(pair[0], (int) domain, (int) type, (int) protocol);
+        if (fd == NULL) {
+            close(pair[0]);
+            close(pair[1]);
+            return _ENOMEM;
+        }
+        fd->socket.net_emul = true;
+        fd->socket.net_emul_icmp = true;
+        fd->socket.net_emul_icmp_fd = pair[1];
+        fd->socket.net_emul_icmp_from = calloc(1, sizeof(*fd->socket.net_emul_icmp_from));
+        if (fd->socket.net_emul_icmp_from != NULL)
+            lock_init(&fd->socket.net_emul_icmp_from->lock, "icmp_from\0");
+        return f_install(fd, type & ~SOCKET_TYPE_MASK);
+    }
     int sock;
-    if (seqpacket_denied_by_host(domain, type, protocol)) {
+    if (net_emul) {
+        sock = socket(AF_UNIX, plain_type == SOCK_STREAM_ ? SOCK_STREAM : SOCK_DGRAM, 0);
+        if (sock >= 0) {
+            // Room for a datagram as large as UDP's, and a stream buffer
+            // like TCP's rather than a unix socket's 8K.
+            int size = 262144;
+            (void) setsockopt(sock, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+            (void) setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+        }
+    } else if (seqpacket_denied_by_host(domain, type, protocol)) {
         sock = -1;
         errno = EPERM;
     } else {
@@ -2608,7 +4556,7 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
                 domain, type, protocol, sock);
 
 #ifdef __APPLE__
-    if (domain == AF_INET_ && type == SOCK_DGRAM_) {
+    if (domain == AF_INET_ && type == SOCK_DGRAM_ && !net_emul) {
         // in some cases, such as ICMP, datagram sockets on mac can default to
         // including the IP header like raw sockets
         int one = 1;
@@ -2616,10 +4564,16 @@ int_t sys_socket(dword_t domain, dword_t type, dword_t protocol) {
     }
 #endif
 
-    fd_t f = sock_fd_create(sock, domain, type, protocol);
-    if (f < 0)
-        close(sock);
-    return f;
+    if (net_emul) {
+        struct fd *fd = sock_fd_adopt(sock, (int) domain, (int) type, (int) protocol);
+        if (fd == NULL) {
+            close(sock);
+            return _ENOMEM;
+        }
+        fd->socket.net_emul = true;
+        return f_install(fd, type & ~SOCKET_TYPE_MASK);
+    }
+    return sock_fd_create(sock, domain, type, protocol);
 }
 
 static void inode_release_if_exist(struct inode_data *inode) {
@@ -2664,6 +4618,77 @@ static void netlink_reply_reset_locked(struct fd *sock) {
     sock->socket.netlink_reply = NULL;
     sock->socket.netlink_reply_len = 0;
     sock->socket.netlink_reply_off = 0;
+    free(sock->socket.netlink_reply_bounds);
+    sock->socket.netlink_reply_bounds = NULL;
+    sock->socket.netlink_reply_nbounds = 0;
+    sock->socket.netlink_reply_bounds_cap = 0;
+}
+
+// Closes the datagram being built, if it has any bytes in it.
+//
+// A netlink socket is a datagram socket: one recvmsg returns ONE datagram.
+// Linux builds a dump one skb per recvmsg -- netlink_dump() runs again on each
+// receive, and the call after the last entry yields an skb holding only
+// NLMSG_DONE -- so a dump reaches the reader as [entries...] and THEN [DONE].
+// Measured on Linux 6.12 for an RTM_GETROUTE dump: recvfrom #1 = 1308 bytes of
+// routes, recvfrom #2 = 20 bytes of DONE.
+//
+// AOK used to hand the whole queue to a single read, DONE included, which is
+// not a shape Linux can produce. fastfetch's default-route scan leaves its
+// message loop as soon as it finds a zero-metric route -- a break out of the
+// wrong loop, its own bug -- and reads again for the DONE it never reached.
+// On Linux that read returns the DONE datagram and it finishes; on AOK there
+// was nothing left to return and the read blocked for ever. It only became a
+// hang in 555: before netlink's blocking receive was implemented that read
+// failed at once with EAGAIN, so the module gave up and printed nothing.
+//
+// A boundary with NETLINK_BOUND_RAW set closes a datagram that is not netlink
+// messages at all but bytes from the kernel itself (netlink_deliver_datagram),
+// which a receive hands over as they are.
+#define NETLINK_BOUND_RAW ((size_t) 1 << (sizeof(size_t) * 8 - 1))
+
+static int netlink_reply_seal_as_locked(struct fd *sock, size_t raw) {
+    size_t sealed = sock->socket.netlink_reply_nbounds == 0 ? 0 :
+        sock->socket.netlink_reply_bounds[sock->socket.netlink_reply_nbounds - 1] &
+        ~NETLINK_BOUND_RAW;
+    if (sock->socket.netlink_reply_len == sealed)
+        return 0;
+    if (sock->socket.netlink_reply_nbounds == sock->socket.netlink_reply_bounds_cap) {
+        size_t cap = sock->socket.netlink_reply_bounds_cap == 0 ? 8 :
+            sock->socket.netlink_reply_bounds_cap * 2;
+        size_t *grown = realloc(sock->socket.netlink_reply_bounds, cap * sizeof(*grown));
+        if (grown == NULL)
+            return _ENOMEM;
+        sock->socket.netlink_reply_bounds = grown;
+        sock->socket.netlink_reply_bounds_cap = cap;
+    }
+    sock->socket.netlink_reply_bounds[sock->socket.netlink_reply_nbounds++] =
+        sock->socket.netlink_reply_len | raw;
+    return 0;
+}
+
+static int netlink_reply_seal_locked(struct fd *sock) {
+    return netlink_reply_seal_as_locked(sock, 0);
+}
+
+// Where the datagram the reader is positioned in ends: the first boundary past
+// netlink_reply_off, or the end of the buffer when the tail is still open.
+// *raw says whether that datagram is kernel bytes rather than messages.
+static size_t netlink_reply_datagram_end_raw_locked(struct fd *sock, bool *raw) {
+    *raw = false;
+    for (size_t i = 0; i < sock->socket.netlink_reply_nbounds; i++) {
+        size_t bound = sock->socket.netlink_reply_bounds[i];
+        if ((bound & ~NETLINK_BOUND_RAW) > sock->socket.netlink_reply_off) {
+            *raw = (bound & NETLINK_BOUND_RAW) != 0;
+            return bound & ~NETLINK_BOUND_RAW;
+        }
+    }
+    return sock->socket.netlink_reply_len;
+}
+
+static size_t netlink_reply_datagram_end_locked(struct fd *sock) {
+    bool raw;
+    return netlink_reply_datagram_end_raw_locked(sock, &raw);
 }
 
 static void netlink_reply_reset(struct fd *sock) {
@@ -2688,8 +4713,9 @@ static int netlink_reply_append_locked(struct fd *sock, const void *data, size_t
 // interleaved with a guest thread's own append, and corrupt message framing
 // -- a fully self-contained nlmsg record is the smallest unit that's safe to
 // interleave with others in the reply stream.
-static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
-        uint32_t seq, const void *payload, size_t payload_len) {
+static int netlink_append_nlmsg_ex(struct fd *sock, uint16_t type, uint16_t flags,
+        uint32_t seq, const void *payload, size_t payload_len,
+        bool seal_before, bool seal_after) {
     struct nlmsghdr_ hdr = {
         .nlmsg_len = NLMSG_HDRLEN + payload_len,
         .nlmsg_type = type,
@@ -2700,7 +4726,16 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
         .nlmsg_pid = sock->socket.netlink_port_id,
     };
     lock(&sock->socket.netlink_reply_lock, 0);
-    int err = netlink_reply_append_locked(sock, &hdr, sizeof(hdr));
+    int err = 0;
+    // Under the same lock hold as the append, so a notification from the watch
+    // thread cannot land between closing the previous datagram and opening this
+    // one.
+    if (seal_before) {
+        err = netlink_reply_seal_locked(sock);
+        if (err < 0)
+            goto out;
+    }
+    err = netlink_reply_append_locked(sock, &hdr, sizeof(hdr));
     if (err < 0)
         goto out;
     if (payload_len != 0) {
@@ -2714,9 +4749,27 @@ static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
         static const char zeros[NLMSG_ALIGNTO] = {};
         err = netlink_reply_append_locked(sock, zeros, pad_len);
     }
+    if (err == 0 && seal_after)
+        err = netlink_reply_seal_locked(sock);
+    // Wakes a receive blocked on the empty queue (netlink_wait_for_message_
+    // locked), whichever thread queued this: a notification from the watch
+    // thread, or a reply to a request another thread sent on this socket.
+    if (err == 0)
+        notify(&sock->socket.netlink_reply_cond);
 out:
     unlock(&sock->socket.netlink_reply_lock);
     return err;
+}
+
+// A standalone reply, an ACK or a notification is a datagram of its own, the
+// way Linux sends each as its own skb. A multi-part dump entry (NLM_F_MULTI)
+// instead accumulates into the datagram being built, which netlink_append_done
+// closes before adding the DONE.
+static int netlink_append_nlmsg(struct fd *sock, uint16_t type, uint16_t flags,
+        uint32_t seq, const void *payload, size_t payload_len) {
+    bool standalone = !(flags & NLM_F_MULTI_);
+    return netlink_append_nlmsg_ex(sock, type, flags, seq, payload, payload_len,
+            standalone, standalone);
 }
 
 static int netlink_append_error(struct fd *sock, uint32_t seq,
@@ -2726,6 +4779,38 @@ static int netlink_append_error(struct fd *sock, uint32_t seq,
         .msg = req ? *req : (struct nlmsghdr_) {},
     };
     return netlink_append_nlmsg(sock, NLMSG_ERROR_, 0, seq, &err, sizeof(err));
+}
+
+// Whether `fd` is a netlink socket: ENOTSOCK for anything that is not a
+// socket, EINVAL for a socket of another family (Linux's
+// netlink_getsockbyfilp, which mq_notify asks through).
+int netlink_fd_check(struct fd *fd) {
+    if (fd->ops != &socket_fdops)
+        return _ENOTSOCK;
+    if (fd->socket.domain != AF_NETLINK_)
+        return _EINVAL;
+    return 0;
+}
+
+// A datagram from the kernel itself to a netlink socket: mq_notify's
+// SIGEV_THREAD cookie (kernel/mqueue.c), which glibc and musl both wait for on
+// a netlink socket of their own. Queued as one datagram of its own, and the
+// socket's readers and pollers woken.
+int netlink_deliver_datagram(struct fd *sock, const void *data, size_t len) {
+    if (netlink_fd_check(sock) < 0)
+        return _EINVAL;
+    lock(&sock->socket.netlink_reply_lock, 0);
+    int err = netlink_reply_seal_locked(sock);
+    if (err == 0)
+        err = netlink_reply_append_locked(sock, data, len);
+    if (err == 0)
+        err = netlink_reply_seal_as_locked(sock, NETLINK_BOUND_RAW);
+    if (err == 0)
+        notify(&sock->socket.netlink_reply_cond);
+    unlock(&sock->socket.netlink_reply_lock);
+    if (err == 0)
+        poll_wakeup(sock, POLL_READ);
+    return err;
 }
 
 static int netlink_append_done(struct fd *sock, uint32_t seq) {
@@ -2740,42 +4825,62 @@ static int netlink_append_done(struct fd *sock, uint32_t seq) {
     // resolution via nsswitch's "resolve [!UNAVAIL=return]"), and why
     // networkctl printed "0 links listed" -- while busybox ip, which doesn't
     // care about the DONE flags, parsed the same bytes fine.
-    return netlink_append_nlmsg(sock, NLMSG_DONE_, NLM_F_MULTI_, seq, &status, sizeof(status));
+    //
+    // Sealed on both sides: the entries queued before it are closed into their
+    // own datagram, and the DONE becomes another, which is the [entries][DONE]
+    // shape Linux delivers. See netlink_reply_seal_locked.
+    return netlink_append_nlmsg_ex(sock, NLMSG_DONE_, NLM_F_MULTI_, seq,
+            &status, sizeof(status), true, true);
 }
 
-static int diag_socket_push(struct diag_socket_entry *entries, struct fd *fd) {
-    for (unsigned i = 0; i < entries->count; i++) {
-        if (entries->fds[i] == fd)
+static int sock_snapshot_push(struct sock_snapshot *snapshot, struct fd *fd) {
+    for (unsigned i = 0; i < snapshot->count; i++) {
+        if (snapshot->fds[i] == fd)
             return 0;
     }
-    if (entries->count == entries->cap) {
-        unsigned new_cap = entries->cap ? entries->cap * 2 : 16;
-        struct fd **new_fds = realloc(entries->fds, sizeof(*new_fds) * new_cap);
+    if (snapshot->count == snapshot->cap) {
+        unsigned new_cap = snapshot->cap ? snapshot->cap * 2 : 16;
+        struct fd **new_fds = realloc(snapshot->fds, sizeof(*new_fds) * new_cap);
         if (new_fds == NULL)
             return _ENOMEM;
-        entries->fds = new_fds;
-        entries->cap = new_cap;
+        snapshot->fds = new_fds;
+        snapshot->cap = new_cap;
     }
-    entries->fds[entries->count++] = fd_retain(fd);
+    snapshot->fds[snapshot->count++] = fd_retain(fd);
     return 0;
 }
 
-static struct fdtable *diag_task_files_retain(struct task *task) {
+// A task's descriptor table, retained, for a walk over every process's
+// sockets.
+//
+// Never a plain blocking lock. The caller holds a task_snapshot, which holds a
+// reference on every task in it, and do_exit() takes general_lock and then
+// waits for exactly those references to go (exit_wait_needed) -- so blocking
+// on the lock of a task that has started to exit waits forever, and so does
+// the task. c0ccaed3 found that with four `ktop -b` against fork churn and
+// fixed /proc/net's copy of this walk; ss(8)'s sock_diag and bind()'s conflict
+// scan went on blocking here. task_lock_unless_exiting skips a task whose exit
+// holds the lock -- it is about to close everything it has open -- and waits
+// out any other holder, so a live process's sockets do not drop out of a
+// listing, or out of the conflict scan, merely because it was busy.
+static struct fdtable *sock_task_files_retain(struct task *task) {
+    if (!task_lock_unless_exiting(task))
+        return NULL;
     struct fdtable *files = NULL;
-    lock(&task->general_lock, 0);
     if (task->files != NULL)
         files = fdtable_retain(task->files);
     unlock(&task->general_lock);
     return files;
 }
 
-static void diag_socket_release(struct diag_socket_entry *entries) {
-    for (unsigned i = 0; i < entries->count; i++)
-        fd_close(entries->fds[i]);
-    free(entries->fds);
+void sock_snapshot_release(struct sock_snapshot *snapshot) {
+    for (unsigned i = 0; i < snapshot->count; i++)
+        fd_close(snapshot->fds[i]);
+    free(snapshot->fds);
+    *snapshot = (struct sock_snapshot) {};
 }
 
-static int diag_collect_sockets(struct diag_socket_entry *entries, int domain, int type) {
+int sock_snapshot_collect(struct sock_snapshot *out, int domain, int type) {
     struct task_snapshot snapshot = {};
     int err = task_snapshot_collect(&snapshot, false);
     if (err < 0)
@@ -2785,7 +4890,7 @@ static int diag_collect_sockets(struct diag_socket_entry *entries, int domain, i
         struct task *task = snapshot.tasks[i];
         if (task == NULL)
             continue;
-        struct fdtable *files = diag_task_files_retain(task);
+        struct fdtable *files = sock_task_files_retain(task);
         if (files == NULL)
             continue;
         lock(&files->lock, 0);
@@ -2795,11 +4900,15 @@ static int diag_collect_sockets(struct diag_socket_entry *entries, int domain, i
                 continue;
             if (fd->socket.domain != domain)
                 continue;
+            // The sockets of the reader's own network namespace
+            // (kernel/net_ns.h): /proc/net and socket-diag list no others.
+            if (fd->socket.net_ns != current_net_ns())
+                continue;
             if (type >= 0 && fd->socket.type != type)
                 continue;
             if (domain != AF_LOCAL_ && fd->real_fd < 0)
                 continue;
-            err = diag_socket_push(entries, fd);
+            err = sock_snapshot_push(out, fd);
             if (err < 0)
                 break;
         }
@@ -2812,19 +4921,56 @@ static int diag_collect_sockets(struct diag_socket_entry *entries, int domain, i
     return err;
 }
 
-static unsigned long diag_socket_inode(const struct fd *fd) {
-    if (fd->inode != NULL)
-        return (unsigned long) fd->inode;
-    if (fd->fake_inode != 0)
-        return (unsigned long) fd->fake_inode;
-    return (unsigned long) (uintptr_t) fd;
+// Every socket is an adhoc descriptor (sock_fd_adopt, and the netlink and
+// restore paths beside it), and adhoc_fd_create gives each one its own inode
+// number: the one fstat reports and /proc/<pid>/fd/N spells socket:[N]. This
+// used to answer fd->inode or fd->fake_inode -- neither of which a socket has
+// (they are the path-opened and fakefs identities) -- and fell through to the
+// struct fd's own ADDRESS, a number that matched nothing any process could
+// see. lsof and ss join their tables to processes on exactly this number, so
+// `lsof -i` found no sockets at all and `ss -p` could name no process.
+unsigned long sock_inode(const struct fd *sock) {
+    return (unsigned long) sock->stat.inode;
 }
 
-static int diag_recv_q(struct fd *fd) {
+// Linux's sock_i_uid: the socket inode's owner -- its creator, or whoever
+// fchown'd it since (sockfs_setattr carries a chown to sk_uid). Both the
+// /proc/net tables and sock_diag reported the READER's uid instead, so every
+// row claimed to belong to whoever was looking.
+uid_t_ sock_uid(const struct fd *sock) {
+    return sock->stat.uid;
+}
+
+static bool sock_is_unix_seqpacket(struct fd *sock);
+static int unix_seqpacket_queued_bytes(struct fd *sock);
+
+int sock_recv_queue(struct fd *sock) {
+    // Message bytes, as Linux counts them (unix_inq_len), not the frames
+    // they travel in on the host (see struct unix_seqpacket_hdr).
+    if (sock_is_unix_seqpacket(sock)) {
+        int queued = unix_seqpacket_queued_bytes(sock);
+        return queued > 0 ? queued : 0;
+    }
     int bytes = 0;
-    if (fd->real_fd >= 0 && ioctl(fd->real_fd, FIONREAD, &bytes) == 0 && bytes > 0)
+    if (sock->real_fd >= 0 && ioctl(sock->real_fd, FIONREAD, &bytes) == 0 && bytes > 0)
         return bytes;
     return 0;
+}
+
+// Whether Linux would list this socket in /proc/net/{tcp,udp}* and sock_diag
+// at all. Both walk the protocol's lookup tables, and a socket is in them only
+// while something can find it: a TCP socket while it is listening or
+// connected -- never one that was only created, or is bound but not yet
+// listening, which is TCP_CLOSE -- and a UDP socket once it has a port. Every
+// open socket used to be listed, as 0.0.0.0:0 in state 07 until then.
+bool sock_inet_is_listed(int type, int state, const struct sockaddr *local) {
+    if (type == SOCK_STREAM_)
+        return state != 7;
+    if (local->sa_family == AF_INET)
+        return ((const struct sockaddr_in *) local)->sin_port != 0;
+    if (local->sa_family == AF_INET6)
+        return ((const struct sockaddr_in6 *) local)->sin6_port != 0;
+    return false;
 }
 
 struct inet_bind_info {
@@ -2885,13 +5031,18 @@ static bool sock_bound_inet_conflicts(struct fd *sock, const struct inet_bind_in
         struct task *task = snapshot.tasks[i];
         if (task == NULL)
             continue;
-        struct fdtable *files = diag_task_files_retain(task);
+        struct fdtable *files = sock_task_files_retain(task);
         if (files == NULL)
             continue;
         lock(&files->lock, 0);
         for (fd_t fd_no = 0; (unsigned) fd_no < files->size; fd_no++) {
             struct fd *other = fdtable_get(files, fd_no);
             if (other == NULL || other == sock || other->ops != &socket_fdops)
+                continue;
+            // An address in another network namespace is another address
+            // (kernel/net_ns.h): a sandbox's recorded bind takes no port
+            // from anyone outside it.
+            if (other->socket.net_ns != sock->socket.net_ns)
                 continue;
             if (other->socket.domain != sock->socket.domain ||
                     other->socket.type != sock->socket.type ||
@@ -2945,36 +5096,56 @@ static bool sock_bound_inet_conflicts(struct fd *sock, const struct inet_bind_in
     return conflict;
 }
 
-static int diag_tcp_state(struct fd *fd) {
+int sock_tcp_state(struct fd *sock) {
 #if defined(__APPLE__)
     struct tcp_connection_info conn_info;
     socklen_t conn_info_size = sizeof(conn_info);
-    if (getsockopt(fd->real_fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &conn_info, &conn_info_size) == 0) {
+    if (getsockopt(sock->real_fd, IPPROTO_TCP, TCP_CONNECTION_INFO, &conn_info, &conn_info_size) == 0) {
+        // Darwin's TCPS_* (netinet/tcp_fsm.h, which iOS does not ship) in
+        // order, as Linux's TCP_* numbers.
         static const uint8_t tcp_state_table[] = {
-            7, 10, 2, 3, 1, 8, 4, 11, 9, 5, 6,
+            7,  // TCPS_CLOSED
+            10, // TCPS_LISTEN
+            2,  // TCPS_SYN_SENT
+            3,  // TCPS_SYN_RECEIVED
+            1,  // TCPS_ESTABLISHED
+            8,  // TCPS_CLOSE_WAIT
+            4,  // TCPS_FIN_WAIT_1
+            11, // TCPS_CLOSING
+            9,  // TCPS_LAST_ACK
+            5,  // TCPS_FIN_WAIT_2
+            6,  // TCPS_TIME_WAIT
         };
         if (conn_info.tcpi_state < sizeof(tcp_state_table))
             return tcp_state_table[conn_info.tcpi_state];
     }
+#elif defined(__linux__)
+    // A Linux host numbers its states exactly as the guest expects, and knows
+    // the ones the fallback below cannot see (a connect still in SYN_SENT has
+    // no peer yet, and would read as closed).
+    struct tcp_info info;
+    socklen_t info_size = sizeof(info);
+    if (getsockopt(sock->real_fd, IPPROTO_TCP, TCP_INFO, &info, &info_size) == 0 &&
+            info.tcpi_state != 0)
+        return info.tcpi_state;
 #endif
-    int acceptconn = 0;
-    socklen_t len = sizeof(acceptconn);
-    if (getsockopt(fd->real_fd, SOL_SOCKET, SO_ACCEPTCONN, &acceptconn, &len) == 0 && acceptconn)
+    // The fallback: listen()'s own record (Darwin has no SO_ACCEPTCONN to
+    // ask), then whether there is a peer.
+    if (sock->socket.listening)
         return 10;
-
     struct sockaddr_storage peer;
-    len = sizeof(peer);
-    if (getpeername(fd->real_fd, (struct sockaddr *) &peer, &len) == 0)
+    socklen_t len = sizeof(peer);
+    if (getpeername(sock->real_fd, (struct sockaddr *) &peer, &len) == 0)
         return 1;
     return 7;
 }
 
 static int diag_unix_state(struct fd *fd) {
-    int acceptconn = 0;
-    socklen_t len = sizeof(acceptconn);
-    if (fd->real_fd >= 0 &&
-            getsockopt(fd->real_fd, SOL_SOCKET, SO_ACCEPTCONN, &acceptconn, &len) == 0 &&
-            acceptconn)
+    // listen()'s own record, as getsockopt(SO_ACCEPTCONN) answers the guest.
+    // This asked the host instead, and Darwin has no SO_ACCEPTCONN at all
+    // (ENOPROTOOPT), so no unix listener was ever TCP_LISTEN here: `ss -xl`
+    // listed none, and plain `ss -x` hid them as closed.
+    if (fd->socket.listening)
         return 10;
     if (fd->socket.unix_peer != NULL)
         return 1;
@@ -3026,10 +5197,12 @@ static int netlink_append_inet_diag(struct fd *sock, const struct nlmsghdr_ *req
     else
         return netlink_append_error(sock, req_hdr->nlmsg_seq, req_hdr, _EOPNOTSUPP);
 
-    struct diag_socket_entry entries = {};
-    int err = diag_collect_sockets(&entries, req->sdiag_family, type);
-    if (err < 0)
+    struct sock_snapshot entries = {};
+    int err = sock_snapshot_collect(&entries, req->sdiag_family, type);
+    if (err < 0) {
+        sock_snapshot_release(&entries);
         return err;
+    }
 
     for (unsigned i = 0; i < entries.count; i++) {
         struct fd *fd = entries.fds[i];
@@ -3041,16 +5214,18 @@ static int netlink_append_inet_diag(struct fd *sock, const struct nlmsghdr_ *req
             continue;
 
         bool has_peer = getpeername(fd->real_fd, (struct sockaddr *) &peer, &peer_len) == 0;
-        int state = type == SOCK_STREAM_ ? diag_tcp_state(fd) : (has_peer ? 1 : 7);
+        int state = type == SOCK_STREAM_ ? sock_tcp_state(fd) : (has_peer ? 1 : 7);
+        if (!sock_inet_is_listed(type, state, (const struct sockaddr *) &local))
+            continue;
         if (req->idiag_states != 0 && !(req->idiag_states & (1u << state)))
             continue;
 
         struct inet_diag_msg_ msg = {};
         msg.idiag_family = req->sdiag_family;
         msg.idiag_state = state;
-        msg.idiag_uid = current->euid;
-        msg.idiag_inode = diag_socket_inode(fd);
-        msg.idiag_rqueue = diag_recv_q(fd);
+        msg.idiag_uid = sock_uid(fd);
+        msg.idiag_inode = sock_inode(fd);
+        msg.idiag_rqueue = sock_recv_queue(fd);
         msg.id.idiag_cookie[0] = 0xffffffffu;
         msg.id.idiag_cookie[1] = 0xffffffffu;
 
@@ -3084,16 +5259,18 @@ static int netlink_append_inet_diag(struct fd *sock, const struct nlmsghdr_ *req
 
     if (err >= 0)
         err = netlink_append_done(sock, req_hdr->nlmsg_seq);
-    diag_socket_release(&entries);
+    sock_snapshot_release(&entries);
     return err;
 }
 
 static int netlink_append_unix_diag(struct fd *sock, const struct nlmsghdr_ *req_hdr,
         const struct unix_diag_req_ *req) {
-    struct diag_socket_entry entries = {};
-    int err = diag_collect_sockets(&entries, AF_LOCAL_, -1);
-    if (err < 0)
+    struct sock_snapshot entries = {};
+    int err = sock_snapshot_collect(&entries, AF_LOCAL_, -1);
+    if (err < 0) {
+        sock_snapshot_release(&entries);
         return err;
+    }
 
     for (unsigned i = 0; i < entries.count; i++) {
         struct fd *fd = entries.fds[i];
@@ -3101,7 +5278,7 @@ static int netlink_append_unix_diag(struct fd *sock, const struct nlmsghdr_ *req
         msg.udiag_family = AF_LOCAL_;
         msg.udiag_type = fd->socket.type;
         msg.udiag_state = diag_unix_state(fd);
-        msg.udiag_ino = diag_socket_inode(fd);
+        msg.udiag_ino = sock_inode(fd);
         msg.udiag_cookie[0] = 0xffffffffu;
         msg.udiag_cookie[1] = 0xffffffffu;
         if (req->udiag_states != 0 && !(req->udiag_states & (1u << msg.udiag_state)))
@@ -3115,7 +5292,7 @@ static int netlink_append_unix_diag(struct fd *sock, const struct nlmsghdr_ *req
 
     if (err >= 0)
         err = netlink_append_done(sock, req_hdr->nlmsg_seq);
-    diag_socket_release(&entries);
+    sock_snapshot_release(&entries);
     return err;
 }
 
@@ -3123,6 +5300,10 @@ static int netlink_handle_diag_request(struct fd *sock, const struct nlmsghdr_ *
         const void *payload, size_t payload_len) {
     if (hdr->nlmsg_type != SOCK_DIAG_BY_FAMILY_)
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
+    // A private network namespace is shown none of the machine's sockets
+    // (kernel/net_ns.h), and its own are not listed yet.
+    if (sock->socket.net_ns != NULL)
+        return netlink_append_done(sock, hdr->nlmsg_seq);
 
     if (payload_len < 1)
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EINVAL);
@@ -3162,7 +5343,18 @@ static bool netlink_attr_streq(const struct nlattr_ *attr, const char *str) {
     size_t data_len = attr->nla_len - sizeof(*attr);
     const char *data = (const char *) (attr + 1);
     size_t str_len = strlen(str);
-    if (data_len > 0 && data[data_len - 1] == '\0')
+    // EVERY trailing NUL, not one, which is what lib/nlattr.c's nla_strcmp
+    // does ("while (attrlen > 0 && buf[attrlen - 1] == '\0') attrlen--").
+    //
+    // A sender may put the true length in nla_len, or the 4-byte-aligned one
+    // -- the payload is padded either way and the kernel accepts both. iotop
+    // reports the true length, so stripping a single NUL was enough for it and
+    // the divergence sat here unnoticed. atopacctd reports the aligned length,
+    // so "TASKSTATS\0" arrived as "TASKSTATS\0\0\0", one strip left eleven
+    // bytes against nine, and the lookup answered ENOENT for the one family
+    // AOK does implement. atop's postinst then hung: "receive NETLINK family,
+    // errno -2", and dpkg wedged behind it.
+    while (data_len > 0 && data[data_len - 1] == '\0')
         data_len--;
     return data_len == str_len && memcmp(data, str, str_len) == 0;
 }
@@ -3177,6 +5369,22 @@ static void netlink_taskstats_from_io(struct taskstats_ *ts, struct task_io_coun
     ts->cancelled_write_bytes = atomic_load_explicit(&io->cancelled_write_bytes, memory_order_relaxed);
     ts->blkio_count = atomic_load_explicit(&io->blkio_count, memory_order_relaxed);
     ts->blkio_delay_total = atomic_load_explicit(&io->blkio_delay_ns, memory_order_relaxed);
+}
+
+// "0-7", "0,2-3", "4". Linux parses this with cpulist_parse and fails EINVAL
+// on anything else; we only need to agree about what is nonsense.
+static bool netlink_cpumask_is_sane(const char *data, size_t len) {
+    size_t n = len;
+    while (n > 0 && data[n - 1] == '\0')
+        n--;
+    if (n == 0)
+        return false;
+    for (size_t i = 0; i < n; i++) {
+        char c = data[i];
+        if ((c < '0' || c > '9') && c != '-' && c != ',')
+            return false;
+    }
+    return true;
 }
 
 static int netlink_taskstats_fill(pid_t_ id, bool tgid, struct taskstats_ *ts) {
@@ -3200,16 +5408,27 @@ static int netlink_taskstats_fill(pid_t_ id, bool tgid, struct taskstats_ *ts) {
         ts->ac_pid = task->pid;
     }
     ts->version = TASKSTATS_VERSION_;
-    // Parent PROCESS: Linux's bacct_add_tsk uses task_tgid_nr_ns(real_parent).
-    // See sys_getppid() for why ->pid is wrong here.
-    ts->ac_ppid = task->parent != NULL ? task->parent->tgid : 0;
-    ts->ac_uid = task->uid;
-    ts->ac_gid = task->gid;
+    // Parent PROCESS: Linux's bacct_add_tsk uses task_tgid_nr_ns(real_parent),
+    // which every thread shares. See sys_getppid() for why ->pid is wrong here,
+    // and task_process_parent for why a thread's own ->parent is.
+    //
+    // As the requester has them, numbers and ids alike: bacct_add_tsk's pid
+    // namespace and user namespace are the caller's (fill_stats_for_pid), so
+    // a parent its pid namespace has no number for is 0. (The records sent
+    // to exit listeners are the initial namespace's: taskstats_exit fills
+    // them with init_pid_ns and init_user_ns, as below.)
+    // (Translated once pids_lock is let go: the namespace lookups take it.)
+    struct task *parent = task_process_parent(task);
+    pid_t_ machine_ppid = parent != NULL ? parent->tgid : 0;
+    ts->ac_uid = current_uid_shown(task->uid);
+    ts->ac_gid = current_gid_shown(task->gid);
     // comm changes only at exec/prctl and is fixed-size; an unlocked copy can
     // at worst be torn between two names, never overrun (ac_comm is larger
     // and pre-zeroed).
     memcpy(ts->ac_comm, task->comm, sizeof(task->comm));
     unlock(&pids_lock);
+    ts->ac_pid = (uint32_t) current_pid_shown_or_zero((pid_t_) ts->ac_pid);
+    ts->ac_ppid = machine_ppid != 0 ? (uint32_t) current_pid_shown_or_zero(machine_ppid) : 0;
     netlink_taskstats_from_io(ts, &io);
     return 0;
 }
@@ -3239,6 +5458,98 @@ static int netlink_append_taskstats(struct fd *sock, const struct nlmsghdr_ *hdr
     aggr->nla_type = tgid ? TASKSTATS_TYPE_AGGR_TGID_ : TASKSTATS_TYPE_AGGR_PID_;
     aggr->nla_len = (uint16_t) (len - aggr_start);
     return netlink_append_nlmsg(sock, GENL_FAMILY_TASKSTATS_, 0, hdr->nlmsg_seq, payload, len);
+}
+
+// ---- exit records pushed to registered listeners -------------------------
+//
+// Staged in thread-local storage between collect and broadcast, because the
+// two halves cannot run in the same place: the record has to be taken inside
+// do_exit's locked region, where the dying task's fields are still there to
+// read, and delivered outside it, because delivery ends in poll_wakeup() and
+// that must not be reached holding a pid or task lock. TLS rather than a
+// parameter so struct taskstats_ stays private to this file, and it is safe
+// because both halves run on the exiting task's own thread, in one function.
+static __thread struct taskstats_ netlink_taskstats_exit_staged;
+
+bool netlink_taskstats_exit_collect(struct task *leader, const struct rusage_ *ru,
+        dword_t status) {
+    if (leader == NULL || ru == NULL)
+        return false;
+    // Nothing listening: this is the usual answer and must cost almost nothing,
+    // because it is asked for every process that exits.
+    bool any = false;
+    lock(&netlink_notify_registry_lock, 0);
+    struct fd *sock;
+    list_for_each_entry(&netlink_notify_registry, sock, socket.netlink_notify_link) {
+        if (sock->socket.netlink_taskstats_listener) { any = true; break; }
+    }
+    unlock(&netlink_notify_registry_lock);
+    if (!any)
+        return false;
+
+    struct taskstats_ *ts = &netlink_taskstats_exit_staged;
+    memset(ts, 0, sizeof(*ts));
+    ts->version = TASKSTATS_VERSION_;
+    ts->ac_pid = leader->pid;
+    ts->ac_ppid = leader->parent != NULL ? leader->parent->tgid : 0;
+    ts->ac_uid = leader->uid;
+    ts->ac_gid = leader->gid;
+    ts->ac_exitcode = status;
+    memcpy(ts->ac_comm, leader->comm, sizeof(leader->comm));
+    // taskstats counts CPU and elapsed time in MICROseconds, unlike acct's
+    // AHZ ticks -- same two numbers, two different units, and mixing them up
+    // is the easiest mistake in this area.
+    ts->ac_utime = (uint64_t) ru->utime.sec * 1000000 + ru->utime.usec;
+    ts->ac_stime = (uint64_t) ru->stime.sec * 1000000 + ru->stime.usec;
+    uint64_t now_ticks = guest_uptime_ticks();
+    uint64_t start_ticks = leader->start_time_ticks;
+    uint64_t elapsed_ticks = now_ticks > start_ticks ? now_ticks - start_ticks : 0;
+    ts->ac_etime = elapsed_ticks * (1000000 / 100);   // 100 Hz ticks -> usec
+    struct timespec now = guest_clock_now(CLOCK_REALTIME_, CLOCK_REALTIME);
+    ts->ac_btime = (uint32_t) (now.tv_sec - (long) (elapsed_ticks / 100));
+    ts->ac_minflt = ru->minflt;
+    ts->ac_majflt = ru->majflt;
+    ts->hiwater_rss = ru->maxrss;
+    struct task_io_counters io = {};
+    task_io_counters_add(&io, &leader->group->io_dead);
+    netlink_taskstats_from_io(ts, &io);
+    return true;
+}
+
+void netlink_taskstats_exit_broadcast(void) {
+    struct fd *candidates[NETLINK_NOTIFY_MAX_CANDIDATES];
+    size_t n = 0;
+    lock(&netlink_notify_registry_lock, 0);
+    struct fd *sock;
+    list_for_each_entry(&netlink_notify_registry, sock, socket.netlink_notify_link) {
+        if (!sock->socket.netlink_taskstats_listener)
+            continue;
+        struct fd *retained = fd_retain_if_live(sock);
+        if (retained == NULL)
+            continue;
+        if (n < NETLINK_NOTIFY_MAX_CANDIDATES)
+            candidates[n++] = retained;
+        else
+            fd_close(retained);
+    }
+    unlock(&netlink_notify_registry_lock);
+
+    // An unsolicited record, so there is no request to answer: sequence 0, the
+    // way the kernel's own taskstats_exit send does.
+    //
+    // AGGR_PID, not AGGR_TGID. taskstats_exit() builds the PID aggregate for
+    // every exiting task and only ADDS a TGID one when a thread group dies,
+    // so an ordinary single-threaded process -- which is what a listener sees
+    // almost all of the time -- arrives as AGGR_PID. Measured on Linux 6.12:
+    // a forked child exiting 3 came back as AGGR_PID with exitcode 768.
+    struct nlmsghdr_ synthetic = {};
+    for (size_t i = 0; i < n; i++) {
+        netlink_append_taskstats(candidates[i], &synthetic, false,
+                netlink_taskstats_exit_staged.ac_pid,
+                &netlink_taskstats_exit_staged);
+        poll_wakeup(candidates[i], POLL_READ);
+        fd_close(candidates[i]);
+    }
 }
 
 static int netlink_handle_generic_request(struct fd *sock, const struct nlmsghdr_ *hdr,
@@ -3272,7 +5583,10 @@ static int netlink_handle_generic_request(struct fd *sock, const struct nlmsghdr
         uint16_t family_id = GENL_FAMILY_TASKSTATS_;
         uint32_t version = TASKSTATS_GENL_VERSION_;
         uint32_t hdrsize = 0;
-        uint32_t maxattr = TASKSTATS_CMD_ATTR_TGID_;
+        // The real TASKSTATS_CMD_ATTR_MAX, which includes the two cpumask
+        // attributes. Advertising 2 said the family could not do the thing it
+        // can now do.
+        uint32_t maxattr = TASKSTATS_CMD_ATTR_DEREGISTER_CPUMASK_;
         // Attribute order matters and must match the kernel's ctrl_fill_info
         // (NAME first, then ID): iotop doesn't scan attrs by type, it grabs
         // the second attribute and expects it to be CTRL_ATTR_FAMILY_ID.
@@ -3299,10 +5613,45 @@ static int netlink_handle_generic_request(struct fd *sock, const struct nlmsghdr
         // The kernel registers taskstats ops with GENL_ADMIN_PERM
         // (CAP_NET_ADMIN) since CVE-2011-2494; genl_rcv_msg fails them with
         // EPERM for unprivileged callers.
-        if (current->euid != 0)
+        if (!superuser())
             return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EPERM);
         if (genl->cmd != TASKSTATS_CMD_GET_)
             return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EOPNOTSUPP);
+
+        // Registering/deregistering as an exit listener. Checked BEFORE the
+        // pid/tgid requirement below, because these carry neither -- which is
+        // why they used to fall through to its EINVAL, and why atopacctd said
+        // "unexpected error on NETLINK: Invalid argument ... switching to
+        // polling mode" against a kernel that had the family it had just
+        // successfully resolved.
+        //
+        // The mask itself is parsed only far enough to reject nonsense. AOK
+        // has no per-CPU taskstats queues to attach to: a record is delivered
+        // to every listener, and a listener that asked for a subset would get
+        // the same records a real kernel would send it for the CPU the process
+        // happened to die on. Storing a mask we could not honour would be a
+        // decoration.
+        const struct nlattr_ *reg = netlink_attr_find(attrs, attrs_len,
+                TASKSTATS_CMD_ATTR_REGISTER_CPUMASK_);
+        const struct nlattr_ *dereg = netlink_attr_find(attrs, attrs_len,
+                TASKSTATS_CMD_ATTR_DEREGISTER_CPUMASK_);
+        if (reg != NULL || dereg != NULL) {
+            const struct nlattr_ *mask = reg != NULL ? reg : dereg;
+            if (mask->nla_len <= sizeof(*mask))
+                return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EINVAL);
+            if (!netlink_cpumask_is_sane((const char *) (mask + 1),
+                        mask->nla_len - sizeof(*mask)))
+                return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EINVAL);
+            lock(&netlink_notify_registry_lock, 0);
+            sock->socket.netlink_taskstats_listener = (reg != NULL);
+            unlock(&netlink_notify_registry_lock);
+            // Linux acknowledges only when asked to; an unsolicited reply
+            // would be read as the first exit record.
+            if (hdr->nlmsg_flags & NLM_F_ACK_)
+                return netlink_append_error(sock, hdr->nlmsg_seq, hdr, 0);
+            return 0;
+        }
+
         bool tgid = false;
         const struct nlattr_ *id_attr = netlink_attr_find(attrs, attrs_len, TASKSTATS_CMD_ATTR_PID_);
         if (id_attr == NULL) {
@@ -3376,7 +5725,7 @@ static int netlink_handle_audit_request(struct fd *sock, const struct nlmsghdr_ 
     }
     // Control needs CAP_AUDIT_CONTROL, user messages CAP_AUDIT_WRITE;
     // approximate both as euid==0 (same policy as the taskstats handler).
-    if (current->euid != 0)
+    if (!superuser())
         return netlink_append_error(sock, hdr->nlmsg_seq, hdr, _EPERM);
 
     int err = 0;
@@ -3470,20 +5819,101 @@ static int netlink_handle_sendmsg(struct fd *sock, const struct msghdr *msg) {
         offset += NLMSG_ALIGN(hdr->nlmsg_len);
     }
     free(req);
+    // The replies are news to a thread polling this socket. The watch thread's
+    // notifications already say so (netlink_notify_deliver_link); a request's
+    // replies did not, so a poll or epoll_wait in another thread found them
+    // only at its next periodic recheck -- measured ~700ms late, where Linux
+    // wakes it at once. A receive blocked in another thread needs no help:
+    // netlink_append_nlmsg notifies it. No lock of ours is held here, which
+    // poll_wakeup requires.
+    lock(&sock->socket.netlink_reply_lock, 0);
+    bool queued = sock->socket.netlink_reply_off < sock->socket.netlink_reply_len;
+    unlock(&sock->socket.netlink_reply_lock);
+    if (queued)
+        poll_wakeup(sock, POLL_READ);
     return err < 0 ? err : (int) req_len;
 }
 
+// A blocking receive with nothing queued waits for a message, as Linux's
+// skb_recv_datagram does. It used to fail with EAGAIN at once, whatever
+// O_NONBLOCK and MSG_DONTWAIT said. Request/response never noticed, because a
+// request's replies are queued inside its own sendmsg; a program waiting for
+// multicast notifications did: iproute2's rtnl_listen() retries on EAGAIN, so
+// `ip monitor` spun at 100% CPU instead of sleeping.
+//
+// wait_for, like every in-process reader (eventfd, inotify, fifos): it wakes
+// for netlink_append_nlmsg's notify, for a signal, and for a checkpoint freeze,
+// and it waits in slices, so a lost wake costs at most a second rather than
+// the wait. Call with netlink_reply_lock held and the queue empty; returns 0
+// once something is queued, still holding the lock.
+//
+// SO_RCVTIMEO is Linux's sk_rcvtimeo: EAGAIN when it runs out, and a zero one
+// (what a negative timeval sets) never waits at all. A signal is EINTR; the
+// caller decides whether SA_RESTART may restart it, which it may not when a
+// timeout is armed (signal(7)).
+static int netlink_wait_for_message_locked(struct fd *sock) {
+    bool timed = sock->socket.netlink_rcvtimeo_set;
+    struct timespec left = sock->socket.netlink_rcvtimeo;
+    if (timed && !timespec_positive(left))
+        return _EAGAIN;
+    for (;;) {
+        int err = wait_for(&sock->socket.netlink_reply_cond,
+                &sock->socket.netlink_reply_lock, timed ? &left : NULL);
+        // A message first, whatever else ended the wait:
+        // __skb_wait_for_more_packets looks at the queue before it asks about
+        // signals, and the signal is still delivered on the way out.
+        if (sock->socket.netlink_reply_off < sock->socket.netlink_reply_len)
+            return 0;
+        if (err == _ETIMEDOUT)
+            return _EAGAIN;
+        // wait_for's _EINTR also means a bare SIGUSR1 poke landed: the
+        // address-space barrier pokes every sibling that is not io_block when
+        // another thread maps or unmaps memory, and the poke marks the wait
+        // interrupted. Measured before this check, a thread of a process whose
+        // other threads ran guest code and called mmap got EINTR ~100ms into
+        // its receive, with no signal sent. Only a signal or a freeze ends the
+        // wait; the same test wait_for itself makes, so the next call cannot
+        // come straight back with the same answer.
+        if (err < 0 && (task_wake_signal_pending() || checkpoint_freeze_pending()))
+            return err;
+    }
+}
+
 static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_flags) {
+    // Asked before the lock: sock_getflags takes none, but nothing here needs
+    // the flags under it either.
+    bool may_wait = !(fake_flags & MSG_DONTWAIT_) && !(fd_getflags(sock) & O_NONBLOCK_);
+    bool timed = false;
+    // A reference of this call's own while it waits. Nothing else holds the
+    // socket for a syscall, so a close() from another thread would free it
+    // under the sleeping reader; with this the close only drops the table's
+    // reference and the last one goes when the receive returns, as Linux's
+    // fput does.
+    struct fd *held = NULL;
     lock(&sock->socket.netlink_reply_lock, 0);
-    size_t available = sock->socket.netlink_reply_len - sock->socket.netlink_reply_off;
+    size_t available = 0;
     bool peek = (fake_flags & MSG_PEEK_) != 0;
     bool want_trunc_len = (fake_flags & MSG_TRUNC_) != 0;
     size_t capacity = diag_iov_capacity(msg->msg_iov, msg->msg_iovlen);
     int ret;
     if (sock->socket.netlink_reply_off >= sock->socket.netlink_reply_len) {
-        ret = _EAGAIN;
-        goto out;
+        if (!may_wait) {
+            ret = _EAGAIN;
+            goto out;
+        }
+        held = fd_retain_if_live(sock);
+        if (held == NULL) {
+            ret = _EBADF;
+            goto out;
+        }
+        timed = sock->socket.netlink_rcvtimeo_set;
+        ret = netlink_wait_for_message_locked(sock);
+        if (ret < 0)
+            goto out;
     }
+    bool raw = false;
+    size_t datagram_end = netlink_reply_datagram_end_raw_locked(sock, &raw);
+    available = datagram_end - sock->socket.netlink_reply_off;
     // No capacity==0 early-out here: a zero-length read must still fall
     // through to the loop below, which truncate-AND-CONSUMES the first
     // message (Linux datagram semantics: a recv always eats the datagram,
@@ -3498,9 +5928,31 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
 
     size_t copied = 0;
     size_t reply_off = sock->socket.netlink_reply_off;
-    while (reply_off + sizeof(struct nlmsghdr_) <= sock->socket.netlink_reply_len) {
+    while (reply_off < datagram_end) {
+        size_t left = datagram_end - reply_off;
         struct nlmsghdr_ *hdr = (struct nlmsghdr_ *)
             (sock->socket.netlink_reply + reply_off);
+        // Not netlink messages: the kernel's own raw datagrams -- mq_notify's
+        // SIGEV_THREAD cookie (kernel/mqueue.c) -- carry no header at all, and
+        // Linux hands every datagram over as bytes. The cookie's zero length
+        // field used to spin this loop for ever, copying nothing each time
+        // round. What fits is copied as it is, and so is anything whose
+        // header does not describe a message inside the datagram.
+        if (raw || left < sizeof(struct nlmsghdr_) || hdr->nlmsg_len < sizeof(struct nlmsghdr_) ||
+                hdr->nlmsg_len > left) {
+            size_t n = left;
+            if (copied + n > capacity)
+                n = capacity - copied;
+            int err = diag_copy_to_iov(msg->msg_iov, msg->msg_iovlen, copied,
+                    sock->socket.netlink_reply + reply_off, n);
+            if (err < 0) {
+                ret = err;
+                goto out;
+            }
+            copied += n;
+            reply_off += n;
+            break;
+        }
         size_t msg_len = NLMSG_ALIGN(hdr->nlmsg_len);
         if (copied != 0 && copied + msg_len > capacity)
             break;
@@ -3522,6 +5974,11 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
             break;
     }
 
+    // Whatever is left of THIS datagram does not survive the read, so the
+    // reader is told it was truncated -- including on a peek, as Linux does.
+    if (reply_off < datagram_end)
+        msg->msg_flags |= MSG_TRUNC;
+
     if (msg->msg_name != NULL) {
         struct sockaddr_nl_ name = {
             .nl_family = AF_NETLINK_,
@@ -3535,8 +5992,11 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
             memcpy(msg->msg_name, &name, copy_len);
         msg->msg_namelen = sizeof(name);
     }
+    // Linux datagram semantics: a receive eats the whole datagram, however
+    // little of it fit. Advancing only to reply_off would hand the untaken tail
+    // of a truncated batch back as a datagram of its own on the next read.
     if (!peek)
-        sock->socket.netlink_reply_off = reply_off;
+        sock->socket.netlink_reply_off = datagram_end;
     if (!peek && sock->socket.netlink_reply_off >= sock->socket.netlink_reply_len)
         netlink_reply_reset_locked(sock);
     if ((msg->msg_flags & MSG_TRUNC) && want_trunc_len)
@@ -3545,10 +6005,18 @@ static int netlink_handle_recvmsg(struct fd *sock, struct msghdr *msg, int fake_
         ret = (int) copied;
 out:
     unlock(&sock->socket.netlink_reply_lock);
+    // Outside the lock: signal_should_restart_syscall takes sighand->lock.
+    // socket_intr_errno's decision, for the timeout this wait kept itself.
+    if (ret == _EINTR)
+        ret = timed ? signal_eintr_no_restart(ret) : signal_restart_or_eintr(ret);
     if (getenv("ISH_NETLINK_DIAG") != NULL)
         printk("NLDIAG: recvmsg pid=%d flags=%#x cap=%zu avail=%zu ret=%d trunc=%d\n",
                current->pid, fake_flags, capacity, available, ret,
                !!(msg->msg_flags & MSG_TRUNC));
+    // Last, and nothing may touch the socket after it: if the guest closed it
+    // while this waited, this is the close.
+    if (held != NULL)
+        fd_close(held);
     return ret;
 }
 
@@ -3564,14 +6032,35 @@ static int netlink_sockaddr_write(guest_addr_t sockaddr_addr, const void *sockad
     return 0;
 }
 
-static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *socket_id) {
+// *bound_type (when asked for) gets the guest type of the socket bound at the
+// name, 0 when none is -- see inode_data.socket_type.
+static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *socket_id,
+                           int *bound_type) {
     char path[MAX_PATH];
-    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_FOLLOW);
+    // A bind CREATES the name, and Linux resolves it exactly as mknod does
+    // (unix_bind_bsd: kern_path_create, then vfs_mknod), so it gets
+    // generic_mknodat's flags: the final component is not followed -- a
+    // dangling symlink there is a name in use, not a place to create the
+    // socket -- a name that exists is EADDRINUSE before permission is asked,
+    // "name/" asks for a directory and a socket is not one (N_SLASH_NOT_A_DIR,
+    // which used to be a copy of the rule right here), and otherwise the
+    // parent must be writable and searchable. Only lookups
+    // were checked: bind followed the final symlink and asked nothing of the
+    // parent, so an unprivileged guest bound sockets in root's directories --
+    // /usr/lib, or a /tmp/.X11-unix a root session had left 0755, where a
+    // later non-root compositor then bound X1. connect() follows symlinks and
+    // needs search on the way and write on the socket (below). Measured on
+    // Linux 6.12 by tests/manual/unix_bind_dir_perms.c.
+    int flags = bind_fd != NULL
+        ? N_SYMLINK_NOFOLLOW | N_PARENT_ONLY | N_PARENT_DIR_WRITE | N_CREATE_EEXIST_FIRST | N_SLASH_NOT_A_DIR
+        : N_SYMLINK_FOLLOW;
+    int err = path_normalize(AT_PWD, path_raw, path, flags);
     if (err < 0)
         return err;
     char guest_path[MAX_PATH]; // pre-trim path for inotify; see generic_openat
     strcpy(guest_path, path);
-    struct mount *mount = find_mount_and_trim_path(path);
+    int mount_flags = 0;
+    struct mount *mount = find_mount_and_trim_path_flags(path, &mount_flags);
     if (mount == NULL)
         return _ENOENT;
     struct statbuf stat;
@@ -3582,6 +6071,10 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
         // If the file exists, fail.
         if (err == 0) {
             err = _EADDRINUSE;
+            goto out;
+        }
+        if (mount_flags & MS_READONLY_) {
+            err = _EROFS;
             goto out;
         }
         // If the file can't be found, try to create it as a socket.
@@ -3639,10 +6132,19 @@ static int unix_socket_get(const char *path_raw, struct fd *bind_fd, uint32_t *s
     lock(&inode->lock, 0);
     if (inode->socket_id == 0)
         inode->socket_id = unix_socket_next_id();
+    if (bind_fd != NULL)
+        inode->socket_type = bind_fd->socket.type;
+    if (bound_type != NULL)
+        *bound_type = inode->socket_type;
     unlock(&inode->lock);
     *socket_id = inode->socket_id;
 
     mount_release(mount);
+    // A bind keeps the reference until its socket closes (release_unix_names),
+    // which is what keeps socket_id on the node while something is bound there
+    // -- and nothing longer. Once the listener is gone, the node is a stale
+    // name: a lookup finds no id, draws a fresh one with no host socket behind
+    // it, and is refused (unix_host_missing_is_refused), as on Linux.
     if (bind_fd != NULL)
         bind_fd->socket.unix_name_inode = inode;
     else
@@ -3739,13 +6241,35 @@ int unix_socket_host_path_for(const char *guest_path, char *out, size_t out_size
 // concurrent sender close (which unregisters under the same lock, then
 // unlinks under peer_lock) either wins entirely -- lookup misses, no link --
 // or blocks until the link is made and then tears it down normally.
+//
+// A token also carries the SCM_RIGHTS parcels its sender posted before the
+// accept side linked the peer. Linux allows fd passing the moment connect()
+// returns -- the transport connection exists then, and accept() only hands
+// the server a descriptor for a child socket that is already connected --
+// but a stream parcel here is queued on the RECEIVING fd, which does not
+// exist until accept() creates it. So it waits with the cookie, on the
+// connection rather than on either fd, and unix_socket_finish_peer() moves
+// it onto the accepted socket's queue at link time. Parking it here rather
+// than on the sender also means a client that sends and closes immediately
+// still delivers: the entry survives as a tombstone, exactly as the cookie
+// itself does.
 struct unix_token {
     uint64_t cookie;
     struct fd *sender;
+    struct list scm;      // struct scm parcels sent before the link
     struct list tokens;
 };
 static lock_t unix_token_lock = LOCK_INITIALIZER;
 static struct list unix_tokens = LIST_INITIALIZER(unix_tokens);
+static void scm_free(struct scm *scm);
+
+static void unix_token_free_scm_locked(struct unix_token *token) {
+    struct scm *scm, *tmp;
+    list_for_each_entry_safe(&token->scm, scm, tmp, queue) {
+        list_remove(&scm->queue);
+        scm_free(scm);
+    }
+}
 
 static struct unix_token *unix_token_find_locked(uint64_t cookie) {
     struct unix_token *token;
@@ -3766,10 +6290,27 @@ static uint64_t unix_token_register(struct fd *sock) {
         arc4random_buf(&token->cookie, sizeof(token->cookie));
     } while (token->cookie == 0 || unix_token_find_locked(token->cookie) != NULL);
     token->sender = sock;
+    list_init(&token->scm);
     list_add(&unix_tokens, &token->tokens);
     uint64_t cookie = token->cookie;
+    sock->socket.unix_peer_cookie = cookie;
     unlock(&unix_token_lock);
     return cookie;
+}
+
+// Park an SCM_RIGHTS parcel with the cookie this socket's connect() put on
+// the wire, for unix_socket_finish_peer() to deliver when the accept side
+// links the peer. Caller holds unix_token_lock. Takes ownership of `scm` and
+// returns true on success; false means there is no unconsumed cookie, i.e.
+// this socket genuinely has no peer and the caller owes the guest EPIPE.
+static bool unix_token_queue_scm_locked(struct fd *sock, struct scm *scm) {
+    if (sock->socket.unix_peer_cookie == 0)
+        return false;
+    struct unix_token *token = unix_token_find_locked(sock->socket.unix_peer_cookie);
+    if (token == NULL || token->sender != sock)
+        return false;
+    list_add_tail(&token->scm, &scm->queue);
+    return true;
 }
 
 // Tombstone every token registered by `sock` (unconsumed sends). Called
@@ -3777,9 +6318,12 @@ static uint64_t unix_token_register(struct fd *sock) {
 // itself must SURVIVE as a tombstone (sender=NULL): its 8 cookie bytes are
 // already on the wire, and the acceptor must still recognize and consume
 // them -- just without linking a peer -- or the guest would read 8 bytes of
-// garbage ahead of its real data. Tombstones of connections that never get
-// accepted are capped; evicting an ancient one merely re-opens the
-// stray-8-bytes corner for a connection nobody accepted in ages.
+// garbage ahead of its real data. Any parcels it carries survive with it,
+// so an fd sent by a client that closed before the server accepted still
+// arrives, the way it does on Linux. Tombstones of connections that never
+// get accepted are capped; evicting an ancient one merely re-opens the
+// stray-8-bytes corner for a connection nobody accepted in ages (and drops
+// its parcels' fd references, which nothing can reach any more).
 #define UNIX_TOKEN_TOMBSTONE_MAX 1024
 static unsigned unix_token_tombstones = 0;
 
@@ -3792,12 +6336,14 @@ static void unix_token_unregister_sender(struct fd *sock) {
             unix_token_tombstones++;
         }
     }
+    sock->socket.unix_peer_cookie = 0;
     if (unix_token_tombstones > UNIX_TOKEN_TOMBSTONE_MAX) {
         list_for_each_entry_safe(&unix_tokens, token, tmp, tokens) {
             if (unix_token_tombstones <= UNIX_TOKEN_TOMBSTONE_MAX)
                 break;
             if (token->sender == NULL) {
                 list_remove(&token->tokens);
+                unix_token_free_scm_locked(token);
                 free(token);
                 unix_token_tombstones--;
             }
@@ -3919,6 +6465,19 @@ static int unix_socket_finish_peer(struct fd *sock) {
         if (peer == NULL)
             unix_token_tombstones--;
         list_remove(&token->tokens);
+        // Parcels the connector sent before this accept ran. They belong to
+        // THIS socket's queue -- it is the receiving fd they were addressed
+        // to, it just did not exist yet -- and they must land on it before
+        // the guest can call recvmsg, which accept4 guarantees by calling
+        // this before it returns the descriptor. Delivered even for a
+        // tombstone: the fds crossed, the sender merely closed afterwards.
+        struct list pending_scm;
+        list_init(&pending_scm);
+        struct scm *pending, *pending_tmp;
+        list_for_each_entry_safe(&token->scm, pending, pending_tmp, queue) {
+            list_remove(&pending->queue);
+            list_add_tail(&pending_scm, &pending->queue);
+        }
         free(token);
 
         // The cookie is validated and its sender is live (its close would
@@ -3942,10 +6501,29 @@ static int unix_socket_finish_peer(struct fd *sock) {
             sock->socket.unix_peer_cred_valid = true;
             peer->socket.unix_peer_cred = sock->socket.unix_cred;
             peer->socket.unix_peer_cred_valid = true;
+            peer->socket.unix_peer_cookie = 0; // consumed: later sends go
+                                               // straight to this queue
             notify(&peer->socket.unix_got_peer);
         }
         sock->socket.unix_peer_pending = false;
         unlock(&peer_lock);
+        if (!list_empty(&pending_scm)) {
+            if (got == sizeof(cookie)) {
+                lock(&sock->lock, 0);
+                list_for_each_entry_safe(&pending_scm, pending, pending_tmp, queue) {
+                    list_remove(&pending->queue);
+                    list_add_tail(&sock->socket.unix_scm, &pending->queue);
+                }
+                unlock(&sock->lock);
+            } else {
+                // The peeked bytes vanished, so the connection died under
+                // us: nothing can ever read these.
+                list_for_each_entry_safe(&pending_scm, pending, pending_tmp, queue) {
+                    list_remove(&pending->queue);
+                    scm_free(pending);
+                }
+            }
+        }
         unlock(&unix_token_lock);
         return 0;
     }
@@ -3969,6 +6547,13 @@ static uint32_t str_hash(const char *str) {
 // The abstract socket namespace is a lot simpler than it sounds: if the first
 // byte of the path is a null byte, then it gets looked up in this hashtable
 // instead of the filesystem.
+//
+// An entry belongs to the socket bound to it and to nothing else, as a name in
+// Linux's unix_socket_table does: `refcount` counts binders, which is at most
+// one (a second bind is EADDRINUSE), and the entry goes when that socket's last
+// descriptor closes (sock_close -> release_unix_names). An accepted socket
+// copies the name for getsockname() but holds no reference, and neither does a
+// connect(), sendto() or sendmsg() that merely looks the name up.
 
 struct unix_abstract {
     unsigned refcount;
@@ -3976,15 +6561,22 @@ struct unix_abstract {
     size_t name_len;
     char *name;
     uint32_t socket_id;
+    int socket_type; // of the socket bound here; see inode_data.socket_type
+    // The network namespace the name is in (kernel/net_ns.h): an abstract
+    // name is found only from the namespace it was bound in. Compared, never
+    // followed -- the socket bound here is what holds the namespace.
+    const struct net_namespace *net_ns;
     struct list links;
 };
 #define ABSTRACT_HASH_SIZE 1024
 static struct list abstract_hash[ABSTRACT_HASH_SIZE];
 static lock_t unix_abstract_lock = LOCK_INITIALIZER;
 
-static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *socket_id) {
+static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *socket_id,
+                             int *bound_type) {
     uint32_t hash = str_hash(name);
     size_t name_len = strlen(name);
+    const struct net_namespace *net_ns = bind_fd != NULL ? bind_fd->socket.net_ns : current_net_ns();
     lock(&unix_abstract_lock, 0);
     struct unix_abstract *sock_tmp;
     struct unix_abstract *sock = NULL;
@@ -3992,7 +6584,7 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
     if (list_null(bucket))
         list_init(bucket);
     list_for_each_entry(bucket, sock_tmp, links) {
-        if (sock_tmp->hash == hash &&
+        if (sock_tmp->hash == hash && sock_tmp->net_ns == net_ns &&
                 sock_tmp->name_len == name_len &&
                 memcmp(sock_tmp->name, name, name_len) == 0) {
             sock = sock_tmp;
@@ -4002,7 +6594,9 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
 
     if (bind_fd != NULL && sock != NULL) {
         unlock(&unix_abstract_lock);
-        return _EEXIST;
+        // Linux's unix_bind_abstract answers a name in use with EADDRINUSE.
+        // This said EEXIST, which no caller checks for.
+        return _EADDRINUSE;
     }
     if (bind_fd == NULL && sock == NULL) {
         unlock(&unix_abstract_lock);
@@ -4025,14 +6619,26 @@ static int unix_abstract_get(const char *name, struct fd *bind_fd, uint32_t *soc
         sock->hash = hash;
         sock->name_len = name_len;
         sock->socket_id = unix_socket_next_id();
+        sock->socket_type = 0;
+        sock->net_ns = net_ns;
         list_add(bucket, &sock->links);
     }
 
-    sock->refcount++;
-    unlock(&unix_abstract_lock);
+    // Only a bind holds the name. A lookup took a reference too, and nothing
+    // ever dropped it, so the first connect() pinned the name for the life of
+    // the process: close the listener, bind the name again, EEXIST -- a
+    // session bus or compositor could never restart on its address. The id is
+    // read under the lock, since without a reference the entry may be freed
+    // the moment it is dropped.
     *socket_id = sock->socket_id;
-    if (bind_fd != NULL)
+    if (bind_fd != NULL) {
+        sock->refcount++;
+        sock->socket_type = bind_fd->socket.type;
         bind_fd->socket.unix_name_abstract = sock;
+    }
+    if (bound_type != NULL)
+        *bound_type = sock->socket_type;
+    unlock(&unix_abstract_lock);
     return 0;
 }
 
@@ -4051,9 +6657,203 @@ static void unix_abstract_release(struct unix_abstract *name) {
     unlock(&unix_abstract_lock);
 }
 
-const char *sock_tmp_prefix = "/tmp/ishsock";
+// ---- host paths for guest unix sockets ----
+//
+// A bound guest AF_UNIX socket is a host socket bound at a host path, and a
+// connect or send to the guest name goes to that path. The path is named by an
+// id that is unique within this process (unix_socket_next_id):
+//
+//   - The app sets sock_tmp_prefix to a name in its own container's tmp
+//     (app/AppDelegate.m) and gets "<prefix>.<id>". One guest runs there.
+//   - Everything else -- the CLI, and the app in the simulator -- leaves it
+//     NULL and gets a directory of its own: "<dir>/<id>".
+//
+// That directory is new. The default prefix used to be "/tmp/ishsock", shared
+// by every ish process on the machine, while the ids restart at 1 in each and
+// bind unlinks its path before binding. So two CLI guests at once took each
+// other's sockets: the second guest's first bind deleted the first guest's
+// /tmp/ishsock.1 and bound its own server there, and the first guest's clients
+// reached the wrong server, or nothing. A session D-Bus died with ECONNREFUSED
+// that way while other runs recreated /tmp/ishsock.1 and .2, and concurrent
+// CLI tests of D-Bus, X and Wayland failed for no reason of their own.
+//
+// The directory comes from mkdtemp, so it is mode 0700 and nobody else's:
+// $TMPDIR/ishsock.XXXXXX, or /tmp/ishsock.XXXXXX when $TMPDIR is unset, not
+// absolute, not usable, or too long for "<dir>/<largest id>" to fit sun_path
+// (104 bytes on Darwin, 108 on Linux). The process holds a flock on it for its
+// whole life. sock_host_dir_cleanup() removes it at exit; a process that never
+// gets there -- killed, crashed -- leaves it unlocked, and the next ish to make
+// a directory in the same place removes it (sock_host_dir_sweep).
+const char *sock_tmp_prefix = NULL;
 
-static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len, struct fd *bind_fd) {
+#define SOCK_HOST_DIR_STEM "ishsock."
+#define SOCK_HOST_ID_DIGITS 10  // UINT32_MAX
+
+static lock_t sock_host_dir_lock = LOCK_INITIALIZER;
+// Written once, under the lock, before sock_host_dir_made is set; read freely
+// after that.
+static char sock_host_dir[sizeof(((struct sockaddr_un *) NULL)->sun_path)];
+static _Atomic bool sock_host_dir_made;
+static int sock_host_dir_errno;
+static pid_t sock_host_dir_pid;
+
+// Empty a socket directory, which only ever holds sockets, and remove it.
+static void sock_host_dir_remove(const char *dir) {
+    DIR *d = opendir(dir);
+    if (d != NULL) {
+        struct dirent *e;
+        while ((e = readdir(d)) != NULL) {
+            if (!is_dot_or_dotdot(e->d_name))
+                unlinkat(dirfd(d), e->d_name, 0);
+        }
+        closedir(d);
+    }
+    rmdir(dir);
+}
+
+// Remove the directories of ish processes that no longer exist. A live one
+// holds a flock on its directory, and the kernel drops that lock however the
+// process ends, SIGKILL included.
+static void sock_host_dir_sweep(const char *base) {
+    DIR *d = opendir(base);
+    if (d == NULL)
+        return;
+    uid_t uid = getuid();
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, SOCK_HOST_DIR_STEM, strlen(SOCK_HOST_DIR_STEM)) != 0)
+            continue;
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", base, e->d_name) >= (int) sizeof(path))
+            continue;
+        // Directories only. /tmp/ishsock.<id> SOCKETS are the layout an older
+        // ish uses, and one may well be running.
+        struct stat st;
+        if (lstat(path, &st) != 0 || !S_ISDIR(st.st_mode) || st.st_uid != uid)
+            continue;
+        int fd = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0)
+            continue;
+        if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+            sock_host_dir_remove(path);
+        close(fd);
+    }
+    closedir(d);
+}
+
+// Make this process's directory under `base`. False if it cannot be made there.
+static bool sock_host_dir_make(const char *base) {
+    static const char leaf[] = "/" SOCK_HOST_DIR_STEM "XXXXXX";
+    size_t base_len = strlen(base);
+    while (base_len > 1 && base[base_len - 1] == '/')
+        base_len--;
+    // "<base>/ishsock.XXXXXX", then "/" and the widest id, then the NUL.
+    char dir[sizeof(sock_host_dir)];
+    if (base_len + (sizeof(leaf) - 1) + 1 + SOCK_HOST_ID_DIGITS + 1 > sizeof(dir))
+        return false;
+    char trimmed[sizeof(dir)];
+    memcpy(trimmed, base, base_len);
+    trimmed[base_len] = '\0';
+
+    sock_host_dir_sweep(trimmed);
+    for (int attempt = 0; attempt < 8; attempt++) {
+        memcpy(dir, trimmed, base_len);
+        memcpy(dir + base_len, leaf, sizeof(leaf));
+        if (mkdtemp(dir) == NULL) {
+            sock_host_dir_errno = errno_map();
+            return false;
+        }
+        int fd = open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) {
+            sock_host_dir_errno = errno_map();
+            rmdir(dir);
+            return false;
+        }
+        // Another process's sweep can find the directory between mkdtemp and
+        // this lock. If it did, it holds the lock (EWOULDBLOCK) or has removed
+        // the directory already, so demand the lock and the same directory
+        // still at the name; otherwise leave that one to the sweep and make
+        // another. Any other flock failure is a filesystem without locks,
+        // where no sweep can take the lock either: carry on without it.
+        struct stat by_fd, by_name;
+        bool swept = flock(fd, LOCK_EX | LOCK_NB) != 0 && errno == EWOULDBLOCK;
+        if (!swept && fstat(fd, &by_fd) == 0 &&
+                stat(dir, &by_name) == 0 && by_fd.st_dev == by_name.st_dev &&
+                by_fd.st_ino == by_name.st_ino) {
+            // The descriptor stays open, unused, for the lock's sake.
+            memcpy(sock_host_dir, dir, sizeof(sock_host_dir));
+            sock_host_dir_pid = getpid();
+            return true;
+        }
+        close(fd);
+    }
+    sock_host_dir_errno = _EAGAIN;
+    return false;
+}
+
+static const char *sock_host_dir_get(void) {
+    if (sock_host_dir_made)
+        return sock_host_dir;
+    lock(&sock_host_dir_lock, 0);
+    if (!sock_host_dir_made) {
+        sock_host_dir_errno = _EACCES;
+        const char *tmpdir = getenv("TMPDIR");
+        if ((tmpdir != NULL && tmpdir[0] == '/' && sock_host_dir_make(tmpdir)) ||
+                sock_host_dir_make("/tmp")) {
+            sock_host_dir_made = true;
+            // For the exits that run atexit handlers. The CLI's usual exit is
+            // _exit from its halt hook, which calls sock_host_dir_cleanup
+            // itself (main.c).
+            atexit(sock_host_dir_cleanup);
+        }
+    }
+    unlock(&sock_host_dir_lock);
+    return sock_host_dir_made ? sock_host_dir : NULL;
+}
+
+void sock_host_dir_cleanup(void) {
+    // Lock-free on purpose: this runs on the way out of the process, from
+    // whatever thread is ending it, with guest locks still held.
+    if (!sock_host_dir_made || sock_host_dir_pid != getpid())
+        return;
+    sock_host_dir_remove(sock_host_dir);
+}
+
+// Where the guest socket `socket_id` is bound on the host.
+static int unix_host_sun_path(uint32_t socket_id, struct sockaddr_un *addr, size_t *len_out) {
+    int n;
+    if (sock_tmp_prefix != NULL) {
+        n = snprintf(addr->sun_path, sizeof(addr->sun_path), "%s.%u", sock_tmp_prefix, socket_id);
+    } else {
+        const char *dir = sock_host_dir_get();
+        if (dir == NULL)
+            return sock_host_dir_errno;
+        n = snprintf(addr->sun_path, sizeof(addr->sun_path), "%s/%u", dir, socket_id);
+    }
+    if (n < 0 || (size_t) n >= sizeof(addr->sun_path))
+        return _ENAMETOOLONG;
+    *len_out = (size_t) n;
+    return 0;
+}
+
+// A guest name that resolves to a socket, whose host path does not exist, has
+// nothing bound to it in this process: a socket file left by an earlier run,
+// say, or one made with mknod. Linux refuses such a connection (ECONNREFUSED,
+// which daemons take to mean "stale, safe to replace"); the host call says
+// ENOENT. It used to say ECONNREFUSED only by luck, when some other process's
+// /tmp/ishsock.<id> happened to sit at the same path.
+static int unix_host_missing_is_refused(struct fd *sock, int err) {
+    if (sock->socket.domain == AF_LOCAL_ && err == _ENOENT)
+        return _ECONNREFUSED;
+    return err;
+}
+
+// *peer_type, when asked for: the guest type of the AF_UNIX socket bound at
+// the address, or 0 (nothing bound there, or not AF_UNIX).
+static int sockaddr_read_bind_type(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len,
+                                   struct fd *bind_fd, int *peer_type) {
+    if (peer_type != NULL)
+        *peer_type = 0;
     // Make sure we can read things without overflowing buffers
     if (*sockaddr_len < 2)
         return _EINVAL;
@@ -4125,19 +6925,31 @@ static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t
 
             uint32_t socket_id;
             int err;
-            if (path_size == 0) {
+            if (path_size == 0)
                 return _ENOENT;
-            } else if (path[0] != '\0') {
+            // Before any name is taken, so a bind that can have no host path
+            // leaves no socket file or abstract name behind.
+            if (sock_tmp_prefix == NULL && sock_host_dir_get() == NULL)
+                return sock_host_dir_errno;
+            if (path[0] != '\0') {
                 STRACE(" unix socket %s", path);
-                err = unix_socket_get(path, bind_fd, &socket_id);
+                err = unix_socket_get(path, bind_fd, &socket_id, peer_type);
             } else {
                 STRACE(" unix abstract socket %s", path + 1);
-                err = unix_abstract_get(path + 1, bind_fd, &socket_id);
+                err = unix_abstract_get(path + 1, bind_fd, &socket_id, peer_type);
                 if (err == _ENOENT && bind_fd == NULL &&
                         unix_socket_should_fallback_x11_path(path + 1)) {
                     STRACE(" unix abstract fallback to path %s", path + 1);
-                    err = unix_socket_get(path + 1, bind_fd, &socket_id);
+                    err = unix_socket_get(path + 1, bind_fd, &socket_id, peer_type);
                 }
+                // An abstract name nobody holds is refused, never missing:
+                // unix_find_abstract() is ECONNREFUSED for connect, sendto and
+                // sendmsg alike. connect() already mapped it; the sends
+                // reported ENOENT, which only went unseen while every name
+                // that had ever been used was leaked (above) and so never
+                // looked unbound.
+                if (err == _ENOENT && bind_fd == NULL)
+                    err = _ECONNREFUSED;
             }
             if (err < 0)
                 return err;
@@ -4147,10 +6959,10 @@ static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t
             }
 
             struct sockaddr_un *real_addr_un = sockaddr;
-            size_t path_len = snprintf(real_addr_un->sun_path, sizeof(real_addr_un->sun_path), "%s.%u", sock_tmp_prefix, socket_id);
-            if (path_len >= sizeof(real_addr_un->sun_path)) {
-                return _ENAMETOOLONG;
-            }
+            size_t path_len = 0;
+            err = unix_host_sun_path(socket_id, real_addr_un, &path_len);
+            if (err < 0)
+                return err;
 #ifdef __APPLE__
             real_addr_un->sun_len = offsetof(struct sockaddr_un, sun_path) + path_len;
 #endif
@@ -4170,10 +6982,15 @@ static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t
     return 0;
 }
 
-static int sockaddr_read(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len) {
-    struct inode_data *inode = NULL;
-    int err = sockaddr_read_bind(sockaddr_addr, sockaddr, sockaddr_len, NULL);
-    inode_release_if_exist(inode);
+static int sockaddr_read_bind(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len,
+                              struct fd *bind_fd) {
+    return sockaddr_read_bind_type(sockaddr_addr, sockaddr, sockaddr_len, bind_fd, NULL);
+}
+
+// A destination address; *peer_type as for sockaddr_read_bind_type, or NULL.
+static int sockaddr_read_type(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len,
+                              int *peer_type) {
+    int err = sockaddr_read_bind_type(sockaddr_addr, sockaddr, sockaddr_len, NULL, peer_type);
     if (err < 0)
         return err;
     // As a *destination* (connect/sendto/sendmsg -- everything except bind,
@@ -4195,9 +7012,21 @@ static int sockaddr_read(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *soc
     return err;
 }
 
+static int sockaddr_read(guest_addr_t sockaddr_addr, void *sockaddr, uint_t *sockaddr_len) {
+    return sockaddr_read_type(sockaddr_addr, sockaddr, sockaddr_len, NULL);
+}
+
 static int ipv6_recverr_fd_get(struct fd *sock);
 
 static int sockaddr_write(guest_addr_t sockaddr_addr, void *sockaddr, uint_t buffer_len, uint_t *sockaddr_len) {
+    // The host returned no address at all: a recvmsg or recvfrom on an
+    // AF_UNIX stream socket, whose peer carries no name. Linux reports a
+    // length of 0 there too. The buffer still holds whatever was in it before
+    // the call, so its "family" is noise -- translating it was an EINVAL that
+    // broke every recvmsg given a name buffer, which Python always passes
+    // (3.14's multiprocessing forkserver died on it).
+    if (*sockaddr_len == 0)
+        return 0;
     struct sockaddr *real_addr = sockaddr;
     struct sockaddr_ *fake_addr = sockaddr;
     fake_addr->family = sock_family_from_real(real_addr->sa_family);
@@ -4436,16 +7265,78 @@ static void inet_nat_remove_owner(struct fd *fd) {
     unlock(&inet_nat_lock);
 }
 
+// A host-side service that guests reach at a loopback endpoint the host
+// cannot give it -- the app's DNS relay, at 127.0.0.53:53 like
+// systemd-resolved's stub, while it really listens on 127.0.0.1:<ephemeral>.
+// Registered as if a guest had bound it, with no guest socket as owner, so
+// the same edge rewriting applies: guest sends to the endpoint reach the
+// host port, and replies read as coming from the endpoint. Network byte
+// order throughout; `type` is the guest's SOCK_*_ value.
+int inet_nat_register_host(uint32_t guest_addr, uint16_t guest_port, uint16_t host_port, int type) {
+    struct inet_nat_entry *entry = malloc(sizeof(*entry));
+    if (entry == NULL)
+        return _ENOMEM;
+    entry->guest_addr = guest_addr;
+    entry->guest_port = guest_port;
+    entry->host_port = host_port;
+    entry->type = type;
+    entry->reuseport = false;
+    entry->owner = NULL;
+    lock(&inet_nat_lock, 0);
+    struct inet_nat_entry *other;
+    list_for_each_entry(&inet_nat_table, other, list) {
+        if (other->guest_port != guest_port || other->type != type)
+            continue;
+        if (other->guest_addr == guest_addr || other->guest_addr == htonl(INADDR_ANY)) {
+            unlock(&inet_nat_lock);
+            free(entry);
+            return _EADDRINUSE;
+        }
+    }
+    list_add_tail(&inet_nat_table, &entry->list);
+    unlock(&inet_nat_lock);
+    return 0;
+}
+
+void inet_nat_unregister_host(uint32_t guest_addr, uint16_t guest_port, int type) {
+    lock(&inet_nat_lock, 0);
+    struct inet_nat_entry *entry, *tmp;
+    list_for_each_entry_safe(&inet_nat_table, entry, tmp, list) {
+        if (entry->owner == NULL && entry->guest_addr == guest_addr &&
+                entry->guest_port == guest_port && entry->type == type) {
+            list_remove(&entry->list);
+            free(entry);
+        }
+    }
+    unlock(&inet_nat_lock);
+}
+
 // Releases whatever unix bind-name (inode-backed or abstract) `fd` currently
 // holds and clears both fields, so a later re-release (e.g. a failed rebind
 // followed by fd close) can't double-release the same name.
 static void release_unix_names(struct fd *fd) {
+    // The name no longer has this socket behind it, so it no longer has a
+    // type to refuse a connect for (unix_socket_get).
+    if (fd->socket.unix_name_inode != NULL) {
+        lock(&fd->socket.unix_name_inode->lock, 0);
+        fd->socket.unix_name_inode->socket_type = 0;
+        unlock(&fd->socket.unix_name_inode->lock);
+    }
     inode_release_if_exist(fd->socket.unix_name_inode);
     fd->socket.unix_name_inode = NULL;
     if (fd->socket.unix_name_abstract != NULL) {
         unix_abstract_release(fd->socket.unix_name_abstract);
         fd->socket.unix_name_abstract = NULL;
     }
+}
+
+// A failed bind leaves the socket unbound: the name it took is given back, and
+// it no longer reports -- to getsockname, or to a checkpoint -- a name it never
+// got. sys_bind_common refuses a second bind before calling this, so the name
+// dropped here is always the one this bind took.
+static void unix_bind_failed(struct fd *sock) {
+    release_unix_names(sock);
+    sock->socket.unix_name_len = 0;
 }
 
 // Linux refuses a connection to a socket that is bound but not yet listening:
@@ -4516,6 +7407,9 @@ static bool sock_bind_probe_ok(struct fd *sock, const void *addr, uint_t addr_le
 static int sock_bind_materialize(struct fd *sock) {
     if (!sock->socket.bind_deferred)
         return 0;
+    // Never, in a private network namespace: see sock_net_private_bind.
+    if (sock_net_private_inet(sock))
+        return 0;
     sock->socket.bind_deferred = false;
     if (bind(sock->real_fd, (struct sockaddr *) sock->socket.deferred_addr,
                 sock->socket.deferred_addr_len) < 0)
@@ -4531,11 +7425,24 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
     struct fd *sock = sock_getfd(sock_fd, &sock_err);
     if (sock == NULL)
         return sock_err;
+    // A unix socket gets one name for its life: Linux's unix_bind answers a
+    // second bind with EINVAL (u->addr is set), and an accepted socket shares
+    // its listener's address, so it counts as bound too. Asked before any name
+    // is taken, because taking one overwrites the reference that holds the
+    // first -- which then could never be released. (Linux resolves a new PATH
+    // first, so a path that exists or has no parent says EADDRINUSE or ENOENT
+    // there, measured on 6.12; only a program binding a bound socket can tell.)
+    if (sock->socket.domain == AF_LOCAL_ && sock->socket.unix_name_len != 0)
+        return _EINVAL;
     struct sockaddr_max_ sockaddr;
-    struct inode_data *inode = NULL;
+    // For AF_LOCAL this takes the name: the socket node's inode (held in
+    // socket.unix_name_inode) or the abstract entry, released when the socket
+    // closes (release_unix_names).
     int err = sockaddr_read_bind(sockaddr_addr, &sockaddr, &sockaddr_len, sock);
-    if (err < 0)
+    if (err < 0) {
+        unix_bind_failed(sock);
         return err;
+    }
 
     if (sock->socket.domain == AF_NETLINK_) {
         struct sockaddr_nl_ *addr = (struct sockaddr_nl_ *) &sockaddr;
@@ -4546,6 +7453,9 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
             sock->socket.netlink_port_id = addr->nl_pid;
         return 0;
     }
+
+    if (sock_net_private_inet(sock))
+        return sock_net_private_bind(sock, &sockaddr, sockaddr_len);
 
     // CAP_NET_BIND_SERVICE: ports below 1024 are privileged on Linux. We had no
     // check at all, so uid 1000 could bind 127.0.0.1:80 or :53 and serve
@@ -4581,7 +7491,6 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
                    ? sockaddr_len : sizeof(sock->socket.deferred_addr));
         sock->socket.deferred_addr_len = sockaddr_len;
         sock->socket.bind_deferred = true;
-        sock->socket.unix_name_inode = inode;
         return 0;
     }
 
@@ -4596,15 +7505,15 @@ static int_t sys_bind_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t so
             int nat_err = inet_nat_bind_fallback(sock,
                     (struct sockaddr_in *) &sockaddr, mapped_err);
             if (nat_err == 0) {
-                sock->socket.unix_name_inode = inode;
+                sockrestart_note_bound(sock);
                 return 0;
             }
             mapped_err = nat_err;
         }
-        release_unix_names(sock);
+        unix_bind_failed(sock);
         return mapped_err;
     }
-    sock->socket.unix_name_inode = inode;
+    sockrestart_note_bound(sock);
     return 0;
 }
 
@@ -4617,9 +7526,103 @@ int_t sys_bind_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockaddr_l
 }
 
 static void fill_cred(struct ucred_ *cred) {
-    cred->pid = current->pid;
+    // The process id, as Linux reports it, not the id of whichever thread is
+    // sending or connecting.
+    cred->pid = current->tgid;
     cred->uid = current->euid;
     cred->gid = current->egid;
+}
+
+// AF_UNIX stream/seqpacket listeners by host address, with the credentials of
+// the process that called listen(). On Linux a connecting client's
+// SO_PEERCRED is the LISTENER's credentials, recorded at listen() and
+// available the moment connect() returns. AOK only filled the client's peer
+// credentials when the server accept()ed and the cookie handshake linked the
+// two (unix_socket_finish_peer), so a client that asked straight after
+// connect() got pid 0, uid/gid -1. sd-bus asks exactly then and treats an
+// invalid pid as ENODATA: on an Arch guest `systemctl` failed with "Failed to
+// connect to system scope bus via local transport: No data available", and
+// journald could not identify its stdout clients.
+struct unix_listener_cred {
+    struct list link;
+    struct fd *sock;
+    char path[sizeof(((struct sockaddr_un *) 0)->sun_path)];
+    struct ucred_ cred;
+};
+static lock_t unix_listener_lock = LOCK_INITIALIZER;
+static struct list unix_listeners = LIST_INITIALIZER(unix_listeners);
+
+static void unix_listener_unregister(struct fd *sock) {
+    lock(&unix_listener_lock, 0);
+    struct unix_listener_cred *entry, *tmp;
+    list_for_each_entry_safe(&unix_listeners, entry, tmp, link) {
+        if (entry->sock == sock) {
+            list_remove(&entry->link);
+            free(entry);
+        }
+    }
+    unlock(&unix_listener_lock);
+}
+
+static void unix_listener_register(struct fd *sock) {
+    if (sock->socket.domain != AF_LOCAL_ || sock->socket.type == SOCK_DGRAM_)
+        return;
+    struct sockaddr_un addr = {};
+    socklen_t len = sizeof(addr);
+    if (getsockname(sock->real_fd, (struct sockaddr *) &addr, &len) < 0 ||
+            addr.sun_family != AF_UNIX || addr.sun_path[0] == '\0')
+        return;
+    unix_listener_unregister(sock); // a second listen() re-records the caller
+    struct unix_listener_cred *entry = calloc(1, sizeof(*entry));
+    if (entry == NULL)
+        return;
+    entry->sock = sock;
+    memcpy(entry->path, addr.sun_path, sizeof(entry->path) - 1);
+    fill_cred(&entry->cred);
+    lock(&unix_listener_lock, 0);
+    list_add(&unix_listeners, &entry->link);
+    unlock(&unix_listener_lock);
+}
+
+// The listener's credentials for a client that just connected to host path
+// `path`, if a guest listener is registered there.
+static bool unix_listener_cred_for(const char *path, struct ucred_ *cred) {
+    bool found = false;
+    lock(&unix_listener_lock, 0);
+    struct unix_listener_cred *entry;
+    list_for_each_entry(&unix_listeners, entry, link) {
+        if (strcmp(entry->path, path) == 0) {
+            *cred = entry->cred;
+            found = true;
+            break;
+        }
+    }
+    unlock(&unix_listener_lock);
+    return found;
+}
+
+// Whether the caller may send `cred` as SCM_CREDENTIALS: Linux's
+// scm_check_creds. The pid has to be the sender's process id, which any of its
+// threads may send, and the uid and gid its real, effective or saved ones.
+// CAP_SYS_ADMIN lifts the pid rule, CAP_SETUID and CAP_SETGID the others. An
+// id of -1 names nobody. GLib's D-Bus client sends getpid() from its worker
+// thread; comparing with that thread's own id refused every such connection
+// ("Error sending credentials" from waybar).
+static int scm_check_creds(const struct ucred_ *cred) {
+    // The ids are the sender's user namespace's (kernel/user_ns.h): one it
+    // does not map is no id at all.
+    uid_t_ uid = current_make_kuid(cred->uid), gid = current_make_kgid(cred->gid);
+    if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID)
+        return _EINVAL;
+    if (current_pid_global(cred->pid) != current->tgid && !current_capable(CAP_SYS_ADMIN_))
+        return _EPERM;
+    if (uid != current->uid && uid != current->euid && uid != current->suid &&
+            !ns_capable(current_user_ns(), CAP_SETUID_))
+        return _EPERM;
+    if (gid != current->gid && gid != current->egid && gid != current->sgid &&
+            !ns_capable(current_user_ns(), CAP_SETGID_))
+        return _EPERM;
+    return 0;
 }
 
 // Per-datagram sender credentials for AF_LOCAL SOCK_DGRAM sockets: every
@@ -4693,6 +7696,349 @@ static void unix_dgram_cred_hdr_fill(struct unix_dgram_cred_hdr *hdr) {
     hdr->scm_cookie = 0;
 }
 
+// AF_UNIX SOCK_SEQPACKET, which the host does not have: macOS answers
+// EPROTONOSUPPORT for it from socket() and socketpair() alike (measured), and
+// the iOS sandbox EPERM, so it rides on a host SOCK_STREAM
+// (unix_seqpacket_fallback_needed). A stream has no message boundaries, and
+// SEQPACKET is boundaries: one receive is one message, a short buffer
+// truncates it (MSG_TRUNC) and the rest of it is gone, and a send is all of a
+// message or none of it. Carried as bytes, three sends of 1, 2 and 4 bytes
+// came back as one 7-byte read, and a program then waiting for the second
+// message waited for ever.
+//
+// So every message travels as a frame: this header, then the payload. Both
+// ends are guest sockets in this emulator -- a host process cannot make one
+// to talk to -- so the wire format is ours, as it is for
+// unix_dgram_cred_hdr, whose credentials and in-band SCM_RIGHTS cookie this
+// carries the same way.
+struct unix_seqpacket_hdr {
+    uint32_t magic;
+    uint32_t len;           // payload bytes after the header
+    uint64_t scm_cookie;    // SCM_RIGHTS parcel (unix_dgram_scm registry), or 0
+    struct ucred_ cred;     // the sender's, for SO_PASSCRED
+    uint32_t pad;
+};
+#define UNIX_SEQPACKET_MAGIC 0x5E9AC4E7
+// Linux's net.core.wmem_default and rmem_default: what SO_SNDBUF and
+// SO_RCVBUF read on a new socket, and less 32 the largest message a send
+// takes (unix_dgram_sendmsg).
+#define UNIX_SEQPACKET_LINUX_BUF 212992
+// The host buffers under a framed socket. A frame goes out whole only while it
+// fits the host send buffer (the low-water mark that keeps it whole is clamped
+// to that, and a larger frame goes out in pieces -- measured), so they must
+// hold the largest frame a guest may send. Darwin's default for a unix stream
+// is 8192.
+#define UNIX_SEQPACKET_HOST_BUF 262144
+
+static bool sock_is_unix_seqpacket(struct fd *sock) {
+    return sock->socket.domain == AF_LOCAL_ && sock->socket.seqpacket_framed &&
+        sock->real_fd >= 0;
+}
+
+static void unix_seqpacket_host_buffers(struct fd *sock, int size) {
+    (void) setsockopt(sock->real_fd, SOL_SOCKET, SO_SNDBUF, &size, sizeof(size));
+    (void) setsockopt(sock->real_fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
+    int got = 0;
+    socklen_t len = sizeof(got);
+    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_SNDBUF, &got, &len) == 0)
+        sock->socket.seqpacket_host_buf = got;
+}
+
+// Every guest SEQPACKET socket whose host socket turned out to be a stream:
+// socket(), socketpair(), accept() and a checkpoint's rebuild all come
+// through sock_fd_adopt. A host that has SEQPACKET of its own keeps it.
+static void unix_seqpacket_host_init(struct fd *sock) {
+    if (sock->socket.domain != AF_LOCAL_ || sock->socket.type != SOCK_SEQPACKET_ ||
+            sock->real_fd < 0)
+        return;
+    int host_type = 0;
+    socklen_t len = sizeof(host_type);
+    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_TYPE, &host_type, &len) < 0 ||
+            host_type != SOCK_STREAM)
+        return;
+    sock->socket.seqpacket_framed = true;
+    lock_init(&sock->socket.seqpacket_send_lock, "seqpacket_send\0");
+    lock_init(&sock->socket.seqpacket_recv_lock, "seqpacket_recv\0");
+    sock->socket.seqpacket_lowat = 0;
+    unix_seqpacket_host_buffers(sock, UNIX_SEQPACKET_HOST_BUF);
+    // Linux's numbers, not the host's, as a Linux socket reports them.
+    sock->socket.so_sndbuf = UNIX_SEQPACKET_LINUX_BUF;
+    sock->socket.so_rcvbuf = UNIX_SEQPACKET_LINUX_BUF;
+    sock->socket.so_sndbuf_set = true;
+    sock->socket.so_rcvbuf_set = true;
+}
+
+// The largest message a send takes whole: Linux's limit, and the host's.
+static size_t unix_seqpacket_max_msg(struct fd *sock) {
+    size_t linux_max = sock->socket.so_sndbuf > 32 ? sock->socket.so_sndbuf - 32 : 0;
+    size_t host_buf = sock->socket.seqpacket_host_buf > 0 ?
+        (size_t) sock->socket.seqpacket_host_buf : 0;
+    size_t host_max = host_buf > sizeof(struct unix_seqpacket_hdr) ?
+        host_buf - sizeof(struct unix_seqpacket_hdr) : 0;
+    return linux_max < host_max ? linux_max : host_max;
+}
+
+// Send one message as one frame: all of it or nothing, as a host sendmsg on a
+// datagram socket would. What keeps the host stream's write whole is
+// SO_SNDLOWAT at the frame's size: Darwin's sosend neither writes nor waits
+// while the free space is below the low-water mark, so with the mark at the
+// frame size nothing goes until all of it fits (measured: never a partial
+// write, and a reader never sees part of a frame). The host descriptor is
+// nonblocking, so "until it fits" is EAGAIN, which the callers wait out as
+// for any other send. `scm_cookie` rides in the header. Returns the payload
+// length, or -1 with errno set.
+static ssize_t unix_seqpacket_sendmsg(struct fd *sock, const struct msghdr *msg, int flags,
+                                      uint64_t scm_cookie) {
+    size_t len = sock_iov_requested(msg->msg_iov, msg->msg_iovlen);
+    if (len > unix_seqpacket_max_msg(sock)) {
+        errno = EMSGSIZE;
+        return -1;
+    }
+    struct unix_seqpacket_hdr hdr = {
+        .magic = UNIX_SEQPACKET_MAGIC,
+        .len = (uint32_t) len,
+        .scm_cookie = scm_cookie,
+    };
+    fill_cred(&hdr.cred);
+    struct iovec stack_iov[9];
+    struct iovec *iov = stack_iov;
+    size_t iovlen = (size_t) msg->msg_iovlen + 1;
+    if (iovlen > sizeof(stack_iov) / sizeof(stack_iov[0])) {
+        iov = malloc(iovlen * sizeof(*iov));
+        if (iov == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    iov[0] = (struct iovec) {.iov_base = &hdr, .iov_len = sizeof(hdr)};
+    if (msg->msg_iovlen > 0)
+        memcpy(&iov[1], msg->msg_iov, (size_t) msg->msg_iovlen * sizeof(*iov));
+    struct msghdr host = {.msg_iov = iov, .msg_iovlen = (int) iovlen};
+    int frame = (int) (sizeof(hdr) + len);
+
+    // The lock keeps the mark and the write together: another sender's
+    // frame size set in between could let this one go out in pieces. It is
+    // never held across a wait -- the write below cannot block.
+    lock(&sock->socket.seqpacket_send_lock, 0);
+    if (sock->socket.seqpacket_lowat != frame &&
+            setsockopt(sock->real_fd, SOL_SOCKET, SO_SNDLOWAT, &frame, sizeof(frame)) == 0)
+        sock->socket.seqpacket_lowat = frame;
+    ssize_t sent = sendmsg(sock->real_fd, &host, flags | MSG_DONTWAIT);
+    int saved = errno;
+    // Part of a frame would derail every message after it, so it has to be
+    // finished, whatever that costs this one caller. The mark makes it
+    // unreachable; this is the belt to that brace.
+    while (sent > 0 && sent < frame) {
+        static _Atomic bool warned;
+        if (!atomic_exchange(&warned, true))
+            printk("WARNING: a SEQPACKET frame went out in pieces (%zd of %d); finishing it\n",
+                   sent, frame);
+        size_t done = (size_t) sent;
+        struct iovec rest[sizeof(stack_iov) / sizeof(stack_iov[0])];
+        struct iovec *rest_iov = iovlen <= sizeof(rest) / sizeof(rest[0]) ? rest :
+            malloc(iovlen * sizeof(*rest_iov));
+        if (rest_iov == NULL)
+            break;
+        memcpy(rest_iov, iov, iovlen * sizeof(*rest_iov));
+        int rest_len = (int) iovlen;
+        socket_iov_advance(rest_iov, &rest_len, done);
+        struct msghdr more = {.msg_iov = rest_iov, .msg_iovlen = rest_len};
+        struct pollfd out = {.fd = sock->real_fd, .events = POLLOUT};
+        poll(&out, 1, 100);
+        ssize_t n = sendmsg(sock->real_fd, &more, flags | MSG_DONTWAIT);
+        if (rest_iov != rest)
+            free(rest_iov);
+        if (n < 0 && errno != EAGAIN && errno != EINTR)
+            break;
+        if (n > 0)
+            sent += n;
+    }
+    unlock(&sock->socket.seqpacket_send_lock);
+    if (iov != stack_iov)
+        free(iov);
+    if (sent < 0) {
+        errno = saved;
+        return -1;
+    }
+    return (ssize_t) len;
+}
+
+// A whole frame waiting? Frames are written whole, so a header with part of
+// its frame behind it is one a checkpoint's requeue is still writing, and the
+// rest is a moment away.
+static bool unix_seqpacket_frame_ready(struct fd *sock, const struct unix_seqpacket_hdr *hdr) {
+    int avail = 0;
+    if (ioctl(sock->real_fd, FIONREAD, &avail) < 0)
+        return true; // let the read below find out
+    return avail >= 0 && (size_t) avail >= sizeof(*hdr) + hdr->len;
+}
+
+// Take one message off the host stream, as a host recvmsg takes one datagram:
+// the payload lands in msg's iovs, as much as they hold, and the rest of the
+// message is discarded with it -- MSG_TRUNC in msg_flags says so -- unless
+// the read is a MSG_PEEK, which takes nothing. *hdr gets the frame's header:
+// the payload's full length, the sender's credentials and its SCM parcel's
+// cookie. Returns the bytes delivered, 0 at end of file, or -1 with errno --
+// EAGAIN while no whole message is waiting (the host descriptor is always
+// nonblocking; the callers wait for POLLIN).
+static ssize_t unix_seqpacket_recvmsg_locked(struct fd *sock, struct msghdr *msg, int flags,
+                                             struct unix_seqpacket_hdr *hdr) {
+    memset(hdr, 0, sizeof(*hdr));
+    msg->msg_flags = 0;
+    msg->msg_controllen = 0;
+    msg->msg_namelen = 0;
+    ssize_t n = recv(sock->real_fd, hdr, sizeof(*hdr), MSG_PEEK | MSG_DONTWAIT);
+    if (n <= 0)
+        return n;
+    if (hdr->magic != UNIX_SEQPACKET_MAGIC) {
+        // Bytes that are not a frame. Nothing in the emulator writes those
+        // to a framed socket, so this is a bug somewhere -- but a reader
+        // wedged behind it for good would be worse than the bytes as they
+        // are, which is what it gets.
+        static _Atomic bool warned;
+        if (!atomic_exchange(&warned, true))
+            printk("WARNING: a SEQPACKET socket received bytes that are not a frame "
+                   "(first word %#x); delivering them unframed\n", hdr->magic);
+        memset(hdr, 0, sizeof(*hdr));
+        return recvmsg(sock->real_fd, msg, (flags & MSG_PEEK) | MSG_DONTWAIT);
+    }
+    if ((size_t) n < sizeof(*hdr) || !unix_seqpacket_frame_ready(sock, hdr)) {
+        errno = EINPROGRESS; // unix_seqpacket_recvmsg: not yet, but soon
+        return -1;
+    }
+
+    size_t cap = sock_iov_requested(msg->msg_iov, msg->msg_iovlen);
+    size_t take = hdr->len < cap ? hdr->len : cap;
+    // The header into scratch, then the caller's iovs cut down to `take`.
+    struct unix_seqpacket_hdr scratch;
+    struct iovec stack_iov[9];
+    struct iovec *iov = stack_iov;
+    size_t iovlen = (size_t) msg->msg_iovlen + 1;
+    if (iovlen > sizeof(stack_iov) / sizeof(stack_iov[0])) {
+        iov = malloc(iovlen * sizeof(*iov));
+        if (iov == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+    }
+    iov[0] = (struct iovec) {.iov_base = &scratch, .iov_len = sizeof(scratch)};
+    size_t used = 1, left = take;
+    for (size_t i = 0; i < (size_t) msg->msg_iovlen && left > 0; i++) {
+        size_t chunk = msg->msg_iov[i].iov_len < left ? msg->msg_iov[i].iov_len : left;
+        iov[used++] = (struct iovec) {.iov_base = msg->msg_iov[i].iov_base, .iov_len = chunk};
+        left -= chunk;
+    }
+    struct msghdr host = {.msg_iov = iov, .msg_iovlen = (int) used};
+    n = recvmsg(sock->real_fd, &host, (flags & MSG_PEEK) | MSG_DONTWAIT);
+    int saved = errno;
+    if (iov != stack_iov)
+        free(iov);
+    if (n < 0) {
+        errno = saved;
+        return -1;
+    }
+    size_t got = (size_t) n > sizeof(scratch) ? (size_t) n - sizeof(scratch) : 0;
+    if (!(flags & MSG_PEEK)) {
+        // What did not fit goes with the message. It is all there already
+        // (unix_seqpacket_frame_ready), so this never waits.
+        size_t discard = hdr->len - take;
+        char sink[4096];
+        while (discard > 0) {
+            ssize_t d = recv(sock->real_fd, sink, discard < sizeof(sink) ? discard : sizeof(sink),
+                             MSG_DONTWAIT);
+            if (d < 0 && errno == EINTR)
+                continue;
+            if (d <= 0)
+                break;
+            discard -= (size_t) d;
+        }
+    }
+    if (hdr->len > take)
+        msg->msg_flags |= MSG_TRUNC;
+    return (ssize_t) (got < take ? got : take);
+}
+
+// The lock makes the look at the header and the read of its frame one step:
+// two readers of one socket otherwise saw the same header, and the second read
+// the NEXT frame's bytes by the first one's length, and every message after
+// that was garbage. Nothing under it waits; a frame still arriving is waited
+// for outside it.
+static ssize_t unix_seqpacket_recvmsg(struct fd *sock, struct msghdr *msg, int flags,
+                                      struct unix_seqpacket_hdr *hdr) {
+    lock(&sock->socket.seqpacket_recv_lock, 0);
+    ssize_t n = unix_seqpacket_recvmsg_locked(sock, msg, flags, hdr);
+    int saved = errno;
+    unlock(&sock->socket.seqpacket_recv_lock);
+    if (n < 0 && saved == EINPROGRESS) {
+        usleep(1000);
+        saved = EAGAIN;
+    }
+    errno = saved;
+    return n;
+}
+
+// SIOCINQ for SEQPACKET: Linux counts the payload of every queued message
+// (unix_inq_len); the host counts frame headers too.
+static int unix_seqpacket_queued_bytes(struct fd *sock) {
+    // Under the receive lock, so the queue starts at a frame, not in the
+    // middle of one a reader is taking.
+    lock(&sock->socket.seqpacket_recv_lock, 0);
+    int avail = 0;
+    if (ioctl(sock->real_fd, FIONREAD, &avail) < 0) {
+        unlock(&sock->socket.seqpacket_recv_lock);
+        return -1;
+    }
+    if (avail <= 0) {
+        unlock(&sock->socket.seqpacket_recv_lock);
+        return 0;
+    }
+    char *buf = malloc((size_t) avail);
+    if (buf == NULL) {
+        unlock(&sock->socket.seqpacket_recv_lock);
+        errno = ENOMEM;
+        return -1;
+    }
+    ssize_t n = recv(sock->real_fd, buf, (size_t) avail, MSG_PEEK | MSG_DONTWAIT);
+    unlock(&sock->socket.seqpacket_recv_lock);
+    int total = 0;
+    size_t off = 0;
+    while (n > 0 && off + sizeof(struct unix_seqpacket_hdr) <= (size_t) n) {
+        struct unix_seqpacket_hdr hdr;
+        memcpy(&hdr, buf + off, sizeof(hdr));
+        if (hdr.magic != UNIX_SEQPACKET_MAGIC)
+            break;
+        total += (int) hdr.len;
+        off += sizeof(hdr) + hdr.len;
+    }
+    free(buf);
+    return total;
+}
+
+// A socket closing with messages still queued: whatever descriptors rode in
+// with them are released, as Linux releases them with the queue. Their
+// parcels wait in the registry for the reader, with no expiry (see
+// unix_dgram_scm_register), so nothing else would.
+static void unix_seqpacket_discard_queue(struct fd *sock) {
+    // What is queued now, and no more: a peer still sending must not keep
+    // the close going.
+    int budget = 0;
+    if (ioctl(sock->real_fd, FIONREAD, &budget) < 0)
+        return;
+    while (budget > 0) {
+        struct unix_seqpacket_hdr hdr;
+        struct msghdr none = {0};
+        ssize_t n = unix_seqpacket_recvmsg(sock, &none, 0, &hdr);
+        if (n < 0 || hdr.magic != UNIX_SEQPACKET_MAGIC)
+            break;
+        budget -= (int) (sizeof(hdr) + hdr.len);
+        if (hdr.scm_cookie != 0) {
+            struct scm *dropped = unix_dgram_scm_take(hdr.scm_cookie);
+            if (dropped != NULL)
+                scm_free(dropped);
+        }
+    }
+}
+
 // /dev/log and /run|/dev/initctl have a built-in fallback sink so guests can
 // log (or send initctl messages) even when no daemon is running. But if a real
 // daemon (e.g. syslog-ng) has bound the socket, we must connect to it for real
@@ -4740,7 +8086,8 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
         return deferred_err;
 
     struct sockaddr_max_ sockaddr;
-    int err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
+    int peer_type = 0;
+    int err = sockaddr_read_type(sockaddr_addr, &sockaddr, &sockaddr_len, &peer_type);
     if (err < 0) {
         // No real socket is bound at /dev/log or initctl: fall back to the
         // built-in sink so logging/initctl still succeed without a daemon.
@@ -4766,7 +8113,61 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
         return 0;
     }
 
-    if (sock->socket.domain == AF_INET_) {
+    // A unix connection joins two sockets of one type; anything else is
+    // EPROTOTYPE (Linux's unix_find_other). The host told stream from datagram
+    // itself, but a SEQPACKET socket here IS a host stream (see
+    // unix_seqpacket_hdr), so a SEQPACKET client reached a STREAM listener,
+    // and the other way round, and each side then misread the other's bytes.
+    if (sock->socket.domain == AF_LOCAL_ && peer_type != 0 && peer_type != sock->socket.type)
+        return _EPROTOTYPE;
+
+    // A private network namespace: before anything can turn the address into
+    // one on the host (the loopback NAT below would).
+    int net_gate = sock_net_dest_gate(sock, &sockaddr);
+    if (net_gate < 0)
+        return net_gate;
+    uint16_t net_emul_stream_port = 0;
+    if (sock->socket.net_emul) {
+        const struct sockaddr *dest = (const struct sockaddr *) &sockaddr;
+        if (sock_net_emul_dgram(sock)) {
+            // A datagram socket's connect is a note of where to send: no
+            // receiver need exist yet, so there is nothing to ask the host.
+            if (dest->sa_family == AF_UNSPEC) {
+                sock->socket.net_emul_dest_port = 0;
+                return 0;
+            }
+            // Somewhere it can go: its loopback, or across a veth.
+            struct net_namespace *to;
+            bool dest_v6;
+            uint8_t src[16], dst[16];
+            int route_err = net_emul_route(sock, dest, &to, &dest_v6, src, dst);
+            if (route_err == _ENETUNREACH)
+                return route_err;
+            if (sock->socket.net_emul_icmp) {
+                // (No port to remember: only that there is a destination.)
+                sock->socket.net_emul_dest_port = 1;
+                net_emul_connected(sock, dest_v6, src, dst);
+                return 0;
+            }
+            if (!sock->socket.net_emul_bound) {
+                int bind_err = net_emul_bind_port(sock, 0, true);
+                if (bind_err < 0)
+                    return bind_err;
+            }
+            sock->socket.net_emul_dest_port = ((const struct sockaddr_in *) dest)->sin_port;
+            // (On a link, to an address nobody there has, too: a destination
+            // all the same, as Linux's UDP connect leaves it.)
+            net_emul_connected(sock, dest_v6, src, dst);
+            return 0;
+        }
+        // A stream: to the listener's binding, from a port of its own.
+        net_emul_stream_port = ((const struct sockaddr_in *) dest)->sin_port;
+        int emul_err = net_emul_dest(sock, &sockaddr, &sockaddr_len, true);
+        if (emul_err < 0)
+            return emul_err;
+    }
+
+    if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul) {
         struct sockaddr_in guest_dest = *(struct sockaddr_in *) &sockaddr;
         if (inet_nat_rewrite_dest(sock, &sockaddr)) {
             // Remember the endpoint the guest THINKS it connected to, so
@@ -4810,7 +8211,32 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
         sock->socket.host_nonblock = false;
     }
     if (err < 0) {
-        int mapped_err = errno_map();
+        int host_errno = errno;
+        int mapped_err = unix_host_missing_is_refused(sock, errno_map());
+#if defined(__APPLE__)
+        // Darwin's connect() says EINVAL for a TCP connection that was
+        // refused before the call got as far as waiting -- on loopback the
+        // reset can come back that fast, and it then finds the socket already
+        // disconnected. Measured on macOS itself: a blocking connect to a
+        // closed port beside one just bound returns EINVAL the first time and
+        // ECONNREFUSED after, while SO_ERROR says ECONNREFUSED every time.
+        // The address was checked before the host was asked, so this EINVAL
+        // is not about an argument: it is the refusal, and Linux says so.
+        if (host_errno == EINVAL && sock->socket.type == SOCK_STREAM_ && !sock->socket.net_emul &&
+                (sock->socket.domain == AF_INET_ || sock->socket.domain == AF_INET6_)) {
+            int so_error = 0;
+            socklen_t so_error_len = sizeof(so_error);
+            if (sock_host_so_error(sock->real_fd, &so_error, &so_error_len) == 0 && so_error != 0)
+                mapped_err = err_map(so_error);
+            else
+                mapped_err = _ECONNREFUSED;
+        }
+#else
+        (void) host_errno;
+#endif
+        // (A listener that closed between the lookup and the call.)
+        if (sock->socket.net_emul && mapped_err == _ENOENT)
+            mapped_err = _ECONNREFUSED;
         if ((mapped_err == _EINPROGRESS || mapped_err == _EALREADY) &&
                 !(fd_getflags(sock) & O_NONBLOCK_)) {
             if (sock_trace_enabled()) {
@@ -4840,7 +8266,7 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
             !socket_tcp_connect_established(sock)) {
         int real_error = 0;
         socklen_t real_error_len = sizeof(real_error);
-        if (getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len) == 0) {
+        if (sock_host_so_error(sock->real_fd, &real_error, &real_error_len) == 0) {
             // A concurrent poll/epoll scan on another thread may have already
             // read-and-cleared SO_ERROR; fall back to what it cached.
             if (real_error == 0 && sock->socket.host_connect_error != 0)
@@ -4859,8 +8285,30 @@ static int_t sys_connect_common(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t
     }
 #endif
 
+    // Connected (or, nonblocking, as good as): who to, for getpeername.
+    if (net_emul_stream_port != 0)
+        sock->socket.net_emul_dest_port = net_emul_stream_port;
     if (sock->socket.domain == AF_LOCAL_) {
         fill_cred(&sock->socket.unix_cred);
+        // The listener's credentials are the client's SO_PEERCRED from now
+        // on, accepted or not (see unix_listener_register).
+        // `sockaddr` is the HOST address here (Darwin's starts with sun_len).
+        if (sock->socket.type != SOCK_DGRAM_ &&
+                ((struct sockaddr *) &sockaddr)->sa_family == AF_UNIX) {
+            struct ucred_ listener_cred;
+            if (unix_listener_cred_for(((struct sockaddr_un *) &sockaddr)->sun_path, &listener_cred)) {
+                lock(&peer_lock, 0);
+                if (!sock->socket.unix_peer_cred_valid) {
+                    sock->socket.unix_peer_cred = listener_cred;
+                    sock->socket.unix_peer_cred_valid = true;
+                }
+                unlock(&peer_lock);
+            }
+        }
+        // Connected to a peer, or dissolved by AF_UNSPEC; see fs/fd.h.
+        if (sock->socket.type == SOCK_DGRAM_)
+            sock->socket.dgram_peer_set =
+                ((struct sockaddr_ *) &sockaddr)->family != AF_UNSPEC;
         // A real connect(2) succeeds again on an AF_UNIX SOCK_DGRAM socket
         // (reconnecting to a new peer, or dissolving the association) --
         // unlike SOCK_STREAM, where a second connect on an already-connected
@@ -4911,23 +8359,62 @@ int_t sys_connect_guest(fd_t sock_fd, guest_addr_t sockaddr_addr, uint_t sockadd
     return sys_connect_common(sock_fd, sockaddr_addr, sockaddr_len);
 }
 
+// The host backlog for a guest listen(). An AF_UNIX listener on Linux queues
+// backlog + 1 connections, and a blocking connect() beyond that waits for room.
+// Darwin queues fewer and refuses the rest at once with ECONNREFUSED, which
+// Linux never says to a listener that exists: wlroots listens on the X display
+// with a backlog of 1, so with one X client queued the compositor's own
+// connect was refused and labwc and Xwayland ended up waiting on each other
+// (the desktop froze when Extreme Tux Racer started). Give AF_UNIX the most
+// Darwin allows; a connect Linux would have made wait just succeeds. TCP keeps
+// the guest's number: both kernels drop a SYN to a full queue and the client
+// retries.
+static int sock_host_backlog(int domain, int backlog) {
+    if (domain == AF_LOCAL_)
+        return SOMAXCONN;
+    return backlog;
+}
+
 int_t sys_listen(fd_t sock_fd, int_t backlog) {
     STRACE("listen(%d, %d)", sock_fd, backlog);
     int_t sock_err;
     struct fd *sock = sock_getfd(sock_fd, &sock_err);
     if (sock == NULL)
         return sock_err;
+    // A private network namespace carries nothing between its sockets yet
+    // (kernel/net_ns.h), and a listener nobody could ever reach is refused
+    // here rather than left waiting -- which is also what makes ECONNREFUSED
+    // the truth for a loopback connect there.
+    if (sock_net_private_inet(sock) && !sock->socket.net_emul)
+        return _EOPNOTSUPP;
+    if (sock->socket.net_emul) {
+        // A TCP socket there listens on its binding, which is nothing of the
+        // host's to rebuild after a suspension. One that never bound is
+        // given a port, as Linux gives it.
+        if (sock_net_emul_dgram(sock))
+            return _EOPNOTSUPP;
+        if (!sock->socket.net_emul_bound) {
+            int emul_err = net_emul_bind_port(sock, 0, true);
+            if (emul_err < 0)
+                return emul_err;
+        }
+        if (listen(sock->real_fd, backlog > 0 ? backlog : 1) < 0)
+            return errno_map();
+        sock->socket.listening = true;
+        return 0;
+    }
     // The bind was deferred so the port would not sit on the host in a state
     // where Darwin swallows connections; this is the moment it must be real.
     int bind_err = sock_bind_materialize(sock);
     if (bind_err < 0)
         return bind_err;
-    int err = listen(sock->real_fd, backlog);
+    int err = listen(sock->real_fd, sock_host_backlog(sock->socket.domain, backlog));
     if (err < 0)
         return errno_map();
     sock->socket.listening = true;
     sock->sockrestart.backlog = backlog;
     sockrestart_begin_listen(sock);
+    unix_listener_register(sock);
     return err;
 }
 
@@ -4949,6 +8436,11 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
     struct fd *sock = sock_getfd(sock_fd, &sock_err);
     if (sock == NULL)
         return sock_err;
+    // The descriptor first, as Linux reserves it: at RLIMIT_NOFILE this is
+    // EMFILE straight away, and a pending connection stays queued rather than
+    // being taken and then closed for want of a slot (f_has_room).
+    if (!f_has_room())
+        return _EMFILE;
     dword_t sockaddr_len = 0;
     if (sockaddr_addr != 0) {
         if (user_get(sockaddr_len_addr, sockaddr_len))
@@ -5068,6 +8560,22 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
                         break; // timeout expired: EAGAIN, matching Linux
                     poll_timeout = remaining_ms > INT_MAX ? INT_MAX : (int) remaining_ms;
                 }
+                // Bounded, like every other host wait in the tree now is -- see
+                // the cap in fs/poll.c for what an unbounded one costs when the
+                // wake poke is lost. Free here: the loop already treats every
+                // return from this poll as "go round and try the accept
+                // again", so an expiry needs no handling of its own, and the
+                // deadline check above still ends the call on time.
+                //
+                // A supplied SO_RCVTIMEO is capped as well as a missing one,
+                // as socket_wait_ready's is. Only the missing one was, so an
+                // accept with a timeout held a checkpoint for whatever was left
+                // of it whenever the freezer's wake was lost -- measured with a
+                // 4s SO_RCVTIMEO, every freeze lasted until it expired, on
+                // arm64 and amd64 alike, and a long one refuses the save.
+                int cap_ms = (int) (POLL_WAKE_RECHECK_NS / 1000000L);
+                if (poll_timeout < 0 || poll_timeout > cap_ms)
+                    poll_timeout = cap_ms;
                 if (notify_pipe[0] < 0 && pipe(notify_pipe) == 0) {
                     fcntl(notify_pipe[0], F_SETFL, O_NONBLOCK);
                     fcntl(notify_pipe[1], F_SETFL, O_NONBLOCK);
@@ -5163,8 +8671,9 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
         // SA_RESTART: accept() is restartable, but not with SO_RCVTIMEO armed
         // (signal(7)) -- restarting would silently extend the guest's timeout.
         int mapped = errno_map();
-        if (mapped == _EINTR && !has_deadline)
-            mapped = signal_restart_or_eintr(mapped);
+        if (mapped == _EINTR)
+            mapped = has_deadline ? signal_eintr_no_restart(mapped)
+                                  : signal_restart_or_eintr(mapped);
         return mapped;
     }
 
@@ -5176,21 +8685,79 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
     if (client_fl >= 0 && (client_fl & O_NONBLOCK))
         (void) fcntl(client, F_SETFL, client_fl & ~O_NONBLOCK);
 
+    // In a private network namespace the peer is a binding (see "Loopback in
+    // a private network namespace"), which the host names by a path longer
+    // than the guest's sockaddr_in: asked for here, in full, and read back
+    // as the loopback address it is. Kept for getpeername too, since the
+    // host forgets a peer that has closed.
+    char emul_peer[128];
+    uint_t emul_peer_len = 0;
+    uint16_t emul_peer_port = 0;
+    // ...and what it connected to, which is this end's own address.
+    bool emul_local_known = false, emul_local_v6 = false, emul_peer_v6 = false;
+    uint8_t emul_local[16], emul_peer_bytes[16];
+    if (sock->socket.net_emul) {
+        socklen_t host_len = sizeof(emul_peer);
+        memset(emul_peer, 0, sizeof(emul_peer));
+        if (getpeername(client, (struct sockaddr *) emul_peer, &host_len) == 0)
+            emul_peer_len = host_len;
+        emul_local_known = net_emul_peer_dst(emul_peer, emul_peer_len, &emul_local_v6, emul_local);
+        net_emul_from_host(sock, emul_peer, &emul_peer_len);
+        emul_peer_port = ((struct sockaddr_in *) emul_peer)->sin_port;
+        emul_peer_v6 = net_emul_addr_bytes(emul_peer, emul_peer_bytes);
+    }
     if (sockaddr_addr != 0) {
-        int err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
+        int err;
+        if (sock->socket.net_emul) {
+            err = sockaddr_write(sockaddr_addr, emul_peer, sizeof(sockaddr), &emul_peer_len);
+            sockaddr_len = emul_peer_len;
+        } else {
+            err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
+        }
         if (err < 0)
             return client;
         if (user_put(sockaddr_len_addr, sockaddr_len))
             return _EFAULT;
     }
 
-    fd_t client_f = sock_fd_create(client,
+    // The new socket is set up completely BEFORE it is installed, and never
+    // looked up by number afterwards. This installed it, then went back to the
+    // table with f_get(client_f) for the AF_LOCAL setup: NULL when the install
+    // had failed (the negative errno is no descriptor), and in a threaded
+    // process another thread could close or reuse that number in between. The
+    // write through the NULL aborted the whole app, three times on bip
+    // (2026-10-02) as Wayfire accepted a client -- with ~300 descriptors open,
+    // well under its limit, so the window, not EMFILE, is the likelier cause.
+    struct fd *client_fd = sock_fd_adopt(client,
             sock->socket.domain, sock->socket.type | flags, sock->socket.protocol);
-    if (client_f < 0)
+    // An accepted socket is in its listener's network namespace, whoever
+    // called accept.
+    if (client_fd != NULL && client_fd->socket.net_ns != sock->socket.net_ns) {
+        net_ns_release(client_fd->socket.net_ns);
+        client_fd->socket.net_ns = net_ns_retain(sock->socket.net_ns);
+    }
+    // ...and, there, has its listener's address: the binding stays the
+    // listener's, and this one only reports it.
+    if (client_fd != NULL && sock->socket.net_emul) {
+        client_fd->socket.net_emul = true;
+        memcpy(client_fd->socket.deferred_addr, sock->socket.deferred_addr, sizeof(sock->socket.deferred_addr));
+        client_fd->socket.deferred_addr_len = sock->socket.deferred_addr_len;
+        client_fd->socket.bind_deferred = sock->socket.bind_deferred;
+        client_fd->socket.net_emul_dest_port = emul_peer_port;
+        // A listener on the wildcard: this connection's own address is the
+        // one the client connected to.
+        if (emul_local_known)
+            net_emul_connected(client_fd, emul_local_v6, emul_local, emul_peer_bytes);
+        client_fd->socket.net_emul_peer_set = true;
+        client_fd->socket.net_emul_peer_v6 = emul_peer_v6;
+        memcpy(client_fd->socket.net_emul_peer_addr, emul_peer_bytes, 16);
+    }
+    if (client_fd == NULL) {
         close(client);
+        return _ENOMEM;
+    }
 
     if (sock->socket.domain == AF_LOCAL_) {
-        struct fd *client_fd = f_get(client_f);
         fill_cred(&client_fd->socket.unix_cred);
         client_fd->socket.unix_name_len = sock->socket.unix_name_len;
         memcpy(client_fd->socket.unix_name, sock->socket.unix_name, sock->socket.unix_name_len);
@@ -5201,7 +8768,8 @@ static int_t sys_accept4_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_
             STRACE("accept4(%d) deferred unix peer link err=%d", sock_fd, peer_err);
     }
 
-    return client_f;
+    // On failure f_install closes the descriptor, and with it the host socket.
+    return f_install(client_fd, (sock->socket.type | flags) & ~SOCKET_TYPE_MASK);
 }
 
 int_t sys_accept4(fd_t sock_fd, addr_t sockaddr_addr, addr_t sockaddr_len_addr, int_t flags) {
@@ -5239,6 +8807,18 @@ static int copy_unix_peer_name(char *sockaddr, dword_t *sockaddr_len, struct fd 
     return peer == NULL ? _ENOTCONN : 0;
 }
 
+// The length getsockname reports for a socket with no address. These are
+// Linux's sockaddr sizes, which are ABI constants and identical on every
+// architecture AOK emulates -- 16 for sockaddr_in, 28 for sockaddr_in6, and
+// for an unnamed unix socket just the two-byte family.
+static dword_t sock_ckpt_hungup_addr_len(int domain) {
+    switch (domain) {
+        case AF_INET_: return 16;
+        case AF_INET6_: return 28;
+    }
+    return 2;
+}
+
 static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, guest_addr_t sockaddr_len_addr) {
     STRACE("getsockname(%d, 0x%llx, 0x%llx)", sock_fd,
             (unsigned long long) sockaddr_addr,
@@ -5269,6 +8849,46 @@ static int_t sys_getsockname_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
     // where Linux has a two-byte family. Writing those bytes back unconverted
     // handed the guest a mangled address -- python's http.server read the
     // host part of getsockname() as an int and died in socket.getfqdn().
+    // Rebuilt by a checkpoint restore with no address of its own. The host
+    // descriptor underneath is an anonymous socketpair end, so asking the host
+    // would tell the guest that its AF_INET socket is an unnamed AF_UNIX one.
+    // Answer with the family the guest knows it by and a zero address -- the
+    // state an unbound socket of that family is genuinely in.
+    if (sock->socket.ckpt_hungup) {
+        dword_t real_len = sock_ckpt_hungup_addr_len(sock->socket.domain);
+        memset(sockaddr, 0, sizeof(sockaddr));
+        // Guest layout, written directly: the family is the first two bytes of
+        // every Linux sockaddr and the rest is zero, so there is nothing for
+        // sockaddr_write to convert.
+        uint16_t family = (uint16_t) sock->socket.domain;
+        memcpy(sockaddr, &family, sizeof(family));
+        dword_t write_len = real_len < sockaddr_len ? real_len : sockaddr_len;
+        if (user_write(sockaddr_addr, sockaddr, write_len))
+            return _EFAULT;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
+
+    // An unbound socket of a private network namespace has the address any
+    // unbound inet socket has: none. (Its host socket would say "an unnamed
+    // AF_UNIX socket".)
+    if (sock->socket.net_emul && !sock->socket.bind_deferred) {
+        dword_t real_len = 0;
+        memset(sockaddr, 0, sizeof(sockaddr));
+        net_emul_from_host(sock, sockaddr, &real_len);
+        if (sock->socket.domain == AF_INET6_)
+            memset(&((struct sockaddr_in6 *) sockaddr)->sin6_addr, 0, sizeof(struct in6_addr));
+        else
+            ((struct sockaddr_in *) sockaddr)->sin_addr.s_addr = htonl(INADDR_ANY);
+        int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
+        if (err < 0)
+            return err;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
+
     if (sock->socket.bind_deferred) {
         dword_t real_len = sock->socket.deferred_addr_len;
         if (real_len > sizeof(sockaddr))
@@ -5363,6 +8983,11 @@ static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
     // write) whenever the guest's requested length was too small to hold it.
     char sockaddr[sizeof(struct sockaddr_storage)];
 
+    // A restore rebuilt this one with its peer already gone, which is what
+    // ENOTCONN means. Asking the host would name the closed socketpair end.
+    if (sock->socket.ckpt_hungup)
+        return _ENOTCONN;
+
     if (sock->socket.domain == AF_NETLINK_) {
         if (sockaddr_len < sizeof(struct sockaddr_nl_))
             return _EINVAL;
@@ -5387,6 +9012,30 @@ static int_t sys_getpeername_common(fd_t sock_fd, guest_addr_t sockaddr_addr, gu
         dword_t write_len = real_len < sockaddr_len ? real_len : sockaddr_len;
         if (user_write(sockaddr_addr, sockaddr, write_len))
             return _EFAULT;
+        if (user_put(sockaddr_len_addr, real_len))
+            return _EFAULT;
+        return 0;
+    }
+
+    // A connected socket of a private network namespace: the port connect()
+    // or accept() recorded, on the namespace's loopback. Not asked of the
+    // host, which names the peer by a path and forgets it when it closes.
+    if (sock->socket.net_emul) {
+        if (sock->socket.net_emul_dest_port == 0)
+            return _ENOTCONN;
+        struct sockaddr_un none = {0};
+        dword_t real_len = 0;
+        memcpy(sockaddr, &none, sizeof(none));
+        uint16_t port = sock->socket.net_emul_icmp ? 0 : sock->socket.net_emul_dest_port;
+        if (sock->socket.net_emul_peer_set)
+            net_emul_write_addr(sock, sockaddr, &real_len, sock->socket.net_emul_peer_v6,
+                    sock->socket.net_emul_peer_addr, port);
+        else
+            net_emul_from_host(sock, sockaddr, &real_len);
+        ((struct sockaddr_in *) sockaddr)->sin_port = port;
+        int err = sockaddr_write(sockaddr_addr, sockaddr, sockaddr_len, &real_len);
+        if (err < 0)
+            return err;
         if (user_put(sockaddr_len_addr, real_len))
             return _EFAULT;
         return 0;
@@ -5491,9 +9140,12 @@ static int_t sys_socketpair_common(dword_t domain, dword_t type, dword_t protoco
     // unix_peer metadata lagging until the lock below -- harmless next to a
     // guaranteed deadlock.
     int fake_sockets[2];
+    // sock_fd_create consumes the host socket it is given, success or not.
     err = fake_sockets[0] = sock_fd_create(sockets[0], domain, type, protocol);
-    if (fake_sockets[0] < 0)
-        goto close_sockets;
+    if (fake_sockets[0] < 0) {
+        close(sockets[1]);
+        return err;
+    }
     err = fake_sockets[1] = sock_fd_create(sockets[1], domain, type, protocol);
     if (fake_sockets[1] < 0)
         goto close_fake_0;
@@ -5508,6 +9160,8 @@ static int_t sys_socketpair_common(dword_t domain, dword_t type, dword_t protoco
     sock2->socket.unix_peer_cred = sock1->socket.unix_cred;
     sock1->socket.unix_peer_cred_valid = true;
     sock2->socket.unix_peer_cred_valid = true;
+    sock1->socket.dgram_peer_set = sock1->socket.type == SOCK_DGRAM_;
+    sock2->socket.dgram_peer_set = sock2->socket.type == SOCK_DGRAM_;
     unlock(&peer_lock);
 
     err = _EFAULT;
@@ -5517,13 +9171,12 @@ static int_t sys_socketpair_common(dword_t domain, dword_t type, dword_t protoco
     STRACE(" [%d, %d]", fake_sockets[0], fake_sockets[1]);
     return 0;
 
+    // The descriptors own the host sockets: closing them closes those, and
+    // closing sockets[] as well closed each host number twice.
 close_fake_1:
     sys_close(fake_sockets[1]);
 close_fake_0:
     sys_close(fake_sockets[0]);
-close_sockets:
-    close(sockets[0]);
-    close(sockets[1]);
     return err;
 }
 
@@ -5566,6 +9219,10 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
     bool sendto_devlog_fallback = sock->socket.domain == AF_LOCAL_ &&
         (guest_sockaddr_is_devlog(sockaddr_addr, sockaddr_len) ||
          guest_sockaddr_is_initctl(sockaddr_addr, sockaddr_len));
+    // A SEQPACKET send ignores an address, as sendmsg does.
+    bool unix_seqpacket = sock_is_unix_seqpacket(sock);
+    if (unix_seqpacket)
+        sockaddr_addr = 0;
     struct sockaddr_max_ sockaddr;
     if (sockaddr_addr) {
         err = sockaddr_read(sockaddr_addr, &sockaddr, &sockaddr_len);
@@ -5576,8 +9233,30 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
             }
             goto error;
         }
-        if (sock->socket.domain == AF_INET_)
+        err = sock_net_dest_gate(sock, &sockaddr);
+        if (err < 0)
+            goto error;
+        if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul)
             inet_nat_rewrite_dest(sock, &sockaddr);
+    }
+    if (sock->socket.net_emul_icmp) {
+        ssize_t sent = net_emul_icmp_send(sock, buffer, len, sockaddr_addr != 0 ? &sockaddr : NULL);
+        free(buffer);
+        return (int_t) sent;
+    }
+    if (sock->socket.net_emul) {
+        // Loopback in a private network namespace: the destination is a
+        // binding there, or nothing.
+        bool use_addr, drop;
+        err = net_emul_send_dest(sock, sockaddr_addr != 0, &sockaddr, &sockaddr_len, &use_addr, &drop);
+        if (err < 0)
+            goto error;
+        if (drop) {
+            free(buffer);
+            return len;
+        }
+        // (Only asked from here on whether there is one.)
+        sockaddr_addr = use_addr ? 1 : 0;
     }
 
     if (sock->socket.domain == AF_NETLINK_) {
@@ -5621,12 +9300,17 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
     bool send_all = socket_call_is_blocking(sock, real_flags) && socket_is_stream(sock);
     size_t sent = 0;
     struct socket_io_wait wait = {};
+    bool peer_gone_dropped = false;
     socket_force_host_nonblock(sock);
     TASK_MAY_BLOCK {
         while (1) {
             errno = 0;
             if (unix_dgram) {
                 res = sendmsg(sock->real_fd, &dgram_msg, real_flags);
+            } else if (unix_seqpacket) {
+                struct iovec whole = {.iov_base = buffer, .iov_len = len};
+                struct msghdr one = {.msg_iov = &whole, .msg_iovlen = 1};
+                res = unix_seqpacket_sendmsg(sock, &one, real_flags, 0);
             } else if (sockaddr_addr == 0) {
                 res = send(sock->real_fd, buffer + sent, len - sent, real_flags);
             } else {
@@ -5648,6 +9332,8 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
                 }
                 continue;
             }
+            if (sock_io_drop_peer_gone(sock, &peer_gone_dropped))
+                continue;
             if (socket_should_retry_io_eintr(sock, real_flags))
                 continue;
             if (socket_should_retry_io_eagain(sock, real_flags)) {
@@ -5681,14 +9367,10 @@ static int_t sys_sendto_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t l
             return _EAGAIN;
         }
         // MSG_NOSIGNAL: EPIPE without the guest's SIGPIPE.
-        int mapped_err = errno_map_flags(flags & MSG_NOSIGNAL_);
+        int mapped_err = unix_host_missing_is_refused(sock, errno_map_flags(flags & MSG_NOSIGNAL_));
         sock_translate_err(sock, &mapped_err);
-        // Linux returns ENOTCONN for a send() on an unconnected AF_UNIX
-        // datagram socket with no destination address; Darwin returns
-        // EDESTADDRREQ. (For AF_INET both kernels use EDESTADDRREQ.)
-        if (sock->socket.domain == AF_LOCAL_ && sockaddr_addr == 0 &&
-                mapped_err == _EDESTADDRREQ)
-            mapped_err = _ENOTCONN;
+        if (sockaddr_addr == 0)
+            mapped_err = unix_send_unconnected_err(sock, mapped_err);
         // A /dev/log or initctl path whose socket exists but has no live reader
         // (e.g. a stale socket left by a dead daemon) falls back to discarding.
         if (sendto_devlog_fallback &&
@@ -5748,7 +9430,10 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
     // receiving into a buffer large enough to hold the whole datagram and then
     // copy back only what the caller asked for. (Netlink has its own MSG_TRUNC
     // path.)
-    bool dgram_trunc = (flags & MSG_TRUNC_) &&
+    // A SEQPACKET frame says its length itself.
+    bool unix_seqpacket = sock_is_unix_seqpacket(sock);
+    struct unix_seqpacket_hdr seq_hdr = {};
+    bool dgram_trunc = (flags & MSG_TRUNC_) && !unix_seqpacket &&
         sock->socket.type != SOCK_STREAM_ && sock->socket.domain != AF_NETLINK_;
     size_t recv_cap = len;
     if (dgram_trunc && recv_cap < 65536)
@@ -5771,7 +9456,14 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
     }
 
     char *buffer = malloc(recv_cap);
-    char sockaddr[sockaddr_len];
+    // What the guest's buffer holds, which is all that is written back. A
+    // socket of a private network namespace is told the sender by the HOST
+    // as a path (see "Loopback in a private network namespace"), which
+    // needs more room than the sockaddr_in the guest made space for.
+    uint_t guest_sockaddr_len = sockaddr_len;
+    char sockaddr[sock->socket.net_emul && sockaddr_len < 128 ? 128 : sockaddr_len];
+    if (sock->socket.net_emul && sockaddr_addr != 0)
+        sockaddr_len = sizeof(sockaddr);
     if (sock->socket.domain == AF_NETLINK_) {
         struct iovec iov = {
             .iov_base = buffer,
@@ -5783,7 +9475,13 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
             .msg_iov = &iov,
             .msg_iovlen = 1,
         };
-        ssize_t netlink_res = netlink_handle_recvmsg(sock, &msg, flags);
+        // io_block, as every other socket wait sets it: /proc reports the
+        // task sleeping rather than running, and the address-space barrier
+        // leaves it unpoked (task_poke_shared_mem).
+        ssize_t netlink_res = 0;
+        TASK_MAY_BLOCK {
+            netlink_res = netlink_handle_recvmsg(sock, &msg, flags);
+        }
         if (netlink_res < 0) {
             free(buffer);
             return (int_t) netlink_res;
@@ -5816,24 +9514,57 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
     int host_flags = waitall ? (real_flags & ~MSG_WAITALL) : real_flags;
     size_t got = 0;
     struct socket_io_wait wait = {};
+    bool peer_gone_dropped = false;
     socket_force_host_nonblock(sock);
     TASK_MAY_BLOCK {
         while (1) {
             sigset_t oldmask;
-            if (!socket_blocking_syscall_begin(&oldmask)) {
+            // Not for a SEQPACKET socket: its read takes a lock, and a poke
+            // that unwound it from in there would leave the lock held for
+            // good -- every other reader of the socket then hangs on it, and
+            // so does the thread's own exit, which waits for its locks. The
+            // read never blocks, so it needs no unwinding out of.
+            //
+            // Nor for a non-blocking call: Linux never fails one with EINTR --
+            // a pending signal is delivered when it returns -- and programs
+            // take EINTR there for a dead peer (Xwayland dropped its window
+            // manager this way, and labwc crashed). The host socket is
+            // non-blocking, so the call cannot sleep for a poke to end.
+            bool host_call_guarded = !unix_seqpacket && socket_call_is_blocking(sock, real_flags);
+            if (host_call_guarded && !socket_blocking_syscall_begin(&oldmask)) {
+                // A failed begin may be nothing but an unwound host SIGUSR1
+                // poke, with no guest signal behind it -- the case fs/real.c's
+                // two sigunwind branches retry and socket_wait_ready ignores.
+                // These two loops alone handed it to the guest as EINTR, and a
+                // checkpoint leaves just such a poke pending: the freezer's
+                // wakes land while the thread has SIGUSR1 blocked, and the call
+                // re-executed after the thaw unblocks it here. Measured:
+                // recvfrom and recvmsg on a UDP socket with SO_RCVTIMEO failed
+                // with EINTR at the thaw, on arm64 and amd64, with no signal
+                // pending and the freeze already over.
+                if (!socket_guest_signal_pending())
+                    continue;
                 res = errno_map();
                 errno = 0;
                 break;
             }
             errno = 0;
-            if (sockaddr_addr == 0 && sockaddr_len_addr == 0) {
+            if (unix_seqpacket) {
+                struct iovec room = {.iov_base = buffer, .iov_len = recv_cap};
+                struct msghdr one = {.msg_iov = &room, .msg_iovlen = 1};
+                res = unix_seqpacket_recvmsg(sock, &one, host_flags, &seq_hdr);
+                // The sender, as Linux names an unbound one: the family alone.
+                if (sockaddr_len >= sizeof(sa_family_t))
+                    ((struct sockaddr *) sockaddr)->sa_family = AF_UNIX;
+            } else if (sockaddr_addr == 0 && sockaddr_len_addr == 0) {
                 res = recv(sock->real_fd, buffer + got, recv_cap - got, host_flags);
             } else {
                 res = recvfrom(sock->real_fd, buffer + got, recv_cap - got, host_flags,
                                sockaddr_addr != 0 ? (void *) sockaddr : NULL,
                                sockaddr_len_addr != 0 ? &sockaddr_len : NULL);
             }
-            socket_blocking_syscall_end();
+            if (host_call_guarded)
+                socket_blocking_syscall_end();
             if (res >= 0) {
                 if (!waitall)
                     break;
@@ -5860,6 +9591,8 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
                 }
                 continue;
             }
+            if (sock_io_drop_peer_gone(sock, &peer_gone_dropped))
+                continue;
             if (socket_should_retry_io_eintr(sock, real_flags))
                 continue;
             if (socket_should_retry_io_eagain(sock, real_flags)) {
@@ -5920,6 +9653,18 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
         return mapped_err;
     }
 
+    if (unix_seqpacket && res >= 0 && seq_hdr.magic == UNIX_SEQPACKET_MAGIC) {
+        // MSG_TRUNC asks for the message's own length, which may be more
+        // than was copied. And a message taken without a msghdr takes its
+        // descriptors nowhere: they are closed, as on Linux.
+        if (flags & MSG_TRUNC_)
+            res = (ssize_t) seq_hdr.len;
+        if (seq_hdr.scm_cookie != 0 && !(real_flags & MSG_PEEK)) {
+            struct scm *dropped = unix_dgram_scm_take(seq_hdr.scm_cookie);
+            if (dropped != NULL)
+                scm_free(dropped);
+        }
+    }
     // Strip the in-band cred header off AF_LOCAL datagrams (this bare
     // recvfrom/recv surface has nowhere to deliver creds; recvmsg does).
     if (unix_dgram && res >= (ssize_t) sizeof(struct unix_dgram_cred_hdr)) {
@@ -5946,10 +9691,18 @@ static int_t sys_recvfrom_common(fd_t sock_fd, guest_addr_t buffer_addr, dword_t
         return _EFAULT;
     }
     free(buffer);
+    bool icmp_have = false, icmp_v6 = false;
+    uint8_t icmp_from[16];
+    if (sock->socket.net_emul_icmp && res > 0)
+        icmp_have = net_emul_icmp_from_take(sock, (real_flags & MSG_PEEK) != 0, &icmp_v6, icmp_from);
     if (sockaddr_addr != 0) {
-        if (sock->socket.domain == AF_INET_)
+        if (sock->socket.net_emul_icmp)
+            net_emul_icmp_from_report(sock, icmp_have, icmp_v6, icmp_from, &sockaddr, &sockaddr_len);
+        else if (sock->socket.net_emul)
+            net_emul_from_host(sock, &sockaddr, &sockaddr_len);
+        else if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_src(sock, &sockaddr);
-        int err = sockaddr_write(sockaddr_addr, sockaddr, sizeof(sockaddr), &sockaddr_len);
+        int err = sockaddr_write(sockaddr_addr, sockaddr, guest_sockaddr_len, &sockaddr_len);
         if (err < 0)
             return err;
     }
@@ -6013,7 +9766,65 @@ static void sock_init_emulation_defaults(struct fd *fd) {
     fd->socket.netlink_rcvbuf = 212992;
     fd->socket.netlink_sndbuf = 212992;
     lock_init(&fd->socket.netlink_reply_lock, "netlink_reply\0");
+    cond_init(&fd->socket.netlink_reply_cond);
     fd->socket.netlink_notify_registered = false;
+}
+
+// SO_RCVTIMEO/SO_SNDTIMEO on a fake netlink socket, which has no host fd to
+// hold them. They were accepted and thrown away, and read back as EBADF, so a
+// receive timeout could never end a wait. Parsed as Linux's sock_set_timeout
+// does, measured on Linux 6.12 (HZ 250), i386 and x86_64:
+//   - the _OLD options take the ABI's struct timeval (8 bytes on i386), the
+//     _NEW ones (66, 67) a 64-bit one on every ABI; a short optlen is EINVAL
+//   - a microsecond field outside [0, 1000000) is EDOM
+//   - zero is no timeout, and so is MAX_SCHEDULE_TIMEOUT / HZ - 1 seconds or
+//     more
+//   - a negative second count is a timeout of zero jiffies: the socket never
+//     waits, and the option reads back as zero
+// Linux rounds what it reads back up to whole jiffies; this does not.
+#define NETLINK_TIMEO_FOREVER_SEC (INT64_MAX / 250 - 1)
+
+static int netlink_timeo_set(struct fd *sock, dword_t option, const char *value,
+        dword_t value_len, enum guest_abi abi) {
+    bool old = option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_;
+    int64_t sec, usec;
+    if (old && abi == GUEST_ABI_I386) {
+        int32_t tv[2];
+        if (value_len < sizeof(tv))
+            return _EINVAL;
+        memcpy(tv, value, sizeof(tv));
+        sec = tv[0];
+        usec = tv[1];
+    } else {
+        int64_t tv[2];
+        if (value_len < sizeof(tv))
+            return _EINVAL;
+        memcpy(tv, value, sizeof(tv));
+        sec = tv[0];
+        usec = tv[1];
+    }
+    if (usec < 0 || usec >= 1000000)
+        return _EDOM;
+    struct timespec timeo = {0};
+    bool set = false;
+    if (sec < 0) {
+        set = true;
+    } else if ((sec != 0 || usec != 0) && sec < NETLINK_TIMEO_FOREVER_SEC) {
+        timeo.tv_sec = (time_t) sec;
+        timeo.tv_nsec = (long) usec * 1000;
+        set = true;
+    }
+    // Under the lock a receive reads them with, so it never sees half of one.
+    lock(&sock->socket.netlink_reply_lock, 0);
+    if (option == SO_RCVTIMEO_OLD_ || option == SO_RCVTIMEO_) {
+        sock->socket.netlink_rcvtimeo = timeo;
+        sock->socket.netlink_rcvtimeo_set = set;
+    } else {
+        sock->socket.netlink_sndtimeo = timeo;
+        sock->socket.netlink_sndtimeo_set = set;
+    }
+    unlock(&sock->socket.netlink_reply_lock);
+    return 0;
 }
 
 static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t option,
@@ -6142,6 +9953,57 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
     // INDEX, so the name is resolved here. The guest sees the host's own
     // interface names (lo0, en0, ...), so no translation is needed beyond
     // that. An empty name unbinds, which is how Linux clears it.
+    // A socket of a private network namespace (kernel/net_ns.h) has "lo" to
+    // be bound to and no group to join: none of this reaches the host's
+    // interfaces.
+    if (sock_net_private_inet(sock)) {
+        if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
+            char name[IFNAMSIZ_ + 1] = "";
+            memcpy(name, value, value_len < IFNAMSIZ_ ? value_len : IFNAMSIZ_);
+            return name[0] == '\0' || strcmp(name, "lo") == 0 ? 0 : _ENODEV;
+        }
+        if (level == SOL_SOCKET_ && option == SO_BINDTOIFINDEX_) {
+            int32_t index = 0;
+            if (value_len >= sizeof(index))
+                memcpy(&index, value, sizeof(index));
+            return index == 0 || index == NET_NS_LO_INDEX ? 0 : _ENODEV;
+        }
+        if ((level == IPPROTO_IP && (option == IP_ADD_MEMBERSHIP_ || option == IP_DROP_MEMBERSHIP_)) ||
+                (level == IPPROTO_IPV6 && (option == IPV6_ADD_MEMBERSHIP_ || option == IPV6_DROP_MEMBERSHIP_)))
+            return _ENODEV;
+        // The IP, TCP and UDP options of a socket whose traffic is the
+        // namespace's loopback (and whose host socket is not an inet one at
+        // all) have nothing to set: TCP_NODELAY on a path with no delay,
+        // a TTL on packets that are never packets. Accepted, as loopback
+        // would accept them, and without effect.
+        // An ICMP socket's own: its filter is kept and applied (ICMP_FILTER
+        // is option 1 of SOL_RAW, 255); the rest of that level, and of
+        // ICMPv6's, has nothing to set either.
+        if (sock->socket.net_emul_icmp && level == 255 && option == 1) {
+            if (value_len < sizeof(dword_t))
+                return _EINVAL;
+            memcpy(&sock->socket.net_emul_icmp_filter, value, sizeof(dword_t));
+            return 0;
+        }
+        if (sock->socket.net_emul_icmp && (level == 255 || level == IPPROTO_ICMPV6))
+            return 0;
+        // Kept: it decides what a wildcard bind takes (net_emul_bind_port).
+        if (sock->socket.net_emul && level == IPPROTO_IPV6 && option == IPV6_V6ONLY_) {
+            if (sock->socket.domain != AF_INET6_)
+                return _ENOPROTOOPT;
+            if (value_len < sizeof(dword_t))
+                return _EINVAL;
+            if (sock->socket.net_emul_bound)
+                return _EINVAL;     // not once it is bound, as on Linux
+            dword_t on;
+            memcpy(&on, value, sizeof(on));
+            sock->socket.net_emul_v6only = on != 0;
+            return 0;
+        }
+        if (sock->socket.net_emul && (level == IPPROTO_IP || level == IPPROTO_TCP ||
+                    level == IPPROTO_UDP || level == IPPROTO_IPV6))
+            return 0;
+    }
     if (level == SOL_SOCKET_ && option == SO_BINDTODEVICE_) {
         char name[sizeof(sock->socket.so_bindtodevice)];
         size_t copy = value_len < sizeof(name) - 1 ? value_len : sizeof(name) - 1;
@@ -6290,9 +10152,21 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             doubled = floor;
         // Best-effort on the host; its own clamps are its business, and a
         // rejection must not fail a call Linux always accepts.
-        int host_val = (int) (v == 0 ? floor / 2 : v);
-        (void) setsockopt(sock->real_fd, SOL_SOCKET,
-                          rcv ? SO_RCVBUF : SO_SNDBUF, &host_val, sizeof(host_val));
+        //
+        // Except under a SEQPACKET socket, whose host buffers must hold the
+        // largest message the guest may send, for that message to go out
+        // whole (unix_seqpacket_sendmsg): they grow with the guest's number
+        // and never shrink below their start, and the guest's number is
+        // what limits a message (unix_seqpacket_max_msg).
+        if (sock_is_unix_seqpacket(sock)) {
+            int want = (int) doubled + (int) sizeof(struct unix_seqpacket_hdr);
+            if (want > sock->socket.seqpacket_host_buf)
+                unix_seqpacket_host_buffers(sock, want);
+        } else {
+            int host_val = (int) (v == 0 ? floor / 2 : v);
+            (void) setsockopt(sock->real_fd, SOL_SOCKET,
+                              rcv ? SO_RCVBUF : SO_SNDBUF, &host_val, sizeof(host_val));
+        }
         if (rcv) {
             sock->socket.so_rcvbuf = doubled;
             sock->socket.so_rcvbuf_set = true;
@@ -6416,6 +10290,10 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
                 sock->socket.netlink_sndbuf = doubled;
             return 0;
         }
+        if (level == SOL_SOCKET_ &&
+                (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_ ||
+                 option == SO_RCVTIMEO_ || option == SO_SNDTIMEO_))
+            return netlink_timeo_set(sock, option, value, value_len, abi);
         // A fake socket is never actually put on the wire, so REUSEADDR/PORT
         // are meaningless here -- but systemd sets SO_REUSEADDR unconditionally
         // on every listening socket it creates, including its kobject-uevent
@@ -6425,9 +10303,7 @@ static int_t sys_setsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         // descriptor"), so systemd-udevd.service (and therefore udev as a
         // whole) never started.
         if (level == SOL_SOCKET_ &&
-                (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_ ||
-                 option == SO_RCVTIMEO_ || option == SO_SNDTIMEO_ ||
-                 option == SO_ATTACH_FILTER_ || option == SO_DETACH_FILTER_ ||
+                (option == SO_ATTACH_FILTER_ || option == SO_DETACH_FILTER_ ||
                  option == SO_REUSEADDR_ || option == SO_REUSEPORT_ ||
                  // The other half of what sd-netlink sets unconditionally
                  // on an rtnetlink manager socket (binds it to the
@@ -6648,6 +10524,25 @@ static bool sockopt_is_linux_soft_unsupported(dword_t level, dword_t option) {
     return false;
 }
 
+// The read side of netlink_timeo_set. A short buffer truncates, as it does on
+// Linux.
+static void netlink_timeo_get(struct fd *sock, dword_t option, enum guest_abi abi,
+        char *value, dword_t user_value_len, dword_t *value_len) {
+    lock(&sock->socket.netlink_reply_lock, 0);
+    struct timespec timeo = option == SO_RCVTIMEO_OLD_ || option == SO_RCVTIMEO_
+            ? sock->socket.netlink_rcvtimeo : sock->socket.netlink_sndtimeo;
+    unlock(&sock->socket.netlink_reply_lock);
+    int64_t sec = timeo.tv_sec;
+    int64_t usec = timeo.tv_nsec / 1000;
+    if ((option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_) && abi == GUEST_ABI_I386) {
+        int32_t tv[2] = {(int32_t) sec, (int32_t) usec};
+        sockopt_store_value(value, user_value_len, value_len, tv, sizeof(tv));
+    } else {
+        int64_t tv[2] = {sec, usec};
+        sockopt_store_value(value, user_value_len, value_len, tv, sizeof(tv));
+    }
+}
+
 static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t option,
         guest_addr_t value_addr, guest_addr_t len_addr, enum guest_abi abi) {
     STRACE("getsockopt(%d, %d, %d, %#llx, %#llx)", sock_fd, level, option,
@@ -6668,7 +10563,18 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         return _EFAULT;
     dword_t value_len = user_value_len;
 
-    if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
+    if (sock->socket.net_emul && (level == IPPROTO_IP || level == IPPROTO_TCP ||
+                level == IPPROTO_UDP || level == IPPROTO_IPV6)) {
+        // See the setsockopt side: these read as unset. An int for all but
+        // TCP_INFO, which is a structure and reads all zero.
+        memset(value, 0, user_value_len != 0 ? user_value_len : 1);
+        if (!(level == IPPROTO_TCP && option == 11 /* TCP_INFO */) && value_len > sizeof(dword_t))
+            value_len = sizeof(dword_t);
+        if (level == IPPROTO_IPV6 && option == IPV6_V6ONLY_ && value_len >= sizeof(dword_t)) {
+            dword_t on = sock->socket.net_emul_v6only;
+            memcpy(value, &on, sizeof(on));
+        }
+    } else if (level == SOL_SOCKET_ && (option == SO_DOMAIN_ || option == SO_TYPE_ || option == SO_PROTOCOL_)) {
         dword_t value_p;
         if (option == SO_DOMAIN_)
             value_p = sock->socket.domain;
@@ -6695,6 +10601,13 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
             cred.uid = cred.gid = -1;
         }
         unlock(&peer_lock);
+        // As the asker's namespaces name the peer: 0 for a process outside
+        // its pid namespace.
+        cred.pid = current_pid_shown_or_zero(cred.pid);
+        if (cred.uid != (uid_t_) -1)
+            cred.uid = current_uid_shown(cred.uid);
+        if (cred.gid != (uid_t_) -1)
+            cred.gid = current_gid_shown(cred.gid);
         sockopt_store_value(value, user_value_len, &value_len, &cred, sizeof(cred));
     } else if (level == SOL_SOCKET_ && option == SO_PASSCRED_) {
         dword_t passcred;
@@ -6715,6 +10628,10 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         // for these on a fake netlink socket.
         dword_t bufsize = option == SO_RCVBUF_ ? sock->socket.netlink_rcvbuf : sock->socket.netlink_sndbuf;
         sockopt_store_value(value, user_value_len, &value_len, &bufsize, sizeof(bufsize));
+    } else if (sock->socket.domain == AF_NETLINK_ && sock->real_fd < 0 && level == SOL_SOCKET_ &&
+            (option == SO_RCVTIMEO_OLD_ || option == SO_SNDTIMEO_OLD_ ||
+             option == SO_RCVTIMEO_ || option == SO_SNDTIMEO_)) {
+        netlink_timeo_get(sock, option, abi, value, user_value_len, &value_len);
     } else if (sock->socket.domain == AF_NETLINK_ && sock->real_fd < 0 && level == SOL_NETLINK_) {
         if (option == NETLINK_CAP_ACK_ || option == NETLINK_EXT_ACK_ || option == NETLINK_GET_STRICT_CHK_) {
             dword_t enabled =
@@ -6845,9 +10762,11 @@ static int_t sys_getsockopt_guest_abi(fd_t sock_fd, dword_t level, dword_t optio
         } else {
             int real_error;
             socklen_t real_error_len = sizeof(real_error);
-            int err = getsockopt(sock->real_fd, SOL_SOCKET, SO_ERROR, &real_error, &real_error_len);
+            int err = sock_host_so_error(sock->real_fd, &real_error, &real_error_len);
             if (err < 0)
                 return errno_map();
+            if (sock_host_error_is_peer_gone(sock, real_error))
+                real_error = 0;
             // SO_ERROR is read-and-clear at the host level: an internal
             // readiness probe (socket_tcp_connect_write_ready, run on every
             // poll/epoll scan of this fd) may have already observed and
@@ -7055,6 +10974,11 @@ struct unix_dgram_scm {
     uint64_t cookie;
     struct scm *scm;
     time_t added;
+    // A SEQPACKET message's parcel: it waits as long as its message does,
+    // which on a connection nobody is reading yet can be any time at all, so
+    // it never expires. The receiving socket's close releases it instead
+    // (unix_seqpacket_discard_queue).
+    bool keep;
     struct list list;
 };
 #define UNIX_DGRAM_SCM_TTL_SECS 60
@@ -7065,7 +10989,7 @@ static void unix_dgram_scm_gc_locked(void) {
     time_t now = time(NULL);
     struct unix_dgram_scm *entry, *tmp;
     list_for_each_entry_safe(&unix_dgram_scms, entry, tmp, list) {
-        if (now - entry->added < UNIX_DGRAM_SCM_TTL_SECS)
+        if (entry->keep || now - entry->added < UNIX_DGRAM_SCM_TTL_SECS)
             continue;
         list_remove(&entry->list);
         scm_free(entry->scm);
@@ -7074,8 +10998,8 @@ static void unix_dgram_scm_gc_locked(void) {
 }
 
 // Takes ownership of `scm` on success; returns its cookie (never 0), or 0
-// on allocation failure (caller keeps ownership).
-static uint64_t unix_dgram_scm_register(struct scm *scm) {
+// on allocation failure (caller keeps ownership). `keep`: see the field.
+static uint64_t unix_dgram_scm_register(struct scm *scm, bool keep) {
     struct unix_dgram_scm *entry = malloc(sizeof(*entry));
     if (entry == NULL)
         return 0;
@@ -7086,6 +11010,7 @@ static uint64_t unix_dgram_scm_register(struct scm *scm) {
     } while (entry->cookie == 0);
     entry->scm = scm;
     entry->added = time(NULL);
+    entry->keep = keep;
     list_add_tail(&unix_dgram_scms, &entry->list);
     uint64_t cookie = entry->cookie;
     unlock(&unix_dgram_scm_lock);
@@ -7342,6 +11267,15 @@ static int sock_cmsg_type_to_fake(int level, int type) {
             case IPV6_HOPLIMIT: return IPV6_HOPLIMIT_;
             case IPV6_TCLASS: return IPV6_TCLASS_;
             case IPV6_RECVERR_: return IPV6_RECVERR_;
+#if defined(__APPLE__)
+            // What IPV6_RECVPKTINFO (set by value, 61: see fs/sock.h) delivers:
+            // Darwin's RFC 3542 IPV6_PKTINFO, 46, hidden behind
+            // __APPLE_USE_RFC_3542 like the option. Linux's is 50. The same
+            // 20-byte in6_pktinfo either way. It was dropped, so an IPv6 server
+            // that asked where a datagram was addressed -- chronyd's [::1]:323
+            // -- never heard.
+            case 46: return 50;
+#endif
         }
     }
     return -1;
@@ -7433,24 +11367,48 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     if (err < 0)
         return err;
 
-    // msg_name
+    // msg_name. A SEQPACKET send ignores one, as Linux's does: the socket
+    // is connected, and the message goes to its peer.
     struct sockaddr_max_ msg_name;
-    if (msg_fake.msg_name != 0) {
+    if (msg_fake.msg_name != 0 && !sock_is_unix_seqpacket(sock)) {
         int err = sockaddr_read(msg_fake.msg_name, &msg_name, &msg_fake.msg_namelen);
         if (err < 0)
             return err;
-        if (sock->socket.domain == AF_INET_)
+        err = sock_net_dest_gate(sock, &msg_name);
+        if (err < 0)
+            return err;
+        if (sock->socket.domain == AF_INET_ && !sock->socket.net_emul)
             inet_nat_rewrite_dest(sock, &msg_name);
         msg.msg_name = &msg_name;
         msg.msg_namelen = msg_fake.msg_namelen;
     } else {
         msg.msg_name = NULL;
     }
+    // Loopback in a private network namespace: as in sendto.
+    bool net_emul_drop = false;
+    if (sock->socket.net_emul && !sock->socket.net_emul_icmp) {
+        bool use_addr;
+        uint_t name_len = msg.msg_name != NULL ? msg.msg_namelen : 0;
+        int emul_err = net_emul_send_dest(sock, msg.msg_name != NULL, &msg_name, &name_len,
+                &use_addr, &net_emul_drop);
+        if (emul_err < 0)
+            return emul_err;
+        msg.msg_name = use_addr ? &msg_name : NULL;
+        msg.msg_namelen = use_addr ? name_len : 0;
+    }
 
     // msg_iovec
     struct guest_iovec_ *msg_iov_fake = user_read_iovecs_abi(current, abi, msg_fake.msg_iov, msg_fake.msg_iovlen);
     if (IS_ERR(msg_iov_fake))
         return PTR_ERR(msg_iov_fake);
+    if (net_emul_drop) {
+        // A datagram for a port nobody has: sent, as far as the sender is told.
+        size_t total = 0;
+        for (size_t i = 0; i < (size_t) msg_fake.msg_iovlen; i++)
+            total += msg_iov_fake[i].len;
+        free(msg_iov_fake);
+        return (int_t) total;
+    }
     struct iovec *msg_iov = NULL;
     if (msg_fake.msg_iovlen != 0) {
         msg_iov = calloc(msg_fake.msg_iovlen, sizeof(*msg_iov));
@@ -7489,6 +11447,24 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
         err = netlink_handle_sendmsg(sock, &msg);
         goto out_free_iov;
     }
+    // ICMP in a private network namespace: one message, answered here.
+    if (sock->socket.net_emul_icmp) {
+        size_t total = 0;
+        for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++)
+            total += msg_iov[i].iov_len;
+        uint8_t *whole = malloc(total != 0 ? total : 1);
+        err = _ENOMEM;
+        if (whole == NULL)
+            goto out_free_iov;
+        size_t at = 0;
+        for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
+            memcpy(whole + at, msg_iov[i].iov_base, msg_iov[i].iov_len);
+            at += msg_iov[i].iov_len;
+        }
+        err = (int_t) net_emul_icmp_send(sock, whole, total, msg.msg_name);
+        free(whole);
+        goto out_free_iov;
+    }
 
     // msg_control
     uint8_t msg_control_buf[2048];
@@ -7522,8 +11498,6 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             goto out_free_iov;
         // figure out how many file descriptors we're sending
         unsigned num_fds = 0;
-        struct ucred_ sender_cred = {};
-        fill_cred(&sender_cred);
         size_t cmsg_off = 0;
         while (cmsg_off < msg_fake.msg_controllen) {
             struct guest_cmsghdr_marshaled cmsg;
@@ -7542,11 +11516,11 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             } else if (cmsg.type == SCM_CREDENTIALS_) {
                 if (data_len != sizeof(struct ucred_))
                     goto out_inval;
-                const struct ucred_ *cred = (const struct ucred_ *) cmsg_data;
-                if (cred->pid != sender_cred.pid ||
-                        cred->uid != sender_cred.uid ||
-                        cred->gid != sender_cred.gid)
-                    goto out_perm;
+                struct ucred_ cred;
+                memcpy(&cred, cmsg_data, sizeof(cred));
+                err = scm_check_creds(&cred);
+                if (err < 0)
+                    goto out_free_iov;
             } else {
                 goto out_inval;
             }
@@ -7557,9 +11531,9 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
         if (num_fds > 0) {
             // The dgram transport carries the parcel by cookie in the
             // in-band header instead (registered below, after the fds are
-            // collected); only the stream transport uses the sentinel-fd +
-            // peer-queue scheme.
-            if (!sock_is_unix_dgram(sock)) {
+            // collected), and so does SEQPACKET's framing; only the stream
+            // transport uses the sentinel-fd + peer-queue scheme.
+            if (!sock_is_unix_dgram(sock) && !sock_is_unix_seqpacket(sock)) {
             // send one (1) real fd and put the rest in a struct scm
             static int real_fd = -1;
             if (real_fd == -1) {
@@ -7594,37 +11568,65 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
                 const fd_t *fds = (const fd_t *) cmsg_data;
                 for (unsigned i = 0; i < data_len / sizeof(fd_t); i++) {
                     STRACE(" sending fd %d", fds[i]);
-                    scm->fds[fd_i++] = fd_retain(f_get(fds[i]));
+                    // A number that names no open descriptor is EBADF and
+                    // nothing is sent, as Linux's scm_fp_copy has it. (It
+                    // was a NULL handed to fd_retain: the emulator's own
+                    // crash, for any guest that passed a closed descriptor
+                    // or the -1 a failed open had just given it.)
+                    struct fd *passed = f_get_retain(fds[i]);
+                    if (passed == NULL) {
+                        scm->num_fds = fd_i; // only these are held
+                        err = _EBADF;
+                        goto out_free_scm;
+                    }
+                    scm->fds[fd_i++] = passed;
                 }
             }
-            if (sock_is_unix_dgram(sock)) {
+            if (sock_is_unix_dgram(sock) || sock_is_unix_seqpacket(sock)) {
                 // Datagram transport: park the parcel in the registry and
                 // ship its cookie in the in-band header (filled below).
                 // There may legitimately be no unix_peer (sendmsg with
                 // msg_name, many-senders-one-receiver sockets like
-                // /run/systemd/notify).
-                dgram_scm_cookie = unix_dgram_scm_register(scm);
+                // /run/systemd/notify). A SEQPACKET frame carries it the
+                // same way, so the fds arrive with their own message.
+                dgram_scm_cookie = unix_dgram_scm_register(scm, sock_is_unix_seqpacket(sock));
                 if (dgram_scm_cookie == 0) {
                     err = _ENOMEM;
                     goto out_free_scm;
                 }
             } else {
+            // Stream transport: the parcel is queued on the RECEIVING fd.
+            // Before the server's accept() there is no receiving fd, so it
+            // waits with the connect side's cookie instead and lands on the
+            // accepted socket when unix_socket_finish_peer() links the two.
+            // Linux allows fd passing from the moment connect() returns, and
+            // a client that connects and immediately passes an fd (Wayland,
+            // D-Bus) used to get EPIPE here.
+            // unix_token_lock nests OUTSIDE peer_lock.
+            lock(&unix_token_lock, 0);
             lock(&peer_lock, 0);
             struct fd *peer = sock->socket.unix_peer;
-            if (peer == NULL) {
+            if (peer != NULL) {
+                printk("INFO: scm-send pid=%d num_fds=%u sock_real=%d peer_real=%d real_ctrl_len=%zu\n",
+                       current ? current->pid : -1, num_fds, sock->real_fd, peer->real_fd,
+                       msg.msg_controllen);
+                lock(&peer->lock, 0);
+                list_add_tail(&peer->socket.unix_scm, &scm->queue);
+                unlock(&peer->lock);
+            } else if (unix_token_queue_scm_locked(sock, scm)) {
+                printk("INFO: scm-send pid=%d num_fds=%u sock_real=%d peer_real=pending real_ctrl_len=%zu\n",
+                       current ? current->pid : -1, num_fds, sock->real_fd,
+                       msg.msg_controllen);
+            } else {
                 printk("INFO: scm-send pid=%d EPIPE: unix_peer is NULL on sock real_fd=%d\n",
                        current ? current->pid : -1, sock->real_fd);
                 unlock(&peer_lock);
+                unlock(&unix_token_lock);
                 err = _EPIPE;
                 goto out_free_scm;
             }
-            printk("INFO: scm-send pid=%d num_fds=%u sock_real=%d peer_real=%d real_ctrl_len=%zu\n",
-                   current ? current->pid : -1, num_fds, sock->real_fd, peer->real_fd,
-                   msg.msg_controllen);
-            lock(&peer->lock, 0);
-            list_add_tail(&peer->socket.unix_scm, &scm->queue);
-            unlock(&peer->lock);
             unlock(&peer_lock);
+            unlock(&unix_token_lock);
             }
         }
     }
@@ -7646,6 +11648,7 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     // unix_dgram_cred_hdr). Use a shadow msghdr with a prepended header iov
     // so the original msg (and its cleanup paths) stay untouched.
     bool unix_dgram_send = sock_is_unix_dgram(sock);
+    bool unix_seqpacket_send = sock_is_unix_seqpacket(sock);
     struct unix_dgram_cred_hdr dgram_hdr;
     struct iovec *dgram_iov = NULL;
     struct msghdr host_send_msg = msg;
@@ -7672,6 +11675,7 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     int resume_iovlen = 0;
     struct msghdr resume_msg = {};
     struct socket_io_wait wait = {};
+    bool peer_gone_dropped = false;
     socket_force_host_nonblock(sock);
     TASK_MAY_BLOCK {
         while (1) {
@@ -7679,7 +11683,10 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             struct msghdr *host_msg = unix_dgram_send ? &host_send_msg : &msg;
             if (resume_iov != NULL)
                 host_msg = &resume_msg;
-            send_res = sendmsg(sock->real_fd, host_msg, real_flags);
+            if (unix_seqpacket_send)
+                send_res = unix_seqpacket_sendmsg(sock, &msg, real_flags, dgram_scm_cookie);
+            else
+                send_res = sendmsg(sock->real_fd, host_msg, real_flags);
             if (send_res >= 0) {
                 if (!send_all)
                     break;
@@ -7715,6 +11722,8 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
                 }
                 continue;
             }
+            if (sock_io_drop_peer_gone(sock, &peer_gone_dropped))
+                continue;
             if (socket_should_retry_io_eintr(sock, real_flags))
                 continue;
             if (socket_should_retry_io_eagain(sock, real_flags)) {
@@ -7746,7 +11755,9 @@ static int_t sys_sendmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             sock_x11_event("sendmsg-eagain", sock, -1, err, requested);
             goto out_free_scm;
         }
-        err = errno_map_flags(flags & MSG_NOSIGNAL_);   // MSG_NOSIGNAL
+        err = unix_host_missing_is_refused(sock, errno_map_flags(flags & MSG_NOSIGNAL_));
+        if (msg.msg_name == NULL)
+            err = unix_send_unconnected_err(sock, err);
         // A /dev/log or initctl path whose socket exists but has no live reader
         // falls back to discarding rather than failing the send.
         if (sendmsg_devlog_fallback &&
@@ -7788,20 +11799,23 @@ out_free_scm:
             if (unix_dgram_scm_take(dgram_scm_cookie) != NULL)
                 scm_free(scm);
         } else {
+            // The parcel is on the peer fd's queue, or still waiting with
+            // the connect cookie, or on neither because the failure came
+            // before it was queued at all. The node itself knows which, so
+            // hold both owners' locks and let list_remove_safe decide.
+            lock(&unix_token_lock, 0);
             lock(&peer_lock, 0);
             struct fd *peer = sock->socket.unix_peer;
-            if (peer != NULL) {
+            if (peer != NULL)
                 lock(&peer->lock, 0);
-                list_remove_safe(&scm->queue);
+            list_remove_safe(&scm->queue);
+            if (peer != NULL)
                 unlock(&peer->lock);
-            }
             unlock(&peer_lock);
+            unlock(&unix_token_lock);
             scm_free(scm);
         }
     }
-    goto out_free_iov;
-out_perm:
-    err = _EPERM;
     goto out_free_iov;
 out_inval:
     err = _EINVAL;
@@ -8021,6 +12035,10 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     if (msg_fake.msg_name != 0) {
         msg.msg_name = msg_name;
         msg.msg_namelen = msg_fake.msg_namelen;
+        // (Room for the path the host names a private network namespace's
+        // sender by; see sys_recvfrom_common.)
+        if (sock->socket.net_emul && msg_name == msg_name_stack)
+            msg.msg_namelen = sizeof(msg_name_stack);
     } else {
         msg.msg_name = NULL;
         msg.msg_namelen = 0;
@@ -8079,7 +12097,10 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     }
 
     if (sock->socket.domain == AF_NETLINK_) {
-        ssize_t res = netlink_handle_recvmsg(sock, &msg, flags);
+        ssize_t res = 0;
+        TASK_MAY_BLOCK { // see the recvfrom path
+            res = netlink_handle_recvmsg(sock, &msg, flags);
+        }
         if (res >= 0) {
             size_t n = (size_t) res;
             for (size_t i = 0; i < (size_t) msg.msg_iovlen; i++) {
@@ -8162,6 +12183,10 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
         host_recv_msg.msg_iovlen = msg.msg_iovlen + 1;
     }
     struct msghdr *host_msg = unix_dgram ? &host_recv_msg : &msg;
+    // A SEQPACKET frame's header goes to scratch the same way (see
+    // unix_seqpacket_recvmsg).
+    bool unix_seqpacket = sock_is_unix_seqpacket(sock);
+    struct unix_seqpacket_hdr seq_hdr = {};
     ssize_t res = 0;
     // See the recvfrom path for why MSG_WAITALL cannot reach a nonblocking
     // host socket. Same emulation, over the iovec array instead of a buffer.
@@ -8175,6 +12200,7 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
     int resume_iovlen = 0;
     struct msghdr resume_msg = {};
     struct socket_io_wait wait = {};
+    bool peer_gone_dropped = false;
     socket_force_host_nonblock(sock);
     TASK_MAY_BLOCK {
         bool use_ipv6_errqueue =
@@ -8184,18 +12210,33 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             sock->socket.ipv6_recverr;
         while (1) {
             sigset_t oldmask;
-            if (!socket_blocking_syscall_begin(&oldmask)) {
+            // Not around a SEQPACKET read, nor a non-blocking call; see
+            // sys_recvfrom_common.
+            bool host_call_guarded = !unix_seqpacket && socket_call_is_blocking(sock, real_flags);
+            if (host_call_guarded && !socket_blocking_syscall_begin(&oldmask)) {
+                // A stray poke is not an interruption; see sys_recvfrom_common.
+                if (!socket_guest_signal_pending())
+                    continue;
                 res = errno_map();
                 errno = 0;
                 break;
             }
             errno = 0;
             struct msghdr *attempt = resume_iov != NULL ? &resume_msg : host_msg;
-            if (use_ipv6_errqueue)
+            if (use_ipv6_errqueue) {
                 res = recvmsg_ipv6_errqueue(sock, attempt, host_flags);
-            else
+            } else if (unix_seqpacket) {
+                res = unix_seqpacket_recvmsg(sock, attempt, host_flags, &seq_hdr);
+                // The sender, as Linux names an unbound one: the family alone.
+                if (res >= 0 && attempt->msg_name != NULL) {
+                    ((struct sockaddr *) attempt->msg_name)->sa_family = AF_UNIX;
+                    attempt->msg_namelen = sizeof(sa_family_t);
+                }
+            } else {
                 res = recvmsg(sock->real_fd, attempt, host_flags);
-            socket_blocking_syscall_end();
+            }
+            if (host_call_guarded)
+                socket_blocking_syscall_end();
             if (res >= 0) {
                 if (!waitall)
                     break;
@@ -8240,6 +12281,8 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
                 }
                 continue;
             }
+            if (sock_io_drop_peer_gone(sock, &peer_gone_dropped))
+                continue;
             if (socket_should_retry_io_eintr(sock, real_flags))
                 continue;
             if (socket_should_retry_io_eagain(sock, real_flags)) {
@@ -8294,6 +12337,18 @@ static int_t sys_recvmsg_guest_abi(fd_t sock_fd, guest_addr_t msghdr_addr, int_t
             else
                 msg.msg_flags &= ~MSG_TRUNC;
         }
+    }
+    if (unix_seqpacket && res >= 0 && seq_hdr.magic == UNIX_SEQPACKET_MAGIC) {
+        // The frame carried what a datagram's header carries: the sender's
+        // credentials, and its descriptors, taken only by a real read (see
+        // the datagram case above). MSG_TRUNC asks for the message's own
+        // length, which may be more than was copied.
+        dgram_hdr.cred = seq_hdr.cred;
+        have_dgram_cred = true;
+        if (seq_hdr.scm_cookie != 0 && !(flags & MSG_PEEK_))
+            dgram_scm = unix_dgram_scm_take(seq_hdr.scm_cookie);
+        if (flags & MSG_TRUNC_)
+            res = (ssize_t) seq_hdr.len;
     }
     size_t requested = sock_iov_requested(msg.msg_iov, msg.msg_iovlen);
     err = 0;
@@ -8517,6 +12572,12 @@ out_recvmsg_done:
                 assert(appended);
             }
             if (have_passcred) {
+                // As the receiver's namespaces name the sender.
+                cred.pid = current_pid_shown_or_zero(cred.pid);
+                if (cred.uid != (uid_t_) -1)
+                    cred.uid = current_uid_shown(cred.uid);
+                if (cred.gid != (uid_t_) -1)
+                    cred.gid = current_gid_shown(cred.gid);
                 bool appended = guest_cmsg_append(abi, guest_msg_control, required_msg_control, &guest_msg_control_len,
                         SOL_SOCKET_, SCM_CREDENTIALS_, &cred, sizeof(cred));
                 assert(appended);
@@ -8552,9 +12613,17 @@ out_recvmsg_done:
         return err;
     }
 
+    bool icmp_have = false, icmp_v6 = false;
+    uint8_t icmp_from[16];
+    if (sock->socket.net_emul_icmp && res > 0)
+        icmp_have = net_emul_icmp_from_take(sock, (real_flags & MSG_PEEK) != 0, &icmp_v6, icmp_from);
     // msg_name (changed)
     if (msg.msg_name != 0) {
-        if (sock->socket.domain == AF_INET_)
+        if (sock->socket.net_emul_icmp)
+            net_emul_icmp_from_report(sock, icmp_have, icmp_v6, icmp_from, msg.msg_name, &msg.msg_namelen);
+        else if (sock->socket.net_emul)
+            net_emul_from_host(sock, msg.msg_name, &msg.msg_namelen);
+        else if (sock->socket.domain == AF_INET_)
             inet_nat_rewrite_src(sock, msg.msg_name);
         int err = sockaddr_write(msg_fake.msg_name, msg.msg_name, msg_fake.msg_namelen, &msg.msg_namelen);
         if (err < 0) {
@@ -8741,6 +12810,57 @@ static int sock_take_pending_error(struct fd *fd) {
     return err_map(err);
 }
 
+// Whether a host socket error is one Linux would never have raised: the
+// ECONNRESET Darwin leaves on an AF_UNIX datagram socket when the socket it is
+// connected to closes (xnu's unp_drop, from the closing socket's unp_detach).
+//
+// On Linux that socket is simply idle. It stays pointed at the dead peer, no
+// error is raised on it, and only its next send finds out. Measured on Linux
+// 6.12, a socketpair whose peer has closed with nothing queued: epoll(EPOLLIN)
+// reports nothing, poll(events=0) is 0, recv(MSG_DONTWAIT) is EAGAIN and
+// SO_ERROR is 0. AOK passed Darwin's error through, as EPOLLIN (the pending
+// error makes the host poll readable), as POLLERR (fs/poll.c's EVFILT_EXCEPT
+// arm) and as ECONNRESET from recv -- whichever looked first, since the error
+// is read-and-clear -- and a send took it too, failing a sendto() to a live
+// address that Linux delivers. So every place that can take it off the host
+// drops it.
+bool sock_host_error_is_peer_gone(struct fd *fd, int host_err) {
+    return host_err == ECONNRESET && fd != NULL && fd->ops == &socket_fdops &&
+        sock_is_unix_dgram(fd);
+}
+
+// For a host recv or send that just failed: whether that was the error above,
+// in which case it is gone now and the caller goes round again. Once per
+// call. The failing call cleared it itself, except for a MSG_PEEK, which
+// leaves a pending error in place -- so clear it here too, or a peek would
+// loop.
+static bool sock_io_drop_peer_gone(struct fd *fd, bool *dropped) {
+    if (*dropped || !sock_host_error_is_peer_gone(fd, errno))
+        return false;
+    int so_error;
+    socklen_t so_error_len = sizeof(so_error);
+    sock_host_so_error(fd->real_fd, &so_error, &so_error_len);
+    *dropped = true;
+    return true;
+}
+
+// The error for a send with no destination on an AF_UNIX socket the host has
+// no connection for. Darwin says EDESTADDRREQ where Linux says ENOTCONN --
+// except the first time on a datagram socket whose connected peer has since
+// closed, which Linux reports as ECONNREFUSED, and only then disconnects (see
+// dgram_peer_set in fs/fd.h). Measured on Linux 6.12, for send and write
+// alike: ECONNREFUSED, then ENOTCONN. (For AF_INET both kernels use
+// EDESTADDRREQ.)
+static int unix_send_unconnected_err(struct fd *sock, int err) {
+    if (sock->socket.domain != AF_LOCAL_ || (err != _EDESTADDRREQ && err != _ENOTCONN))
+        return err;
+    if (sock->socket.type == SOCK_DGRAM_ && sock->socket.dgram_peer_set) {
+        sock->socket.dgram_peer_set = false;
+        return _ECONNREFUSED;
+    }
+    return _ENOTCONN;
+}
+
 static int sock_poll(struct fd *fd) {
     if (sock_is_devlog_sink(fd))
         return POLL_WRITE;
@@ -8760,6 +12880,18 @@ static int sock_poll(struct fd *fd) {
         }
         return types;
     }
+    // Rebuilt by a checkpoint restore with its peer already closed. Unlike
+    // conn_dead just below, there IS an end-of-file waiting here, and that is
+    // the whole point: Linux reports a peer-closed socket as readable for
+    // exactly that reason, because a read returns 0. So POLL_READ belongs
+    // alongside POLL_HUP. Without it a program that waits for POLLIN before
+    // reading never reads the end-of-file it is being told about -- measured
+    // as revents 0x18 on a restored socket, the failure
+    // docs/historical/build_555_musts.md item 4 describes. Placed ahead of the
+    // half-close discriminator below on purpose: there is no live peer to ask
+    // with a zero-length send, and no half-close to tell apart.
+    if (fd->socket.ckpt_hungup)
+        return POLL_READ | POLL_HUP;
     // The connection is gone for good -- iOS killed it while the device slept,
     // and sock_translate_err has already said so once. Report what Linux shows
     // for a dead connection, and specifically NOT POLL_READ: a poll loop that
@@ -8771,25 +12903,73 @@ static int sock_poll(struct fd *fd) {
     if (fd->socket.conn_dead)
         return POLL_ERR | POLL_HUP;
     int types = realfs_poll(fd);
-    // Darwin's poll() answers POLLHUP the moment the peer stops writing and
-    // gives no way to tell that from a connection that is actually finished.
-    // Linux keeps them apart: EPOLLRDHUP for the peer's half, EPOLLHUP only
-    // once both directions are down. Reporting HUP for a half-close is
-    // provably wrong -- the socket is still writable, and a program treats
-    // EPOLLHUP as "connection over" and drops it.
+    // A unix stream or seqpacket socket that is not connected -- never was,
+    // or only bound, or its connect() failed -- is POLLOUT|POLLHUP on Linux
+    // (unix_poll: a connection-based socket in TCP_CLOSE hangs up; measured
+    // 0x14 on 6.12), and nothing at all on Darwin, so a poll on one waited
+    // for ever. labwc did exactly that on the 5th-gen iPad after Xwayland
+    // crashed: its window manager waited on such a socket and the whole
+    // desktop froze. Asked only when the host reported nothing, which a
+    // connected socket almost never does (it is writable), and never of a
+    // listener, which Linux also reports as nothing.
+    if (types == 0 && fd->socket.domain == AF_LOCAL_ && !fd->socket.listening &&
+            (fd->socket.type == SOCK_STREAM_ || fd->socket.type == SOCK_SEQPACKET_)) {
+        struct sockaddr_storage peer;
+        socklen_t peer_len = sizeof(peer);
+        if (getpeername(fd->real_fd, (struct sockaddr *) &peer, &peer_len) < 0 &&
+                errno == ENOTCONN)
+            return POLL_WRITE | POLL_HUP;
+    }
+    // An AF_UNIX datagram socket whose peer has closed polls readable on
+    // Darwin, for the pending error Linux never raises (see
+    // sock_host_error_is_peer_gone). Take it off, and look again. Only when
+    // the host said readable, so an idle socket pays nothing; any other
+    // error is kept for the guest, as every internal SO_ERROR read keeps it.
+    if ((types & POLL_READ) && sock_is_unix_dgram(fd)) {
+        int so_error = 0;
+        socklen_t so_error_len = sizeof(so_error);
+        if (sock_host_so_error(fd->real_fd, &so_error, &so_error_len) == 0 &&
+                so_error != 0) {
+            if (sock_host_error_is_peer_gone(fd, so_error))
+                types = realfs_poll(fd);
+            else if (fd->socket.host_connect_error == 0)
+                fd->socket.host_connect_error = so_error;
+        }
+    }
+    // Darwin's poll() answers POLLHUP when EITHER direction is down, and gives
+    // no way to tell which. Linux keeps them apart: EPOLLRDHUP (with EPOLLIN)
+    // once there is nothing more to read, EPOLLHUP only once both directions
+    // are down. Reporting HUP for a half-close is provably wrong -- the socket
+    // is still writable, and a program treats EPOLLHUP as "connection over"
+    // and drops it.
     //
-    // A zero-length send is the discriminator, and it is a single syscall with
-    // nothing to clean up: it transmits no segment, leaves pending inbound
+    // So ask about each direction. The read side first, with a poll for
+    // POLLIN alone: that registers only Darwin's read filter, whose EOF means
+    // the peer shut its side (or we shut our read side, which Linux also
+    // reports as RDHUP). Without it there is no RDHUP and no HUP at all, and
+    // the POLLHUP came from our OWN shutdown(SHUT_WR): Linux reports that as
+    // writable and nothing else (measured, 0x4 where AOK said OUT|HUP|RDHUP
+    // 0x2014, docs/build_556_musts.md §3). It matters because the usual reason
+    // to shut down writing is to wait for the reply, and HUP said none would
+    // come.
+    //
+    // Then the write side, with a zero-length send: a single syscall with
+    // nothing to clean up, it transmits no segment, leaves pending inbound
     // data alone, and returns EPIPE exactly when our own write direction has
     // gone. (SIGPIPE is ignored process-wide -- kernel/init.c -- so it cannot
-    // fire here.) Only for connection-oriented sockets: on a datagram socket a
-    // zero-length send would put an empty datagram on the wire.
+    // fire here.) That alone could not tell our own half-close from the
+    // peer's full close, which is why it is asked second. Only for
+    // connection-oriented sockets: on a datagram socket a zero-length send
+    // would put an empty datagram on the wire.
     if ((types & POLL_HUP) &&
             (fd->socket.type == SOCK_STREAM_ || fd->socket.type == SOCK_SEQPACKET_)) {
         types &= ~POLL_HUP;
-        types |= POLL_RDHUP;
-        if (send(fd->real_fd, "", 0, MSG_DONTWAIT) < 0 && errno == EPIPE)
-            types |= POLL_HUP;
+        struct pollfd read_side = {.fd = fd->real_fd, .events = POLLIN};
+        if (poll(&read_side, 1, 0) > 0 && (read_side.revents & POLLHUP)) {
+            types |= POLL_RDHUP;
+            if (send(fd->real_fd, "", 0, MSG_DONTWAIT) < 0 && errno == EPIPE)
+                types |= POLL_HUP;
+        }
     }
 #if defined(__APPLE__)
     if (types & POLL_WRITE)
@@ -8813,8 +12993,15 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         return 0;
     if (fd->socket.domain == AF_NETLINK_) {
         // Mirror recvfrom()/recvmsg(): deliver the buffered netlink reply to a
-        // bare read()/readv() too. Returns _EAGAIN when no reply is queued, the
-        // same as the recvfrom() path.
+        // bare read()/readv() too, waiting for one the same way when the
+        // socket blocks.
+        //
+        // Except for a read of nothing, which Linux's sock_read_iter answers
+        // with 0 before it looks at the queue. Now that an empty queue waits,
+        // passing it on would block a zero-length read until a message came
+        // -- and then eat that message, which recvmsg does and read does not.
+        if (size == 0)
+            return 0;
         struct iovec iov = {
             .iov_base = buf,
             .iov_len = size,
@@ -8828,9 +13015,11 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
     if (fd->real_fd < 0)
         return _EOPNOTSUPP;
     if (fd->socket.domain == AF_LOCAL_) {
+        // The peer handshake waits with none of the guest's timeout, so an
+        // interruption there is an untimed wait's: restartable.
         int err = unix_socket_finish_peer(fd);
         if (err < 0)
-            return err;
+            return signal_restart_or_eintr(err);
     }
     // AF_LOCAL datagrams arrive with an in-band cred header (see struct
     // unix_dgram_cred_hdr): land it in a scratch struct via a 2-iov recvmsg
@@ -8842,34 +13031,63 @@ static ssize_t sock_read(struct fd *fd, void *buf, size_t size) {
         {.iov_base = buf, .iov_len = size},
     };
     struct msghdr dgram_msg = {.msg_iov = dgram_iov, .msg_iovlen = 2};
+    bool unix_seqpacket = sock_is_unix_seqpacket(fd);
+    struct unix_seqpacket_hdr seq_hdr = {};
     ssize_t res = 0;
     struct socket_io_wait wait = {};
+    bool peer_gone_dropped = false;
     socket_force_host_nonblock(fd);
     TASK_MAY_BLOCK {
         while (1) {
             errno = 0;
-            if (unix_dgram)
+            if (unix_dgram) {
                 res = recvmsg(fd->real_fd, &dgram_msg, 0);
-            else
+            } else if (unix_seqpacket) {
+                struct iovec room = {.iov_base = buf, .iov_len = size};
+                struct msghdr one = {.msg_iov = &room, .msg_iovlen = 1};
+                res = unix_seqpacket_recvmsg(fd, &one, 0, &seq_hdr);
+            } else {
                 res = read(fd->real_fd, buf, size);
+            }
             if (res >= 0)
                 break;
+            if (sock_io_drop_peer_gone(fd, &peer_gone_dropped))
+                continue;
+            // Before the retry check, whose pending-signal test takes a lock
+            // and can clobber errno.
+            bool host_eintr = errno == EINTR;
             if (socket_should_retry_io_eintr(fd, 0))
                 continue;
+            if (host_eintr) {
+                // A guest signal cut the host call itself short.
+                //
+                // break, not a goto past the loop: this loop is the whole
+                // body of TASK_MAY_BLOCK, a for loop whose end clears
+                // io_block, and a goto out of it skips that. read(2)'s own
+                // TASK_MAY_BLOCK hid it, but nothing here should rely on that.
+                res = socket_intr_errno(fd, POLLIN, &wait);
+                errno = 0;
+                break;
+            }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
                     socket_call_is_blocking(fd, 0)) {
                 int wait_err = socket_wait_ready(fd, POLLIN, &wait);
                 if (wait_err < 0) {
                     res = wait_err;
                     errno = 0;
-                    goto out_read;
+                    break;
                 }
                 continue;
             }
             break;
         }
     }
-out_read:
+    if (fd->socket.net_emul_icmp && res > 0) {
+        // (A read reports no sender, but takes the message's all the same.)
+        bool v6;
+        uint8_t from[16];
+        net_emul_icmp_from_take(fd, false, &v6, from);
+    }
     if (res <= 0) {
         // A pending socket error outranks both EOF and EAGAIN, and AOK's own
         // poll probe may already have taken it off the host. See
@@ -8901,6 +13119,12 @@ out_read:
         else
             sock_x11_event("read-err", fd, -1, err, size);
         return err;
+    }
+    // See the recvfrom path: plain read() discards the parcel.
+    if (unix_seqpacket && res >= 0 && seq_hdr.scm_cookie != 0) {
+        struct scm *dropped = unix_dgram_scm_take(seq_hdr.scm_cookie);
+        if (dropped != NULL)
+            scm_free(dropped);
     }
     if (unix_dgram && res >= (ssize_t) sizeof(dgram_hdr) &&
             dgram_hdr.magic == UNIX_DGRAM_CRED_MAGIC) {
@@ -8954,6 +13178,21 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
         dgram_msg.msg_iov = dgram_iov;
         dgram_msg.msg_iovlen = 2;
     }
+    // A connected datagram socket of a private network namespace: connect()
+    // only recorded where it goes (see sys_connect_common).
+    struct sockaddr_max_ emul_dest;
+    uint_t emul_dest_len = 0;
+    bool emul_to = false;
+    if (fd->socket.net_emul_icmp)
+        return net_emul_icmp_send(fd, buf, size, NULL);
+    if (fd->socket.net_emul && sock_net_emul_dgram(fd)) {
+        bool drop;
+        int emul_err = net_emul_send_dest(fd, false, &emul_dest, &emul_dest_len, &emul_to, &drop);
+        if (emul_err < 0)
+            return emul_err;
+        if (drop)
+            return (ssize_t) size;
+    }
     ssize_t res = 0;
     // Plain write(2) on a socket is how most guests actually send, and a
     // blocking one must not come back short. See the sendto path: the host
@@ -8962,14 +13201,23 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
     bool send_all = !unix_dgram && socket_call_is_blocking(fd, 0) && socket_is_stream(fd);
     size_t sent = 0;
     struct socket_io_wait wait = {};
+    bool peer_gone_dropped = false;
     socket_force_host_nonblock(fd);
+    bool unix_seqpacket = sock_is_unix_seqpacket(fd);
     TASK_MAY_BLOCK {
         while (1) {
             errno = 0;
-            if (unix_dgram)
+            if (unix_dgram) {
                 res = sendmsg(fd->real_fd, &dgram_msg, 0);
-            else
+            } else if (unix_seqpacket) {
+                struct iovec whole = {.iov_base = (void *) buf, .iov_len = size};
+                struct msghdr one = {.msg_iov = &whole, .msg_iovlen = 1};
+                res = unix_seqpacket_sendmsg(fd, &one, 0, 0);
+            } else if (emul_to) {
+                res = sendto(fd->real_fd, buf, size, 0, (void *) &emul_dest, emul_dest_len);
+            } else {
                 res = write(fd->real_fd, (const char *) buf + sent, size - sent);
+            }
             if (res >= 0) {
                 if (!send_all)
                     break;
@@ -8985,14 +13233,24 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
                 }
                 continue;
             }
+            if (sock_io_drop_peer_gone(fd, &peer_gone_dropped))
+                continue;
+            bool host_eintr = errno == EINTR; // see sock_read
             if (socket_should_retry_io_eintr(fd, 0))
                 continue;
+            if (host_eintr) {
+                // A guest signal cut the host call itself short. break, as in
+                // sock_read: a goto out of TASK_MAY_BLOCK leaves io_block set.
+                res = sent > 0 ? (ssize_t) sent : socket_intr_errno(fd, POLLOUT, &wait);
+                errno = 0;
+                break;
+            }
             if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
                     socket_call_is_blocking(fd, 0)) {
                 int wait_err = socket_wait_ready(fd, POLLOUT, &wait);
                 if (wait_err < 0) {
                     res = sent > 0 ? (ssize_t) sent : wait_err;
-                    goto out_write;
+                    break;
                 }
                 continue;
             }
@@ -9001,7 +13259,6 @@ static ssize_t sock_write(struct fd *fd, const void *buf, size_t size) {
             break;
         }
     }
-out_write:
     if (res < 0) {
         if (res > -4096 && res < 0 && errno == 0)
             return res;
@@ -9012,6 +13269,7 @@ out_write:
         }
         int err = errno_map();
         sock_translate_err(fd, &err);
+        err = unix_send_unconnected_err(fd, err);
         sock_trace("write", fd, -1, err);
         if (err == _EAGAIN)
             sock_x11_event("write-eagain", fd, -1, err, size);
@@ -9027,25 +13285,178 @@ out_write:
     return res;
 }
 
+// The interface ioctls for a socket of a private network namespace
+// (kernel/net_ns.h): "lo", index 1, and the namespace's veth and dummy links
+// (fs/net_vif.h). *handled is false for a command that is not one of them.
+static int net_ns_if_ioctl(struct net_namespace *ns, int cmd, void *arg, bool *handled) {
+    *handled = true;
+    struct ifreq_ *ifreq = arg;
+    struct net_vif_info vifs[NET_NS_MAX_VIFS];
+    if (cmd == SIOCGIFCONF_) {
+        bool is_64bit = task_is_64bit(current);
+        struct guest_ifconf32_ *ifconf32 = arg;
+        struct guest_ifconf64_ *ifconf64 = arg;
+        int32_t guest_len = is_64bit ? ifconf64->guest_len : ifconf32->guest_len;
+        guest_addr_t guest_buf = is_64bit ? ifconf64->guest_buf : ifconf32->guest_buf;
+        size_t entry_size = is_64bit ? sizeof(struct guest_ifreq_addr64_) : sizeof(struct guest_ifreq_addr32_);
+        // One entry an IPv4 address of an up link, as inet_gifconf makes them.
+        int n = net_vif_list(ns, vifs, NET_NS_MAX_VIFS);
+        if (n > NET_NS_MAX_VIFS)
+            n = NET_NS_MAX_VIFS;
+        size_t total = 0, used = 0;
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = -1; i < n; i++) {
+                int count = i < 0 ? (atomic_load(&ns->lo_addr4) ? 1 : 0) : vifs[i].n_addrs;
+                for (int j = 0; j < count; j++) {
+                    if (i >= 0 && (vifs[i].addrs[j].v6 || !vifs[i].up))
+                        continue;
+                    if (pass == 0) {
+                        total += entry_size;
+                        continue;
+                    }
+                    if (guest_buf == 0 || guest_len <= 0 || used + entry_size > (size_t) guest_len)
+                        continue;
+                    struct guest_ifreq_addr64_ entry = {};
+                    strcpy(entry.ifr_name, i < 0 ? "lo" : vifs[i].name);
+                    entry.guest_addr.sin_family = AF_INET_;
+                    if (i < 0)
+                        entry.guest_addr.sin_addr = htonl(INADDR_LOOPBACK);
+                    else
+                        memcpy(&entry.guest_addr.sin_addr, vifs[i].addrs[j].addr, 4);
+                    if (user_write(guest_buf + used, &entry, entry_size))
+                        return _EFAULT;
+                    used += entry_size;
+                }
+            }
+        }
+        int32_t result_len = guest_buf == 0 ? (int32_t) total : (int32_t) used;
+        if (is_64bit)
+            ifconf64->guest_len = result_len;
+        else
+            ifconf32->guest_len = result_len;
+        return 0;
+    }
+    if (cmd == SIOCGIFNAME_) {
+        int index = ifreq->ifr_ifru.ifindex;
+        if (index != NET_NS_LO_INDEX && net_vif_get(ns, index, NULL, &vifs[0]) != 0)
+            return _ENODEV;
+        memset(ifreq->ifr_name, 0, sizeof(ifreq->ifr_name));
+        strcpy(ifreq->ifr_name, index == NET_NS_LO_INDEX ? "lo" : vifs[0].name);
+        return 0;
+    }
+    if (cmd != SIOCGIFINDEX_ && cmd != SIOCGIFFLAGS_ && cmd != SIOCSIFFLAGS_ && cmd != SIOCGIFTXQLEN_ && cmd != SIOCGIFMTU_ &&
+            cmd != SIOCGIFMETRIC_ && cmd != SIOCGIFHWADDR_ && cmd != SIOCGIFADDR_ &&
+            cmd != SIOCGIFDSTADDR_ && cmd != SIOCGIFBRDADDR_ && cmd != SIOCGIFNETMASK_) {
+        *handled = false;
+        return 0;
+    }
+    char name[IFNAMSIZ_ + 1] = "";
+    memcpy(name, ifreq->ifr_name, IFNAMSIZ_);
+    if (strcmp(name, "lo") != 0) {
+        struct net_vif_info *vif = &vifs[0];
+        if (net_vif_get(ns, 0, name, vif) != 0)
+            return _ENODEV;
+        switch (cmd) {
+            case SIOCGIFINDEX_: ifreq->ifr_ifru.ifindex = vif->index; return 0;
+            case SIOCGIFFLAGS_: {
+                unsigned flags = IFF_BROADCAST_LINUX_ | (vif->kind == NET_VIF_DUMMY ? IFF_NOARP_LINUX_ : IFF_MULTICAST_LINUX_);
+                if (vif->up)
+                    flags |= IFF_UP_LINUX_;
+                if (vif->lower_up)
+                    flags |= IFF_RUNNING_LINUX_;
+                ifreq->ifr_ifru.flags = (int16_t) flags;
+                return 0;
+            }
+            case SIOCSIFFLAGS_: {
+                if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+                    return _EPERM;
+                struct net_vif_change change = {.up = (ifreq->ifr_ifru.flags & IFF_UP_LINUX_) != 0};
+                return net_vif_change(ns, vif->index, &change);
+            }
+            case SIOCGIFTXQLEN_: ifreq->ifr_ifru.qlen = 1000; return 0;
+            case SIOCGIFMTU_: ifreq->ifr_ifru.mtu = (int) vif->mtu; return 0;
+            case SIOCGIFMETRIC_: ifreq->ifr_ifru.metric = 0; return 0;
+            case SIOCGIFHWADDR_:
+                memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+                ifreq->ifr_ifru.addr.family = ARPHRD_ETHER_;
+                memcpy(ifreq->ifr_ifru.addr.data, vif->mac, 6);
+                return 0;
+        }
+        // Its first IPv4 address (the primary, as devinet_ioctl finds it).
+        const struct net_vif_addr *addr = NULL;
+        for (int i = 0; i < vif->n_addrs && addr == NULL; i++)
+            if (!vif->addrs[i].v6)
+                addr = &vif->addrs[i];
+        if (addr == NULL)
+            return _EADDRNOTAVAIL;
+        uint32_t a, mask = addr->prefix == 0 ? 0 : htonl(0xffffffffu << (32 - addr->prefix));
+        memcpy(&a, addr->addr, 4);
+        struct sockaddr_in_ *in = (struct sockaddr_in_ *) &ifreq->ifr_ifru.addr;
+        memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+        in->sin_family = AF_INET_;
+        in->sin_addr = cmd == SIOCGIFNETMASK_ ? mask : cmd == SIOCGIFBRDADDR_ ? (a | ~mask) : a;
+        return 0;
+    }
+    switch (cmd) {
+        case SIOCGIFINDEX_: ifreq->ifr_ifru.ifindex = NET_NS_LO_INDEX; return 0;
+        case SIOCGIFFLAGS_: ifreq->ifr_ifru.flags = (int16_t) net_ns_lo_flags(ns); return 0;
+        case SIOCSIFFLAGS_: {
+            // `ip link set lo up` the old way (busybox, ifconfig): the same
+            // as RTM_NEWLINK above, addresses included.
+            if (!ns_capable(ns->user_ns, CAP_NET_ADMIN_))
+                return _EPERM;
+            bool up = (ifreq->ifr_ifru.flags & IFF_UP_LINUX_) != 0;
+            atomic_store(&ns->lo_up, up);
+            if (up) {
+                atomic_store(&ns->lo_addr4, true);
+                atomic_store(&ns->lo_addr6, true);
+            }
+            return 0;
+        }
+        case SIOCGIFTXQLEN_: ifreq->ifr_ifru.qlen = 1000; return 0;
+        case SIOCGIFMTU_: ifreq->ifr_ifru.mtu = 65536; return 0;
+        case SIOCGIFMETRIC_: ifreq->ifr_ifru.metric = 0; return 0;
+        case SIOCGIFHWADDR_:
+            memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+            ifreq->ifr_ifru.addr.family = ARPHRD_LOOPBACK_;
+            return 0;
+    }
+    // An address of "lo": the one it has, once it has it.
+    if (!atomic_load(&ns->lo_addr4))
+        return _EADDRNOTAVAIL;
+    struct sockaddr_in_ *in = (struct sockaddr_in_ *) &ifreq->ifr_ifru.addr;
+    memset(&ifreq->ifr_ifru, 0, sizeof(ifreq->ifr_ifru));
+    in->sin_family = AF_INET_;
+    in->sin_addr = cmd == SIOCGIFNETMASK_ ? htonl(0xff000000u) : htonl(INADDR_LOOPBACK);
+    return 0;
+}
+
 static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
     if (cmd == SIOCGSKNS_) {
-        // Which network namespace this socket lives in. There is exactly one
-        // here, so the answer is always the same fd the /proc/<pid>/ns/net
-        // link opens -- which is the truthful answer, not a stand-in.
-        //
-        // Worth having because it is how lsns learns that a socket belongs to
-        // a namespace at all. Refused, it falls back to opening every
-        // descriptor of every process and asking each one whether it is a
-        // namespace, which is noisy and much slower.
+        // Which network namespace this socket lives in. AOK presents no
+        // network namespaces at all, as a kernel built without CONFIG_NET_NS
+        // does (no /proc/<pid>/ns/net -- see fs/proc/pid.c for why systemd
+        // needs that), so proc_ns_open finds no "net" and this is EINVAL.
+        // lsns sees no ns/net either and does not ask.
         if (!superuser())
             return _EPERM;
         struct fd *ns = proc_ns_open(current->pid, "net");
-        if (ns == NULL)
+        if (ns == NULL || (IS_ERR(ns) && PTR_ERR(ns) == _ENOENT))
             return _EINVAL;
         if (IS_ERR(ns))
             return PTR_ERR(ns);
         return f_install(ns, O_CLOEXEC_);
     }
+    if (fd->socket.net_ns != NULL) {
+        bool handled;
+        int err = net_ns_if_ioctl(fd->socket.net_ns, cmd, arg, &handled);
+        if (handled)
+            return err;
+    }
+    // The machine's interfaces are the host's, and not a guest's to set:
+    // what this ioctl has always answered here.
+    if (cmd == SIOCSIFFLAGS_)
+        return _ENOTTY;
     if (cmd == SIOCGIFNAME_)
         return sock_ifreq_name_from_index(arg);
     if (cmd == SIOCGIFCONF_)
@@ -9071,8 +13482,19 @@ static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
     if (cmd == SIOCGIFNETMASK_)
         return sock_ifreq_addr_field_from_name(arg, SOCK_IFREQ_NETMASK_);
     if (fd->real_fd < 0) {
-        if (cmd == FIONREAD_)
-            *(dword_t *) arg = (dword_t) (fd->socket.netlink_reply_len - fd->socket.netlink_reply_off);
+        if (cmd == FIONREAD_) {
+            // SIOCINQ on a datagram socket is the size of the NEXT datagram,
+            // not the whole backlog. Gated on the domain like every other
+            // reader of these fields: other real_fd<0 kinds alias the union.
+            dword_t queued = 0;
+            if (fd->socket.domain == AF_NETLINK_) {
+                lock(&fd->socket.netlink_reply_lock, 0);
+                queued = (dword_t) (netlink_reply_datagram_end_locked(fd) -
+                        fd->socket.netlink_reply_off);
+                unlock(&fd->socket.netlink_reply_lock);
+            }
+            *(dword_t *) arg = queued;
+        }
         else if (cmd == SIOCOUTQ_)
             // Emulated (netlink) sockets never queue outgoing bytes.
             *(dword_t *) arg = 0;
@@ -9101,6 +13523,13 @@ static int sock_ioctl(struct fd *fd, int cmd, void *arg) {
 #endif
         return 0;
     }
+    if (cmd == FIONREAD_ && sock_is_unix_seqpacket(fd)) {
+        int queued = unix_seqpacket_queued_bytes(fd);
+        if (queued < 0)
+            return errno_map();
+        *(dword_t *) arg = (dword_t) queued;
+        return 0;
+    }
     return realfs_ioctl(fd, cmd, arg);
 }
 
@@ -9114,6 +13543,7 @@ static ssize_t sock_ioctl_size(int cmd) {
         case SIOCGIFCONF_:
         case SIOCGIFINDEX_:
         case SIOCGIFFLAGS_:
+        case SIOCSIFFLAGS_:
         case SIOCGIFTXQLEN_:
         case SIOCGIFMTU_:
         case SIOCGIFMETRIC_:
@@ -9161,6 +13591,8 @@ static int sock_setflags(struct fd *fd, dword_t flags) {
 
 static int sock_close(struct fd *fd) {
     sockrestart_end_listen(fd);
+    if (fd->socket.domain == AF_LOCAL_ && fd->socket.listening)
+        unix_listener_unregister(fd);
     if (fd->socket.domain == AF_NETLINK_) {
         netlink_notify_unregister(fd);
         netlink_reply_reset(fd);
@@ -9192,14 +13624,29 @@ static int sock_close(struct fd *fd) {
         close(fd->socket.ipv6_recverr_fd);
         fd->socket.ipv6_recverr_fd = -1;
     }
+    if (fd->socket.net_emul)
+        net_emul_release(fd);
+    if (fd->socket.net_emul_icmp) {
+        close(fd->socket.net_emul_icmp_fd);
+        free(fd->socket.net_emul_icmp_from);
+        fd->socket.net_emul_icmp_from = NULL;
+        fd->socket.net_emul_icmp = false;
+    }
+    net_ns_release(fd->socket.net_ns);
+    fd->socket.net_ns = NULL;
     if (fd->real_fd < 0)
         return 0;
+    if (sock_is_unix_seqpacket(fd))
+        unix_seqpacket_discard_queue(fd);
     return realfs_close(fd);
 }
 
 const struct fd_ops socket_fdops = {
+    .name = "socket",
     .read = sock_read,
     .write = sock_write,
+    // See socket_intr_errno.
+    .decides_restart = true,
     .close = sock_close,
     .poll = sock_poll,
     .getflags = sock_getflags,
@@ -9280,4 +13727,762 @@ int_t sys_socketcall_guest(dword_t call_num, guest_addr_t args_addr) {
 
 int_t sys_socketcall(dword_t call_num, addr_t args_addr) {
     return sys_socketcall_guest(call_num, args_addr);
+}
+
+// ------------------------------------------------- checkpoint save/restore
+//
+// A socket is described well enough to be BUILT again, never photographed --
+// the host object belongs to this process and does not outlive it. On iOS it
+// does not even outlive a suspension: the system tears connected sockets down
+// while the app is frozen, which is what the ENOTCONN->ECONNRESET translation
+// above exists to report. So a connection that cannot be resumed comes back
+// hung up rather than costing the whole session. See fs/sock_ckpt.h.
+
+const char *sock_ckpt_state_name(uint32_t state) {
+    switch (state) {
+        case SOCK_CKPT_FRESH: return "fresh";
+        case SOCK_CKPT_BOUND: return "bound";
+        case SOCK_CKPT_LISTEN: return "listen";
+        case SOCK_CKPT_NETLINK: return "netlink";
+        case SOCK_CKPT_HUNGUP: return "hungup";
+        case SOCK_CKPT_PAIR: return "pair";
+    }
+    return "?";
+}
+
+// Did a bind() actually put this socket somewhere? A socket that has never
+// been bound still answers getsockname -- with the wildcard address and port
+// zero -- so the presence of a name proves nothing and the port is the test.
+static bool sock_ckpt_addr_is_bound(const void *addr, socklen_t len) {
+    const struct sockaddr *sa = addr;
+    if (len < (socklen_t) sizeof(sa->sa_family))
+        return false;
+    if (sa->sa_family == AF_INET && len >= (socklen_t) sizeof(struct sockaddr_in))
+        return ((const struct sockaddr_in *) addr)->sin_port != 0;
+    if (sa->sa_family == AF_INET6 && len >= (socklen_t) sizeof(struct sockaddr_in6))
+        return ((const struct sockaddr_in6 *) addr)->sin6_port != 0;
+    return false;
+}
+
+// The options a rebuild would otherwise lose; see sock_ckpt_desc.
+static void sock_ckpt_capture_options(struct fd *sock, struct sock_ckpt_desc *out) {
+    out->passcred = sock->socket.unix_passcred ? 1 : 0;
+    out->timestampns = sock->socket.so_timestampns ? 1 : 0;
+    out->so_rcvbuf = sock->socket.so_rcvbuf;
+    out->so_sndbuf = sock->socket.so_sndbuf;
+    out->so_rcvbuf_set = sock->socket.so_rcvbuf_set ? 1 : 0;
+    out->so_sndbuf_set = sock->socket.so_sndbuf_set ? 1 : 0;
+    if (sock->real_fd < 0)
+        return;
+    int v = 0;
+    socklen_t len = sizeof(v);
+    if (getsockopt(sock->real_fd, SOL_SOCKET, SO_TIMESTAMP, &v, &len) == 0)
+        out->host_timestamp = v != 0;
+    len = sizeof(v);
+    if (sock->socket.so_rcvbuf_set &&
+            getsockopt(sock->real_fd, SOL_SOCKET, SO_RCVBUF, &v, &len) == 0)
+        out->host_rcvbuf = v;
+    len = sizeof(v);
+    if (sock->socket.so_sndbuf_set &&
+            getsockopt(sock->real_fd, SOL_SOCKET, SO_SNDBUF, &v, &len) == 0)
+        out->host_sndbuf = v;
+}
+
+void sock_ckpt_apply_options(struct fd *sock, const struct sock_ckpt_desc *desc) {
+    if (sock == NULL || sock->ops != &socket_fdops)
+        return;
+    sock->socket.unix_passcred = desc->passcred != 0;
+    sock->socket.so_timestampns = desc->timestampns != 0;
+    if (desc->so_rcvbuf_set) {
+        sock->socket.so_rcvbuf = desc->so_rcvbuf;
+        sock->socket.so_rcvbuf_set = true;
+    }
+    if (desc->so_sndbuf_set) {
+        sock->socket.so_sndbuf = desc->so_sndbuf;
+        sock->socket.so_sndbuf_set = true;
+    }
+    if (sock->real_fd < 0)
+        return;
+    // Best effort, as the original setsockopt was: the host's own limits are
+    // its business, and a refusal here costs an option, not the socket.
+    if (desc->host_timestamp) {
+        int on = 1;
+        (void) setsockopt(sock->real_fd, SOL_SOCKET, SO_TIMESTAMP, &on, sizeof(on));
+    }
+    if (desc->host_rcvbuf > 0) {
+        int v = desc->host_rcvbuf;
+        (void) setsockopt(sock->real_fd, SOL_SOCKET, SO_RCVBUF, &v, sizeof(v));
+    }
+    if (desc->host_sndbuf > 0) {
+        int v = desc->host_sndbuf;
+        (void) setsockopt(sock->real_fd, SOL_SOCKET, SO_SNDBUF, &v, sizeof(v));
+    }
+}
+
+int sock_ckpt_describe(struct fd *sock, struct sock_ckpt_desc *out) {
+    if (sock == NULL || sock->ops != &socket_fdops)
+        return _EINVAL;
+    memset(out, 0, sizeof(*out));
+    out->domain = sock->socket.domain;
+    out->type = sock->socket.type;
+    out->protocol = sock->socket.protocol;
+    if (sock->real_fd >= 0) {
+        int flags = fcntl(sock->real_fd, F_GETFL);
+        out->nonblock = (flags >= 0 && (flags & O_NONBLOCK)) ? 1 : 0;
+    }
+    sock_ckpt_capture_options(sock, out);
+
+    // Netlink is emulated end to end (real_fd < 0), so there is no host object
+    // to have lost and the rebuild is exact -- port id included, because that
+    // is the address the guest knows this socket by.
+    if (sock->socket.domain == AF_NETLINK_) {
+        out->state = SOCK_CKPT_NETLINK;
+        out->netlink_port_id = sock->socket.netlink_port_id;
+        out->netlink_groups = sock->socket.netlink_groups;
+        return 0;
+    }
+    if (sock->real_fd < 0) {
+        out->state = SOCK_CKPT_HUNGUP;
+        return 0;
+    }
+    // Connected to another socket in this image: rebuilt as a connected pair.
+    // unix_peer is set for a socketpair and for both sides of a connect/accept
+    // (the cookie handshake), and cleared when either end closes, so a live
+    // link means the other end is held by a process in the image too.
+    if (sock->socket.domain == AF_LOCAL_) {
+        lock(&peer_lock, 0);
+        struct fd *peer = sock->socket.unix_peer;
+        if (peer != NULL) {
+            uintptr_t a = (uintptr_t) sock, b = (uintptr_t) peer;
+            out->state = SOCK_CKPT_PAIR;
+            out->pair_cookie = (uint64_t) (a < b ? a : b);
+            out->pair_end = a < b ? 0 : 1;
+            out->cred_pid = sock->socket.unix_cred.pid;
+            out->cred_uid = sock->socket.unix_cred.uid;
+            out->cred_gid = sock->socket.unix_cred.gid;
+            out->peer_pid = sock->socket.unix_peer_cred.pid;
+            out->peer_uid = sock->socket.unix_peer_cred.uid;
+            out->peer_gid = sock->socket.unix_peer_cred.gid;
+            out->peer_cred_valid = sock->socket.unix_peer_cred_valid ? 1 : 0;
+            size_t name_len = sock->socket.unix_name_len;
+            if (name_len > 0 && name_len <= sizeof(out->addr)) {
+                memcpy(out->addr, sock->socket.unix_name, name_len);
+                out->addr_len = (uint32_t) name_len;
+            }
+        }
+        unlock(&peer_lock);
+        if (peer != NULL)
+            return 0;
+    }
+    // Connected: the far end is a process somewhere else, which will not be
+    // there on the way back.
+    char peer[SOCK_CKPT_ADDR_MAX];
+    socklen_t peer_len = sizeof(peer);
+    if (getpeername(sock->real_fd, (struct sockaddr *) peer, &peer_len) == 0) {
+        out->state = SOCK_CKPT_HUNGUP;
+        return 0;
+    }
+    // A bound AF_LOCAL socket is rebuilt from its GUEST path, not from the
+    // host address: the host path is an ishsock name allocated per run
+    // (unix_host_sun_path) and means nothing on the way back, while the guest
+    // path is the name every client knows. Stored in `addr` -- see the note on
+    // that field for why one buffer carries two different things.
+    //
+    // This used to come back hung up, on the reasoning that it cost "that
+    // socket rather than the session". For tmux the socket IS the session:
+    // its server's listener came back hung up and the server exited 1 within a
+    // dozen syscalls of resuming, taking every window with it.
+    if (sock->socket.domain == AF_LOCAL_) {
+        size_t name_len = sock->socket.unix_name_len;
+        if (name_len == 0 || name_len > sizeof(out->addr)) {
+            // Never bound (a client socket), or a name too long to be one we
+            // wrote. Nothing to put back.
+            out->state = SOCK_CKPT_HUNGUP;
+            return 0;
+        }
+        memcpy(out->addr, sock->socket.unix_name, name_len);
+        out->addr_len = (uint32_t) name_len;
+        out->state = sock->socket.listening ? SOCK_CKPT_LISTEN : SOCK_CKPT_BOUND;
+        if (out->state == SOCK_CKPT_LISTEN)
+            out->backlog = sock->sockrestart.backlog > 0
+                    ? (uint32_t) sock->sockrestart.backlog : 128;
+        // The node's mode and ownership, as they are now -- after whatever
+        // chmod/chown the daemon did once it had bound. Whatever socket node
+        // sits at the path is the one every client meets, and the one the
+        // rebuild's bind replaces, so it is the one described -- even when it
+        // is not this socket's own node (unix_name_inode), which happens only
+        // if the daemon unlinked or replaced its path while still bound. The
+        // rebuild takes the path back in that case too.
+        if (sock->socket.unix_name[0] != '\0') {
+            char path[sizeof(sock->socket.unix_name) + 1];
+            memcpy(path, sock->socket.unix_name, name_len);
+            path[name_len] = '\0';
+            struct statbuf st;
+            if (generic_statat(AT_PWD, path, &st, AT_SYMLINK_NOFOLLOW_) >= 0 &&
+                    S_ISSOCK(st.mode)) {
+                out->node_known = 1;
+                out->node_mode = st.mode & 07777;
+                out->node_uid = st.uid;
+                out->node_gid = st.gid;
+            }
+        }
+        return 0;
+    }
+    if (sock->socket.domain != AF_INET_ && sock->socket.domain != AF_INET6_) {
+        out->state = SOCK_CKPT_HUNGUP;
+        return 0;
+    }
+
+    if (sock->socket.bind_deferred) {
+        // Not on the host yet (see sock_bind_materialize), so what bind() was
+        // told is the only record of where this socket goes.
+        uint32_t len = sock->socket.deferred_addr_len;
+        if (len > sizeof(out->addr))
+            len = sizeof(out->addr);
+        memcpy(out->addr, sock->socket.deferred_addr, len);
+        out->addr_len = len;
+        out->state = SOCK_CKPT_BOUND;
+    } else {
+        socklen_t len = sizeof(out->addr);
+        if (getsockname(sock->real_fd, (struct sockaddr *) out->addr, &len) == 0 &&
+                sock_ckpt_addr_is_bound(out->addr, len)) {
+            out->addr_len = (uint32_t) len;
+            out->state = sock->socket.listening ? SOCK_CKPT_LISTEN : SOCK_CKPT_BOUND;
+        } else {
+            memset(out->addr, 0, sizeof(out->addr));
+            out->state = SOCK_CKPT_FRESH;
+        }
+    }
+    if (out->state == SOCK_CKPT_LISTEN)
+        out->backlog = sock->sockrestart.backlog > 0
+                ? (uint32_t) sock->sockrestart.backlog : 128;
+    return 0;
+}
+
+// A descriptor whose peer is already gone. A socketpair with one end closed is
+// exactly that, and it behaves correctly everywhere it matters: read gives 0,
+// write gives EPIPE, and poll gives POLLIN|POLLHUP -- so a select loop wakes,
+// reads the end-of-file and closes, which is what every program already does
+// when a peer disappears. A plain unconnected socket would NOT do that: it
+// polls WRITABLE, and the loop spins forever.
+static struct fd *sock_ckpt_hungup_fd(const struct sock_ckpt_desc *desc, int *err) {
+    int pair[2];
+    int real_type = desc->type == SOCK_DGRAM_ ? SOCK_DGRAM : SOCK_STREAM;
+    if (socketpair(AF_UNIX, real_type, 0, pair) < 0) {
+        *err = errno_map();
+        return NULL;
+    }
+    close(pair[1]);
+    struct fd *fd = sock_fd_adopt(pair[0], desc->domain, desc->type, desc->protocol);
+    if (fd == NULL) {
+        close(pair[0]);
+        *err = _ENOMEM;
+        return NULL;
+    }
+    fd->socket.ckpt_hungup = true;
+    // NOT conn_dead. That marker means "iOS killed this connection and there is
+    // nothing left to read", and sock_poll answers it with POLL_ERR|POLL_HUP
+    // and DELIBERATELY no POLL_READ, so a poll loop is not told to read
+    // something that will only error. This socket is the other case: its peer
+    // is closed and there IS an end-of-file waiting, which is what a restore
+    // wants the guest to read. Measured: with conn_dead set, poll returned
+    // 0x18 (HUP|ERR) and a program waiting for POLLIN before reading never
+    // read the EOF it was being told about -- the exact failure
+    // docs/historical/build_555_musts.md item 4 describes.
+    return fd;
+}
+
+// Why the last rebuild could not put a socket back. The printks below go to
+// fd 555, which nothing on a device reads, so a listener that came back hung
+// up looked exactly like one that came back listening until something tried
+// to connect -- an iPad's sshd after a resume.
+static char sock_ckpt_failure[160];
+
+const char *sock_ckpt_rebuild_failure(void) {
+    return sock_ckpt_failure[0] != '\0' ? sock_ckpt_failure : NULL;
+}
+
+static void sock_ckpt_note_failure(const struct sock_ckpt_desc *desc,
+        const char *what, int host_errno) {
+    char host[INET6_ADDRSTRLEN] = "?";
+    unsigned port = 0;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    size_t n = desc->addr_len < sizeof(ss) ? desc->addr_len : sizeof(ss);
+    memcpy(&ss, desc->addr, n);
+    if (n >= sizeof(struct sockaddr_in) && ss.ss_family == AF_INET) {
+        struct sockaddr_in *in = (struct sockaddr_in *) &ss;
+        inet_ntop(AF_INET, &in->sin_addr, host, sizeof(host));
+        port = ntohs(in->sin_port);
+    } else if (n >= sizeof(struct sockaddr_in6) && ss.ss_family == AF_INET6) {
+        struct sockaddr_in6 *in6 = (struct sockaddr_in6 *) &ss;
+        inet_ntop(AF_INET6, &in6->sin6_addr, host, sizeof(host));
+        port = ntohs(in6->sin6_port);
+    }
+    snprintf(sock_ckpt_failure, sizeof(sock_ckpt_failure), "%s socket, %s %s port %u: %s",
+             sock_ckpt_state_name(desc->state), what, host, port, strerror(host_errno));
+}
+
+// Put a bound AF_UNIX socket back where the guest left it.
+//
+// Replays bind() by GUEST path, which is the only durable name: the host side
+// is an ishsock file allocated per run, so the address getsockname gave at
+// save time names nothing now. The work the old comment called "separate" is
+// the stale node -- the image's filesystem still has the S_IFSOCK the previous
+// run created, and unix_socket_get refuses to bind over an existing name. So
+// the leftover is removed first, and only when it is a SOCKET: a path that has
+// since become a regular file belongs to something else and must not be eaten.
+// mkdir -p for the directories above a restored socket's path. Best effort by
+// design: a component that already exists, or cannot be made, is not this
+// function's problem -- the bind below reports what actually matters.
+static void sock_ckpt_make_parents(const char *path) {
+    char buf[SOCKADDR_DATA_MAX + 1];
+    size_t n = strlen(path);
+    if (n == 0 || n >= sizeof(buf))
+        return;
+    memcpy(buf, path, n + 1);
+    for (char *p = buf + 1; *p != '\0'; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        generic_mkdirat(AT_PWD, buf, 0755);
+        *p = '/';
+    }
+}
+
+static struct fd *sock_ckpt_rebuild_unix(const struct sock_ckpt_desc *desc, int *err) {
+    int real_domain = sock_family_to_real((int) desc->domain);
+    int real_type = sock_type_to_real((int) desc->type, (int) desc->protocol);
+    if (real_domain < 0 || real_type < 0 || desc->addr_len == 0 ||
+            desc->addr_len > sizeof(desc->addr))
+        return sock_ckpt_hungup_fd(desc, err);
+
+    int s = sock_host_socket((int) desc->domain, (int) desc->type,
+                             (int) desc->protocol, real_domain, real_type);
+    if (s < 0) {
+        sock_ckpt_note_failure(desc, "socket", errno);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    // Adopted BEFORE the bind, because unix_socket_get records the name and
+    // the inode on the fd -- it is the bind's bookkeeping, not an afterthought.
+    struct fd *fd = sock_fd_adopt(s, (int) desc->domain, (int) desc->type,
+                                  (int) desc->protocol);
+    if (fd == NULL) {
+        close(s);
+        *err = _ENOMEM;
+        return NULL;
+    }
+
+    char path[SOCKADDR_DATA_MAX + 1];
+    size_t path_size = desc->addr_len;
+    if (path_size > SOCKADDR_DATA_MAX)
+        path_size = SOCKADDR_DATA_MAX;
+    memcpy(path, desc->addr, path_size);
+    path[path_size] = '\0';
+
+    uint32_t socket_id;
+    int e;
+    if (path[0] != '\0') {
+        // The directory the socket lives in may not exist yet.
+        //
+        // Almost every unix socket on a Linux system sits under /run or /tmp,
+        // and those are TMPFS: empty on the way back, because a tmpfs is not
+        // part of the root the image was taken against. So the bind failed
+        // with ENOENT on the PARENT, not on the socket -- and on a real system
+        // the daemon that owns the socket would have made the directory itself
+        // before binding. Recreated here for the same reason, one component at
+        // a time.
+        sock_ckpt_make_parents(path);
+        struct statbuf stale = {};
+        if (generic_statat(AT_PWD, path, &stale, 0) >= 0 &&
+                (stale.mode & S_IFMT) == S_IFSOCK)
+            generic_unlinkat(AT_PWD, path);
+        e = unix_socket_get(path, fd, &socket_id, NULL);
+    } else {
+        // An abstract name has no filesystem node to be stale; it is simply
+        // taken again.
+        e = unix_abstract_get(path + 1, fd, &socket_id, NULL);
+    }
+    if (e < 0) {
+        sock_ckpt_note_failure(desc, "name", -e);
+        printk("WARNING: checkpoint: reclaiming unix socket name failed: %d\n", e);
+        fd_close(fd);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    fd->socket.unix_name_len = (unsigned) path_size;
+    memcpy(fd->socket.unix_name, path, path_size);
+    // The node as the daemon left it, not as the replayed bind made it.
+    // Ownership first: that is the order chown(2) then chmod(2) leave it in.
+    if (path[0] != '\0' && desc->node_known) {
+        generic_setattrat(AT_PWD, path, make_attr(uid, (uid_t_) desc->node_uid), false);
+        generic_setattrat(AT_PWD, path, make_attr(gid, (uid_t_) desc->node_gid), false);
+        generic_setattrat(AT_PWD, path, make_attr(mode, (mode_t_) desc->node_mode), false);
+    }
+
+    struct sockaddr_un un = {};
+    size_t host_len = 0;
+    if ((e = unix_host_sun_path(socket_id, &un, &host_len)) < 0) {
+        sock_ckpt_note_failure(desc, "hostpath", -e);
+        fd_close(fd);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+#ifdef __APPLE__
+    un.sun_len = offsetof(struct sockaddr_un, sun_path) + host_len;
+#endif
+    un.sun_family = PF_LOCAL;
+    unlink(un.sun_path);
+    if (bind(s, (const struct sockaddr *) &un,
+             (socklen_t) (offsetof(struct sockaddr_un, sun_path) + host_len)) < 0) {
+        sock_ckpt_note_failure(desc, "bind", errno);
+        printk("WARNING: checkpoint: rebinding unix socket failed: %s\n", strerror(errno));
+        fd_close(fd);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    if (desc->state == SOCK_CKPT_LISTEN) {
+        if (listen(s, sock_host_backlog(AF_LOCAL_, (int) desc->backlog)) < 0) {
+            sock_ckpt_note_failure(desc, "listen", errno);
+            printk("WARNING: checkpoint: relistening unix socket failed: %s\n", strerror(errno));
+            fd_close(fd);
+            return sock_ckpt_hungup_fd(desc, err);
+        }
+        fd->socket.listening = true;
+        fd->sockrestart.backlog = (int) desc->backlog;
+        sockrestart_begin_listen(fd);
+    }
+    if (desc->nonblock) {
+        int flags = fcntl(s, F_GETFL);
+        if (flags >= 0)
+            fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
+    return fd;
+}
+
+int sock_ckpt_rebuild_pair(const struct sock_ckpt_desc *desc,
+                           struct fd **end0, struct fd **end1) {
+    *end0 = *end1 = NULL;
+    int real_domain = sock_family_to_real((int) desc->domain);
+    int real_type = sock_type_to_real((int) desc->type, (int) desc->protocol);
+    if (real_domain < 0 || real_type < 0)
+        return _EINVAL;
+    int pair[2];
+    int e;
+    if (seqpacket_denied_by_host((int) desc->domain, (int) desc->type, 0)) {
+        e = -1;
+        errno = EPERM;
+    } else {
+        e = socketpair(real_domain, real_type, 0, pair);
+    }
+#if defined(__APPLE__)
+    if (e < 0 && unix_seqpacket_fallback_needed((int) desc->domain, (int) desc->type,
+                                                0, errno))
+        e = socketpair(real_domain, SOCK_STREAM, 0, pair);
+#endif
+    if (e < 0)
+        return errno_map();
+    struct fd *a = sock_fd_adopt(pair[0], (int) desc->domain, (int) desc->type,
+                                 (int) desc->protocol);
+    struct fd *b = a != NULL ? sock_fd_adopt(pair[1], (int) desc->domain,
+                                             (int) desc->type,
+                                             (int) desc->protocol) : NULL;
+    if (a == NULL || b == NULL) {
+        if (a != NULL)
+            fd_close(a);
+        else
+            close(pair[0]);
+        close(pair[1]);
+        return _ENOMEM;
+    }
+    lock(&peer_lock, 0);
+    a->socket.unix_peer = b;
+    b->socket.unix_peer = a;
+    unlock(&peer_lock);
+    *end0 = a;
+    *end1 = b;
+    return 0;
+}
+
+void sock_ckpt_apply_pair_end(struct fd *sock, const struct sock_ckpt_desc *desc) {
+    lock(&peer_lock, 0);
+    sock->socket.unix_cred.pid = desc->cred_pid;
+    sock->socket.unix_cred.uid = desc->cred_uid;
+    sock->socket.unix_cred.gid = desc->cred_gid;
+    sock->socket.unix_peer_cred.pid = desc->peer_pid;
+    sock->socket.unix_peer_cred.uid = desc->peer_uid;
+    sock->socket.unix_peer_cred.gid = desc->peer_gid;
+    sock->socket.unix_peer_cred_valid = desc->peer_cred_valid != 0;
+    // The name getsockname reports -- an accepted socket's is its listener's
+    // path -- restored as a label only: nothing is bound by it.
+    if (desc->addr_len > 0 && desc->addr_len <= sizeof(sock->socket.unix_name)) {
+        memcpy(sock->socket.unix_name, desc->addr, desc->addr_len);
+        sock->socket.unix_name_len = (uint8_t) desc->addr_len;
+    }
+    unlock(&peer_lock);
+    if (desc->nonblock && sock->real_fd >= 0) {
+        int fl = fcntl(sock->real_fd, F_GETFL);
+        if (fl >= 0)
+            fcntl(sock->real_fd, F_SETFL, fl | O_NONBLOCK);
+    }
+}
+
+// The host descriptor is made non-blocking for the length of a drain or a
+// requeue and put back after. MSG_DONTWAIT is not enough: Darwin's AF_UNIX
+// stream send ignores it and sleeps for room -- measured, a restore wedged in
+// __sendto for good.
+static int sock_ckpt_nonblock(int real_fd) {
+    int old = fcntl(real_fd, F_GETFL);
+    if (old >= 0 && !(old & O_NONBLOCK))
+        fcntl(real_fd, F_SETFL, old | O_NONBLOCK);
+    return old;
+}
+static void sock_ckpt_nonblock_end(int real_fd, int old) {
+    if (old >= 0 && !(old & O_NONBLOCK))
+        fcntl(real_fd, F_SETFL, old);
+}
+
+char *sock_ckpt_queued(struct fd *sock, size_t *len) {
+    *len = 0;
+    if (sock->real_fd < 0)
+        return NULL;
+    lock(&peer_lock, 0);
+    bool scm_pending = !list_empty(&sock->socket.unix_scm);
+    struct fd *peer = sock->socket.unix_peer;
+    int peer_fd = peer != NULL ? peer->real_fd : -1;
+    unlock(&peer_lock);
+    if (scm_pending)
+        printk("WARNING: checkpoint: a socket had descriptors in flight; its "
+               "bytes are carried, the descriptors cannot be\n");
+    int host_type = 0;
+    socklen_t tl = sizeof(host_type);
+    getsockopt(sock->real_fd, SOL_SOCKET, SO_TYPE, &host_type, &tl);
+
+    char *blob = NULL;
+    size_t used = 0, cap = 0;
+    bool oom = false;
+#define SOCK_CKPT_PUT(p, n) do { \
+        size_t _n = (n); \
+        if (!oom && used + _n > cap) { \
+            size_t _c = cap ? cap * 2 : 1024; \
+            while (_c < used + _n) _c *= 2; \
+            char *_b = realloc(blob, _c); \
+            if (_b == NULL) oom = true; else { blob = _b; cap = _c; } \
+        } \
+        if (!oom) { memcpy(blob + used, (p), _n); used += _n; } \
+    } while (0)
+
+    if (host_type == SOCK_STREAM) {
+        // A stream is peeked: the bytes stay where they are.
+        int avail = 0;
+        if (ioctl(sock->real_fd, FIONREAD, &avail) < 0 || avail <= 0)
+            return NULL;
+        char *buf = malloc((size_t) avail);
+        if (buf == NULL)
+            return NULL;
+        ssize_t n = recv(sock->real_fd, buf, (size_t) avail, MSG_PEEK | MSG_DONTWAIT);
+        if (n > 0) {
+            uint32_t mlen = (uint32_t) n;
+            SOCK_CKPT_PUT(&mlen, sizeof(mlen));
+            SOCK_CKPT_PUT(buf, (size_t) n);
+        }
+        free(buf);
+    } else {
+        // Datagrams cannot be peeked past the first, so the queue is drained
+        // and every message sent straight back from the peer, in order --
+        // which needs the peer. Without one, it is left alone and not carried.
+        // No FIONREAD gate: it counts bytes, and a zero-length datagram is a
+        // message too.
+        if (peer_fd < 0)
+            return NULL;
+        char *msg = malloc(65536);
+        if (msg == NULL)
+            return NULL;
+        int old_flags = sock_ckpt_nonblock(sock->real_fd);
+        for (;;) {
+            ssize_t n = recv(sock->real_fd, msg, 65536, MSG_DONTWAIT);
+            if (n < 0)
+                break;
+            // Out of memory, stop taking them: every one taken goes back,
+            // this one last, behind whatever was never taken -- reordered,
+            // but none lost.
+            size_t before = used;
+            uint32_t mlen = (uint32_t) n;
+            SOCK_CKPT_PUT(&mlen, sizeof(mlen));
+            SOCK_CKPT_PUT(msg, (size_t) n);
+            if (oom) {
+                used = before;
+                int of = sock_ckpt_nonblock(peer_fd);
+                sock_ckpt_requeue(peer, blob, used);
+                send(peer_fd, msg, (size_t) n, 0);
+                sock_ckpt_nonblock_end(peer_fd, of);
+                used = 0;
+                break;
+            }
+        }
+        free(msg);
+        sock_ckpt_nonblock_end(sock->real_fd, old_flags);
+        if (oom)
+            printk("WARNING: checkpoint: out of memory reading a socket's "
+                   "datagrams; they are not carried, and are now out of order\n");
+        else if (sock_ckpt_requeue(peer, blob, used) < 0)
+            printk("WARNING: checkpoint: could not put a socket's datagrams back "
+                   "after reading them\n");
+    }
+    if (oom) {
+        free(blob);
+        return NULL;
+    }
+#undef SOCK_CKPT_PUT
+    *len = used;
+    return blob;
+}
+
+// Never blocks: at a save the machine is frozen and nothing would ever drain
+// the other end. A queue that held these bytes once has room for them, but a
+// fresh pair's buffers are the host's defaults, so a full one is grown once
+// to the size of the whole queue before giving up.
+static bool sock_ckpt_grow_buffers(struct fd *from_peer, size_t len) {
+    int want = len + 4096 > INT_MAX ? INT_MAX : (int) (len + 4096);
+    bool grew = false;
+    int cur = 0;
+    socklen_t cl = sizeof(cur);
+    if (getsockopt(from_peer->real_fd, SOL_SOCKET, SO_SNDBUF, &cur, &cl) == 0 && cur < want &&
+            setsockopt(from_peer->real_fd, SOL_SOCKET, SO_SNDBUF, &want, sizeof(want)) == 0)
+        grew = true;
+    lock(&peer_lock, 0);
+    struct fd *to = from_peer->socket.unix_peer;
+    int to_fd = to != NULL ? to->real_fd : -1;
+    unlock(&peer_lock);
+    cl = sizeof(cur);
+    if (to_fd >= 0 && getsockopt(to_fd, SOL_SOCKET, SO_RCVBUF, &cur, &cl) == 0 && cur < want &&
+            setsockopt(to_fd, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want)) == 0)
+        grew = true;
+    return grew;
+}
+
+int sock_ckpt_requeue(struct fd *from_peer, const char *blob, size_t len) {
+    if (from_peer == NULL || from_peer->real_fd < 0)
+        return _EBADF;
+    bool grown = false;
+    int err = 0;
+    int old_flags = sock_ckpt_nonblock(from_peer->real_fd);
+    size_t at = 0;
+    while (at + sizeof(uint32_t) <= len) {
+        uint32_t mlen;
+        memcpy(&mlen, blob + at, sizeof(mlen));
+        at += sizeof(mlen);
+        if (mlen > len - at) {
+            err = _EINVAL;
+            break;
+        }
+        size_t sent = 0;
+        do {
+            ssize_t n = send(from_peer->real_fd, blob + at + sent, mlen - sent,
+                             MSG_DONTWAIT);
+            if (n < 0) {
+                if (errno == EINTR)
+                    continue;
+                if ((errno == EAGAIN || errno == ENOBUFS) && !grown) {
+                    grown = true;
+                    if (sock_ckpt_grow_buffers(from_peer, len))
+                        continue;
+                }
+                err = errno_map();
+                break;
+            }
+            sent += (size_t) n;
+        } while (sent < mlen);
+        if (err < 0)
+            break;
+        at += mlen;
+    }
+    sock_ckpt_nonblock_end(from_peer->real_fd, old_flags);
+    return err;
+}
+
+struct fd *sock_ckpt_rebuild(const struct sock_ckpt_desc *desc, int *err) {
+    *err = 0;
+    sock_ckpt_failure[0] = '\0';
+    if (desc->state == SOCK_CKPT_NETLINK) {
+        struct fd *fd = adhoc_fd_create(&socket_fdops);
+        if (fd == NULL) {
+            *err = _ENOMEM;
+            return NULL;
+        }
+        fd->stat.mode = S_IFSOCK | 0666;
+        fd->stat.uid = current != NULL ? current->fsuid : 0;
+        fd->stat.gid = current != NULL ? current->fsgid : 0;
+        fd->type = S_IFSOCK;
+        fd->real_fd = -1;
+        fd->socket.domain = desc->domain;
+        fd->socket.type = desc->type;
+        fd->socket.protocol = desc->protocol;
+        sock_init_emulation_defaults(fd);
+        fd->socket.netlink_port_id = desc->netlink_port_id != 0
+                ? desc->netlink_port_id : netlink_next_port_id();
+        fd->socket.netlink_groups = desc->netlink_groups;
+        netlink_notify_register(fd);
+        return fd;
+    }
+    if (desc->state == SOCK_CKPT_HUNGUP)
+        return sock_ckpt_hungup_fd(desc, err);
+    if (desc->domain == AF_LOCAL_)
+        return sock_ckpt_rebuild_unix(desc, err);
+
+    int real_domain = sock_family_to_real((int) desc->domain);
+    int real_type = sock_type_to_real((int) desc->type, (int) desc->protocol);
+    if (real_domain < 0 || real_type < 0)
+        return sock_ckpt_hungup_fd(desc, err);
+    int s = sock_host_socket((int) desc->domain, (int) desc->type,
+                             (int) desc->protocol, real_domain, real_type);
+    if (s < 0) {
+        int e = errno;
+        sock_ckpt_note_failure(desc, "socket", e);
+        printk("WARNING: checkpoint: socket(%d, %d, %d) failed: %s\n",
+               real_domain, real_type, desc->protocol, strerror(e));
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    // The address may still be considered taken -- the same reason
+    // sockrestart_on_resume sets these, and here the process that held it may
+    // genuinely still be shutting down.
+    int reuse = 1;
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+    setsockopt(s, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif
+    if (desc->addr_len != 0 &&
+            bind(s, (const struct sockaddr *) desc->addr,
+                 (socklen_t) desc->addr_len) < 0) {
+        int e = errno;
+        sock_ckpt_note_failure(desc, "bind", e);
+        printk("WARNING: checkpoint: rebinding a restored socket failed: %s\n",
+               strerror(e));
+        close(s);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    if (desc->state == SOCK_CKPT_LISTEN &&
+            listen(s, desc->backlog > 0 ? (int) desc->backlog : 128) < 0) {
+        int e = errno;
+        sock_ckpt_note_failure(desc, "listen", e);
+        printk("WARNING: checkpoint: relistening a restored socket failed: %s\n",
+               strerror(e));
+        close(s);
+        return sock_ckpt_hungup_fd(desc, err);
+    }
+    if (desc->nonblock) {
+        int flags = fcntl(s, F_GETFL);
+        if (flags >= 0)
+            fcntl(s, F_SETFL, flags | O_NONBLOCK);
+    }
+    struct fd *fd = sock_fd_adopt(s, (int) desc->domain, (int) desc->type,
+                                  (int) desc->protocol);
+    if (fd == NULL) {
+        close(s);
+        *err = _ENOMEM;
+        return NULL;
+    }
+    if (desc->state == SOCK_CKPT_LISTEN) {
+        fd->socket.listening = true;
+        fd->sockrestart.backlog = (int) desc->backlog;
+        sockrestart_begin_listen(fd);
+    }
+    return fd;
 }

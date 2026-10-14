@@ -1,0 +1,306 @@
+/*
+ * acct_records.c -- BSD process accounting: acct(2) and the records it writes.
+ *
+ * Checks:
+ *   - acct(path) turns accounting on, acct(NULL) turns it off
+ *   - one 64-byte acct_v3 record per PROCESS exit, not per thread
+ *   - ac_version is 3, ac_comm is the exec'd name, ac_pid/ac_ppid are right
+ *   - ac_ppid names the parent PROCESS for a child a non-main thread forked,
+ *     not the forking thread's tid (Linux's task_tgid_nr_ns(real_parent))
+ *   - ac_exitcode is the WAIT-encoded status (exit 7 -> 0x0700), not the code
+ *   - AFORK is set for a child that never exec'd and clear for one that did
+ *   - ac_etime is in AHZ (centisecond) units, held as an IEEE float
+ *
+ * Runs unchanged on Linux, which is the point: the record format is Linux's
+ * and the only way to be sure of it is to make the same assertions against a
+ * real kernel. Needs root (CAP_SYS_PACCT); skips cleanly without it.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include "test_common.h"
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+
+#define ACCT_COMM_ 16
+#define AFORK_ 0x01
+
+struct acct_v3_t {
+    uint8_t  ac_flag;
+    uint8_t  ac_version;
+    uint16_t ac_tty;
+    uint32_t ac_exitcode;
+    uint32_t ac_uid;
+    uint32_t ac_gid;
+    uint32_t ac_pid;
+    uint32_t ac_ppid;
+    uint32_t ac_btime;
+    uint32_t ac_etime_bits;
+    uint16_t ac_utime;
+    uint16_t ac_stime;
+    uint16_t ac_mem;
+    uint16_t ac_io;
+    uint16_t ac_rw;
+    uint16_t ac_minflt;
+    uint16_t ac_majflt;
+    uint16_t ac_swaps;
+    char     ac_comm[ACCT_COMM_];
+};
+
+static int check(const char *label, int cond) {
+    if (cond) { test_logf("ok   %s\n", label); return 1; }
+    printf("FAIL %s\n", label);
+    failures_total++;
+    return 0;
+}
+
+static float etime_of(const struct acct_v3_t *r) {
+    float f;
+    memcpy(&f, &r->ac_etime_bits, sizeof(f));
+    return f;
+}
+
+static int do_acct(const char *path) {
+    return syscall(SYS_acct, path);
+}
+
+/* A child forked by a thread that is not the main one: its parent is still
+ * this PROCESS. AOK recorded the forking thread's tid as ac_ppid. */
+static pid_t thread_child = -1;
+
+static void *fork_from_thread(void *arg) {
+    (void) arg;
+    thread_child = fork();
+    if (thread_child == 0)
+        _exit(0);
+    int st = 0;
+    if (thread_child > 0)
+        waitpid(thread_child, &st, 0);
+    return NULL;
+}
+
+int main(void) {
+    /* The path lives in an MMAP'd page, not in a literal or on the stack.
+     *
+     * On a 64-bit guest the stack sits just below 4 GiB and a string literal
+     * is lower still, so both survive being truncated to a dword -- which is
+     * why a whole class of pointer-argument bugs has passed hand-written tests
+     * for years. An mmap'd page is where a real allocation lands (0x7ffff...
+     * on amd64, 0x7fffb... on arm64) and is the only shape that proves acct's
+     * pointer reaches the kernel whole. */
+    char *path = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (path == MAP_FAILED) {
+        printf("acct_records: FAIL (mmap: %s)\n", strerror(errno));
+        return 1;
+    }
+    strcpy(path, "/tmp/aok-acct-test");
+    test_log_if(1, "  path buffer at %p\n", (void *) path);
+    unlink(path);
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        printf("acct_records: FAIL (create %s: %s)\n", path, strerror(errno));
+        return 1;
+    }
+    close(fd);
+
+    errno = 0;
+    if (do_acct(path) != 0) {
+        // EPERM is "you are not root", which is not this test's business.
+        // ENOSYS is "the kernel does not have it", which IS -- and skipping on
+        // it would have made this file silent about the bug it exists for: the
+        // arm64 implementation sat behind a clean-ENOSYS list that answered
+        // before the syscall table, so acct returned ENOSYS with the code
+        // present and a skip-on-any-error test reported success.
+        if (errno == EPERM || errno == EACCES) {
+            printf("acct_records: SKIP (needs root: %s)\n", strerror(errno));
+            return 0;
+        }
+        printf("FAIL acct.on (%s)\n", strerror(errno));
+        printf("acct_records: 1 FAILURES\n");
+        return 1;
+    }
+    test_logf("ok   acct.on\n");
+
+    /* A child that EXECS: ac_comm becomes the new program, AFORK clear. */
+    pid_t exec_child = fork();
+    if (exec_child == 0) {
+        execl("/bin/true", "true", (char *) NULL);
+        _exit(9);
+    }
+    int st = 0;
+    waitpid(exec_child, &st, 0);
+
+    /* A child that does NOT exec, exiting 7: AFORK set, ac_exitcode 7<<8. */
+    pid_t fork_child = fork();
+    if (fork_child == 0)
+        _exit(7);
+    waitpid(fork_child, &st, 0);
+
+    /* A child that lives a MEASURED length of time, so ac_etime's unit is
+     * asserted rather than assumed. Self-calibrating against the wall clock
+     * the parent measures, because an emulated guest is slower than a real
+     * kernel and a fixed window would be a load test, not a unit test. The
+     * window still separates the three candidates: for a ~1s child, AHZ
+     * centiseconds gives ~100, seconds would give 1, milliseconds ~1000. */
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    pid_t timed_child = fork();
+    if (timed_child == 0) {
+        struct timespec nap = { .tv_sec = 1, .tv_nsec = 0 };
+        nanosleep(&nap, NULL);
+        _exit(0);
+    }
+    waitpid(timed_child, &st, 0);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double wall_cs = ((t1.tv_sec - t0.tv_sec) * 1e9 +
+                      (t1.tv_nsec - t0.tv_nsec)) / 1e7;   /* centiseconds */
+
+    pthread_t forker;
+    if (pthread_create(&forker, NULL, fork_from_thread, NULL) == 0)
+        pthread_join(forker, NULL);
+
+    check("acct.off", do_acct(NULL) == 0);
+
+    /* Read the records back. */
+    FILE *f = fopen(path, "rb");
+    if (!check("acct.file.open", f != NULL))
+        return failures_total ? 1 : 0;
+    struct acct_v3_t recs[64];
+    size_t n = fread(recs, sizeof(recs[0]), 64, f);
+    fclose(f);
+    test_logf("ok   acct.records = %zu\n", n);
+    check("acct.records.some", n >= 2);
+
+    const struct acct_v3_t *r_exec = NULL, *r_fork = NULL;
+    for (size_t i = 0; i < n; i++) {
+        if (recs[i].ac_pid == (uint32_t) exec_child) r_exec = &recs[i];
+        if (recs[i].ac_pid == (uint32_t) fork_child) r_fork = &recs[i];
+    }
+
+    if (check("acct.exec_child.present", r_exec != NULL)) {
+        check("acct.exec_child.version", r_exec->ac_version == 3);
+        check("acct.exec_child.comm", strncmp(r_exec->ac_comm, "true", 4) == 0);
+        check("acct.exec_child.ppid", r_exec->ac_ppid == (uint32_t) getpid());
+        check("acct.exec_child.exitcode", r_exec->ac_exitcode == 0);
+        check("acct.exec_child.no_afork", (r_exec->ac_flag & AFORK_) == 0);
+        check("acct.exec_child.etime_sane", etime_of(r_exec) >= 0 && etime_of(r_exec) < 100000);
+        test_log_if(1, "  exec child: comm=%.16s flag=%u exit=%u etime=%g\n",
+                r_exec->ac_comm, r_exec->ac_flag, r_exec->ac_exitcode, etime_of(r_exec));
+    }
+    if (check("acct.fork_child.present", r_fork != NULL)) {
+        /* 7 << 8: the wait-encoded status, which is what Linux records. */
+        check("acct.fork_child.exitcode", r_fork->ac_exitcode == (7u << 8));
+        check("acct.fork_child.afork", (r_fork->ac_flag & AFORK_) != 0);
+        check("acct.fork_child.ppid", r_fork->ac_ppid == (uint32_t) getpid());
+        test_log_if(1, "  fork child: comm=%.16s flag=%u exit=%u etime=%g\n",
+                r_fork->ac_comm, r_fork->ac_flag, r_fork->ac_exitcode, etime_of(r_fork));
+    }
+
+    const struct acct_v3_t *r_thread = NULL;
+    for (size_t i = 0; i < n; i++)
+        if (thread_child > 0 && recs[i].ac_pid == (uint32_t) thread_child) r_thread = &recs[i];
+    if (check("acct.thread_child.present", r_thread != NULL)) {
+        check("acct.thread_child.ppid", r_thread->ac_ppid == (uint32_t) getpid());
+        test_log_if(1, "  thread child: ppid=%u, want %d\n", r_thread->ac_ppid, (int) getpid());
+    }
+
+    const struct acct_v3_t *r_timed = NULL;
+    for (size_t i = 0; i < n; i++)
+        if (recs[i].ac_pid == (uint32_t) timed_child) r_timed = &recs[i];
+    if (check("acct.timed_child.present", r_timed != NULL)) {
+        double etime = etime_of(r_timed);
+        test_log_if(1, "  timed child: measured %.1f cs, recorded etime %g\n",
+                wall_cs, etime);
+        check("acct.timed_child.etime_is_ahz",
+                etime >= wall_cs * 0.5 && etime <= wall_cs * 2.0 + 50.0);
+    }
+
+    unlink(path);
+
+    /* Accounting is the caller's pid namespace's -- Linux's acct_on takes
+     * task_active_pid_ns(current) -- and a process's exit is recorded in each
+     * namespace from its own up that has accounting on, its pid and its
+     * parent's numbered as that namespace numbers them. The init of a new pid
+     * namespace turns it on there and forks a child that exits 7: the
+     * namespace's file has it as 2, child of 1; the outside's, on meanwhile,
+     * has it by its machine pid, child of the init's. */
+    char *ns_path = path + 2048;
+    strcpy(ns_path, "/tmp/aok-acct-test-ns");
+    strcpy(path, "/tmp/aok-acct-test-out");
+    unlink(path);
+    unlink(ns_path);
+    int ok_files = 1;
+    for (int i = 0; i < 2; i++) {
+        int one = open(i ? ns_path : path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        ok_files &= one >= 0;
+        if (one >= 0)
+            close(one);
+    }
+    if (check("acct.ns.files", ok_files) && check("acct.ns.outside_on", do_acct(path) == 0)) {
+        pid_t ns_init = -1;
+        if (unshare(CLONE_NEWPID) != 0) {
+            check("acct.ns.unshare", 0);
+        } else {
+            fflush(stdout);
+            ns_init = fork();
+            if (ns_init == 0) {
+                if (do_acct(ns_path) != 0)
+                    _exit(10);
+                pid_t g = fork();
+                if (g == 0)
+                    _exit(7);
+                int gs = 0;
+                waitpid(g, &gs, 0);
+                // (Off before its own exit, which this namespace's file then
+                // does not have.)
+                if (do_acct(NULL) != 0)
+                    _exit(11);
+                _exit(g == 2 ? 0 : 12);
+            }
+            int st = -1;
+            waitpid(ns_init, &st, 0);
+            check("acct.ns.init_ok", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        }
+        check("acct.ns.outside_off", do_acct(NULL) == 0);
+        struct acct_v3_t inside[16], outside[64];
+        size_t n_in = 0, n_out = 0;
+        FILE *fi = fopen(ns_path, "rb");
+        if (fi != NULL) { n_in = fread(inside, sizeof(inside[0]), 16, fi); fclose(fi); }
+        FILE *fo = fopen(path, "rb");
+        if (fo != NULL) { n_out = fread(outside, sizeof(outside[0]), 64, fo); fclose(fo); }
+        const struct acct_v3_t *g_in = NULL, *g_out = NULL;
+        for (size_t i = 0; i < n_in; i++)
+            if (inside[i].ac_exitcode == 7 << 8) g_in = &inside[i];
+        for (size_t i = 0; i < n_out; i++)
+            if (outside[i].ac_exitcode == 7 << 8 && outside[i].ac_ppid == (uint32_t) ns_init) g_out = &outside[i];
+        check("acct.ns.inside_only_child", n_in == 1 && g_in != NULL);
+        if (g_in != NULL) {
+            check("acct.ns.inside_pid", g_in->ac_pid == 2);
+            check("acct.ns.inside_ppid", g_in->ac_ppid == 1);
+            test_log_if(1, "  inside: pid %u ppid %u\n", g_in->ac_pid, g_in->ac_ppid);
+        }
+        if (check("acct.ns.outside_child", g_out != NULL))
+            check("acct.ns.outside_pid_is_machine", g_out->ac_pid != 2 && g_out->ac_pid != 0);
+    }
+    unlink(path);
+    unlink(ns_path);
+    if (failures_total) {
+        printf("acct_records: %d FAILURES\n", failures_total);
+        return 1;
+    }
+    printf("acct_records: PASS\n");
+    return 0;
+}

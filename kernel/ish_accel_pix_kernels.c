@@ -15,6 +15,13 @@ void ish_pix_copy_row(const void *src, void *dst, uint32_t pixels) {
     memcpy(dst, src, (size_t) pixels * 4);
 }
 
+void ish_pix_copy_row_set_alpha(const void *src, void *dst, uint32_t pixels) {
+    const uint32_t *s = (const uint32_t *) src;
+    uint32_t *d = (uint32_t *) dst;
+    for (uint32_t i = 0; i < pixels; i++)
+        d[i] = s[i] | 0xff000000u;
+}
+
 // Fast approximate divide-by-255, exact for all inputs in [0,255] -- the
 // same identity pixman itself uses internally (verified empirically: see
 // the OVER validation this kernel is derived from).
@@ -73,5 +80,79 @@ void ish_pix_over_mask_row(const void *src, const uint8_t *mask, void *dst, uint
         uint8_t og = add_sat_un8(sg, mul_un8(dg, inv));
         uint8_t ob = add_sat_un8(sb, mul_un8(db, inv));
         d[i] = ((uint32_t) oa << 24) | ((uint32_t) or_ << 16) | ((uint32_t) og << 8) | ob;
+    }
+}
+
+// One premultiplied OVER of s (already scaled by any mask) onto d, the
+// formula ish_pix_over_row and ish_pix_over_mask_row share.
+static inline uint32_t over_px(uint8_t sa, uint8_t sr, uint8_t sg, uint8_t sb, uint32_t dp) {
+    uint8_t da = (uint8_t) (dp >> 24), dr = (uint8_t) (dp >> 16), dg = (uint8_t) (dp >> 8), db = (uint8_t) dp;
+    uint8_t inv = (uint8_t) (255 - sa);
+    uint8_t oa = add_sat_un8(sa, mul_un8(da, inv));
+    uint8_t or_ = add_sat_un8(sr, mul_un8(dr, inv));
+    uint8_t og = add_sat_un8(sg, mul_un8(dg, inv));
+    uint8_t ob = add_sat_un8(sb, mul_un8(db, inv));
+    return ((uint32_t) oa << 24) | ((uint32_t) or_ << 16) | ((uint32_t) og << 8) | ob;
+}
+
+void ish_pix_over_solid_row(uint32_t src, void *dst, uint32_t pixels) {
+    uint32_t *d = (uint32_t *) dst;
+    uint8_t sa = (uint8_t) (src >> 24), sr = (uint8_t) (src >> 16), sg = (uint8_t) (src >> 8), sb = (uint8_t) src;
+    for (uint32_t i = 0; i < pixels; i++)
+        d[i] = over_px(sa, sr, sg, sb, d[i]);
+}
+
+void ish_pix_over_solid_mask_row(uint32_t src, const uint8_t *mask, void *dst, uint32_t pixels) {
+    uint32_t *d = (uint32_t *) dst;
+    uint8_t sa = (uint8_t) (src >> 24), sr = (uint8_t) (src >> 16), sg = (uint8_t) (src >> 8), sb = (uint8_t) src;
+    for (uint32_t i = 0; i < pixels; i++) {
+        uint8_t ma = mask[i];
+        d[i] = over_px(mul_un8(sa, ma), mul_un8(sr, ma), mul_un8(sg, ma), mul_un8(sb, ma), d[i]);
+    }
+}
+
+// pixman's bilinear_interpolation (pixman-inlines.h): the four weights are
+// exact products of the 8-bit distances, and each channel is truncated once.
+static inline uint32_t bilinear_px(uint32_t tl, uint32_t tr, uint32_t bl, uint32_t br,
+        uint32_t distx, uint32_t disty) {
+    distx <<= 1;
+    disty <<= 1;
+    uint32_t wtl = (256 - distx) * (256 - disty), wtr = distx * (256 - disty);
+    uint32_t wbl = (256 - distx) * disty, wbr = distx * disty;
+    uint32_t out = 0;
+    for (int sh = 0; sh < 32; sh += 8) {
+        uint32_t c = ((tl >> sh) & 0xff) * wtl + ((tr >> sh) & 0xff) * wtr +
+                     ((bl >> sh) & 0xff) * wbl + ((br >> sh) & 0xff) * wbr;
+        out |= (c >> 16) << sh;
+    }
+    return out;
+}
+
+static inline uint32_t bilinear_tap(const uint32_t *row, int32_t col0, int32_t cols, int32_t src_width,
+        int32_t c, uint32_t tap_or) {
+    if (row == NULL || c < 0 || c >= src_width)
+        return 0;
+    // The caller reads every column a row can reach; anything else is a bug
+    // in the caller, and reads as transparent rather than out of bounds.
+    if (c < col0 || c >= col0 + cols)
+        return 0;
+    return row[c - col0] | tap_or;
+}
+
+void ish_pix_bilinear_row(const uint32_t *row1, const uint32_t *row2, int32_t col0, int32_t cols,
+        int32_t src_width, int32_t x, int32_t ux, int disty, uint32_t tap_or,
+        uint32_t *out, uint32_t pixels) {
+    for (uint32_t i = 0; i < pixels; i++, x += ux) {
+        int32_t x1 = x >> 16; // pixman_fixed_to_int: arithmetic, so it floors
+        uint32_t distx = (uint32_t) (x >> 9) & 0x7f;
+        if (x1 >= src_width || x1 + 1 < 0 || (row1 == NULL && row2 == NULL)) {
+            out[i] = 0;
+            continue;
+        }
+        out[i] = bilinear_px(bilinear_tap(row1, col0, cols, src_width, x1, tap_or),
+                             bilinear_tap(row1, col0, cols, src_width, x1 + 1, tap_or),
+                             bilinear_tap(row2, col0, cols, src_width, x1, tap_or),
+                             bilinear_tap(row2, col0, cols, src_width, x1 + 1, tap_or),
+                             distx, (uint32_t) disty);
     }
 }

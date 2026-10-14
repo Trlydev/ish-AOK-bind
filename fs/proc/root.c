@@ -6,8 +6,10 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
+#include "kernel/fs.h"
 #include "kernel/swap.h"
 #include "fs/mem.h"
 #include "fs/proc.h"
@@ -22,12 +24,15 @@
 #include "kernel/abi.h"
 #include "kernel/init.h"
 #include "kernel/hostinfo.h"
+#include "kernel/BatteryStatus.h"
 // Last, deliberately: this header #defines POLL_* over the SIGPOLL si_code
 // constants glibc declares as an ENUM, so any system header pulled in after
 // it turns those enumerators into numeric literals. Clang on Darwin never
 // sees it; gcc on Linux fails the build outright. fs/proc.c orders it the
 // same way for the same reason.
 #include "fs/poll.h"
+#include "fs/virtgpu.h"
+#include "jit/arm64_mops.h"
 
 extern int console_major;
 extern int console_minor;
@@ -96,6 +101,19 @@ static void format_cpuid_flags(char *buf, size_t size) {
         NULL, "tbm", "topoext", "perfctr_core", "perfctr_nb", NULL,
         "bpext", "ptsc", "perfctr_llc", "mwaitx", NULL, NULL,
     };
+    // Leaf 7 in Linux's word order (subleaf 0's EBX, subleaf 1's EAX,
+    // subleaf 0's ECX), with Linux's names; only bits AOK can set are named.
+    static const char *const leaf7_ebx_names[32] = {
+        [3] = "bmi1", [5] = "avx2", [8] = "bmi2", [16] = "avx512f", [17] = "avx512dq",
+        [21] = "avx512ifma", [28] = "avx512cd", [30] = "avx512bw", [31] = "avx512vl",
+    };
+    static const char *const leaf7_1_eax_names[32] = {
+        [4] = "avx_vnni", [5] = "avx512_bf16",
+    };
+    static const char *const leaf7_ecx_names[32] = {
+        [1] = "avx512vbmi", [2] = "umip", [6] = "avx512_vbmi2", [8] = "gfni", [9] = "vaes", [10] = "vpclmulqdq",
+        [11] = "avx512_vnni", [12] = "avx512_bitalg", [14] = "avx512_vpopcntdq", [22] = "rdpid",
+    };
     dword_t eax = 1, ebx = 0, ecx = 0, edx = 0;
 
     buf[0] = '\0';
@@ -108,6 +126,23 @@ static void format_cpuid_flags(char *buf, size_t size) {
         eax = 0x80000001u;
         do_cpuid(&eax, &ebx, &ecx, &edx);
         append_cpuid_flags(buf, size, ecx, edx, ext_ecx_names, ext_edx_names);
+    }
+
+    eax = 0;
+    do_cpuid(&eax, &ebx, &ecx, &edx);
+    if (eax >= 7) {
+        eax = 7;
+        ecx = 0;
+        do_cpuid(&eax, &ebx, &ecx, &edx);
+        dword_t max_sub = eax, l7_ebx = ebx, l7_ecx = ecx;
+        append_cpuid_leaf_flags(buf, size, l7_ebx, leaf7_ebx_names);
+        if (max_sub >= 1) {
+            eax = 7;
+            ecx = 1;
+            do_cpuid(&eax, &ebx, &ecx, &edx);
+            append_cpuid_leaf_flags(buf, size, eax, leaf7_1_eax_names);
+        }
+        append_cpuid_leaf_flags(buf, size, l7_ecx, leaf7_ecx_names);
     }
 }
 
@@ -128,9 +163,9 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
     enum guest_abi abi = current != NULL ? current->abi : GUEST_ABI_I386;
     struct guest_abi_desc abi_desc = guest_abi_desc(abi);
     dword_t eax = 0;
-    dword_t ebx;
-    dword_t ecx;
-    dword_t edx;
+    dword_t ebx = 0;
+    dword_t ecx = 0; // a subleaf on the way in
+    dword_t edx = 0;
 
     // arm64 guests get the aarch64 cpuinfo format (implementer/part/
     // Features), not the x86 one — tools parse "Features" for the same
@@ -151,12 +186,16 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
             // Real Linux derives this string from AT_HWCAP — keep it in
             // lockstep with kernel/exec.c's hwcap (uniform on every host
             // device: SHA512/CRC32 fall back to soft gadgets pre-A13/A10).
-            proc_printf(buf, "Features        : fp asimd cpuid aes pmull sha1 sha2 crc32 atomics sha3 sha512\n");
-            proc_printf(buf, "CPU implementer : 0x61\n"); // Apple (the silicon underneath)
+            proc_printf(buf, "Features        : fp asimd cpuid aes pmull sha1 sha2 crc32 atomics sha3 sha512%s\n",
+                    arm64_mops_advertised() ? " mops" : "");
+            // MIDR_EL1's fields, the same ones `mrs` gives (emu/cpu.h has
+            // why this is not the Apple core underneath, which it used to
+            // name: 0x61, part 0x023, an M1).
+            proc_printf(buf, "CPU implementer : 0x%02x\n", ARM64_GUEST_MIDR_IMPLEMENTER);
             proc_printf(buf, "CPU architecture: 8\n");
-            proc_printf(buf, "CPU variant     : 0x0\n");
-            proc_printf(buf, "CPU part        : 0x023\n");
-            proc_printf(buf, "CPU revision    : 1\n");
+            proc_printf(buf, "CPU variant     : 0x%x\n", ARM64_GUEST_MIDR_VARIANT);
+            proc_printf(buf, "CPU part        : 0x%03x\n", ARM64_GUEST_MIDR_PART);
+            proc_printf(buf, "CPU revision    : %d\n", ARM64_GUEST_MIDR_REVISION);
             proc_printf(buf, "host arch       : %s\n", arm_host_architecture);
             proc_printf(buf, "host machine    : %s\n", arm_host_machine_identifier);
             proc_printf(buf, "host device     : %s\n", arm_host_device_name);
@@ -171,9 +210,10 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
     }
 
     // riscv64 guests get the riscv cpuinfo format. Parsers key on the
-    // "isa" line; keep it in lockstep with kernel/exec.c's AT_HWCAP
-    // (rv64imafdc = exactly what the JIT implements; no V, no bitmanip)
-    // and the Sv39 layout from guest_abi_vm_layout.
+    // "isa" line; keep it in lockstep with what the JIT implements, with
+    // kernel/exec.c's AT_HWCAP (the single letters) and kernel/calls.c's
+    // riscv_hwprobe (the same extensions as bits), and with the Sv39 layout
+    // from guest_abi_vm_layout. Multi-letter extensions in Linux's order.
     if (abi == GUEST_ABI_RISCV64) {
         char *rv_host_architecture = copyHostArchitecture();
         char *rv_host_machine_identifier = copyHostMachineIdentifier();
@@ -183,7 +223,7 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
         for (int cpu = 0; cpu < rv_cpu_count; cpu++) {
             proc_printf(buf, "processor       : %d\n", cpu);
             proc_printf(buf, "hart            : %d\n", cpu);
-            proc_printf(buf, "isa             : rv64imafdc\n");
+            proc_printf(buf, "isa             : rv64imafdcv_zicbom_zicbop_zicboz_zicntr_zicond_zicsr_zifencei_zihintntl_zihintpause_zimop_zawrs_zfa_zfhmin_zca_zcb_zcd_zcmop_zba_zbb_zbs_zve32f_zve32x_zve64d_zve64f_zve64x_zvbb_zvfhmin_zvkb_zvkt\n");
             proc_printf(buf, "mmu             : sv39\n");
             proc_printf(buf, "uarch           : ish-aok,jit\n");
             proc_printf(buf, "host arch       : %s\n", rv_host_architecture);
@@ -206,9 +246,21 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
     dword_t cpuid_level = eax;
 
     eax = 1;
+    ecx = 0;
     do_cpuid(&eax, &ebx, &ecx, &edx);
+    // Family, model and stepping come from the signature, decoded the way
+    // Linux's x86_family()/x86_model() do it, so this file and CPUID cannot
+    // disagree. They used to be written out here by hand, and said family 6
+    // model 85 while CPUID said family 0.
+    unsigned cpu_family = (eax >> 8) & 0xf;
+    unsigned cpu_model = (eax >> 4) & 0xf;
+    if (cpu_family == 0xf)
+        cpu_family += (eax >> 20) & 0xff;
+    if (cpu_family >= 6)
+        cpu_model |= ((eax >> 16) & 0xf) << 4;
+    unsigned cpu_stepping = eax & 0xf;
 
-    char cpu_flags[512] = { 0 };
+    char cpu_flags[1024] = { 0 };
     format_cpuid_flags(cpu_flags, sizeof(cpu_flags));
     char *host_architecture = copyHostArchitecture();
     char *host_machine_identifier = copyHostMachineIdentifier();
@@ -224,11 +276,11 @@ static int proc_show_cpuinfo(struct proc_entry *UNUSED(entry), struct proc_data 
     for( i=0; i<cpu_count ; i++ ) {
         proc_printf(buf, "processor       : %d\n",i);
         proc_printf(buf, "vendor_id       : %s\n", vendor_id);
-        proc_printf(buf, "cpu family      : %d\n", guest_abi_is_64bit(abi) ? 6 : 1);
-        proc_printf(buf, "model           : %d\n", guest_abi_is_64bit(abi) ? 85 : 1);
+        proc_printf(buf, "cpu family      : %u\n", cpu_family);
+        proc_printf(buf, "model           : %u\n", cpu_model);
         proc_printf(buf, "model name      : iSH Virtual %s-compatible CPU @ 1.066GHz\n",
                     abi_desc.uname_machine);
-        proc_printf(buf, "stepping        : %d\n",1);
+        proc_printf(buf, "stepping        : %u\n", cpu_stepping);
         proc_printf(buf, "CPU MHz         : 1066.00\n");
         proc_printf(buf, "cache size      : %d kb\n",0);
         proc_printf(buf, "physical id     : %d\n",0);
@@ -326,7 +378,26 @@ static int proc_show_stat(struct proc_entry *UNUSED(entry), struct proc_data *bu
 #endif
     proc_printf(buf, "ctxt %"PRIu64"\n", ctxt);
     struct uptime_info btime = get_uptime();
-    struct timespec uptime_ts = {.tv_sec = btime.uptime_ticks / 100, .tv_nsec = btime.uptime_ticks % 100};
+    // uptime_ticks counts USER_HZ ticks, so the remainder of the division is
+    // CENTISECONDS -- it was stored straight into tv_nsec, a field 10 million
+    // times finer, which threw uptime's whole sub-second part away and left
+    // the subtraction below working with floor(uptime) instead of uptime.
+    //
+    // The btime it printed was right anyway, because
+    // guest_clock_place_origins puts the guest's uptime zero on a whole
+    // second: the dropped fraction moved the computed boot instant forward by
+    // less than a second, and the truncation to tv_sec took it straight back
+    // off. But that left NO room. The realtime read below happens after the
+    // uptime read, so any stall between them adds to the same fraction, and
+    // whenever the fraction was near a full second a stall of a few tens of
+    // milliseconds carried the floor onto the NEXT second -- btime changed
+    // between two reads taken a moment apart. Carrying the real fraction
+    // leaves the gap a whole second of room instead of whatever happens to
+    // be left of the current one. (proc_uptime_clock asserts both halves.)
+    struct timespec uptime_ts = {
+        .tv_sec = (time_t) (btime.uptime_ticks / 100),
+        .tv_nsec = (long) (btime.uptime_ticks % 100) * 10000000L,   // a tick is 10 ms
+    };
     struct timespec boot_time = timespec_subtract(timespec_now(CLOCK_REALTIME), uptime_ts);
     proc_printf(buf, "btime %ld\n", boot_time.tv_sec);
     // Cumulative, not the live count: Linux's "processes" is the number of
@@ -363,6 +434,35 @@ struct mem_page_class_totals {
 // kernel/fork.c), so summing leaders avoids counting the same address space
 // once per thread. A bare CLONE_VM without CLONE_THREAD would be missed, but
 // nothing in this codebase creates that combination.
+//
+// Each address space's figures are counters (mem_class_pages_now), not a walk.
+// This used to walk every page of every address space under its read lock,
+// which made one read cost a pass over every mapped page in the guest. The
+// .NET GC reads this file on every collection and maps its code heap twice
+// from a 2 GiB memfd: MEASURED on amd64, one read took 0.5 ms alone and 54 ms
+// beside that mapping (200-1200 ms on a loaded host), and an mmap on another
+// thread waited out each one for the write lock. Linux's read is constant,
+// 0.011 ms either way. Now it costs a few loads per process, takes no lock on
+// any address space, and reports the same numbers the walk did.
+// ISH_MEM_CLASS_CHECK=1 walks as well and stops the emulator if they differ.
+static bool mem_class_check_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *v = getenv("ISH_MEM_CLASS_CHECK");
+        enabled = (v != NULL && *v == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
+static void mem_class_check(struct task *task, struct mm *mm) {
+    size_t walked[MEM_PAGE_CLASSES], counted[MEM_PAGE_CLASSES];
+    if (!mem_class_pages_verify(&mm->mem, walked, counted))
+        die("ISH_MEM_CLASS_CHECK: pid %d (%s): walked anon %zu shmem %zu file %zu, "
+            "counted %zu %zu %zu", (int) task->pid, task->comm,
+            walked[MEM_PAGE_ANON], walked[MEM_PAGE_SHMEM], walked[MEM_PAGE_FILE],
+            counted[MEM_PAGE_ANON], counted[MEM_PAGE_SHMEM], counted[MEM_PAGE_FILE]);
+}
+
 static void collect_mem_page_stats(struct mem_page_class_totals *out) {
     memset(out, 0, sizeof(*out));
 
@@ -370,6 +470,7 @@ static void collect_mem_page_stats(struct mem_page_class_totals *out) {
     if (task_snapshot_collect(&snapshot, true) < 0)
         return;
 
+    bool check = mem_class_check_enabled();
     for (unsigned i = 0; i < snapshot.count; i++) {
         struct task *task = snapshot.tasks[i];
         // task_snapshot_collect() only checks task->exiting at snapshot time
@@ -392,32 +493,28 @@ static void collect_mem_page_stats(struct mem_page_class_totals *out) {
         // is harmless.
         if (trylock(&task->general_lock) != 0)
             continue;
+        // Read under general_lock rather than through a reference, as
+        // task_maxrss_kb does: do_exit holds the same lock across
+        // `mm_release(task->mm); task->mm = NULL;`, so the mm cannot go while
+        // it is held, and this reader never becomes the one whose release
+        // tears an address space down.
         struct mm *mm = task->mm;
-        if (mm != NULL)
-            mm_retain(mm);
-        unlock(&task->general_lock);
-        if (mm == NULL)
-            continue;
-
-        struct mem *mem = &mm->mem;
-        mem_read_lock_quiesce_aware(mem);
-        page_t page = 0;
-        while (page < mem->page_limit) {
-            struct pt_entry *pt = mem_pt(mem, page);
-            if (pt != NULL) {
-                if (pt->flags & P_ANONYMOUS) {
-                    if (pt->flags & P_SHARED)
-                        out->shmem_bytes += PAGE_SIZE;
-                    else
-                        out->anon_bytes += PAGE_SIZE;
-                } else {
-                    out->mapped_bytes += PAGE_SIZE;
-                }
-            }
-            mem_next_page(mem, &page);
+        if (mm != NULL) {
+            struct mem *mem = &mm->mem;
+            out->anon_bytes += (uint64_t) mem_class_pages_now(mem, MEM_PAGE_ANON) * PAGE_SIZE;
+            out->shmem_bytes += (uint64_t) mem_class_pages_now(mem, MEM_PAGE_SHMEM) * PAGE_SIZE;
+            out->mapped_bytes += (uint64_t) mem_class_pages_now(mem, MEM_PAGE_FILE) * PAGE_SIZE;
+            if (check)
+                mm_retain(mm);
         }
-        mem_read_unlock_quiesce_aware(mem);
-        mm_release(mm);
+        unlock(&task->general_lock);
+        // The check walks under the mm's own locks, which must not be taken
+        // under general_lock: mem_ptr's COW break takes general_lock while
+        // holding the read lock, the opposite order.
+        if (check && mm != NULL) {
+            mem_class_check(task, mm);
+            mm_release(mm);
+        }
     }
 
     task_snapshot_release(&snapshot);
@@ -548,11 +645,15 @@ DirectMap1G:           0 kB
     return 0;
 }
 
+// Linux's "%lu.%02lu %lu.%02lu": uptime, then the idle time summed over every
+// CPU, which is why the second can exceed the first. Both in hundredths, from
+// ticks at USER_HZ. It printed "%lu.%lu" -- 12.05 s as "12.5", later than the
+// 12.10 read after it -- and the uptime a second time where the idle time goes.
 static int proc_show_uptime(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    struct uptime_info uptime_info = get_uptime();
-    unsigned long uptime = uptime_info.uptime_ticks;
-    
-    proc_printf(buf, "%lu.%lu %lu.%lu\n", uptime / 100, uptime % 100, uptime / 100, uptime % 100);
+    unsigned long uptime = (unsigned long) get_uptime().uptime_ticks;
+    // The same ledger as /proc/stat's "cpu" line, so the two agree.
+    unsigned long idle = (unsigned long) get_total_cpu_usage().idle_ticks;
+    proc_printf(buf, "%lu.%02lu %lu.%02lu\n", uptime / 100, uptime % 100, idle / 100, idle % 100);
     return 0;
 }
 static int proc_show_vmstat(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -649,13 +750,17 @@ static int proc_show_loadavg(struct proc_entry *UNUSED(entry), struct proc_data 
     get_guest_loadavg(loads);
     struct pid *last_pid = pid_get_last_allocated();
     int last_pid_id = last_pid ? last_pid->id : 0;
+    // (The last one its own pid namespace handed out, for a reader in one.)
+    struct pid_namespace *reader_ns = current_pid_ns();
+    if (reader_ns != NULL)
+        last_pid_id = reader_ns->last_nr;
     double load_1m = loads[0] / 65536.0;
     double load_5m = loads[1] / 65536.0;
     double load_15m = loads[2] / 65536.0;
     int blocked_task_count = get_count_of_blocked_tasks();
     int alive_task_count = get_count_of_alive_tasks();
     // running_task_count is calculated abool proc_net_readdir(struct proc_entry * UNUSED(entry), unsigned long *index, struct proc_entry *next_entry) pproximetly, since we don't know the real number of currently running tasks.
-    int running_task_count = MIN(get_cpu_count(), (int)(alive_task_count - blocked_task_count));
+    int running_task_count = MIN(get_cpu_count_allowed(), (int)(alive_task_count - blocked_task_count));
     proc_printf(buf, "%.2f %.2f %.2f %u/%u %u\n", load_1m, load_5m, load_15m, running_task_count, alive_task_count, last_pid_id);
     return 0;
 }
@@ -664,7 +769,7 @@ static int proc_readlink_self(struct proc_entry *UNUSED(entry), char *buf) {
     // Linux's /proc/self points at the bare pid ("123"), with no trailing slash.
     // The path resolver appends "/rest" itself, so the slash was never needed and
     // only corrupted readlink("/proc/self") for callers that parse the pid.
-    snprintf(buf, MAX_PATH, "%d", current->pid);
+    snprintf(buf, MAX_PATH, "%d", current_pid_shown(current->pid));
     return 0;
 }
 
@@ -681,7 +786,7 @@ static int proc_readlink_thread_self(struct proc_entry *UNUSED(entry), char *buf
     // to /proc/self/task/<tid>. Our /proc/self is already the thread, so both
     // fallbacks resolve -- but a missing entry costs a failed lookup on a path
     // Android userspace takes constantly.
-    snprintf(buf, MAX_PATH, "%d/task/%d", current->tgid, current->pid);
+    snprintf(buf, MAX_PATH, "%d/task/%d", current_pid_shown(current->tgid), current_pid_shown(current->pid));
     return 0;
 }
 
@@ -839,9 +944,9 @@ static int proc_show_sysvipc_msg(struct proc_entry *UNUSED(entry), struct proc_d
     return 0;
 }
 
-// System V shared memory is not implemented here, so the file is its header
-// alone -- which is what Linux shows when no segment exists, and what `ipcs
-// -m` prints. The header is the part ipcs needs to parse the file at all.
+// Shared memory segments (kernel/ipc.c) are not listed yet, so the file is its
+// header alone -- which is what Linux shows when no segment exists, and what
+// `ipcs -m` prints. The header is the part ipcs needs to parse the file at all.
 static int proc_show_sysvipc_shm(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "%10s %10s %-10s %20s %5s %5s %6s %5s %5s %5s %5s %10s %10s %10s %20s %20s\n",
                 "key", "shmid", "perms", "size", "cpid", "lpid", "nattch",
@@ -886,21 +991,85 @@ static void proc_print_escaped(struct proc_data *buf, const char *str) {
     *(at_start) = false; \
 } while (0)
 
-int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    struct mount *mount;
+// The root a mount listing is relative to: that of the task for a
+// /proc/<pid>/{mounts,mountinfo} (as on Linux, which takes it from the task at
+// open), the reader's for /proc/mounts and /proc/mountinfo. "/" unchrooted.
+// Resolved before mounts_lock is taken: a path lookup may take it too.
+static int proc_mounts_root(struct proc_entry *entry, char *root_path) {
+    struct fs_info *fs = NULL;
+    if (entry->pid != 0) {
+        struct task *task = pid_get_task_zombie_global_ref(entry->pid);
+        if (task != NULL) {
+            if (task_lock_unless_exiting(task)) {
+                if (task->fs != NULL)
+                    fs = fs_info_retain(task->fs);
+                unlock(&task->general_lock);
+            }
+            task_ref_cnt_mod(task, -1);
+        }
+    } else if (current != NULL && current->fs != NULL) {
+        fs = fs_info_retain(current->fs);
+    }
+    strcpy(root_path, "/");
+    if (fs == NULL)
+        return 0;
+    int err = fs_root_path(fs, root_path);
+    fs_info_release(fs);
+    return err;
+}
+
+// A mount point (fs/mount.c's form: "" for the root) as seen from `root`,
+// into out; false when it lies outside that root. Linux leaves such a mount
+// out of the listing (seq_path_root's SEQ_SKIP) and shows the rest relative
+// to the root. Printing every mount with its global path made a chroot's
+// listing name paths that do not exist inside it: in the device suite's
+// chroot legs a bind the test had just made never matched its own path.
+static bool proc_mount_point_in_root(const char *point, const char *root, char *out) {
+    if (strcmp(root, "/") == 0) {
+        // Another mount namespace's tree is under a staging point
+        // (kernel/mnt_ns.h), where no path from this root leads.
+        if (mount_staging_point_len(point, strlen(point)) != 0)
+            return false;
+        strcpy(out, point[0] == '\0' ? "/" : point);
+        return true;
+    }
+    size_t n = strlen(root);
+    if (strcmp(point, root) == 0) {
+        strcpy(out, "/");
+        return true;
+    }
+    if (strncmp(point, root, n) != 0 || point[n] != '/')
+        return false;
+    strcpy(out, point + n);
+    return true;
+}
+
+int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf) {
+    char root_path[MAX_PATH + 1];
+    int err = proc_mounts_root(entry, root_path);
+    if (err < 0)
+        return err;
     // The mounts list is mutated under mounts_lock (fs/mount.c) and was walked
     // here without it, so a concurrent mount or umount could free the entry
     // this loop was standing on -- a use-after-free reachable from an ordinary
     // `cat /proc/mounts`, and systemd reads mountinfo on every mount change.
     lock(&mounts_lock, 0);
-    list_for_each_entry(&mounts, mount, mounts) {
-        // A detached fsmount() has no mountpoint on Linux and appears in no
-        // listing until move_mount places it. See struct mount.
-        if (mount->detached)
+    // In mount-ID order, without a detached fsmount() -- which has no
+    // mountpoint on Linux and appears in no listing until move_mount places
+    // it. See mounts_listed_locked.
+    size_t count = 0;
+    // A mount another was mounted over is listed too, as on Linux, at the
+    // point it is under (fs/mount.c).
+    struct mount **listed = mounts_listed_locked_covered(&count, true);
+    if (listed == NULL) {
+        unlock(&mounts_lock);
+        return _ENOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct mount *mount = listed[i];
+        char point[MAX_PATH + 1];
+        if (!proc_mount_point_in_root(mount_listed_point(mount), root_path, point))
             continue;
-        const char *point = mount->point;
-        if (point[0] == '\0')
-            point = "/";
 
         // An empty source would print as an empty field, and /proc/mounts is
         // space-separated with no quoting: busybox then reads the mount point
@@ -924,61 +1093,136 @@ int proc_show_mounts(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
         if (mount->info && mount->info[0] != '\0') // Ensure it's not NULL and not empty.
             proc_printf_comma(buf, &at_start, "%s", mount->info);
         proc_printf(buf, " 0 0\n");
-    };
+    }
     unlock(&mounts_lock);
+    free(listed);
     return 0;
 }
 
-// Caller holds mounts_lock, like proc_mountinfo_parent_id below.
-static int proc_mountinfo_id(struct mount *target) {
-    return mount_id_locked(target);
-}
-
-// Caller holds mounts_lock: this walks the same list its caller is iterating,
-// so it must not take the lock again.
+// The mount `target` is mounted on -- Linux's mnt_parent -- as mountinfo's
+// second field. Caller holds mounts_lock: this walks the same list its caller
+// is iterating, so it must not take the lock again.
+//
+// These must form a tree, because readers walk them as one. libmount climbs
+// from the smallest parent ID until the parent is missing from the table, and
+// findmnt recurses from there through each mount's children; a loop in either
+// direction never ends (see the comment on mount_id in fs/mount.c for the loop
+// there was). What guarantees it: every parent chosen below comes strictly
+// earlier in one fixed order -- a shorter point, or the same point mounted
+// earlier -- so following parents only ever goes down that order and must stop.
+// It stops at the bottom mount on the root, whose parent is MOUNT_ID_HIDDEN,
+// an ID the table never contains: what Linux shows for the root, whose parent
+// is the rootfs outside every process's root.
 static int proc_mountinfo_parent_id(struct mount *target) {
-    const char *point = target->point;
-    if (point[0] == '\0')
-        return 1;
-
     struct mount *mount;
-    list_for_each_entry(&mounts, mount, mounts) {
-        if (mount == target)
-            continue;
-        size_t n = mount->point_len;
-        if (n >= target->point_len)
-            continue;
-        if (strncmp(point, mount->point, n) != 0)
-            continue;
-        if (point[n] != '/' && point[n] != '\0')
-            continue;
-        return proc_mountinfo_id(mount);
+    // The old root after pivot_root(".", "."): stacked over the new root,
+    // which is what it is mounted on (fs/mount.c, mnt_ns_pivot_root).
+    if (target->pivot_over != 0 && !target->detached && !target->lazy_umount)
+        return target->pivot_over;
+    // A covered mount sits on what it was mounted on, which was there before
+    // what covers it: of the mounts whose place in the tree holds its own,
+    // the longest, and of those at that place the newest older than the
+    // coverer. (A covered one's place is the point it is covered at.)
+    if (target->detached && target->covered_by != 0 && target->covered_point != NULL) {
+        const char *place = target->covered_point;
+        size_t place_len = strlen(place);
+        size_t tree = mount_staging_point_len(place, place_len);
+        struct mount *best = NULL;
+        size_t best_len = 0;
+        list_for_each_entry(&mounts, mount, mounts) {
+            if (mount == target || mount->lazy_umount || mount_id(mount) >= target->covered_by)
+                continue;
+            if (mount->detached && (mount->covered_by == 0 || mount->covered_point == NULL))
+                continue;
+            const char *theirs = mount_listed_point(mount);
+            size_t n = strlen(theirs);
+            if (n >= place_len || strncmp(place, theirs, n) != 0 || place[n] != '/')
+                continue;
+            if (mount_staging_point_len(theirs, n) != tree)
+                continue;
+            if (best == NULL || n > best_len || (n == best_len && mount_id(mount) > mount_id(best))) {
+                best = mount;
+                best_len = n;
+            }
+        }
+        if (best != NULL)
+            return mount_id(best);
     }
-    return 1;
+    // The root of a mount namespace's tree sits on nothing a listing shows,
+    // as the initial root does; its point has the initial root's "" for a
+    // prefix like every other, which is not the same thing.
+    bool ns_root = mount_staging_point_len(target->point, target->point_len) == target->point_len &&
+        target->point_len != 0;
+    // Mounted on top of another mount at the very same point -- a second
+    // mount on /mnt, or on / -- it sits on that one, as on Linux. The list
+    // keeps equal points newest first, so the mount directly beneath is the
+    // next entry after this one with the same point; entries of one length
+    // are contiguous, so the search ends where the length changes.
+    for (struct list *item = target->mounts.next; item != &mounts; item = item->next) {
+        mount = list_entry(item, struct mount, mounts);
+        if (mount->point_len != target->point_len)
+            break;
+        if (!mount->detached && strcmp(mount->point, target->point) == 0)
+            return mount_id(mount);
+    }
+    // Otherwise it sits in the tree of the mount with the longest point that
+    // is a proper prefix of its own, ending at a '/'. The first such entry is
+    // that point's topmost mount: the one a path resolves through. The root's
+    // point is "", a prefix of every other point.
+    list_for_each_entry(&mounts, mount, mounts) {
+        size_t n = mount->point_len;
+        if (ns_root)
+            break;
+        if (mount->detached || n >= target->point_len)
+            continue;
+        // ...and nothing in a namespace's tree sits on a mount outside it.
+        if (mount_staging_point_len(target->point, target->point_len) != mount_staging_point_len(mount->point, n))
+            continue;
+        if (strncmp(target->point, mount->point, n) == 0 && target->point[n] == '/')
+            return mount_id(mount);
+    }
+    return MOUNT_ID_HIDDEN;
 }
 
-int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    struct mount *mount;
-    // See proc_show_mounts. Held across proc_mountinfo_parent_id's own walk of
-    // the list, which is why that one must not lock.
+int proc_show_mountinfo(struct proc_entry *entry, struct proc_data *buf) {
+    char root_path[MAX_PATH + 1];
+    int err = proc_mounts_root(entry, root_path);
+    if (err < 0)
+        return err;
+    // See proc_show_mounts, for the lock and the order. Held across
+    // proc_mountinfo_parent_id's own walk of the list, which is why that one
+    // must not lock.
     lock(&mounts_lock, 0);
-    list_for_each_entry(&mounts, mount, mounts) {
-        // Same as proc_show_mounts: a detached fsmount() is not in any mount
-        // listing until move_mount gives it a point.
-        if (mount->detached)
+    size_t count = 0;
+    // A mount another was mounted over is listed too, as on Linux, at the
+    // point it is under (fs/mount.c).
+    struct mount **listed = mounts_listed_locked_covered(&count, true);
+    if (listed == NULL) {
+        unlock(&mounts_lock);
+        return _ENOMEM;
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct mount *mount = listed[i];
+        char point[MAX_PATH + 1];
+        if (!proc_mount_point_in_root(mount_listed_point(mount), root_path, point))
             continue;
-        const char *point = mount->point;
-        if (point[0] == '\0')
-            point = "/";
 
-        int id = proc_mountinfo_id(mount);
+        int id = mount_id(mount);
         int parent_id = proc_mountinfo_parent_id(mount);
 
         // Field 3 is the device files on this mount report through st_dev, so
         // it comes from the same place that number does (fs/mount.c) rather
         // than being made up here; the two must not contradict each other.
         dev_t_ dev = mount_dev(mount);
-        proc_printf(buf, "%d %d %d:%d / ", id, parent_id, dev_major(dev), dev_minor(dev));
+        proc_printf(buf, "%d %d %d:%d ", id, parent_id, dev_major(dev), dev_minor(dev));
+        // Field 4, the directory of its filesystem the mount shows: "/" for an
+        // ordinary mount, and for a bind the source's path within the origin
+        // -- bind_prefix, which do_bind_mount already resolved through any
+        // bind the source was itself reached by, so a bind of a bind names
+        // the same directory. Linux: "229 39 254:3 /bp-src /tmp/bp-dst".
+        const char *root = mount->bind_origin != NULL ? mount->bind_prefix : "/";
+        proc_print_escaped(buf, root[0] == '\0' ? "/" : root);
+        proc_printf(buf, " ");
         proc_print_escaped(buf, point);
         proc_printf(buf, " %s", mount->flags & MS_READONLY_ ? "ro" : "rw");
         if (mount->flags & MS_NOSUID_)
@@ -987,6 +1231,14 @@ int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf)
             proc_printf(buf, ",nodev");
         if (mount->flags & MS_NOEXEC_)
             proc_printf(buf, ",noexec");
+        // The optional fields: how it propagates (fs/mount.c). None for a
+        // private mount.
+        if (mount->shared_id != 0)
+            proc_printf(buf, " shared:%d", mount->shared_id);
+        if (mount->master_id != 0)
+            proc_printf(buf, " master:%d", mount->master_id);
+        if (mount->unbindable)
+            proc_printf(buf, " unbindable");
         proc_printf(buf, " - %s ", mount->fs->name);
         const char *source = mount_display_source(mount);
         proc_print_escaped(buf, source[0] == '\0' ? "/" : source);
@@ -996,6 +1248,7 @@ int proc_show_mountinfo(struct proc_entry *UNUSED(entry), struct proc_data *buf)
         proc_printf(buf, "\n");
     }
     unlock(&mounts_lock);
+    free(listed);
     return 0;
 }
 
@@ -1053,6 +1306,17 @@ static int proc_root_pid_compare(const void *lhs, const void *rhs) {
     return (a > b) - (a < b);
 }
 
+// Whether /proc lists this task: processes only, as Linux does, which walks
+// thread-group leaders. A thread's /proc/<tid> still opens by name, and
+// /proc/<pid>/task lists every thread. Listing every task made ps, pgrep and
+// top show each thread of a program as another process (waybar: 13 rows for
+// one). A leader that exited before its other threads stays linked, so its
+// process is still listed, as on Linux.
+// And only what the reader's pid namespace holds (kernel/pid_ns.h).
+static bool proc_root_lists_task(struct task *task) {
+    return task != NULL && task->group != NULL && task->group->leader == task && task_visible(task);
+}
+
 static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     if (entry->child_names != NULL) {
         free_string_array(entry->child_names);
@@ -1066,7 +1330,7 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
         // Zombies are listed too: an unreaped process still exists, still owns
         // its pid, and ps must be able to show it.
-        if (pid_entry->task == NULL)
+        if (!proc_root_lists_task(pid_entry->task))
             continue;
         used++;
     }
@@ -1075,8 +1339,9 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
     // Room for the synthetic kernel threads too (kernel/task.c): they have no
     // task in alive_pids_list, so the walk above cannot see them, but /proc has
     // to list them or nothing will look.
+    // (The machine's: a pid namespace has none of its own.)
     unsigned nkthreads = 0;
-    while (pid_kthread_at(nkthreads) != 0)
+    while (current_pid_ns() == NULL && pid_kthread_at(nkthreads) != 0)
         nkthreads++;
     used += nkthreads;
 
@@ -1089,7 +1354,7 @@ static void proc_root_refresh_pid_snapshot(struct proc_entry *entry) {
         pids[filled++] = (dword_t) pid_kthread_at(k);
     complex_lockt(&pids_lock, 0);
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
-        if (pid_entry->task == NULL)
+        if (!proc_root_lists_task(pid_entry->task))
             continue;
         if (filled >= used)
             break;
@@ -1233,6 +1498,33 @@ enum sysfs_node_kind {
     sysfs_net_tx_errors,
     sysfs_net_tx_dropped,
     sysfs_net_collisions,
+    sysfs_class_power_supply,
+    sysfs_power_battery,
+    sysfs_battery_uevent,
+    sysfs_battery_type,
+    sysfs_battery_present,
+    sysfs_battery_status,
+    sysfs_battery_capacity,
+    sysfs_power_mains,
+    sysfs_mains_uevent,
+    sysfs_mains_type,
+    sysfs_mains_online,
+    sysfs_class_tty,
+    sysfs_tty_tty0,
+    sysfs_tty0_active,
+    sysfs_dev_char_drm,
+    sysfs_platform,
+    sysfs_gpu_dir,
+    sysfs_gpu_uevent,
+    sysfs_gpu_subsystem,
+    sysfs_gpu_drm,
+    sysfs_render_dir,
+    sysfs_render_dev,
+    sysfs_render_uevent,
+    sysfs_render_device,
+    sysfs_render_subsystem,
+    sysfs_class_drm,
+    sysfs_class_drm_render,
 };
 
 // A node is identified by (kind, cpu, index). cpu is -1 except under cpuN/,
@@ -1351,14 +1643,35 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
     //
     //     lsblk: failed to access sysfs directory: /sys/dev/block
     //
-    // char/ is present and empty because that is what AOK can honestly say:
-    // it models no character devices in sysfs at all, and /sys/class does not
+    // char/ is present and, but for the GPU render node below, empty: AOK
+    // models no other character device in sysfs, and /sys/class does not
     // list them either. An absent directory would be a different claim, and
     // the wrong one -- Linux always has both.
     {sysfs_dev, sysfs_root, "dev", SYSFS_DIR},
     {sysfs_dev_block, sysfs_dev, "block", SYSFS_DIR},
     {sysfs_dev_char, sysfs_dev, "char", SYSFS_DIR},
     {sysfs_dev_block_link, sysfs_dev_block, NULL, SYSFS_LNK},
+
+    // The virtio-gpu render node (fs/virtgpu.c), present only when it is.
+    // libdrm's drmGetDevices2 -- how Mesa's Venus driver finds a GPU -- takes
+    // a /dev/dri node for a DRM device only if /sys/dev/char/<maj>:<min>/
+    // device/drm exists, reads the bus from that device's `subsystem` link,
+    // and for a platform device names it from MODALIAS in its uevent. So:
+    //
+    //   /sys/dev/char/226:128 -> ../../devices/platform/aok-gpu/drm/renderD128
+    //   /sys/devices/platform/aok-gpu/{uevent, subsystem, drm/renderD128/}
+    //   /sys/class/drm/renderD128 -> ../../devices/platform/aok-gpu/drm/renderD128
+    {sysfs_dev_char_drm, sysfs_dev_char, "226:128", SYSFS_LNK},
+    {sysfs_platform, sysfs_devices, "platform", SYSFS_DIR},
+    {sysfs_gpu_dir, sysfs_platform, "aok-gpu", SYSFS_DIR},
+    {sysfs_gpu_uevent, sysfs_gpu_dir, "uevent", SYSFS_REG},
+    {sysfs_gpu_subsystem, sysfs_gpu_dir, "subsystem", SYSFS_LNK},
+    {sysfs_gpu_drm, sysfs_gpu_dir, "drm", SYSFS_DIR},
+    {sysfs_render_dir, sysfs_gpu_drm, "renderD128", SYSFS_DIR},
+    {sysfs_render_dev, sysfs_render_dir, "dev", SYSFS_REG},
+    {sysfs_render_uevent, sysfs_render_dir, "uevent", SYSFS_REG},
+    {sysfs_render_device, sysfs_render_dir, "device", SYSFS_LNK},
+    {sysfs_render_subsystem, sysfs_render_dir, "subsystem", SYSFS_LNK},
 
     // /sys/class exists on every Linux system, and its absence is not cosmetic.
     // Devuan's /etc/init.d/eudev tests `[ ! -d /sys/class/ ]` and reports
@@ -1370,6 +1683,8 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
     {sysfs_class, sysfs_root, "class", SYSFS_DIR},
     {sysfs_class_block, sysfs_class, "block", SYSFS_DIR},
     {sysfs_class_block_dev, sysfs_class_block, GUEST_DISK_NAME, SYSFS_DIR},
+    {sysfs_class_drm, sysfs_class, "drm", SYSFS_DIR},
+    {sysfs_class_drm_render, sysfs_class_drm, "renderD128", SYSFS_LNK},
 
     // /sys/class/net, which is where a lot of userland actually looks for
     // per-interface byte counters -- NOT /proc/net/dev. btop is one: its binary
@@ -1399,6 +1714,53 @@ static const struct sysfs_node_desc sysfs_node_descs[] = {
     {sysfs_net_tx_errors, sysfs_net_statistics, "tx_errors", SYSFS_REG},
     {sysfs_net_tx_dropped, sysfs_net_statistics, "tx_dropped", SYSFS_REG},
     {sysfs_net_collisions, sysfs_net_statistics, "collisions", SYSFS_REG},
+
+    // /sys/class/power_supply: the battery, where Linux userland looks for it.
+    // waybar's battery module watches this directory with inotify and DISABLED
+    // ITSELF when it was missing ("Could not watch for battery plug/unplug");
+    // btop reads capacity, htop reads uevent.
+    //
+    // The directory always exists. What is under it depends on the host: while
+    // the host reports a battery, BAT0 and an AC adapter, shaped like ACPI's; a
+    // host with no battery -- the CLI, a desktop Mac -- gets an empty
+    // directory, which is what Linux shows on a machine without one. See
+    // sysfs_power_supply_known().
+    //
+    // Only what the host actually reports is published: a state and a
+    // percentage. No energy_*, charge_*, voltage_*, current_*, power_* or
+    // time_to_* files, because iOS gives no such figures and an invented one
+    // is worse than an absent file -- a tool that finds none falls back to
+    // capacity, a tool that finds a wrong one believes it. htop's battery
+    // meter, which needs a full-charge figure, therefore reads N/A.
+    //
+    // BAT0 is listed before AC on purpose. waybar takes as its adapter the
+    // LAST supply in directory order with an `online` or `status` file, and
+    // BAT0 has a status: listed after AC, BAT0 would become the "adapter", and
+    // waybar would decide whether a discharging battery is plugged in from a
+    // BAT0/online that does not exist.
+    {sysfs_class_power_supply, sysfs_class, "power_supply", SYSFS_DIR},
+    {sysfs_power_battery, sysfs_class_power_supply, "BAT0", SYSFS_DIR},
+    {sysfs_power_mains, sysfs_class_power_supply, "AC", SYSFS_DIR},
+
+    {sysfs_battery_uevent, sysfs_power_battery, "uevent", SYSFS_REG},
+    {sysfs_battery_type, sysfs_power_battery, "type", SYSFS_REG},
+    {sysfs_battery_present, sysfs_power_battery, "present", SYSFS_REG},
+    {sysfs_battery_status, sysfs_power_battery, "status", SYSFS_REG},
+    {sysfs_battery_capacity, sysfs_power_battery, "capacity", SYSFS_REG},
+
+    {sysfs_mains_uevent, sysfs_power_mains, "uevent", SYSFS_REG},
+    {sysfs_mains_type, sysfs_power_mains, "type", SYSFS_REG},
+    {sysfs_mains_online, sysfs_power_mains, "online", SYSFS_REG},
+
+    // /sys/class/tty/tty0/active: the virtual console currently in the
+    // foreground. systemd checks for it by name and says so when it is
+    // missing -- "System has /dev/tty0 but not /sys/class/tty/tty0/active
+    // which is broken, ignoring: No such file or directory" -- before falling
+    // back to guessing which console to put a getty on. AOK has one console,
+    // the one /proc/consoles and the synthesized console= already name.
+    {sysfs_class_tty, sysfs_class, "tty", SYSFS_DIR},
+    {sysfs_tty_tty0, sysfs_class_tty, "tty0", SYSFS_DIR},
+    {sysfs_tty0_active, sysfs_tty_tty0, "active", SYSFS_REG},
 };
 
 #undef SYSFS_DIR
@@ -1527,10 +1889,25 @@ static bool sysfs_net_iface_at(int index, struct net_iface_stats *out) {
     return true;
 }
 
+// The host's battery, if it reports one. A state without a level is treated as
+// no battery at all: every consumer of BAT0 wants its capacity, and there is
+// no honest number to put there.
+static bool sysfs_power_supply_known(struct host_battery_status *battery) {
+    hostBatteryStatus(battery);
+    return battery->state != HOST_BATTERY_UNKNOWN && battery->level >= 0;
+}
+
 // How many instances of this kind exist under one parent.
 static size_t sysfs_net_file_data(struct sysfs_node node, char *buf, size_t bufsize);
+static size_t sysfs_power_supply_file_data(struct sysfs_node node, char *buf, size_t bufsize);
 
 static int sysfs_node_multiplicity(enum sysfs_node_kind kind) {
+    if (kind == sysfs_power_battery || kind == sysfs_power_mains) {
+        struct host_battery_status battery;
+        return sysfs_power_supply_known(&battery) ? 1 : 0;
+    }
+    if (kind == sysfs_dev_char_drm || kind == sysfs_gpu_dir || kind == sysfs_class_drm)
+        return virtgpu_available() ? 1 : 0;
     if (kind == sysfs_cpu_dir)
         return sysfs_cpu_count();
     if (kind == sysfs_net_dir)
@@ -1588,6 +1965,10 @@ static bool sysfs_lookup_child(struct sysfs_node parent, const char *name, size_
 
         if (desc->name != NULL) {
             if (strlen(desc->name) != namelen || strncmp(desc->name, name, namelen) != 0)
+                continue;
+            // A named node can still be absent: the power supplies exist only
+            // while the host reports a battery.
+            if (sysfs_node_multiplicity(desc->kind) < 1)
                 continue;
             *child_out = sysfs_node_make(desc->kind, parent.cpu, parent.index);
             return true;
@@ -1779,6 +2160,22 @@ static size_t sysfs_file_data(struct sysfs_node node, char *buf, size_t bufsize)
         case sysfs_cpu_uevent:
             return snprintf(buf, bufsize, "DRIVER=processor\n");
 
+        case sysfs_gpu_uevent:
+            return snprintf(buf, bufsize, "DRIVER=virtio_gpu\nMODALIAS=platform:aok-gpu\n");
+        case sysfs_render_dev:
+            return snprintf(buf, bufsize, "%d:%d\n", DRM_MAJOR, DEV_VIRTGPU_RENDER_MINOR);
+        case sysfs_render_uevent:
+            return snprintf(buf, bufsize, "MAJOR=%d\nMINOR=%d\nDEVNAME=dri/renderD128\n",
+                            DRM_MAJOR, DEV_VIRTGPU_RENDER_MINOR);
+
+        // Always a tty name: this file names a VIRTUAL CONSOLE, and tty1 is
+        // the one AOK presents even when the console itself was redirected to
+        // a pts (the CLI), where Linux would have no tty0 to ask about.
+        case sysfs_tty0_active:
+            if (console_major == TTY_CONSOLE_MAJOR)
+                return snprintf(buf, bufsize, "tty%d\n", console_minor);
+            return snprintf(buf, bufsize, "tty1\n");
+
         case sysfs_topo_physical_package_id:
         case sysfs_topo_cluster_id:
             return snprintf(buf, bufsize, "0\n");
@@ -1873,6 +2270,16 @@ static size_t sysfs_file_data(struct sysfs_node node, char *buf, size_t bufsize)
             return snprintf(buf, bufsize, "0\n");
         case sysfs_block_dev_hidden:
             return snprintf(buf, bufsize, "0\n");
+
+        case sysfs_battery_uevent:
+        case sysfs_battery_type:
+        case sysfs_battery_present:
+        case sysfs_battery_status:
+        case sysfs_battery_capacity:
+        case sysfs_mains_uevent:
+        case sysfs_mains_type:
+        case sysfs_mains_online:
+            return sysfs_power_supply_file_data(node, buf, bufsize);
         default:
             return 0;
     }
@@ -1890,6 +2297,70 @@ static unsigned int sysfs_net_linux_flags(unsigned int host_flags) {
 #else
     return host_flags;           // already Linux's
 #endif
+}
+
+// BAT0 and AC. The contents follow Linux's power_supply class
+// (Documentation/ABI/testing/sysfs-class-power), and uevent is what that class
+// writes for these properties on 6.12: DEVTYPE from the device type, then NAME
+// and TYPE, then one POWER_SUPPLY_* line per property in the order an ACPI
+// battery declares them.
+static size_t sysfs_power_supply_file_data(struct sysfs_node node, char *buf, size_t bufsize) {
+    struct host_battery_status battery;
+    // The battery went away while this file was open.
+    if (!sysfs_power_supply_known(&battery))
+        return 0;
+
+    int capacity = (int) (battery.level * 100.0f + 0.5f);
+    if (capacity > 100)
+        capacity = 100;
+    const char *status;
+    switch (battery.state) {
+        case HOST_BATTERY_CHARGING:
+            status = "Charging";
+            break;
+        case HOST_BATTERY_FULL:
+            status = "Full";
+            break;
+        default:
+            status = "Discharging";
+            break;
+    }
+    // iOS's charging and full both mean plugged in; unplugged means running
+    // from the battery. It has no "Not charging" to report.
+    int online = battery.state == HOST_BATTERY_CHARGING || battery.state == HOST_BATTERY_FULL;
+
+    switch (node.kind) {
+        case sysfs_battery_uevent:
+            return snprintf(buf, bufsize,
+                            "DEVTYPE=power_supply\n"
+                            "POWER_SUPPLY_NAME=BAT0\n"
+                            "POWER_SUPPLY_TYPE=Battery\n"
+                            "POWER_SUPPLY_STATUS=%s\n"
+                            "POWER_SUPPLY_PRESENT=1\n"
+                            "POWER_SUPPLY_CAPACITY=%d\n",
+                            status, capacity);
+        case sysfs_battery_type:
+            return snprintf(buf, bufsize, "Battery\n");
+        case sysfs_battery_present:
+            return snprintf(buf, bufsize, "1\n");
+        case sysfs_battery_status:
+            return snprintf(buf, bufsize, "%s\n", status);
+        case sysfs_battery_capacity:
+            return snprintf(buf, bufsize, "%d\n", capacity);
+        case sysfs_mains_uevent:
+            return snprintf(buf, bufsize,
+                            "DEVTYPE=power_supply\n"
+                            "POWER_SUPPLY_NAME=AC\n"
+                            "POWER_SUPPLY_TYPE=Mains\n"
+                            "POWER_SUPPLY_ONLINE=%d\n",
+                            online);
+        case sysfs_mains_type:
+            return snprintf(buf, bufsize, "Mains\n");
+        case sysfs_mains_online:
+            return snprintf(buf, bufsize, "%d\n", online);
+        default:
+            return 0;
+    }
 }
 
 static size_t sysfs_net_file_data(struct sysfs_node node, char *buf, size_t bufsize) {
@@ -1955,7 +2426,7 @@ static struct fd *sysfs_open(struct mount *mount, const char *path, int UNUSED(f
     mount_retain(mount);
     fd->mount = mount;
     fd->type = sysfs_node_mode(node) & S_IFMT;
-    fd->fs_data = sysfs_encode_node(node);
+    fd->sysfs.node = sysfs_encode_node(node);
     return fd;
 }
 
@@ -1987,14 +2458,20 @@ static ssize_t sysfs_readlink(struct mount *UNUSED(mount), const char *path,
     // /sys/class/net/utun15/statistics/rx_bytes, against 19 us for
     // /sys/block/sda/size. btop reads six such counters per interface.
     //
-    // Every symlink in this tree lives under /sys/dev/block/, and there is
-    // exactly one kind of them, so anything that cannot be one is refused
-    // without walking anywhere.
-    static const char dev_block_prefix[] = "dev/block/";
+    // Every symlink in this tree lives under one of these, so anything
+    // elsewhere is refused without walking anywhere.
+    static const char *const link_prefixes[] = {
+        "dev/block/", "dev/char/", "devices/platform/", "class/drm/",
+    };
     const char *p = path;
     while (*p == '/')
         p++;
-    if (strncmp(p, dev_block_prefix, sizeof(dev_block_prefix) - 1) != 0)
+    bool may_be_link = false;
+    for (size_t i = 0; i < sizeof(link_prefixes) / sizeof(link_prefixes[0]); i++) {
+        if (strncmp(p, link_prefixes[i], strlen(link_prefixes[i])) == 0)
+            may_be_link = true;
+    }
+    if (!may_be_link)
         return _EINVAL;     // not a symlink: readlink(2)'s answer for one
 
     struct sysfs_node node;
@@ -2008,6 +2485,21 @@ static ssize_t sysfs_readlink(struct mount *UNUSED(mount), const char *path,
         case sysfs_dev_block_link:
             // /sys/dev/block/8:0 -> ../../block/sda
             len = snprintf(target, sizeof(target), "../../block/%s", GUEST_DISK_NAME);
+            break;
+        case sysfs_dev_char_drm:
+            len = snprintf(target, sizeof(target), "../../devices/platform/aok-gpu/drm/renderD128");
+            break;
+        case sysfs_class_drm_render:
+            len = snprintf(target, sizeof(target), "../../devices/platform/aok-gpu/drm/renderD128");
+            break;
+        case sysfs_gpu_subsystem:
+            len = snprintf(target, sizeof(target), "../../../bus/platform");
+            break;
+        case sysfs_render_device:
+            len = snprintf(target, sizeof(target), "../../../aok-gpu");
+            break;
+        case sysfs_render_subsystem:
+            len = snprintf(target, sizeof(target), "../../../../../class/drm");
             break;
         default:
             return _EINVAL;
@@ -2029,11 +2521,11 @@ static int sysfs_stat(struct mount *UNUSED(mount), const char *path, struct stat
 }
 
 static int sysfs_fstat(struct fd *fd, struct statbuf *stat) {
-    return sysfs_stat_common(sysfs_decode_node(fd->fs_data), stat);
+    return sysfs_stat_common(sysfs_decode_node(fd->sysfs.node), stat);
 }
 
 static int sysfs_getpath(struct fd *fd, char *buf) {
-    struct sysfs_node node = sysfs_decode_node(fd->fs_data);
+    struct sysfs_node node = sysfs_decode_node(fd->sysfs.node);
 
     // Walk up to the root collecting names, then emit them in order.
     char names[8][32];
@@ -2063,7 +2555,7 @@ static int sysfs_getpath(struct fd *fd, char *buf) {
 }
 
 static ssize_t sysfs_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) {
-    struct sysfs_node node = sysfs_decode_node(fd->fs_data);
+    struct sysfs_node node = sysfs_decode_node(fd->sysfs.node);
     if (S_ISDIR(sysfs_node_mode(node)))
         return _EISDIR;
 
@@ -2072,6 +2564,7 @@ static ssize_t sysfs_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) 
     // snprintf reports what it WOULD have written; never read past the buffer.
     if (size >= sizeof(data))
         size = sizeof(data) - 1;
+    fd->sysfs.read = true;
     if (off < 0 || (size_t) off > size)
         return 0;
     size_t remaining = size - off;
@@ -2093,14 +2586,14 @@ static ssize_t sysfs_write(struct fd *UNUSED(fd), const void *UNUSED(buf), size_
 }
 
 static off_t_ sysfs_lseek(struct fd *fd, off_t_ off, int whence) {
-    struct sysfs_node node = sysfs_decode_node(fd->fs_data);
+    struct sysfs_node node = sysfs_decode_node(fd->sysfs.node);
     if (S_ISDIR(sysfs_node_mode(node)))
         return _EINVAL;
     return generic_seek(fd, off, whence, sysfs_file_size(node));
 }
 
 static int sysfs_readdir(struct fd *fd, struct dir_entry *entry) {
-    struct sysfs_node node = sysfs_decode_node(fd->fs_data);
+    struct sysfs_node node = sysfs_decode_node(fd->sysfs.node);
     if (!S_ISDIR(sysfs_node_mode(node)))
         return _ENOTDIR;
 
@@ -2171,13 +2664,22 @@ static int sysfs_close(struct fd *UNUSED(fd)) {
 // forever, at zero CPU, on the most ordinary way there is to consult a sysfs
 // file. `cat` worked, which is what made it look like the file was fine.
 //
-// The mask is sysfs's own, measured on Devuan rather than assumed: an
-// attribute reports POLLIN|POLLOUT|POLLPRI|POLLERR (0xf), where a procfs file
-// reports the plain DEFAULT_POLLMASK of POLLIN|POLLOUT (0x5). The extra two
-// are how sysfs signals "this attribute may have changed" to a poller camped
-// on it; reporting them keeps a caller that distinguishes the two kinds of
-// file seeing what it would see on Linux.
-static int sysfs_poll(struct fd *UNUSED(fd)) {
+// The mask is sysfs's own, measured on Linux rather than assumed: an attribute
+// reports POLLIN|POLLOUT|POLLPRI|POLLERR (0xf) from the moment it is opened
+// until it is first READ, and plain POLLIN|POLLOUT (0x5) after that -- until
+// the attribute changes, which is what the extra two mean: kernfs compares the
+// file's event count with the one this descriptor's last read saw. A
+// directory is 0x5 throughout. (lseek does not re-arm it; pread does count.)
+//
+// Reporting 0xf for ever spun elogind at a full core, on every boot: it
+// watches /sys/class/tty/tty0/active with no events at all, so it is woken by
+// POLLERR alone, and it rereads the file each time to learn the new console
+// -- and was woken again at once. Nothing here ever changes an attribute
+// behind a reader, so once read, an attribute stays quiet.
+static int sysfs_poll(struct fd *fd) {
+    struct sysfs_node node = sysfs_decode_node(fd->sysfs.node);
+    if (S_ISDIR(sysfs_node_mode(node)) || fd->sysfs.read)
+        return POLL_READ | POLL_WRITE;
     return POLL_READ | POLL_WRITE | POLL_PRI | POLL_ERR;
 }
 

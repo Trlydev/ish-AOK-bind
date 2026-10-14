@@ -1,9 +1,14 @@
+#include <stdarg.h>
 #include <string.h>
 #include <stdio.h>
 #include "debug.h"
 #include "app/DiagnosticsBridge.h"
 #include "jit/jit.h"
 #include "kernel/calls.h"
+#include "kernel/rseq.h"
+#include "kernel/seccomp.h"
+#include "kernel/acct.h"
+#include "kernel/checkpoint.h"
 #include "emu/interrupt.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
@@ -18,6 +23,7 @@
 extern bool isGlibC;
 
 static guest_addr_t current_fault_ip(const struct cpu_state *cpu);
+static void handle_general_protection_interrupt(struct cpu_state *cpu, word_t error_code);
 
 dword_t syscall_stub(void) {
     STRACE("syscall_stub()");
@@ -964,6 +970,7 @@ static syscall_t i386_syscall_table[] = {
     [47]  = (syscall_t) sys_getgid,
     [49]  = (syscall_t) sys_geteuid,
     [50]  = (syscall_t) sys_getegid,
+    [51]  = (syscall_t) sys_acct,
     [52]  = (syscall_t) sys_umount2,
     [54]  = (syscall_t) sys_ioctl,
     [55]  = (syscall_t) sys_fcntl32,
@@ -1087,19 +1094,32 @@ static syscall_t i386_syscall_table[] = {
     [214] = (syscall_t) sys_setgid,
     [215] = (syscall_t) sys_setfsuid,
     [216] = (syscall_t) sys_setfsgid,
+    [217] = (syscall_t) sys_pivot_root,
     [218] = (syscall_t) sys_mincore,
     [219] = (syscall_t) sys_madvise,
     [220] = (syscall_t) sys_getdents64,
     [221] = (syscall_t) sys_fcntl,
     [224] = (syscall_t) sys_gettid,
     [225] = (syscall_t) syscall_success_stub, // readahead
-    [226 ... 237] = (syscall_t) sys_xattr_stub,
+    [226] = (syscall_t) sys_setxattr,
+    [227] = (syscall_t) sys_lsetxattr,
+    [228] = (syscall_t) sys_fsetxattr,
+    [229] = (syscall_t) sys_getxattr,
+    [230] = (syscall_t) sys_lgetxattr,
+    [231] = (syscall_t) sys_fgetxattr,
+    [232] = (syscall_t) sys_listxattr,
+    [233] = (syscall_t) sys_llistxattr,
+    [234] = (syscall_t) sys_flistxattr,
+    [235] = (syscall_t) sys_removexattr,
+    [236] = (syscall_t) sys_lremovexattr,
+    [237] = (syscall_t) sys_fremovexattr,
     [238] = (syscall_t) sys_tkill,
     [239] = (syscall_t) sys_sendfile64,
     [240] = (syscall_t) sys_futex,
     [241] = (syscall_t) sys_sched_setaffinity,
     [242] = (syscall_t) sys_sched_getaffinity,
     [243] = (syscall_t) sys_set_thread_area,
+    [244] = (syscall_t) sys_get_thread_area,
     // The io_* family. 246-249 were absent rather than stubbed, and absent is
     // worse: a missing entry is a "missing syscall" SIGSYS kill instead of an
     // errno, so a 32-bit guest touching AIO died without even a log line.
@@ -1130,6 +1150,12 @@ static syscall_t i386_syscall_table[] = {
     [274] = (syscall_t) sys_mbind,
     [275] = (syscall_t) sys_get_mempolicy,
     [276] = (syscall_t) sys_set_mempolicy,
+    [277] = (syscall_t) sys_mq_open,
+    [278] = (syscall_t) sys_mq_unlink,
+    [279] = (syscall_t) sys_mq_timedsend,
+    [280] = (syscall_t) sys_mq_timedreceive,
+    [281] = (syscall_t) sys_mq_notify,
+    [282] = (syscall_t) sys_mq_getsetattr,
     [284] = (syscall_t) sys_waitid,
     [288] = (syscall_t) sys_keyctl,
     [289] = (syscall_t) sys_ioprio_set,
@@ -1158,7 +1184,7 @@ static syscall_t i386_syscall_table[] = {
     [315] = (syscall_t) sys_tee,
     [316] = (syscall_t) sys_vmsplice,
     [314] = (syscall_t) syscall_success_stub, // sync_file_range
-    [318] = (syscall_t) syscall_success_stub, // getcpu
+    [318] = (syscall_t) sys_getcpu,
     [319] = (syscall_t) sys_epoll_pwait,
     [320] = (syscall_t) sys_utimensat,
     [321] = (syscall_t) sys_signalfd,
@@ -1175,7 +1201,8 @@ static syscall_t i386_syscall_table[] = {
     [332] = (syscall_t) sys_inotify_init1,
     [333] = (syscall_t) sys_preadv_i386,
     [334] = (syscall_t) sys_pwritev_i386,
-    [336] = (syscall_t) syscall_stub, // perf_event_open
+    [335] = (syscall_t) sys_rt_tgsigqueueinfo,
+    [336] = (syscall_t) syscall_stub_silent, // perf_event_open -- see arm64 [241]
     [337] = (syscall_t) sys_recvmmsg,
     [340] = (syscall_t) sys_prlimit64,
     [341] = (syscall_t) syscall_eopnotsupp_stub, // name_to_handle_at
@@ -1183,11 +1210,12 @@ static syscall_t i386_syscall_table[] = {
     [343] = (syscall_t) sys_clock_adjtime, // clock_adjtime (EPERM: iSH can't slew the iOS clock)
     [344] = (syscall_t) sys_syncfs,
     [345] = (syscall_t) sys_sendmmsg,
+    [346] = (syscall_t) sys_setns,
     [347] = (syscall_t) sys_process_vm_readv,
     [349] = (syscall_t) sys_kcmp,
     [352] = (syscall_t) syscall_stub, // sched_getattr
     [353] = (syscall_t) sys_renameat2,
-    [354] = (syscall_t) syscall_eopnotsupp_stub, // seccomp
+    [354] = (syscall_t) sys_seccomp,
     [355] = (syscall_t) sys_getrandom,
     [356] = (syscall_t) sys_memfd_create,
     [358] = (syscall_t) sys_execveat,
@@ -1207,6 +1235,7 @@ static syscall_t i386_syscall_table[] = {
     [372] = (syscall_t) sys_recvmsg,
     [373] = (syscall_t) sys_shutdown,
     [375] = (syscall_t) sys_membarrier, // membarrier
+    [376] = (syscall_t) sys_mlock2,
     [377] = (syscall_t) sys_copy_file_range,
     [378] = (syscall_t) sys_preadv2_i386,
     [379] = (syscall_t) sys_pwritev2_i386,
@@ -1243,6 +1272,8 @@ static syscall_t i386_syscall_table[] = {
     [413] = (syscall_t) sys_pselect_time64, // pselect6_time64
     [414] = (syscall_t) sys_ppoll_time64,
     [417] = (syscall_t) sys_recvmmsg_time64, // recvmmsg_time64
+    [418] = (syscall_t) sys_mq_timedsend_time64,
+    [419] = (syscall_t) sys_mq_timedreceive_time64,
     [421] = (syscall_t) sys_rt_sigtimedwait_time64, // rt_sigtimedwait_time64
     [422] = (syscall_t) sys_futex_time64, // futex_time64
     [424] = (syscall_t) sys_pidfd_send_signal,
@@ -1259,9 +1290,9 @@ static syscall_t i386_syscall_table[] = {
     [435] = (syscall_t) sys_clone3, // clone3
     [436] = (syscall_t) sys_close_range,
     [437] = (syscall_t) sys_openat2,
-    [438] = (syscall_t) syscall_stub_silent, // pidfd_getfd
+    [438] = (syscall_t) sys_pidfd_getfd,
     [439] = (syscall_t) sys_faccessat, // faccessat2
-    [440] = (syscall_t) syscall_stub_silent, // process_madvise
+    [440] = (syscall_t) sys_process_madvise, // 64-bit ABIs dispatch it natively
     [441] = (syscall_t) sys_epoll_pwait2, // epoll_pwait2
     // 442-448, 450, 451, 453: same post-5.x-syscall gap as the arm64 table
     // (identical syscall numbers on i386 -- Linux assigns these consistently
@@ -1270,7 +1301,7 @@ static syscall_t i386_syscall_table[] = {
     // dword-fit check for the two 64-bit-register ABIs (amd64/arm64); i386
     // registers are already word-sized, so a stub here can't SIGSYS the way
     // it did on arm64 before that table also got explicit arg counts.
-    [442] = (syscall_t) syscall_stub_silent, // mount_setattr
+    [442] = (syscall_t) sys_mount_setattr,
     [443] = (syscall_t) syscall_stub_silent, // quotactl_fd
     [444] = (syscall_t) syscall_stub_silent, // landlock_create_ruleset
     [445] = (syscall_t) syscall_stub_silent, // landlock_add_rule
@@ -1295,7 +1326,7 @@ static syscall_t i386_syscall_table[] = {
     [462] = (syscall_t) syscall_stub_silent, // mseal
     // 463-469: xattrat family (6.13), open_tree_attr (6.15),
     // file_getattr/file_setattr (6.17). Same silent-ENOSYS treatment as
-    // 442-462 -- any pre-6.13 kernel (uname advertises 5.20) returns ENOSYS
+    // 442-462 -- any pre-6.13 kernel (uname advertises 5.10) returns ENOSYS
     // for all of these, and callers fall back to the classic xattr path
     // (which reports ENOTSUP like a no-xattr filesystem). Observed: Arch
     // aarch64 useradd -m probing getxattrat/464 during the /etc/skel copy
@@ -1364,6 +1395,7 @@ static inline qword_t riscv64_syscall_number(const struct cpu_state *cpu);
 static inline void riscv64_syscall_args(const struct cpu_state *cpu, qword_t args[6]);
 static inline void riscv64_syscall_result(struct cpu_state *cpu, dword_t result);
 void handle_syscall_interrupt(struct cpu_state *cpu);
+static bool seccomp_exempt(qword_t syscall_num);
 
 struct syscall_abi_dispatch {
     enum guest_abi abi;
@@ -1532,12 +1564,14 @@ static syscall_t amd64_syscall_table[470] = {
     [151] = (syscall_t) sys_mlockall,
     [152] = (syscall_t) sys_munlockall,
     [153] = (syscall_t) syscall_success_stub, // vhangup (tty-cleanup no-op)
+    [155] = (syscall_t) sys_pivot_root, // (its paths go through the native handler)
     [157] = (syscall_t) sys_prctl,
     [158] = (syscall_t) sys_arch_prctl,
     [159] = (syscall_t) sys_adjtimex, // adjtimex (pointer arg goes through the native handler)
     [160] = (syscall_t) sys_setrlimit64,
     [161] = (syscall_t) sys_chroot,
     [162] = (syscall_t) syscall_success_stub, // sync
+    [163] = (syscall_t) sys_acct,
     [164] = (syscall_t) sys_settimeofday,
     [165] = (syscall_t) sys_mount,
     [166] = (syscall_t) sys_umount2,
@@ -1548,10 +1582,21 @@ static syscall_t amd64_syscall_table[470] = {
     [171] = (syscall_t) sys_setdomainname,
     [186] = (syscall_t) sys_gettid,
     [187] = (syscall_t) syscall_success_stub, // readahead
-    [188 ... 199] = (syscall_t) sys_xattr_stub,
+    [188] = (syscall_t) sys_setxattr,
+    [189] = (syscall_t) sys_lsetxattr,
+    [190] = (syscall_t) sys_fsetxattr,
+    [191] = (syscall_t) sys_getxattr,
+    [192] = (syscall_t) sys_lgetxattr,
+    [193] = (syscall_t) sys_fgetxattr,
+    [194] = (syscall_t) sys_listxattr,
+    [195] = (syscall_t) sys_llistxattr,
+    [196] = (syscall_t) sys_flistxattr,
+    [197] = (syscall_t) sys_removexattr,
+    [198] = (syscall_t) sys_lremovexattr,
+    [199] = (syscall_t) sys_fremovexattr,
     [200] = (syscall_t) sys_tkill,
     [201] = (syscall_t) sys_time_amd64,
-    [202] = (syscall_t) sys_futex,
+    [202] = (syscall_t) sys_futex_amd64_guest,
     [203] = (syscall_t) sys_sched_setaffinity,
     [204] = (syscall_t) sys_sched_getaffinity,
     // The io_* family, which had NO amd64 entries at all -- so an amd64 guest
@@ -1585,6 +1630,14 @@ static syscall_t amd64_syscall_table[470] = {
     [237] = (syscall_t) sys_mbind,
     [238] = (syscall_t) sys_set_mempolicy,
     [239] = (syscall_t) sys_get_mempolicy,
+    // mq_* (240-245): dispatched natively (full-width pointers); these pass
+    // the NULL check.
+    [240] = (syscall_t) sys_mq_open,
+    [241] = (syscall_t) sys_mq_unlink,
+    [242] = (syscall_t) sys_mq_timedsend,
+    [243] = (syscall_t) sys_mq_timedreceive,
+    [244] = (syscall_t) sys_mq_notify,
+    [245] = (syscall_t) sys_mq_getsetattr,
     [247] = (syscall_t) sys_waitid,
     [250] = (syscall_t) sys_keyctl,
     [251] = (syscall_t) sys_ioprio_set,
@@ -1614,7 +1667,7 @@ static syscall_t amd64_syscall_table[470] = {
     [276] = (syscall_t) sys_tee,
     [278] = (syscall_t) sys_vmsplice,
     [277] = (syscall_t) syscall_success_stub, // sync_file_range
-    [317] = (syscall_t) syscall_eopnotsupp_stub, // seccomp
+    [317] = (syscall_t) sys_seccomp, // really handle_amd64_native_memory_syscall
     [280] = (syscall_t) sys_utimensat_amd64,
     [281] = (syscall_t) sys_epoll_pwait,
     [282] = (syscall_t) sys_signalfd,
@@ -1635,6 +1688,10 @@ static syscall_t amd64_syscall_table[470] = {
     [295] = (syscall_t) sys_preadv_amd64,
     [296] = (syscall_t) sys_pwritev_amd64,
     [297] = (syscall_t) sys_rt_tgsigqueueinfo,
+    // perf_event_open. There was no entry here at all, which is not quieter:
+    // the dispatcher logs a NULL as "missing amd64 syscall 298", the same
+    // noise by another name. See arm64 [241] for why it is silent.
+    [298] = (syscall_t) syscall_stub_silent, // perf_event_open
     [299] = (syscall_t) sys_recvmmsg_amd64,
     [302] = (syscall_t) sys_prlimit64,
     [303] = (syscall_t) syscall_eopnotsupp_stub, // name_to_handle_at
@@ -1642,7 +1699,8 @@ static syscall_t amd64_syscall_table[470] = {
     [305] = (syscall_t) sys_clock_adjtime_amd64, // clock_adjtime (EPERM; full-width read-state TODO)
     [306] = (syscall_t) sys_syncfs,
     [307] = (syscall_t) sys_sendmmsg_amd64,
-    [309] = (syscall_t) syscall_success_stub, // getcpu
+    [308] = (syscall_t) sys_setns,
+    [309] = (syscall_t) sys_getcpu, // dispatched natively (full-width pointers)
     [310] = (syscall_t) sys_process_vm_readv,
     [312] = (syscall_t) sys_kcmp,
     [316] = (syscall_t) sys_renameat2,
@@ -1650,6 +1708,7 @@ static syscall_t amd64_syscall_table[470] = {
     [319] = (syscall_t) sys_memfd_create,
     [322] = (syscall_t) sys_execveat,
     [324] = (syscall_t) sys_membarrier,
+    [325] = (syscall_t) sys_mlock2, // dispatched natively (full-width); entry needed to pass the NULL check
     [326] = (syscall_t) sys_copy_file_range,
     [327] = (syscall_t) sys_preadv2_amd64,
     [328] = (syscall_t) sys_pwritev2_amd64,
@@ -1683,9 +1742,9 @@ static syscall_t amd64_syscall_table[470] = {
     [435] = (syscall_t) sys_clone3,
     [436] = (syscall_t) sys_close_range,
     [437] = (syscall_t) sys_openat2,
-    [438] = (syscall_t) syscall_stub_silent, // pidfd_getfd
+    [438] = (syscall_t) sys_pidfd_getfd,
     [439] = (syscall_t) sys_faccessat,
-    [440] = (syscall_t) syscall_stub_silent, // process_madvise
+    [440] = (syscall_t) sys_process_madvise, // 64-bit ABIs dispatch it natively
     [441] = (syscall_t) sys_epoll_pwait2,
     // 442-448, 450, 451, 453: same post-5.x-syscall gap as the arm64 table
     // (identical syscall numbers on amd64). Unlike i386, these DO need
@@ -1694,7 +1753,7 @@ static syscall_t amd64_syscall_table[470] = {
     // guest registers, so a stub without an arg-count override would trade
     // the noisy-but-safe "missing syscall" ENOSYS for a real SIGSYS on
     // garbage upper argument registers (exactly what happened on arm64).
-    [442] = (syscall_t) syscall_stub_silent, // mount_setattr
+    [442] = (syscall_t) sys_mount_setattr,
     [443] = (syscall_t) syscall_stub_silent, // quotactl_fd
     [444] = (syscall_t) syscall_stub_silent, // landlock_create_ruleset
     [445] = (syscall_t) syscall_stub_silent, // landlock_add_rule
@@ -1753,6 +1812,100 @@ static syscall_t amd64_syscall_table[470] = {
 static dword_t sys_riscv_hwprobe(void) {
     return _ENOSYS; // probe fails cleanly; callers use fallback paths
 }
+
+// riscv_hwprobe(pairs, pair_count, cpusetsize, cpus, flags) for the riscv64
+// guest, reached with full-width arguments through
+// handle_asm_generic_native_syscall. It answers for exactly what the JIT
+// implements (jit/gen.c gen_step_riscv64): glibc's ifuncs and compilers'
+// runtimes pick code paths from these bits, so a bit set here is a promise
+// that those instructions run. Constants from the Linux uapi
+// asm/hwprobe.h. Every CPU is the same, so the cpu set is not consulted; a
+// key this does not know comes back as -1, as on a kernel that predates it.
+#define RISCV_HWPROBE_KEY_MVENDORID 0
+#define RISCV_HWPROBE_KEY_MARCHID 1
+#define RISCV_HWPROBE_KEY_MIMPID 2
+#define RISCV_HWPROBE_KEY_BASE_BEHAVIOR 3
+#define RISCV_HWPROBE_KEY_IMA_EXT_0 4
+#define RISCV_HWPROBE_KEY_CPUPERF_0 5
+#define RISCV_HWPROBE_KEY_ZICBOZ_BLOCK_SIZE 6
+#define RISCV_HWPROBE_KEY_MISALIGNED_SCALAR_PERF 9
+#define RISCV_HWPROBE_BASE_BEHAVIOR_IMA (1ull << 0)
+#define RISCV_HWPROBE_IMA_FD (1ull << 0)
+#define RISCV_HWPROBE_IMA_C (1ull << 1)
+#define RISCV_HWPROBE_IMA_V (1ull << 2)
+#define RISCV_HWPROBE_EXT_ZVBB (1ull << 17)
+#define RISCV_HWPROBE_EXT_ZVKB (1ull << 19)
+#define RISCV_HWPROBE_EXT_ZVKT (1ull << 26)
+#define RISCV_HWPROBE_EXT_ZVFHMIN (1ull << 31)
+#define RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF 10
+#define RISCV_HWPROBE_EXT_ZBA (1ull << 3)
+#define RISCV_HWPROBE_EXT_ZBB (1ull << 4)
+#define RISCV_HWPROBE_EXT_ZBS (1ull << 5)
+#define RISCV_HWPROBE_EXT_ZICOND (1ull << 35)
+#define RISCV_HWPROBE_EXT_ZCA (1ull << 43)
+#define RISCV_HWPROBE_EXT_ZCB (1ull << 44)
+#define RISCV_HWPROBE_EXT_ZCD (1ull << 45)
+#define RISCV_HWPROBE_EXT_ZICBOZ (1ull << 6)
+#define RISCV_HWPROBE_EXT_ZFHMIN (1ull << 28)
+#define RISCV_HWPROBE_EXT_ZFA (1ull << 32)
+#define RISCV_HWPROBE_EXT_ZIHINTNTL (1ull << 29)
+#define RISCV_HWPROBE_EXT_ZIHINTPAUSE (1ull << 36)
+#define RISCV_HWPROBE_EXT_ZIMOP (1ull << 42)
+#define RISCV_HWPROBE_EXT_ZCMOP (1ull << 47)
+#define RISCV_HWPROBE_EXT_ZAWRS (1ull << 48)
+#define RISCV_HWPROBE_EXT_ZICNTR (1ull << 50)
+#define RISCV_HWPROBE_EXT_ZICBOM (1ull << 55)
+#define RISCV_HWPROBE_EXT_ZICBOP (1ull << 60)
+#define RISCV_HWPROBE_KEY_ZICBOM_BLOCK_SIZE 12
+#define RISCV_HWPROBE_KEY_ZICBOP_BLOCK_SIZE 15
+static dword_t sys_riscv_hwprobe_guest(guest_addr_t pairs, qword_t pair_count,
+        qword_t UNUSED(cpusetsize), guest_addr_t UNUSED(cpus), dword_t flags) {
+    if (flags != 0)
+        return _EINVAL; // RISCV_HWPROBE_WHICH_CPUS is not offered
+    for (qword_t i = 0; i < pair_count; i++) {
+        struct { sqword_t key; qword_t value; } pair;
+        guest_addr_t addr = pairs + i * sizeof(pair);
+        if (user_get(addr, pair))
+            return _EFAULT;
+        pair.value = 0;
+        switch (pair.key) {
+        case RISCV_HWPROBE_KEY_MVENDORID:
+        case RISCV_HWPROBE_KEY_MARCHID:
+        case RISCV_HWPROBE_KEY_MIMPID:
+        case RISCV_HWPROBE_KEY_CPUPERF_0:            // MISALIGNED_UNKNOWN
+        case RISCV_HWPROBE_KEY_MISALIGNED_SCALAR_PERF: // ..._SCALAR_UNKNOWN
+        case RISCV_HWPROBE_KEY_MISALIGNED_VECTOR_PERF: // ..._VECTOR_UNKNOWN
+            break;
+        case RISCV_HWPROBE_KEY_ZICBOZ_BLOCK_SIZE:    // cbo.zero's block (Zic64b)
+        case RISCV_HWPROBE_KEY_ZICBOM_BLOCK_SIZE:
+        case RISCV_HWPROBE_KEY_ZICBOP_BLOCK_SIZE:
+            pair.value = 64;
+            break;
+        case RISCV_HWPROBE_KEY_BASE_BEHAVIOR:
+            pair.value = RISCV_HWPROBE_BASE_BEHAVIOR_IMA;
+            break;
+        case RISCV_HWPROBE_KEY_IMA_EXT_0:
+            pair.value = RISCV_HWPROBE_IMA_FD | RISCV_HWPROBE_IMA_C | RISCV_HWPROBE_EXT_ZBA |
+                    RISCV_HWPROBE_EXT_ZBB | RISCV_HWPROBE_EXT_ZBS | RISCV_HWPROBE_EXT_ZICOND |
+                    RISCV_HWPROBE_EXT_ZCA | RISCV_HWPROBE_EXT_ZCB | RISCV_HWPROBE_EXT_ZCD |
+                    RISCV_HWPROBE_EXT_ZICBOZ | RISCV_HWPROBE_EXT_ZICBOM | RISCV_HWPROBE_EXT_ZICBOP |
+                    RISCV_HWPROBE_EXT_ZIHINTNTL | RISCV_HWPROBE_EXT_ZIHINTPAUSE |
+                    RISCV_HWPROBE_EXT_ZIMOP | RISCV_HWPROBE_EXT_ZCMOP | RISCV_HWPROBE_EXT_ZAWRS |
+                    RISCV_HWPROBE_EXT_ZICNTR | RISCV_HWPROBE_EXT_ZFA | RISCV_HWPROBE_EXT_ZFHMIN |
+                    // V (jit/guest-riscv64/vector.S) with Zvbb, which includes Zvkb,
+                    // Zvfhmin and Zvkt
+                    RISCV_HWPROBE_IMA_V | RISCV_HWPROBE_EXT_ZVBB | RISCV_HWPROBE_EXT_ZVKB |
+                    RISCV_HWPROBE_EXT_ZVKT | RISCV_HWPROBE_EXT_ZVFHMIN;
+            break;
+        default:
+            pair.key = -1;
+            break;
+        }
+        if (user_put(addr, pair))
+            return _EFAULT;
+    }
+    return 0;
+}
 static dword_t sys_riscv_flush_icache(void) {
     return 0; // translated blocks are invalidated on guest code writes
 }
@@ -1760,7 +1913,18 @@ static dword_t sys_riscv_flush_icache(void) {
 static syscall_t arm64_syscall_table[470] = {
     // I/O
     [2] = (syscall_t) sys_io_submit,
-    [5 ... 16] = (syscall_t) sys_xattr_stub,
+    [5] = (syscall_t) sys_setxattr,
+    [6] = (syscall_t) sys_lsetxattr,
+    [7] = (syscall_t) sys_fsetxattr,
+    [8] = (syscall_t) sys_getxattr,
+    [9] = (syscall_t) sys_lgetxattr,
+    [10] = (syscall_t) sys_fgetxattr,
+    [11] = (syscall_t) sys_listxattr,
+    [12] = (syscall_t) sys_llistxattr,
+    [13] = (syscall_t) sys_flistxattr,
+    [14] = (syscall_t) sys_removexattr,
+    [15] = (syscall_t) sys_lremovexattr,
+    [16] = (syscall_t) sys_fremovexattr,
     [17]  = (syscall_t) sys_getcwd,
     [19]  = (syscall_t) sys_eventfd2,
     [20]  = (syscall_t) sys_epoll_create,
@@ -1833,7 +1997,7 @@ static syscall_t arm64_syscall_table[470] = {
     [95]  = (syscall_t) sys_waitid,
     [96]  = (syscall_t) sys_set_tid_address,
     [97]  = (syscall_t) sys_unshare,
-    [98]  = (syscall_t) sys_futex,
+    [98]  = (syscall_t) sys_futex_amd64_guest,
     [99]  = (syscall_t) sys_set_robust_list_amd64,
     [100] = (syscall_t) sys_get_robust_list_amd64,
     [101] = (syscall_t) sys_nanosleep_amd64,
@@ -1924,16 +2088,32 @@ static syscall_t arm64_syscall_table[470] = {
     [3] = (syscall_t) sys_io_cancel,
     [4] = (syscall_t) sys_io_getevents,
     [18] = (syscall_t) syscall_stub, // lookup_dcookie
-    [41] = (syscall_t) syscall_stub, // pivot_root
+    [41] = (syscall_t) sys_pivot_root, // (its paths go through the 64-bit switch)
     [42] = (syscall_t) syscall_stub, // nfsservctl
     [60] = (syscall_t) syscall_stub, // quotactl
     [69] = (syscall_t) sys_preadv_guest, // preadv
     [70] = (syscall_t) sys_pwritev_guest, // pwritev
     [74] = (syscall_t) syscall_stub_silent, // signalfd4
-    [75] = (syscall_t) syscall_stub, // vmsplice
-    [77] = (syscall_t) syscall_stub, // tee
+    // 75 (vmsplice), 76 (splice) and 77 (tee) are NOT listed here: they are
+    // already at the top of this table with their real implementations, and
+    // all three are dispatched by handle_asm_generic_native_syscall, which
+    // runs before the table is ever called. The parity sweep re-listed 75 and
+    // 77 as syscall_stub, and because a later designated initializer wins,
+    // the sweep's entries replaced the real ones.
+    //
+    // That did not break either call -- the dispatcher had already answered
+    // them -- but the table is read for one thing before the dispatcher runs:
+    // syscall_is_logged_stub. So every working vmsplice announced itself as
+    // "arm64 stub syscall 75" at ERROR level, on a guest where log_stub_syscall
+    // does not even rate-limit (its budget only covers abi < 2, and arm64 is 2,
+    // riscv64 3). Measured on an aarch64 guest: tests/manual/splice_vmsplice
+    // passed every transfer check -- 10 bytes gathered, "abc"/"def" scattered
+    // back out -- and logged three of those lines while doing it.
+    //
+    // tee's ENOSYS is sys_tee's own documented decision (AOK pipes are host
+    // pipes, which cannot be read without consuming), not a missing entry.
     [84] = (syscall_t) syscall_stub_silent, // sync_file_range
-    [89] = (syscall_t) syscall_stub, // acct
+    [89] = (syscall_t) sys_acct, // acct
     [104] = (syscall_t) syscall_stub, // kexec_load
     [105] = (syscall_t) syscall_stub, // init_module
     [106] = (syscall_t) syscall_stub, // delete_module
@@ -1941,14 +2121,16 @@ static syscall_t arm64_syscall_table[470] = {
     [127] = (syscall_t) sys_sched_rr_get_interval, // sched_rr_get_interval
     [128] = (syscall_t) syscall_stub, // restart_syscall
     [162] = (syscall_t) sys_setdomainname, // setdomainname
-    [168] = (syscall_t) syscall_stub_silent, // getcpu
+    [168] = (syscall_t) sys_getcpu, // dispatched natively (full-width pointers)
     [171] = (syscall_t) sys_adjtimex, // adjtimex
-    [180] = (syscall_t) syscall_stub, // mq_open
-    [181] = (syscall_t) syscall_stub, // mq_unlink
-    [182] = (syscall_t) syscall_stub, // mq_timedsend
-    [183] = (syscall_t) syscall_stub, // mq_timedreceive
-    [184] = (syscall_t) syscall_stub, // mq_notify
-    [185] = (syscall_t) syscall_stub, // mq_getsetattr
+    // mq_* (180-185): dispatched natively (full-width pointers); these pass
+    // the NULL check.
+    [180] = (syscall_t) sys_mq_open,
+    [181] = (syscall_t) sys_mq_unlink,
+    [182] = (syscall_t) sys_mq_timedsend,
+    [183] = (syscall_t) sys_mq_timedreceive,
+    [184] = (syscall_t) sys_mq_notify,
+    [185] = (syscall_t) sys_mq_getsetattr,
     // SysV message queues (fakeroot's faked<->libfakeroot IPC, so every
     // makepkg/dpkg-buildpackage package() stage). Dispatch natively
     // (full-width) like shm above; entries pass the NULL check.
@@ -1982,21 +2164,29 @@ static syscall_t arm64_syscall_table[470] = {
     [238] = (syscall_t) syscall_stub, // migrate_pages
     [239] = (syscall_t) syscall_stub, // move_pages
     [240] = (syscall_t) syscall_stub_silent, // rt_tgsigqueueinfo
-    [241] = (syscall_t) syscall_stub, // perf_event_open
+    // perf_event_open: atop opens it per sample interval for per-process PMU
+    // counters and carries on without them when it fails -- as it must on any
+    // kernel with CONFIG_PERF_EVENTS=n, perf_event_paranoid=3, or a container
+    // that blocks it. Verified on an aarch64 guest: with ENOSYS, `atop -P CPU
+    // 1 1` still produced a complete CPU record and exited 0. A benign-
+    // fallback stub like add_key and bpf above, and a noisy one, because the
+    // probe repeats for as long as atop runs: reported from a device as an
+    // ERROR line every few seconds.
+    [241] = (syscall_t) syscall_stub_silent, // perf_event_open
     [262] = (syscall_t) syscall_stub, // fanotify_init
     [263] = (syscall_t) syscall_stub, // fanotify_mark
     [264] = (syscall_t) syscall_stub_silent, // name_to_handle_at
     [265] = (syscall_t) syscall_stub_silent, // open_by_handle_at
     [266] = (syscall_t) syscall_stub_silent, // clock_adjtime
     [267] = (syscall_t) sys_syncfs,
-    [268] = (syscall_t) syscall_stub, // setns
+    [268] = (syscall_t) sys_setns,
     [270] = (syscall_t) syscall_stub_silent, // process_vm_readv
     [271] = (syscall_t) syscall_stub, // process_vm_writev
     [272] = (syscall_t) sys_kcmp,
     [273] = (syscall_t) syscall_stub, // finit_module
     [274] = (syscall_t) syscall_stub, // sched_setattr
     [275] = (syscall_t) syscall_stub, // sched_getattr
-    [277] = (syscall_t) syscall_stub_silent, // seccomp
+    [277] = (syscall_t) sys_seccomp, // really handle_asm_generic_native_syscall
     // bpf: systemd probes this at unit-start time for cgroup BPF device/IP
     // accounting programs and explicitly falls back (logging its own
     // "BPF firewalling not supported by kernel" diagnostic) on ENOSYS --
@@ -2004,7 +2194,7 @@ static syscall_t arm64_syscall_table[470] = {
     // spamming "ERROR: arm64 stub syscall 280" 8x in a row during boot.
     [280] = (syscall_t) syscall_stub_silent, // bpf
     [282] = (syscall_t) syscall_stub, // userfaultfd
-    [284] = (syscall_t) syscall_stub, // mlock2
+    [284] = (syscall_t) sys_mlock2, // dispatched natively (full-width); entry needed to pass the NULL check
     [286] = (syscall_t) sys_preadv2_guest, // preadv2
     [287] = (syscall_t) sys_pwritev2_guest, // pwritev2
     [288] = (syscall_t) syscall_stub, // pkey_mprotect
@@ -2033,8 +2223,8 @@ static syscall_t arm64_syscall_table[470] = {
     [432] = (syscall_t) sys_fsmount,
     [433] = (syscall_t) syscall_stub_silent, // fspick
     [434] = (syscall_t) sys_pidfd_open,
-    [438] = (syscall_t) syscall_stub_silent, // pidfd_getfd
-    [440] = (syscall_t) syscall_stub_silent, // process_madvise
+    [438] = (syscall_t) sys_pidfd_getfd,
+    [440] = (syscall_t) sys_process_madvise, // 64-bit ABIs dispatch it natively
     [452] = (syscall_t) syscall_stub_silent, // fchmodat2
     [198] = (syscall_t) sys_socket,
     [199] = (syscall_t) sys_socketpair,
@@ -2104,7 +2294,7 @@ static syscall_t arm64_syscall_table[470] = {
     // that already handle ENOSYS (all of the above are optional/best-effort
     // in real userspace) get it quietly, matching the rest of this table's
     // policy for post-5.x syscalls.
-    [442] = (syscall_t) syscall_stub_silent, // mount_setattr
+    [442] = (syscall_t) sys_mount_setattr,
     [443] = (syscall_t) syscall_stub_silent, // quotactl_fd
     [444] = (syscall_t) syscall_stub_silent, // landlock_create_ruleset
     [445] = (syscall_t) syscall_stub_silent, // landlock_add_rule
@@ -2203,6 +2393,27 @@ static const struct syscall_abi_dispatch *syscall_dispatch_for_abi(enum guest_ab
     }
 }
 
+// The syscall a task is blocked in, read from its own register file.
+//
+// While a task sits inside a syscall its registers still hold the number it
+// entered with (x8 on arm64, rax on amd64, eax on i386, a7 on riscv64), and
+// nothing it does while blocked changes that. For the checkpoint freezer, so
+// a refusal can say WHICH syscall a task would not come out of: without it,
+// "did not reach a syscall boundary" sent an investigation after the wrong
+// culprit -- a chronyd process on a device was guessed to be in a socket read,
+// and teaching socket reads to stop changed nothing.
+//
+// Meaningless for a native program, which has no guest register file, and for
+// a task that is not in a syscall; the caller decides whether to ask.
+long task_blocked_syscall(struct task *task, const char **abi_name) {
+    const struct syscall_abi_dispatch *dispatch = syscall_dispatch_for_abi(task->abi);
+    if (abi_name != NULL)
+        *abi_name = dispatch != NULL && dispatch->name != NULL ? dispatch->name : "?";
+    if (dispatch == NULL || dispatch->syscall_number == NULL)
+        return -1;
+    return (long) dispatch->syscall_number(&task->cpu);
+}
+
 void dump_stack(int lines);
 
 static bool syscall_is_logged_stub(syscall_t syscall) {
@@ -2214,19 +2425,71 @@ static bool syscall_result_is_errno(dword_t result) {
     return signed_result < 0 && signed_result >= -4095;
 }
 
-static bool syscall_result_should_restart(dword_t result) {
+// Takes a POINTER because the freeze case has to rewrite what the caller hands
+// on. `_EINTR` is what the wait actually returned; `_ERESTART` is what has to
+// reach the dispatcher, because a NATIVE caller has no program counter to
+// rewind and re-issues the call from the value alone
+// (kernel/native_syscall.c). Handing it the unconverted EINTR meant a native
+// shell blocked in wait() saw its command interrupted by the checkpoint rather
+// than resumed after it -- and the shell then exited, taking the guest with
+// it, before the image was finished.
+static bool syscall_result_should_restart(dword_t *resultp) {
+    dword_t result = *resultp;
     sdword_t r = (sdword_t) result;
-    if (r != _ERESTART && r != _ERESTART_NOHAND) {
-        if (current != NULL)
+    // A CHECKPOINT FREEZE restarts everything, including the calls signal(7)
+    // never restarts.
+    //
+    // That is not a liberty, it is the definition of a freeze: the guest must
+    // not be able to tell it happened. Linux's own freezer does the same --
+    // a task is woken out of its wait, parks, and re-enters the wait
+    // afterwards, and poll() does not report EINTR because the machine was
+    // suspended. Here the wake comes from checkpoint_freeze_all rather than
+    // from a signal, so there is no handler to consult and no SA_RESTART to
+    // honour; the PC is rewound and the syscall re-executes on the far side,
+    // which for a restore is the far side of a reboot.
+    //
+    // What it costs is a timed wait's remaining time, which a restart has to
+    // carry the way Linux's restart_block does. The sleeps and the poll family
+    // do: they report a freeze as the _ERESTART_NOHAND it is and keep their
+    // deadline (sleep_restart_deadline, poll_restart_deadline), which a
+    // checkpoint image carries too. Every other timed wait arrives here as a
+    // bare EINTR and starts its timeout again -- futex, sigtimedwait,
+    // semtimedop, a socket's SO_RCVTIMEO (docs/TODO.md).
+    if (r == _EINTR && checkpoint_freeze_pending()) {
+        if (current != NULL) {
             current->restart_nohand_pending = false;
+            current->restart_sys_pending = false;
+        }
+        *resultp = (dword_t) _ERESTART;
+        return true;
+    }
+    // ERESTARTNOINTR: restarted like a freeze, with no flag set, so no handler
+    // can cancel it.
+    if (r == _ERESTART_NOINTR) {
+        if (current != NULL) {
+            current->restart_nohand_pending = false;
+            current->restart_sys_pending = false;
+        }
+        *resultp = (dword_t) _ERESTART;
+        return true;
+    }
+    if (r != _ERESTART && r != _ERESTART_NOHAND) {
+        if (current != NULL) {
+            current->restart_nohand_pending = false;
+            current->restart_sys_pending = false;
+        }
         return false;
     }
-    // Remember which flavour, for the handler-setup path: an _ERESTART_NOHAND
-    // restart is cancelled by a handler running before the syscall re-executes
-    // (Linux's ERESTARTNOHAND), an _ERESTART one is not. Recorded here because
-    // this predicate is checked immediately before every PC rewind.
-    if (current != NULL)
+    // Remember which flavour, for the handler-setup path (receive_signal): an
+    // _ERESTART_NOHAND restart is cancelled by any handler running before the
+    // syscall re-executes (Linux's ERESTARTNOHAND), an _ERESTART one by a
+    // handler without SA_RESTART (ERESTARTSYS). A freeze's restart, above, by
+    // neither. Recorded here because this predicate is checked immediately
+    // before every PC rewind.
+    if (current != NULL) {
         current->restart_nohand_pending = (r == _ERESTART_NOHAND);
+        current->restart_sys_pending = (r == _ERESTART);
+    }
     return true;
 }
 
@@ -2545,6 +2808,9 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 429: // move_mount(from_dfd, from_path, to_dfd, to_path, flags)
         result = (dword_t) sys_move_mount_guest((fd_t) raw_args[0], raw_args[1],
                 (fd_t) raw_args[2], raw_args[3], (dword_t) raw_args[4]); break;
+    case 442: // mount_setattr(dfd, path, flags, uattr, usize)
+        result = (dword_t) sys_mount_setattr_guest((fd_t) raw_args[0], raw_args[1],
+                (dword_t) raw_args[2], raw_args[3], raw_args[4]); break;
 
     // The io_* family. An aio_context_t is the address of the context's ring
     // page, so arg 0 is a full 64-bit guest address on every call after
@@ -2587,7 +2853,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 29: result = sys_ioctl_guest((fd_t) raw_args[0], (dword_t) raw_args[1], raw_args[2]); break;
     case 34: result = sys_mkdirat_guest((fd_t) raw_args[0], raw_args[1], (mode_t_) raw_args[2]); break;
     case 35: result = sys_unlinkat_guest((fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2]); break;
-    case 37: result = sys_linkat_guest((fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3]); break;
+    case 37: result = sys_linkat_guest((fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3], (int_t) raw_args[4]); break;
     case 38: result = sys_renameat_guest((fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3]); break;
     case 43: result = sys_statfs_amd64_guest(raw_args[0], raw_args[1]); break;
     case 44: result = sys_fstatfs_amd64_guest((fd_t) raw_args[0], raw_args[1]); break;
@@ -2605,21 +2871,22 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 116: result = (dword_t) sys_syslog_guest((int_t) raw_args[0], raw_args[1], (int_t) raw_args[2]); break;
     case 53: result = sys_fchmodat_guest((fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]); break;
     case 54: result = sys_fchownat_guest((fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2], (dword_t) raw_args[3], (int) raw_args[4]); break;
-    // xattr family (5-16): the legacy table's sys_xattr_stub entries are
-    // unreachable from here — the 64-bit path/name/value pointers trip the
-    // legacy marshal's full-width check, SIGSYS-killing the caller (cp -p,
-    // rsync, tar --xattrs). Dispatch natively through the same *_guest
-    // wrappers the amd64 cases (188-199) use; l-variants share the plain
-    // wrappers exactly as the amd64 dispatch does (all funnel to the
-    // ENOTSUP stub today, but full-width so nothing dies on the way).
-    case 5: case 6: result = (dword_t) sys_setxattr_guest( raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]); break; // setxattr/lsetxattr
-    case 7: result = (dword_t) sys_fsetxattr_guest( (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]); break; // fsetxattr
-    case 8: case 9: result = (dword_t) sys_getxattr_guest( raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]); break; // getxattr/lgetxattr
-    case 10: result = (dword_t) sys_fgetxattr_guest( (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]); break; // fgetxattr
-    case 11: case 12: result = (dword_t) sys_listxattr_guest( raw_args[0], raw_args[1], (dword_t) raw_args[2]); break; // listxattr/llistxattr
-    case 13: result = (dword_t) sys_flistxattr_guest( (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]); break; // flistxattr
-    case 14: case 15: result = (dword_t) sys_removexattr_guest( raw_args[0], raw_args[1]); break; // removexattr/lremovexattr
-    case 16: result = (dword_t) sys_fremovexattr_guest( (fd_t) raw_args[0], raw_args[1]); break; // fremovexattr
+    // xattr family (5-16), dispatched here rather than through the legacy
+    // table: its 32-bit marshal would SIGSYS-kill a caller passing 64-bit
+    // path/name/value pointers (cp -p, rsync, tar --xattrs). Sizes are full
+    // width -- a size past 4 GiB is E2BIG, not whatever its low half says.
+    case 5: result = sys_setxattr_guest(raw_args[0], raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]); break;
+    case 6: result = sys_lsetxattr_guest(raw_args[0], raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]); break;
+    case 7: result = sys_fsetxattr_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]); break;
+    case 8: result = sys_getxattr_guest(raw_args[0], raw_args[1], raw_args[2], raw_args[3]); break;
+    case 9: result = sys_lgetxattr_guest(raw_args[0], raw_args[1], raw_args[2], raw_args[3]); break;
+    case 10: result = sys_fgetxattr_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3]); break;
+    case 11: result = sys_listxattr_guest(raw_args[0], raw_args[1], raw_args[2]); break;
+    case 12: result = sys_llistxattr_guest(raw_args[0], raw_args[1], raw_args[2]); break;
+    case 13: result = sys_flistxattr_guest((fd_t) raw_args[0], raw_args[1], raw_args[2]); break;
+    case 14: result = sys_removexattr_guest(raw_args[0], raw_args[1]); break;
+    case 15: result = sys_lremovexattr_guest(raw_args[0], raw_args[1]); break;
+    case 16: result = sys_fremovexattr_guest((fd_t) raw_args[0], raw_args[1]); break;
     // truncate/ftruncate/fallocate carry 64-bit sizes in SINGLE registers
     // on aarch64; the legacy table routed them to the *_amd64 shims, which
     // expect the amd64 marshal's SPLIT low/high convention — so size_high
@@ -2659,7 +2926,9 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 80: result = sys_fstat_arm64_guest((fd_t) raw_args[0], raw_args[1]); break;
     case 88: result = sys_utimensat_amd64_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]); break;
     case 96: result = (dword_t) sys_set_tid_address_guest(raw_args[0]); break;
-    case 98: result = sys_futex_guest(raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3], raw_args[4], (dword_t) raw_args[5]); break;
+    // 64-bit guest: its struct timespec is 16 bytes, so the timeout must be
+    // read with the time64 layout. See sys_futex_amd64_guest (kernel/futex.c).
+    case 98: result = sys_futex_amd64_guest(raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3], raw_args[4], (dword_t) raw_args[5]); break;
     case 99: result = (dword_t) sys_set_robust_list_amd64_guest(raw_args[0], (dword_t) raw_args[1]); break;
     case 100: result = (dword_t) sys_get_robust_list_amd64_guest((pid_t_) raw_args[0], raw_args[1], raw_args[2]); break;
     case 113: result = sys_clock_gettime_amd64_guest((dword_t) raw_args[0], raw_args[1]); break;
@@ -2681,6 +2950,12 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 233: result = sys_madvise_guest(raw_args[0], raw_args[1], (dword_t) raw_args[2]); break;
     case 260: result = sys_wait4_guest((pid_t_) raw_args[0], raw_args[1], (dword_t) raw_args[2], raw_args[3]); break;
     case 278: result = sys_getrandom_guest(raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2]); break;
+    case 258: // riscv_hwprobe: riscv-only (an unused arch-specific number on arm64)
+        result = current->abi == GUEST_ABI_RISCV64
+            ? sys_riscv_hwprobe_guest(raw_args[0], raw_args[1], raw_args[2], raw_args[3],
+                    (dword_t) raw_args[4])
+            : (dword_t) _ENOSYS;
+        break;
     case 291: result = sys_statx_amd64_guest((fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2], (dword_t) raw_args[3], raw_args[4]); break;
     // Socket family: all pointer-bearing (sockaddr/msghdr/optval), so the
     // legacy dword marshalling truncates the 64-bit guest pointers — which
@@ -2719,6 +2994,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 36: result = (dword_t) sys_symlinkat_guest( raw_args[0], (fd_t) raw_args[1], raw_args[2]); break; // symlinkat
     case 39: result = (dword_t) sys_umount2_guest( raw_args[0], (dword_t) raw_args[1]); break; // umount2
     case 40: result = (dword_t) sys_mount_guest( raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], raw_args[4]); break; // mount
+    case 41: result = (dword_t) sys_pivot_root_guest(raw_args[0], raw_args[1]); break; // pivot_root
     case 51: result = (dword_t) sys_chroot_guest(raw_args[0]); break; // chroot
     case 59: result = (dword_t) sys_pipe2( raw_args[0], (int_t) raw_args[1]); break; // pipe2
     case 86: result = (dword_t) sys_timerfd_settime64_guest( (fd_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]); break; // timerfd_settime
@@ -2731,7 +3007,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 107: result = (dword_t) sys_timer_create_amd64_guest( (dword_t) raw_args[0], raw_args[1], raw_args[2]); break; // timer_create
     case 108: result = (dword_t) sys_timer_gettime64_guest( (dword_t) raw_args[0], raw_args[1]); break; // timer_gettime
     case 110: result = (dword_t) sys_timer_settime64_guest( (dword_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]); break; // timer_settime
-    case 112: result = (dword_t) sys_clock_settime( (dword_t) raw_args[0], raw_args[1]); break; // clock_settime
+    case 112: result = (dword_t) sys_clock_settime_guest( (dword_t) raw_args[0], raw_args[1]); break; // clock_settime
     case 114: result = (dword_t) sys_clock_getres_amd64_guest( (dword_t) raw_args[0], raw_args[1]); break; // clock_getres
     case 115: result = (dword_t) sys_clock_nanosleep_amd64_guest( (dword_t) raw_args[0], (int_t) raw_args[1], raw_args[2], raw_args[3]); break; // clock_nanosleep
     case 117: result = (dword_t) sys_ptrace_guest( (dword_t) raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3]); break; // ptrace
@@ -2758,6 +3034,9 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     case 227: result = (dword_t) sys_msync_guest(raw_args[0], raw_args[1], (int_t) raw_args[2]); break; // msync
     case 228: result = (dword_t) sys_mlock_guest(raw_args[0], raw_args[1]); break; // mlock
     case 229: result = (dword_t) sys_munlock_guest(raw_args[0], raw_args[1]); break; // munlock
+    // mlock2(addr, len, flags): as mlock, and flags is an int, so the low half
+    // of its register is all Linux reads. It was on the clean-ENOSYS list below.
+    case 284: result = (dword_t) sys_mlock2_guest(raw_args[0], raw_args[1], (dword_t) raw_args[2]); break; // mlock2
     case 232: result = (dword_t) sys_mincore_guest(raw_args[0], raw_args[1], raw_args[2]); break; // mincore
     case 235: result = (dword_t) sys_mbind_guest( raw_args[0], raw_args[1], (int_t) raw_args[2], raw_args[3], raw_args[4], (uint_t) raw_args[5]); break; // mbind
     case 243: result = (dword_t) sys_recvmmsg_amd64_guest( (fd_t) raw_args[0], raw_args[1], (uint_t) raw_args[2], (int_t) raw_args[3], raw_args[4]); break; // recvmmsg
@@ -2825,35 +3104,52 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
               // regression caught it)
     case 81:  // sync
     case 84:  // sync_file_range
-    case 168: // getcpu
     case 213: // readahead
         result = 0; break;
+    // Not in the no-op group above: it writes through its pointers, and the
+    // group's calls, falling into it, would have had theirs taken for
+    // pointers -- vhangup came back EFAULT on riscv64, and sync handed
+    // getcpu whatever its argument registers held.
+    case 168: result = sys_getcpu_guest(raw_args[0], raw_args[1], raw_args[2]); break; // getcpu
     // EOPNOTSUPP probes (amd64 parity: elogind/systemd fall back)
     case 264: // name_to_handle_at
     case 265: // open_by_handle_at
-    case 277: // seccomp
         result = _EOPNOTSUPP; break;
+    case 277: // seccomp(op, flags, args): args is a full-width pointer
+        result = (dword_t) sys_seccomp_guest((uint_t) raw_args[0], (uint_t) raw_args[1],
+                raw_args[2]); break;
     // preadv2/pwritev2: iov pointer and offset are full 64-bit values that
     // trip the legacy marshal's dword-fit check (SIGSYS). Route natively,
     // same pattern as the amd64 intercept in handle_amd64_native_memory_syscall.
-    case 286: // preadv2(fd, iov, iovcnt, offset, flags)
+    // The raw call is (fd, iov, iovcnt, pos_l, pos_h, flags) on every ABI;
+    // on a 64-bit one pos_l is the whole offset (Linux's pos_from_hilo shifts
+    // pos_h out) and musl passes the offset's high half there. Reading the
+    // flags from pos_h lost them: RWF_NOAPPEND and RWF_APPEND did nothing.
+    case 286: // preadv2(fd, iov, iovcnt, pos_l, pos_h, flags)
         result = (dword_t) sys_preadv2_guest((fd_t) raw_args[0], raw_args[1],
-                     (dword_t) raw_args[2], (off_t_) raw_args[3], (uint_t) raw_args[4]); break;
-    case 287: // pwritev2(fd, iov, iovcnt, offset, flags)
+                     (dword_t) raw_args[2], (off_t_) raw_args[3], (uint_t) raw_args[5]); break;
+    case 287: // pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)
         result = (dword_t) sys_pwritev2_guest((fd_t) raw_args[0], raw_args[1],
-                      (dword_t) raw_args[2], (off_t_) raw_args[3], (uint_t) raw_args[4]); break;
+                      (dword_t) raw_args[2], (off_t_) raw_args[3], (uint_t) raw_args[5]); break;
     case 272: // kcmp(pid1, pid2, type, idx1, idx2)
         result = (dword_t) sys_kcmp((pid_t_) raw_args[0], (pid_t_) raw_args[1],
                       (dword_t) raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]); break;
+    // acct takes a PATH, so full-width here like swapon/swapoff -- and it has
+    // to be here at ALL because 89 was on the clean-ENOSYS list below. Wiring
+    // arm64_syscall_table alone changed nothing, exactly as that list's own
+    // comment warns for the io_* family and swapon: this switch runs first and
+    // answered ENOSYS, so a guest still saw "cannot switch on process
+    // accounting: Function not implemented" with the implementation present.
+    case 89:
+        result = (dword_t) sys_acct_guest(raw_args[0]); break;
     // clean ENOSYS: known syscalls with no implementation; native so
     // 64-bit pointer args never trip the legacy-marshal validation
     // (0-4 are the io_* family, implemented above -- they were on this
     // ENOSYS list, which is why wiring arm64_syscall_table alone changed
     // nothing: this native list runs first and answered for them.)
-    case 18: case 41: case 42:
-    case 60: case 89: case 104: case 105: case 106:
+    case 18: case 42: // (41, pivot_root, is implemented above)
+    case 60: case 104: case 105: case 106:
     case 128:
-    case 180: case 181: case 182: case 183: case 184: case 185:
     // (186-193 are the real SysV msg/sem implementations above)
     // 224/225 (swapon/swapoff) are gone from this list and implemented in
     // arm64_syscall_table -- and the comment above is why that alone was not
@@ -2861,12 +3157,22 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     // entry looked wired and did nothing.
     case 217: case 218:
     case 234: case 238: case 239: case 241: case 262:
-    case 263: case 268: case 271: case 273:
-    case 274: case 275: case 280: case 282: case 284:
+    case 263: case 271: case 273:
+    case 274: case 275: case 280: case 282:
     case 288: case 289: case 290: case 294:
-    case 425: case 426: case 427: case 438: case 440:
+    case 425: case 426: case 427:
     case 449: // futex_waitv
         result = _ENOSYS; break;
+    case 268: result = (dword_t) sys_setns((fd_t) raw_args[0], (dword_t) raw_args[1]); break; // setns
+    case 438: result = (dword_t) sys_pidfd_getfd((fd_t) raw_args[0], (fd_t) raw_args[1], (dword_t) raw_args[2]); break; // pidfd_getfd
+    // POSIX message queues (kernel/mqueue.c).
+    case 180: result = (dword_t) sys_mq_open_guest(raw_args[0], (dword_t) raw_args[1], (mode_t_) raw_args[2], raw_args[3]); break;
+    case 181: result = sys_mq_unlink_guest(raw_args[0]); break;
+    case 182: result = sys_mq_timedsend_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], raw_args[4]); break;
+    case 183: result = sys_mq_timedreceive_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]); break;
+    case 184: result = sys_mq_notify_guest((fd_t) raw_args[0], raw_args[1]); break;
+    case 185: result = sys_mq_getsetattr_guest((fd_t) raw_args[0], raw_args[1], raw_args[2]); break;
+    case 440: result = sys_process_madvise_guest((fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]); break; // process_madvise
     case 0xacc0: // iSH crypto accelerator: AEAD seal/open (ISH_SYS_AEAD)
         result = sys_ish_aead_guest(raw_args[0]); break;
     case 0xacc1: // iSH pixman accelerator: FILL/COPY/OVER (ISH_SYS_PIXOP)
@@ -2874,7 +3180,7 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
     default:
         return false; // not handled here: fall through to the legacy-marshalled table
     }
-    if (syscall_result_should_restart(result)) {
+    if (syscall_result_should_restart(&result)) {
         // A native caller has no PC to rewind: it gets the restart code back
         // and re-issues the call itself (kernel/native_syscall.c).
         if (native_syscall_active) {
@@ -2905,6 +3211,12 @@ static bool handle_asm_generic_native_syscall(struct cpu_state *cpu, qword_t sys
 static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t syscall_num,
         const qword_t raw_args[6]) {
     switch (syscall_num) {
+    // seccomp(op, flags, args): args is a 64-bit pointer (a sock_fprog or an
+    // action), which the legacy marshalling cannot carry.
+    case 317:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_seccomp_guest(
+                (uint_t) raw_args[0], (uint_t) raw_args[1], raw_args[2]));
+        return true;
     // swapon/swapoff take a PATH. Like case 2 below they must be handled here
     // with full-width args: through the legacy-marshalled table an amd64
     // guest's 64-bit pointer is refused and the guest gets SIGSYS ("Bad system
@@ -2918,6 +3230,11 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     case 168:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_swapoff(raw_args[0]));
         return true;
+    // acct(path), for the same reason: a path on the heap is above 4 GiB and
+    // the legacy marshalling cannot carry it.
+    case 163:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_acct_guest(raw_args[0]));
+        return true;
     case 2:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_open_guest(
                 raw_args[0], (dword_t) raw_args[1], (mode_t_) raw_args[2]));
@@ -2925,7 +3242,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     case 0:
     {
         dword_t result = sys_read_guest((fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -2978,7 +3295,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_poll_guest(
                     raw_args[0], (dword_t) raw_args[1], (int_t) raw_args[2]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3038,7 +3355,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_select_amd64_guest(
                     (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3261,6 +3578,12 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_munlock_guest(raw_args[0],
                 raw_args[1]));
         return true;
+    // mlock2(addr, len, flags): mlock's full-width range, and an int of flags,
+    // whose register's upper half Linux never reads.
+    case 325:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_mlock2_guest(raw_args[0],
+                raw_args[1], (dword_t) raw_args[2]));
+        return true;
     case 158:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_arch_prctl_guest(
                 (int_t) raw_args[0], raw_args[1]));
@@ -3310,16 +3633,20 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         return true;
     case 202:
     {
-        dword_t result = sys_futex_guest(
+        // 64-bit timespec; see sys_futex_amd64_guest (kernel/futex.c).
+        dword_t result = sys_futex_amd64_guest(
                 raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3],
                 raw_args[4], (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
         }
         return true;
     }
+    case 155: // pivot_root
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_pivot_root_guest(raw_args[0], raw_args[1]));
+        return true;
     case 161:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_chroot_guest(raw_args[0]));
         return true;
@@ -3368,7 +3695,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         // the timespec entirely -- but it now reads and range-checks it before
         // refusing, the way Linux orders EFAULT, EINVAL and EPERM, and a
         // hardcoded 0 made every well-formed call report EFAULT.
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_clock_settime(
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_clock_settime_guest(
                 (dword_t) raw_args[0], raw_args[1]));
         return true;
     case 228:
@@ -3403,7 +3730,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_epoll_wait_guest(
                     (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3460,7 +3787,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         return true;
     case 265:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_linkat_guest(
-                (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3]));
+                (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3], (int_t) raw_args[4]));
         return true;
     case 266:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_symlinkat_guest(
@@ -3474,6 +3801,10 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_fchmodat_guest(
                 (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]));
         return true;
+    case 308: // setns(fd, nstype): two ints; the unused argument registers hold garbage
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_setns(
+                (fd_t) raw_args[0], (dword_t) raw_args[1]));
+        return true;
     case 269:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_faccessat_guest(
                 (fd_t) raw_args[0], raw_args[1], (mode_t_) raw_args[2], 0));
@@ -3486,7 +3817,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_pselect_amd64_guest(
                     (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4], raw_args[5]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3496,7 +3827,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_ppoll_amd64_guest(
                     raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3523,7 +3854,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_epoll_pwait_guest(
                     (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], (int_t) raw_args[3],
                     raw_args[4], (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3546,41 +3877,80 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_prlimit64_guest(
                 (pid_t_) raw_args[0], (dword_t) raw_args[1], raw_args[2], raw_args[3]));
         return true;
-    case 188:
-    case 189:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_setxattr_guest(
-                raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]));
+    case 188: // setxattr
+    case 189: // lsetxattr
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) (syscall_num == 188
+                ? sys_setxattr_guest : sys_lsetxattr_guest)(
+                raw_args[0], raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]));
         return true;
     case 190:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_fsetxattr_guest(
-                (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]));
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_fsetxattr_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], (dword_t) raw_args[4]));
         return true;
-    case 191:
-    case 192:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_getxattr_guest(
-                raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]));
+    case 191: // getxattr
+    case 192: // lgetxattr
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) (syscall_num == 191
+                ? sys_getxattr_guest : sys_lgetxattr_guest)(
+                raw_args[0], raw_args[1], raw_args[2], raw_args[3]));
         return true;
     case 193:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_fgetxattr_guest(
-                (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3]));
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_fgetxattr_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3]));
         return true;
-    case 194:
-    case 195:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_listxattr_guest(
-                raw_args[0], raw_args[1], (dword_t) raw_args[2]));
+    case 194: // listxattr
+    case 195: // llistxattr
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) (syscall_num == 194
+                ? sys_listxattr_guest : sys_llistxattr_guest)(
+                raw_args[0], raw_args[1], raw_args[2]));
         return true;
     case 196:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_flistxattr_guest(
-                (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2]));
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_flistxattr_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2]));
         return true;
-    case 197:
-    case 198:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_removexattr_guest(
+    case 197: // removexattr
+    case 198: // lremovexattr
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) (syscall_num == 197
+                ? sys_removexattr_guest : sys_lremovexattr_guest)(
                 raw_args[0], raw_args[1]));
         return true;
     case 199:
-        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_fremovexattr_guest(
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_fremovexattr_guest(
                 (fd_t) raw_args[0], raw_args[1]));
+        return true;
+    case 309: // getcpu
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_getcpu_guest(
+                raw_args[0], raw_args[1], raw_args[2]));
+        return true;
+    case 240: // mq_open
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_mq_open_guest(
+                raw_args[0], (dword_t) raw_args[1], (mode_t_) raw_args[2], raw_args[3]));
+        return true;
+    case 241: // mq_unlink
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_mq_unlink_guest(raw_args[0]));
+        return true;
+    case 242: // mq_timedsend
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_mq_timedsend_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], raw_args[4]));
+        return true;
+    case 243: // mq_timedreceive
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_mq_timedreceive_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2], raw_args[3], raw_args[4]));
+        return true;
+    case 244: // mq_notify
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_mq_notify_guest(
+                (fd_t) raw_args[0], raw_args[1]));
+        return true;
+    case 245: // mq_getsetattr
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_mq_getsetattr_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2]));
+        return true;
+    case 438: // pidfd_getfd
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_pidfd_getfd(
+                (fd_t) raw_args[0], (fd_t) raw_args[1], (dword_t) raw_args[2]));
+        return true;
+    case 440: // process_madvise
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) (sdword_t) sys_process_madvise_guest(
+                (fd_t) raw_args[0], raw_args[1], raw_args[2], (dword_t) raw_args[3], (dword_t) raw_args[4]));
         return true;
     case 307:
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_sendmmsg_amd64_guest(
@@ -3698,7 +4068,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
     {
         dword_t result = sys_wait4_guest(
                 (pid_t_) raw_args[0], raw_args[1], (dword_t) raw_args[2], raw_args[3]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, 61, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3722,7 +4092,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_futex_time64_guest(
                 raw_args[0], (dword_t) raw_args[1], (dword_t) raw_args[2], raw_args[3],
                 raw_args[4], (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result)) {
+        if (syscall_result_should_restart(&result)) {
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         } else {
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3811,7 +4181,7 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         dword_t result = sys_epoll_pwait2_guest(
                     (fd_t) raw_args[0], raw_args[1], (int_t) raw_args[2], raw_args[3], raw_args[4],
                     (dword_t) raw_args[5]);
-        if (syscall_result_should_restart(result))
+        if (syscall_result_should_restart(&result))
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
         else
             amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) result);
@@ -3831,6 +4201,21 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
                 (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3],
                 raw_args[4], (uint_t) raw_args[5]));
         return true;
+    // splice(fd_in, off_in, fd_out, off_out, len, flags) -- the third member of
+    // that family and the one that was left behind. The legacy table routed it
+    // to sys_splice, the i386 entry point, whose two offset arguments are
+    // 32-bit addr_t and whose count is a 32-bit dword_t. A guest offset
+    // pointer that does not fit a dword is exactly what the marshaller refuses,
+    // so `splice(fd, &off, ...)` with `off` anywhere but the low 4 GiB
+    // SIGSYS-KILLED the caller. Measured on devuan-amd64-test: the same call
+    // with the offset on the stack (0xffffec78) returns 4, and with the offset
+    // in an mmap'd page (0x7ffffdfc7000) dies with "Bad system call". A
+    // >4 GiB count was silently truncated by the same signature.
+    case 275:
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_splice_guest(
+                (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3],
+                raw_args[4], (dword_t) raw_args[5]));
+        return true;
     // preadv/pwritev(fd, iov, iovcnt, pos_l, pos_h) -- native so the 64-bit
     // iovec pointer and a >4GiB offset survive the marshaller. On a 64-bit ABI
     // pos_l already carries the whole offset (the kernel's pos_from_hilo
@@ -3849,12 +4234,12 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
               // 64-bit iovec pointer and pos survive the marshaller
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_preadv2_guest(
                 (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2],
-                (off_t_) (raw_args[3] | (raw_args[4] << 32)), (uint_t) raw_args[5]));
+                (off_t_) raw_args[3], (uint_t) raw_args[5]));
         return true;
     case 328: // pwritev2(fd, iov, iovcnt, pos_l, pos_h, flags)
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_pwritev2_guest(
                 (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2],
-                (off_t_) (raw_args[3] | (raw_args[4] << 32)), (uint_t) raw_args[5]));
+                (off_t_) raw_args[3], (uint_t) raw_args[5]));
         return true;
     // vmsplice(fd, iov, iovcnt, flags). The legacy table routed this to
     // sys_vmsplice, which is the i386 entry point: it takes a 32-bit addr_t
@@ -3892,6 +4277,11 @@ static bool handle_amd64_native_memory_syscall(struct cpu_state *cpu, qword_t sy
         amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_move_mount_guest(
                 (fd_t) raw_args[0], raw_args[1], (fd_t) raw_args[2], raw_args[3],
                 (dword_t) raw_args[4]));
+        return true;
+    case 442: // mount_setattr(dfd, path, flags, uattr, usize)
+        amd64_syscall_result_qword(cpu, (qword_t) (sqword_t) sys_mount_setattr_guest(
+                (fd_t) raw_args[0], raw_args[1], (dword_t) raw_args[2], raw_args[3],
+                raw_args[4]));
         return true;
 
     // The io_* family, for the same reason again, and here it is unavoidable
@@ -3953,6 +4343,14 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
         return 1;
     case 277: // sync_file_range -- success stub ignores all args
     case 152: // munlockall() -- no args at all
+    case 164: // settimeofday(tv, tz) -- an EPERM stub that dereferences
+              // NEITHER pointer (kernel/time.c). Validating them therefore
+              // decided nothing and, on a guest whose timeval is anywhere but
+              // the low 4 GiB, SIGSYS-KILLED a caller that should simply have
+              // been told EPERM. Measured with an mmap'd timeval on
+              // devuan-amd64-test: "Bad system call" before the handler ran.
+              // Named as a remaining candidate for this treatment in the
+              // comment on syscall_legacy_args_are_scalars; this is it.
         return 0;
     case 15:  // rt_sigreturn
     case 24:  // sched_yield
@@ -3975,9 +4373,11 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
     case 253: // inotify_init
     case 303: // name_to_handle_at (EOPNOTSUPP stub; args ignored, and its
     case 304: // open_by_handle_at  pointer args are 64-bit guest addresses)
-    case 317: // seccomp (EOPNOTSUPP stub; arg3 is a 64-bit sock_fprog* -- man-db's
-              // sandbox probe; classify 0-arg so the pointer doesn't SIGSYS the marshaller)
-    case 309: // getcpu stubbed
+    case 317: // seccomp: handled with full-width args by
+              // handle_amd64_native_memory_syscall before this is consulted;
+              // 0-arg here so nothing ever marshals its pointer
+    case 309: // getcpu: handled with full-width args by
+              // handle_amd64_native_memory_syscall before this is consulted
     case 425: // io_uring_setup    (ENOSYS stub; callers use ordinary syscalls)
     case 426: // io_uring_enter
     case 427: // io_uring_register
@@ -3986,14 +4386,11 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
     // (fs/mount.c) taking genuine pointer args -- removed from this 0-arg
     // group so the default full-width classification below validates them.
     case 433: // fspick
-    case 438: // pidfd_getfd
-    case 440: // process_madvise
     // Same reasoning: silent ENOSYS stubs whose args are never read, several
     // of which take real 64-bit guest pointers (mount_setattr's uattr,
     // landlock's ruleset/rule attr, cachestat's range/result structs) that
     // would otherwise trip the dword-fit check and SIGSYS the caller (the
     // arm64 table hit this exact bug with process_mrelease/448).
-    case 442: // mount_setattr
     case 443: // quotactl_fd
     case 444: // landlock_create_ruleset
     case 445: // landlock_add_rule
@@ -4051,7 +4448,6 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
     case 150: // munlock
     case 151: // mlockall(flags) -- x86-64 rsi-rbp are caller garbage here
     case 161: // chroot
-    case 164: // settimeofday
     case 166: // umount2
     case 170: // sethostname
     case 201: // time
@@ -4210,6 +4606,18 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
     case 452: // fchmodat2
     case 424: // pidfd_send_signal(pidfd, sig, info, flags) -- info is ignored
               // (UNUSED, never dereferenced), so the raw pointer arg is safe here
+    case 276: // tee(fd_in, fd_out, len, flags) -- four, not the default six.
+              // Over-counting made the marshaller validate r8/r9, which a
+              // four-argument syscall() never writes, so the verdict came from
+              // whatever the caller happened to leave in them. On glibc that is
+              // reliably a >4 GiB address, and `syscall(SYS_tee, a, b, 7, 0)`
+              // was SIGSYS-KILLED every time; on musl it usually is not, so the
+              // same source passed on Alpine and died on Devuan -- and passed
+              // or died in the suite depending on what ran before it. AOK
+              // answers tee with ENOSYS on purpose (kernel/fs.c), and a caller
+              // has to survive the call to receive it. Same bug class as
+              // tkill(200)/membarrier(324) above. arm64 is unaffected: its tee
+              // (77) is dispatched natively and never reaches this classifier.
         return 4;
     case 56:  // clone
     case 25:  // mremap
@@ -4261,9 +4669,9 @@ static unsigned amd64_syscall_legacy_arg_count(qword_t syscall_num) {
 // instead of silently truncating (how dmesg broke).
 static unsigned arm64_syscall_legacy_arg_count(qword_t syscall_num) {
     switch (syscall_num) {
-    case 258: // riscv_hwprobe: ENOSYS stub ignores its 5 args, one of which
-              // is a full-width pointer — classify 0-arg so it can't SIGSYS
-              // (the pidfd_open/seccomp precedent; apk probes at startup)
+    case 258: // riscv_hwprobe on riscv64 is handled natively (full-width
+              // args); here only arm64's unused 258 arrives, ENOSYS, args
+              // unread -- classify 0-arg so it can't SIGSYS
     case 259: // riscv_flush_icache: no-op stub; start/end args are 64-bit
     case 124: // sched_yield
     case 157: // setsid
@@ -4292,7 +4700,6 @@ static unsigned arm64_syscall_legacy_arg_count(qword_t syscall_num) {
     // range/result structs) that would otherwise trip the dword-fit check
     // and SIGSYS the caller instead of the intended silent ENOSYS (observed:
     // stress-ng's process_mrelease (448) probe got SIGSYS'd this way).
-    case 442: // mount_setattr
     case 443: // quotactl_fd
     case 444: // landlock_create_ruleset
     case 445: // landlock_add_rule
@@ -4481,7 +4888,7 @@ static bool syscall_legacy_args_are_scalars(enum guest_abi abi, qword_t syscall_
         case 219: // keyctl (sys_keyctl only switches on cmd; arg2-arg5 unread)
         case 230: // mlockall
         case 231: // munlockall
-        case 258: // riscv_hwprobe (ENOSYS stub; args unread)
+        case 258: // arm64's unused 258 (ENOSYS; riscv_hwprobe is native)
         case 259: // riscv_flush_icache (no-op stub; args unread)
         case 267: // syncfs
         case 424: // pidfd_send_signal (the siginfo pointer is never dereferenced)
@@ -4699,12 +5106,38 @@ sqword_t syscall_dispatch_native(qword_t syscall_num, const qword_t raw_args[6])
     if (current == NULL)
         return _EFAULT;
 
+    // As handle_syscall_interrupt: nothing an earlier syscall left for a
+    // restart may decide this one. A re-issue after _ERESTART comes through
+    // here too, and needs none of it -- its decision was already made.
+    signal_restart_state_clear();
+
     STRACE("%d(%s) %d:%d native call %-3llu ", current->pid, current->comm,
            current->reference.count,
            __atomic_load_n(&current->locks_held.count, __ATOMIC_RELAXED),
            (unsigned long long) syscall_num);
 
     sqword_t result;
+    // seccomp holds for a native program as for any other: its calls are
+    // numbered asm-generic, which is aarch64's numbering, so that is the
+    // architecture a filter sees. There is no guest instruction pointer, and
+    // no register file for a tracer's PTRACE_EVENT_SECCOMP rewrite to reach,
+    // so after that stop the call goes ahead as asked -- if the filters still
+    // allow it.
+    if (unlikely(__atomic_load_n(&current->seccomp_mode, __ATOMIC_ACQUIRE) != SECCOMP_MODE_DISABLED_) &&
+            !seccomp_exempt(syscall_num)) {
+        enum seccomp_verdict v = seccomp_syscall_enter(GUEST_ABI_ARM64, syscall_num,
+                raw_args, 0, &result, false);
+        if (v == SECCOMP_TRACED)
+            v = seccomp_syscall_enter(GUEST_ABI_ARM64, syscall_num, raw_args, 0, &result, true);
+        if (v == SECCOMP_ANSWERED) {
+            STRACE(" = 0x%llx (seccomp)\n", (unsigned long long) result);
+            return result;
+        }
+        if (v != SECCOMP_RUN && v != SECCOMP_TRACED) {
+            STRACE(" = seccomp\n");
+            return _ENOSYS;
+        }
+    }
     native_syscall_active = true;
     native_syscall_value = (qword_t) (sqword_t) _ENOSYS;
     bool handled = handle_asm_generic_native_syscall(NULL, syscall_num, raw_args);
@@ -4732,8 +5165,15 @@ sqword_t syscall_dispatch_native(qword_t syscall_num, const qword_t raw_args[6])
             result = _EFAULT;
         } else {
             syscall_t syscall = arm64_syscall_dispatch.table[syscall_num];
-            result = (sqword_t) (sdword_t) syscall(args[0], args[1], args[2],
+            dword_t table_result = syscall(args[0], args[1], args[2],
                     args[3], args[4], args[5]);
+            // The freeze conversion handle_asm_generic_native_syscall's tail
+            // gives every call it handles. native_syscall_args re-issues an
+            // _ERESTART but hands a plain EINTR to the program, so without it
+            // a native flock(2) -- one of the few blocking calls that reaches
+            // this table -- would fail with EINTR across a checkpoint.
+            syscall_result_should_restart(&table_result);
+            result = (sqword_t) (sdword_t) table_result;
         }
     }
 
@@ -4875,7 +5315,80 @@ static void handle_amd64_syscall_interrupt(struct cpu_state *cpu) {
     }
 }
 
+// The iSH-private accelerator calls (ISH_SYS_AEAD, ISH_SYS_PIXOP, below) are
+// not system calls in any sense a filter is about: each is computation on the
+// caller's own memory, done on the host instead of emulated, and changes
+// nothing outside it -- what Linux does in the vDSO, which seccomp never sees
+// either. A filter could not stop the same work done in guest code, so
+// refusing it confines nothing; it would only break sandboxed programs that
+// load the crypto provider, whose default-deny filters (OpenSSH's pre-auth
+// child's among them) kill on any number they do not list.
+static bool seccomp_exempt(qword_t syscall_num) {
+    return syscall_num == 0xacc0 || syscall_num == 0xacc1;
+}
+
+// The address after the syscall instruction, which is where every ABI's pc
+// stands while the call is dispatched (prepare_syscall_restart steps back
+// from it).
+static qword_t syscall_insn_next_ip(const struct cpu_state *cpu, enum guest_abi abi) {
+    switch (abi) {
+        case GUEST_ABI_AMD64: return cpu->amd64_rip;
+        case GUEST_ABI_ARM64: return cpu->arm64_pc;
+        case GUEST_ABI_RISCV64: return cpu->riscv64_pc;
+        case GUEST_ABI_I386:
+        default: return cpu->eip;
+    }
+}
+
+// Ask seccomp about the call in the registers. An answer it gives is written
+// back as the call's result; a PTRACE_EVENT_SECCOMP stop's rewrite is read
+// back in, and *syscall_num updated to it.
+static enum seccomp_verdict seccomp_check_guest_syscall(struct cpu_state *cpu,
+        const struct syscall_abi_dispatch *dispatch, qword_t *syscall_num) {
+    qword_t args[6];
+    sqword_t result = 0;
+    dispatch->syscall_args(cpu, args);
+    qword_t ip = syscall_insn_next_ip(cpu, dispatch->abi);
+    enum seccomp_verdict v = seccomp_syscall_enter(dispatch->abi, *syscall_num, args, ip,
+            &result, false);
+    if (v == SECCOMP_TRACED) {
+        // Linux: the tracer may have changed the call, or skipped it by
+        // setting the number to -1, in which case whatever it left in the
+        // result register stands. Otherwise the filters are asked again about
+        // what it is now.
+        *syscall_num = dispatch->syscall_number(cpu);
+        if ((sdword_t) *syscall_num < 0)
+            return SECCOMP_TRACED;
+        dispatch->syscall_args(cpu, args);
+        v = seccomp_syscall_enter(dispatch->abi, *syscall_num, args, ip, &result, true);
+        if (v == SECCOMP_TRACED)
+            v = SECCOMP_RUN;
+    }
+    if (v == SECCOMP_ANSWERED) {
+        if (dispatch->abi == GUEST_ABI_AMD64)
+            amd64_syscall_result_qword(cpu, (qword_t) result);
+        else
+            dispatch->syscall_result(cpu, (dword_t) result);
+    }
+    return v;
+}
+
 void handle_syscall_interrupt(struct cpu_state *cpu) {
+    // A pending restart ends here. Its cancellation (receive_signal) only means
+    // anything between the rewind and the syscall instruction running again,
+    // and this is that instruction -- or whatever a tracer put in its place.
+    // Left set, a handler that ran later would step a PC that no longer sits
+    // after a syscall and overwrite a register with EINTR. Nothing else clears
+    // them reliably: most of handle_amd64_native_memory_syscall's cases write
+    // their result straight to RAX and never pass syscall_result_should_restart.
+    //
+    // So does the restart answer an earlier syscall's interruption recorded:
+    // it is not this syscall's. Nothing before the syscall body below can
+    // record a new one -- the entry stop waits with wait_for_ignore_signals,
+    // which is never marked. The native dispatcher, syscall_dispatch_native,
+    // does the same. See signal_restart_state_clear.
+    signal_restart_state_clear();
+
     const struct syscall_abi_dispatch *dispatch = syscall_dispatch_for_abi(current->abi);
     if (dispatch->table == NULL) {
         printk("ERROR: %d(%s) syscall dispatch for guest ABI %s is not implemented yet\n",
@@ -4893,6 +5406,27 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
     qword_t raw_args[6];
     dword_t args[6];
     qword_t syscall_num = dispatch->syscall_number(cpu);
+    if (unlikely(guestprof_on))
+        guestprof_state_syscall((unsigned long) syscall_num);
+
+    // seccomp, after the ptrace entry stop as Linux has it (a tracer's rewrite
+    // is what the filters see), and before anything else looks at the number:
+    // a filter decides out-of-range numbers too.
+    if (unlikely(__atomic_load_n(&current->seccomp_mode, __ATOMIC_ACQUIRE) != SECCOMP_MODE_DISABLED_) &&
+            !seccomp_exempt(syscall_num)) {
+        switch (seccomp_check_guest_syscall(cpu, dispatch, &syscall_num)) {
+            case SECCOMP_RUN:
+                break;
+            case SECCOMP_ANSWERED:
+                if (current->ptrace.traced && current->ptrace.stop_at_syscall &&
+                        current->ptrace.syscall_stopped)
+                    ptrace_syscall_stop(cpu);
+                return;
+            case SECCOMP_SKIPPED:
+            case SECCOMP_TRACED:
+                return;
+        }
+    }
     // iSH-private syscalls live above every real syscall range (ISH_SYS_AEAD =
     // 0xacc0, ISH_SYS_PIXOP = 0xacc1), so they'd fail the range check below
     // and index the table out of bounds. Intercept them here, for EVERY guest
@@ -4950,6 +5484,7 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
         log_stub_syscall(cpu, dispatch, (unsigned) syscall_num, "stub");
 
     dispatch->syscall_args(cpu, raw_args);
+    checkpoint_trace_syscall((unsigned long) syscall_num);
     amd64_tty2_shell_syscall_trace_enter(syscall_num, raw_args);
     amd64_tracked_proc_trace_enter(syscall_num, raw_args);
     if (dispatch->abi == GUEST_ABI_AMD64 && syscall_num == 15) {
@@ -5003,14 +5538,35 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
         // clearing it on the way past destroyed it before the handler-setup
         // path could read it, turning every handler-cancelled ERESTARTNOHAND
         // back into a restart. That regressed all five of the poll-family
-        // cases this backstop was not even meant to touch.
-        bool restart_pending =
+        // cases this backstop was not even meant to touch. A flag left set by
+        // an earlier rewind is cleared as each syscall starts instead, at the
+        // top of this function.
+        //
+        // A CHECKPOINT FREEZE is a restart too, but it arrives as a plain
+        // _EINTR: the freezer wakes the wait, the wait returns EINTR, and only
+        // syscall_result_should_restart knows to turn that into _ERESTART
+        // while the freeze is on. Asking about the restart codes alone handed
+        // the EINTR to the guest from every case above that does not call it
+        // -- measured on alpine and devuan amd64 roots, a checkpoint taken
+        // while tasks were blocked gave EINTR from 18 syscalls, readv, write,
+        // recvfrom, nanosleep, waitid and F_SETLKW among them, all calls the
+        // funnel restarts for arm64. The flag below comes out false for it,
+        // as the funnel's own freeze branch leaves it: no handler may cancel
+        // a freeze's restart.
+        bool freeze_restart =
+            (sqword_t) result == (sqword_t) (sdword_t) _EINTR &&
+            checkpoint_freeze_pending();
+        bool restart_pending = freeze_restart ||
             (sqword_t) result == (sqword_t) (sdword_t) _ERESTART ||
-            (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
+            (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND ||
+            (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOINTR;
         if (restart_pending) {
-            if (current != NULL)
+            if (current != NULL) {
                 current->restart_nohand_pending =
                     (sqword_t) result == (sqword_t) (sdword_t) _ERESTART_NOHAND;
+                current->restart_sys_pending =
+                    (sqword_t) result == (sqword_t) (sdword_t) _ERESTART;
+            }
             prepare_syscall_restart(cpu, &amd64_syscall_dispatch, syscall_num, raw_args[0]);
             if (current->ptrace.traced && current->ptrace.stop_at_syscall &&
                     current->ptrace.syscall_stopped)
@@ -5069,7 +5625,7 @@ void handle_syscall_interrupt(struct cpu_state *cpu) {
     amd64_enomem_syscall_trace(syscall_num, raw_args, trace_result);
     amd64_tracked_proc_trace_exit(syscall_num, raw_args, trace_result);
     amd64_tty2_shell_syscall_trace_exit(syscall_num, trace_result);
-    if (syscall_result_should_restart(result)) {
+    if (syscall_result_should_restart(&result)) {
         if (current->ptrace.traced && current->ptrace.stop_at_syscall) {
             dispatch->syscall_result(cpu, result);
             if (current->ptrace.syscall_stopped)
@@ -5097,8 +5653,8 @@ static void dump_amd64_store_trace(const struct cpu_state *cpu);
 static void dump_fault_pt_state(guest_addr_t addr);
 static void dump_arm64_fault_panel(guest_addr_t addr, unsigned retry, void *resolved);
 static bool amd64_verbose_fault_trace_enabled(void);
-static bool handle_i386_read_fault_gpf(struct cpu_state *cpu);
-static bool handle_i386_write_fault_gpf(struct cpu_state *cpu);
+static bool handle_i386_read_fault_gpf(struct cpu_state *cpu, bool reported);
+static bool handle_i386_write_fault_gpf(struct cpu_state *cpu, bool reported);
 static bool handle_i386_call_stack_gpf(struct cpu_state *cpu);
 static bool handle_i386_stack_store_gpf(struct cpu_state *cpu);
 
@@ -5159,22 +5715,39 @@ static void dump_arm64_fault_memdump(const struct cpu_state *cpu) {
     }
 }
 
+// snprintf that appends at *pos and never lets *pos run past the buffer, so a
+// truncated register dump stays a terminated string instead of an overflow.
+static void fault_event_append(char *buf, size_t size, size_t *pos, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+static void fault_event_append(char *buf, size_t size, size_t *pos, const char *fmt, ...) {
+    if (*pos + 1 >= size)
+        return;
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(buf + *pos, size - *pos, fmt, args);
+    va_end(args);
+    if (n < 0)
+        return;
+    *pos = *pos + (size_t) n < size ? *pos + (size_t) n : size - 1;
+}
+
 static void record_guest_fault_event(const char *kind, const struct cpu_state *cpu,
                                      guest_addr_t fault_addr, bool is_write) {
     char summary[512];
-    char detail[1024];
+    char detail[2048];
     char opcode[128];
     size_t opcode_pos = 0;
     guest_addr_t ip = current_fault_ip(cpu);
+    // current_fault_ip already dereferences current, so it is not NULL here.
+    // The label used to be "amd64" or else "i386", which named every arm64
+    // and riscv64 fault i386 and printed the i386 register file for it -- a
+    // file an arm64 task never uses, rewritten from host scratch registers by
+    // the shared jit_exit's save_regs, so its values were noise.
+    enum guest_abi abi = current->abi;
 
     snprintf(summary, sizeof(summary),
              "pid=%d comm=%s abi=%s ip=%#llx fault_addr=%#llx access=%s",
-             current != NULL ? current->pid : -1,
-             current != NULL ? current->comm : "?",
-             // Every non-amd64 guest used to be recorded as "i386", so an
-             // arm64 crash arrived labelled as the one ABI it could not be
-             // -- and this record is what you read when the guest is gone.
-             current != NULL ? guest_abi_desc(current->abi).name : "?",
+             current->pid, current->comm, guest_abi_name(abi),
              (unsigned long long) ip,
              (unsigned long long) fault_addr,
              is_write ? "write" : "read");
@@ -5196,7 +5769,43 @@ static void record_guest_fault_event(const char *kind, const struct cpu_state *c
     }
     opcode[opcode_pos < sizeof(opcode) ? opcode_pos : sizeof(opcode) - 1] = '\0';
 
-    if (current != NULL && current->abi == GUEST_ABI_AMD64) {
+    if (abi == GUEST_ABI_ARM64) {
+        // Fixed-width little-endian instructions: the previous one, the
+        // faulting one in brackets, and the next two, as objdump prints them.
+        // The byte window above brackets one byte and splits the faulting word.
+        opcode_pos = 0;
+        opcode[0] = '\0';
+        for (int i = -1; i < 3; i++) {
+            uint32_t insn = 0;
+            char word[9] = "????????";
+            if (!user_get(ip + (guest_addr_t) (4 * i), insn))
+                snprintf(word, sizeof(word), "%08x", insn);
+            fault_event_append(opcode, sizeof(opcode), &opcode_pos, "%s%s%s%s",
+                               i == 0 ? "[" : "", word, i == 0 ? "]" : "",
+                               i != 2 ? " " : "");
+        }
+        size_t pos = 0;
+        fault_event_append(detail, sizeof(detail), &pos, "opcode window: %s\n", opcode);
+        for (int i = 0; i < 31; i++)
+            fault_event_append(detail, sizeof(detail), &pos, "x%d=%#llx%s", i,
+                               (unsigned long long) cpu->arm64_regs[i],
+                               (i % 4 == 3 || i == 30) ? "\n" : " ");
+        fault_event_append(detail, sizeof(detail), &pos,
+                           "sp=%#llx pc=%#llx nzcv=%#x tpidr=%#llx",
+                           (unsigned long long) cpu->arm64_sp,
+                           (unsigned long long) cpu->arm64_pc,
+                           (unsigned) cpu->arm64_nzcv,
+                           (unsigned long long) cpu->arm64_tpidr);
+    } else if (abi == GUEST_ABI_RISCV64) {
+        size_t pos = 0;
+        fault_event_append(detail, sizeof(detail), &pos, "opcode window: %s\n", opcode);
+        for (int i = 0; i < 32; i++)
+            fault_event_append(detail, sizeof(detail), &pos, "x%d=%#llx%s", i,
+                               (unsigned long long) cpu->riscv64_regs[i],
+                               i % 4 == 3 ? "\n" : " ");
+        fault_event_append(detail, sizeof(detail), &pos, "pc=%#llx",
+                           (unsigned long long) cpu->riscv64_pc);
+    } else if (abi == GUEST_ABI_AMD64) {
         snprintf(detail, sizeof(detail),
                  "opcode window: %s\n"
                  "rax=%#llx rbx=%#llx rcx=%#llx rdx=%#llx\n"
@@ -5259,7 +5868,200 @@ static guest_addr_t current_fault_ip(const struct cpu_state *cpu) {
     return cpu->eip;
 }
 
+// An instruction fetch from a page that is mapped but not executable
+// (emu/tlb.h tlb_fetch, INT_PF_EXEC): SIGSEGV with SEGV_ACCERR at the address
+// that could not be fetched, as Linux delivers for NX. Code in memory mapped
+// without PROT_EXEC ran before -- nothing checked -- so a heap or stack
+// overflow that got to write code could also get to run it.
+//
+// Not the page-fault path: that retries a fault it can resolve, and a page
+// that is only readable resolves for a read every time.
+static void handle_exec_fault_interrupt(struct cpu_state *cpu) {
+    cpu->trapno = INT_PF;
+    cpu->segfault_was_write = false;
+    // Executable again by now -- an mprotect(PROT_EXEC) that landed after the
+    // fault was compiled into a block. pt_set_flags threw that block away, so
+    // running the instruction again translates it afresh.
+    if (mmu_page_executable(&current->mem->mmu, PAGE(cpu->segfault_addr)))
+        return;
+    record_guest_fault_event("exec-fault", cpu, cpu->segfault_addr, false);
+    struct siginfo_ info = {
+        .code = SEGV_ACCERR_,
+        .fault.addr = cpu->segfault_addr,
+    };
+    deliver_signal(current, SIGSEGV_, info);
+}
+
+// A canonical amd64 address has bits 63-47 all equal: 48-bit linear
+// addresses, as the CPUID and /proc/cpuinfo this emulator reports give.
+static bool amd64_addr_canonical(guest_addr_t addr) {
+    return (guest_addr_t) ((int64_t) ((uint64_t) addr << 16) >> 16) == addr;
+}
+
+// The kernel log lines Linux 5.10 writes when a task runs SGDT, SIDT, SMSW,
+// SLDT or STR on a UMIP processor, which it then spoofs (arch/x86/kernel/
+// umip.c: umip_printk, two lines an instruction, through one ratelimit of 5
+// lines per 2 minutes, which reports what it dropped when the next window
+// opens -- ___ratelimit). The JIT's gadgets call this, then store the spoofed
+// value themselves (math.S x86_umip_put, misc.S umip_*). inst is umip.c's
+// UMIP_INST_* number.
+static bool umip_ratelimit(void) {
+    static lock_t rl_lock = LOCK_INITIALIZER;
+    static struct timespec begin;
+    static int printed, missed;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    bool ok;
+    lock(&rl_lock, 0);
+    if (begin.tv_sec == 0 && begin.tv_nsec == 0)
+        begin = now;
+    if (now.tv_sec - begin.tv_sec > 2 * 60 ||
+            (now.tv_sec - begin.tv_sec == 2 * 60 && now.tv_nsec > begin.tv_nsec)) {
+        if (missed != 0) {
+            printk("umip_printk: %d callbacks suppressed\n", missed);
+            missed = 0;
+        }
+        begin = now;
+        printed = 0;
+    }
+    ok = printed < 5;
+    if (ok)
+        printed++;
+    else
+        missed++;
+    unlock(&rl_lock);
+    return ok;
+}
+
+void x86_umip_warn(struct cpu_state *cpu, unsigned inst, qword_t ip, qword_t sp) {
+    (void) cpu;
+    static const char *const names[] = {"SGDT", "SIDT", "SMSW", "SLDT", "STR"};
+    if (inst >= sizeof(names) / sizeof(names[0]))
+        return;
+    if (umip_ratelimit())
+        printk("umip: %s[%d] ip:%llx sp:%llx: %s instruction cannot be used by applications.\n",
+               current->comm, current->pid, (unsigned long long) ip, (unsigned long long) sp,
+               names[inst]);
+    if (umip_ratelimit())
+        printk("umip: %s[%d] ip:%llx sp:%llx: For now, expensive software emulation returns the result.\n",
+               current->comm, current->pid, (unsigned long long) ip, (unsigned long long) sp);
+}
+
+// ---- which guest faults are reported to the kernel log ---------------------
+//
+// A fault report is a screenful: the line, the registers, an opcode window,
+// page-table state, the stack. Every fault used to get one, including the
+// ones a program takes on purpose and catches -- a JVM's null checks, a
+// test that raises 61,440 #UDs to see what each reports -- and a distro's
+// syslog daemon then wrote all of it to disk twice. Three suite runs left
+// 1.3 GB in /var/log and filled a phone.
+//
+// Linux prints for a fault only when nobody will handle it
+// (show_unhandled_signals, unhandled_signal()) and ratelimits that. So:
+//
+//   unhandled (the default)  a report when the signal will kill the program
+//                            -- no handler, or blocked, and no tracer to
+//                            hand it to -- at most 10 in any 5 seconds
+//   all                      every fault, unlimited: what it was, for
+//                            working on the emulator
+//   none                     nothing
+//
+// /proc/ish/fault_reports reads and sets it; ISH_FAULT_REPORTS sets it for a
+// CLI run from the start.
+enum { FAULT_REPORTS_NONE, FAULT_REPORTS_UNHANDLED, FAULT_REPORTS_ALL };
+static _Atomic int fault_reports_mode = -1; // -1: not decided yet
+static _Atomic unsigned long fault_reports_suppressed_total;
+
+static const char *const fault_reports_names[] = {"none", "unhandled", "all"};
+
+int guest_fault_reports_parse(const char *text, size_t len) {
+    for (int i = 0; i < 3; i++)
+        if (strlen(fault_reports_names[i]) == len && memcmp(text, fault_reports_names[i], len) == 0)
+            return i;
+    return -1;
+}
+
+int guest_fault_reports_get(unsigned long *suppressed) {
+    int mode = atomic_load(&fault_reports_mode);
+    if (mode < 0) {
+        const char *env = getenv("ISH_FAULT_REPORTS");
+        mode = env != NULL ? guest_fault_reports_parse(env, strlen(env)) : -1;
+        if (mode < 0)
+            mode = FAULT_REPORTS_UNHANDLED;
+        atomic_store(&fault_reports_mode, mode);
+    }
+    if (suppressed != NULL)
+        *suppressed = atomic_load(&fault_reports_suppressed_total);
+    return mode;
+}
+
+const char *guest_fault_reports_name(int mode) {
+    return mode >= 0 && mode < 3 ? fault_reports_names[mode] : "?";
+}
+
+void guest_fault_reports_set(int mode) {
+    if (mode >= FAULT_REPORTS_NONE && mode <= FAULT_REPORTS_ALL)
+        atomic_store(&fault_reports_mode, mode);
+}
+
+// Whether the fault about to be delivered to `current` as `sig` gets a report.
+// Ask once per fault, before printing any of it.
+static bool guest_fault_reported(int sig) {
+    int mode = guest_fault_reports_get(NULL);
+    if (mode == FAULT_REPORTS_ALL)
+        return true;
+    if (mode == FAULT_REPORTS_NONE)
+        return false;
+    // Linux's unhandled_signal(), and one more: a handler that cannot run
+    // because the signal is blocked is no handler -- the fault kills.
+    struct sighand *sighand = current->sighand;
+    lock(&sighand->lock, 0);
+    addr_t handler = sighand->action[sig].handler;
+    unlock(&sighand->lock);
+    bool handled = handler != SIG_DFL_ && handler != SIG_IGN_ && !sigset_has(current->blocked, sig);
+    if (handled || current->ptrace.traced)
+        return false;
+
+    static lock_t rl_lock = LOCK_INITIALIZER;
+    static struct timespec begin;
+    static int printed, missed;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    lock(&rl_lock, 0);
+    long long since_ms = (now.tv_sec - begin.tv_sec) * 1000LL + (now.tv_nsec - begin.tv_nsec) / 1000000;
+    if ((begin.tv_sec == 0 && begin.tv_nsec == 0) || since_ms > 5000) {
+        if (missed != 0)
+            printk("guest faults: %d reports suppressed\n", missed);
+        missed = 0;
+        begin = now;
+        printed = 0;
+    }
+    bool ok = printed < 10;
+    if (ok) {
+        printed++;
+    } else {
+        missed++;
+        atomic_fetch_add(&fault_reports_suppressed_total, 1);
+    }
+    unlock(&rl_lock);
+    return ok;
+}
+
 void handle_page_fault_interrupt(struct cpu_state *cpu) {
+    // A UMIP-spoofed store's fault (emu/cpu.h umip_report): consumed here,
+    // whatever happens next.
+    bool umip = cpu->umip_report;
+    cpu->umip_report = false;
+    // A data access to a non-canonical address is not a page fault on the
+    // hardware but #GP(0), before any translation: SIGSEGV with si_code
+    // SI_KERNEL and no address, REG_TRAPNO 13 (camd, Linux 6.12, a load and a
+    // store at 0x8000000000001000 and at 0x0000900000001000). It came out as
+    // SEGV_MAPERR at the address. (A spoofed store is Linux's copy_to_user,
+    // which fails there like anywhere else.)
+    if (!umip && current->abi == GUEST_ABI_AMD64 && !amd64_addr_canonical(cpu->segfault_addr)) {
+        handle_general_protection_interrupt(cpu, 0);
+        return;
+    }
     // AArch64 TBI: bits 56-63 are not part of the address, so the fault has to
     // be RESOLVED against the untagged one. This is not a workaround for a
     // missing mask somewhere upstream of here -- it is what Linux's own
@@ -5387,16 +6189,19 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
                                         cpu->segfault_was_write ? MEM_WRITE : MEM_READ);
 
     if (ptr == NULL && task_take_swap_io_fault()) {
-        // The mapping is fine; its CONTENTS could not be read back from the
-        // swap file. Linux answers that with SIGBUS/BUS_ADRERR, the same as a
-        // truncated file mapping (handle_bus_interrupt below), not with
-        // SIGSEGV -- the address is valid, the hardware could not deliver it.
-        printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (swap read failed)\n",
-               current->pid, current->comm, guest_abi_desc(current->abi).name,
-               (unsigned long long) cpu->segfault_addr,
-               (unsigned long long) current_fault_ip(cpu));
-        record_guest_fault_event("swap-io-error", cpu, cpu->segfault_addr,
-                                 cpu->segfault_was_write);
+        // The mapping is fine; its CONTENTS could not be had -- read back from
+        // the swap file, or read to copy a file page past the end of its file
+        // for a copy-on-write break. Linux answers that with SIGBUS/BUS_ADRERR,
+        // the same as a truncated file mapping (handle_bus_interrupt below), not
+        // with SIGSEGV -- the address is valid, the hardware could not deliver it.
+        if (guest_fault_reported(SIGBUS_)) {
+            printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (page contents unreadable)\n",
+                   current->pid, current->comm, guest_abi_desc(current->abi).name,
+                   (unsigned long long) cpu->segfault_addr,
+                   (unsigned long long) current_fault_ip(cpu));
+            record_guest_fault_event("swap-io-error", cpu, cpu->segfault_addr,
+                                     cpu->segfault_was_write);
+        }
         struct siginfo_ bus_info = {
             .code = BUS_ADRERR_,
             .fault.addr = cpu->segfault_addr,
@@ -5406,95 +6211,98 @@ void handle_page_fault_interrupt(struct cpu_state *cpu) {
     }
 
     if (ptr == NULL) {
-        printk("ERROR: %d(%s) [%s] page fault on %#llx at %#llx%s\n",
-               current->pid, current->comm, guest_abi_desc(current->abi).name,
-               (unsigned long long) cpu->segfault_addr,
-               (unsigned long long) current_fault_ip(cpu),
-               cpu->segfault_was_write ? " (write)" : " (read)");
-        if (current->abi == GUEST_ABI_ARM64) {
-            for (int i = 0; i < 31; i += 4)
-                printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
-                       i, (unsigned long long) cpu->arm64_regs[i],
-                       i + 1, i + 1 < 31 ? (unsigned long long) cpu->arm64_regs[i + 1] : 0,
-                       i + 2, i + 2 < 31 ? (unsigned long long) cpu->arm64_regs[i + 2] : 0,
-                       i + 3, i + 3 < 31 ? (unsigned long long) cpu->arm64_regs[i + 3] : 0);
-            printk("  sp=%#llx pc=%#llx tpidr=%#llx\n",
-                   (unsigned long long) cpu->arm64_sp,
-                   (unsigned long long) cpu->arm64_pc,
-                   (unsigned long long) cpu->arm64_tpidr);
-            // A fault address with a top byte set is a TBI-tagged pointer that
-            // reached somewhere it should have been untagged. Saying so here
-            // costs one line and is the difference between "a wild pointer"
-            // and "one missing mask" -- which is exactly how long the first
-            // one of these took to work out.
-            //
-            // Two very different things end up here now, and confusing them
-            // costs a session: the untagged address being unmapped too (a
-            // genuine wild pointer, the tag is not what killed it), or the
-            // untagged address being perfectly fine and the access still not
-            // completing (the loop cap above tripped -- a real emulator bug,
-            // and the tag IS implicated). Say which.
-            if (fault_addr != cpu->segfault_addr)
-                printk("  TAGGED POINTER: tag=%#x untagged=%#llx (%s)\n",
-                       (unsigned) (cpu->segfault_addr >> 56),
-                       (unsigned long long) fault_addr,
-                       looping
-                           ? "MAPPED -- resolved and re-faulted until the loop "
-                             "cap tripped, so something below here is still "
-                             "seeing the tag"
-                           : "unmapped as well, so the tag is not what killed it");
-            // The page-table state for the FAULTING address, not the pc. On
-            // amd64 this has always been printed; arm64 never had it, which is
-            // why "the access cannot complete even though the page is there"
-            // could be stated without anyone being able to see what "there"
-            // meant.
-            dump_fault_pt_state(cpu->segfault_addr);
-            dump_arm64_fault_panel(cpu->segfault_addr, 0, ptr);
-            dump_addr_backing("  pc-backing", current_fault_ip(cpu));
-            // And where the call came FROM. pc-backing alone was not enough
-            // for the crash that prompted this: idmap2d faulted inside an
-            // outline-atomics dispatch stub (__aarch64_ldadd4_relax and
-            // friends), which builds no stack frame, so pc named a compiler
-            // helper and nothing named the caller. x30 does, and it is the
-            // only thing that does -- dump_stack below walks the EMULATOR's
-            // stack, not the guest's.
-            //
-            // Printed unconditionally rather than only when pc is a helper: at
-            // the point of the fault we cannot tell a helper from ordinary
-            // code, and one extra line is cheaper than another device round
-            // trip. When the call was a plain leaf fault this just repeats the
-            // caller, which is still worth having.
-            if (cpu->arm64_regs[arm64_x30] != 0)
-                dump_addr_backing("  lr-backing", cpu->arm64_regs[arm64_x30]);
-            dump_arm64_fault_memdump(cpu);
-            arm64_watch_dump();
-        }
-        if (current->abi == GUEST_ABI_RISCV64) {
-            for (int i = 0; i < 32; i += 4)
-                printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
-                       i, (unsigned long long) cpu->riscv64_regs[i],
-                       i + 1, (unsigned long long) cpu->riscv64_regs[i + 1],
-                       i + 2, (unsigned long long) cpu->riscv64_regs[i + 2],
-                       i + 3, (unsigned long long) cpu->riscv64_regs[i + 3]);
-            printk("  pc=%#llx\n", (unsigned long long) cpu->riscv64_pc);
-        }
-        dump_opcode_window(current_fault_ip(cpu));
-        if (current->abi == GUEST_ABI_AMD64) {
-            dump_amd64_regs(cpu);
-            dump_fault_pt_state(cpu->segfault_addr);
-            dump_amd64_cc1_trace(cpu);
-            dump_amd64_cc1_jit_trace(cpu);
-            if (amd64_verbose_fault_trace_enabled()) {
-                dump_amd64_loader_state(cpu);
-                dump_amd64_store_trace(cpu);
+        bool report = guest_fault_reported(SIGSEGV_);
+        if (report) {
+            printk("ERROR: %d(%s) [%s] page fault on %#llx at %#llx%s\n",
+                   current->pid, current->comm, guest_abi_desc(current->abi).name,
+                   (unsigned long long) cpu->segfault_addr,
+                   (unsigned long long) current_fault_ip(cpu),
+                   cpu->segfault_was_write ? " (write)" : " (read)");
+            if (current->abi == GUEST_ABI_ARM64) {
+                for (int i = 0; i < 31; i += 4)
+                    printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
+                           i, (unsigned long long) cpu->arm64_regs[i],
+                           i + 1, i + 1 < 31 ? (unsigned long long) cpu->arm64_regs[i + 1] : 0,
+                           i + 2, i + 2 < 31 ? (unsigned long long) cpu->arm64_regs[i + 2] : 0,
+                           i + 3, i + 3 < 31 ? (unsigned long long) cpu->arm64_regs[i + 3] : 0);
+                printk("  sp=%#llx pc=%#llx tpidr=%#llx\n",
+                       (unsigned long long) cpu->arm64_sp,
+                       (unsigned long long) cpu->arm64_pc,
+                       (unsigned long long) cpu->arm64_tpidr);
+                // A fault address with a top byte set is a TBI-tagged pointer that
+                // reached somewhere it should have been untagged. Saying so here
+                // costs one line and is the difference between "a wild pointer"
+                // and "one missing mask" -- which is exactly how long the first
+                // one of these took to work out.
+                //
+                // Two very different things end up here now, and confusing them
+                // costs a session: the untagged address being unmapped too (a
+                // genuine wild pointer, the tag is not what killed it), or the
+                // untagged address being perfectly fine and the access still not
+                // completing (the loop cap above tripped -- a real emulator bug,
+                // and the tag IS implicated). Say which.
+                if (fault_addr != cpu->segfault_addr)
+                    printk("  TAGGED POINTER: tag=%#x untagged=%#llx (%s)\n",
+                           (unsigned) (cpu->segfault_addr >> 56),
+                           (unsigned long long) fault_addr,
+                           looping
+                               ? "MAPPED -- resolved and re-faulted until the loop "
+                                 "cap tripped, so something below here is still "
+                                 "seeing the tag"
+                               : "unmapped as well, so the tag is not what killed it");
+                // The page-table state for the FAULTING address, not the pc. On
+                // amd64 this has always been printed; arm64 never had it.
+                dump_fault_pt_state(cpu->segfault_addr);
+                dump_arm64_fault_panel(cpu->segfault_addr, 0, ptr);
+                dump_addr_backing("  pc-backing", current_fault_ip(cpu));
+                // And where the call came FROM. pc-backing alone was not enough
+                // for the crash that prompted this: idmap2d faulted inside an
+                // outline-atomics dispatch stub (__aarch64_ldadd4_relax and
+                // friends), which builds no stack frame, so pc named a compiler
+                // helper and nothing named the caller. x30 does, and it is the
+                // only thing that does -- dump_stack below walks the EMULATOR's
+                // stack, not the guest's.
+                if (cpu->arm64_regs[arm64_x30] != 0)
+                    dump_addr_backing("  lr-backing", cpu->arm64_regs[arm64_x30]);
+                dump_arm64_fault_memdump(cpu);
+                arm64_watch_dump();
             }
+            if (current->abi == GUEST_ABI_RISCV64) {
+                for (int i = 0; i < 32; i += 4)
+                    printk("  x%d=%#llx x%d=%#llx x%d=%#llx x%d=%#llx\n",
+                           i, (unsigned long long) cpu->riscv64_regs[i],
+                           i + 1, (unsigned long long) cpu->riscv64_regs[i + 1],
+                           i + 2, (unsigned long long) cpu->riscv64_regs[i + 2],
+                           i + 3, (unsigned long long) cpu->riscv64_regs[i + 3]);
+                printk("  pc=%#llx\n", (unsigned long long) cpu->riscv64_pc);
+            }
+            dump_opcode_window(current_fault_ip(cpu));
+            if (current->abi == GUEST_ABI_AMD64) {
+                dump_amd64_regs(cpu);
+                dump_fault_pt_state(cpu->segfault_addr);
+                dump_amd64_cc1_trace(cpu);
+                dump_amd64_cc1_jit_trace(cpu);
+                if (amd64_verbose_fault_trace_enabled()) {
+                    dump_amd64_loader_state(cpu);
+                    dump_amd64_store_trace(cpu);
+                }
+            }
+            record_guest_fault_event("page-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
         }
-        record_guest_fault_event("page-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
         struct siginfo_ info = {
             .code = mem_segv_reason(current->mem, fault_addr),
             .fault.addr = cpu->segfault_addr,
         };
-        dump_stack(8);
+        // force_sig_info_umip_fault: SEGV_MAPERR at the operand, CR2 that
+        // address and the error code a user write's.
+        if (umip) {
+            info.code = SEGV_MAPERR_;
+            info.fault.addr = cpu->umip_report_addr;
+            cpu->segfault_addr = cpu->umip_report_addr;
+            cpu->segfault_was_write = true;
+        }
+        if (report)
+            dump_stack(8);
         deliver_signal(current, SIGSEGV_, info);
     }
 }
@@ -5619,10 +6427,16 @@ static void dump_fault_pt_state(guest_addr_t addr) {
     read_unlock(&current->mem->lock);
 }
 
-static void handle_general_protection_interrupt(struct cpu_state *cpu) {
-    if (handle_i386_read_fault_gpf(cpu))
+// error_code is the #GP's: a selector, an `int n` gate, or 0 (see
+// INT_GPF_CODE in emu/interrupt.h).
+static void handle_general_protection_interrupt(struct cpu_state *cpu, word_t error_code) {
+    // Consumed here whatever happens next, so a stale one cannot turn a later
+    // fault that reported nothing into a page fault at 0.
+    bool reported = cpu->segfault_reported;
+    cpu->segfault_reported = false;
+    if (handle_i386_read_fault_gpf(cpu, reported))
         return;
-    if (handle_i386_write_fault_gpf(cpu))
+    if (handle_i386_write_fault_gpf(cpu, reported))
         return;
     if (handle_i386_call_stack_gpf(cpu))
         return;
@@ -5632,38 +6446,53 @@ static void handle_general_protection_interrupt(struct cpu_state *cpu) {
     guest_addr_t ip = current_fault_ip(cpu);
     uint8_t first_opcode = 0;
     bool have_first_opcode = user_get(ip, first_opcode) == 0;
-    printk("ERROR: %d(%s) [%s] general protection fault at %#llx: ",
-           current->pid, current->comm, guest_abi_desc(current->abi).name, (unsigned long long) ip);
-    for (int i = 0; i < 8; i++) {
-        uint8_t b;
-        if (user_get(ip + i, b))
-            break;
-        printk("%02x ", b);
-    }
-    printk("\n");
-    dump_opcode_window(ip);
-    if (current->abi == GUEST_ABI_AMD64) {
-        dump_amd64_regs(cpu);
-        dump_amd64_cc1_trace(cpu);
-        dump_amd64_cc1_jit_trace(cpu);
-        if (have_first_opcode && first_opcode == 0xf4) {
-            dump_amd64_hlt_tls_state(cpu);
-            if (amd64_hlt_is_zero_sentinel_trap(ip))
-                dump_amd64_hlt_zero_sentinel_state(cpu);
+    if (guest_fault_reported(SIGSEGV_)) {
+        printk("ERROR: %d(%s) [%s] general protection fault(%#x) at %#llx: ",
+               current->pid, current->comm, guest_abi_desc(current->abi).name, error_code,
+               (unsigned long long) ip);
+        for (int i = 0; i < 8; i++) {
+            uint8_t b;
+            if (user_get(ip + i, b))
+                break;
+            printk("%02x ", b);
         }
-        if (amd64_verbose_fault_trace_enabled()) {
-            dump_amd64_loader_state(cpu);
-            dump_amd64_store_trace(cpu);
+        printk("\n");
+        dump_opcode_window(ip);
+        if (current->abi == GUEST_ABI_AMD64) {
+            dump_amd64_regs(cpu);
+            dump_amd64_cc1_trace(cpu);
+            dump_amd64_cc1_jit_trace(cpu);
+            if (have_first_opcode && first_opcode == 0xf4) {
+                dump_amd64_hlt_tls_state(cpu);
+                if (amd64_hlt_is_zero_sentinel_trap(ip))
+                    dump_amd64_hlt_zero_sentinel_state(cpu);
+            }
+            if (amd64_verbose_fault_trace_enabled()) {
+                dump_amd64_loader_state(cpu);
+                dump_amd64_store_trace(cpu);
+            }
         }
+        record_guest_fault_event("general-protection-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+        dump_stack(8);
     }
-    record_guest_fault_event("general-protection-fault", cpu, cpu->segfault_addr, cpu->segfault_was_write);
-    dump_stack(8);
     cpu->trapno = INT_GPF;
+    cpu->gp_error_code = error_code;
     cpu->segfault_addr = 0;
     cpu->segfault_was_write = false;
+    // x86 Linux delivers a user-mode #GP with force_sig(SIGSEGV)
+    // (gp_user_force_sig_segv): si_code SI_KERNEL and no address, so si_addr
+    // reads NULL. Where it happened is the frame's REG_RIP/REG_EIP -- the
+    // instruction itself -- and what happened is REG_TRAPNO 13 and REG_ERR,
+    // the error code. Measured on camd (Linux 6.12, -m64 and -m32) for port
+    // I/O, HLT, CLI, STI, `int n`, bad selectors in MOV and POP Sreg, IRET and
+    // sigreturn, and non-canonical addresses. si_addr used to be the
+    // instruction here, which a handler reading it as the faulting data
+    // address took for a wild pointer. arm64 and riscv64 have no #GP; what
+    // reaches this for them keeps the PC.
+    bool x86 = current->abi == GUEST_ABI_I386 || current->abi == GUEST_ABI_AMD64;
     struct siginfo_ info = {
         .code = SI_KERNEL_,
-        .fault.addr = current_fault_ip(cpu),
+        .fault.addr = x86 ? 0 : current_fault_ip(cpu),
     };
     deliver_signal(current, SIGSEGV_, info);
 }
@@ -5836,17 +6665,21 @@ static bool i386_gpf_addr_needs_page_fault(guest_addr_t fault_addr, int type) {
     return needs_page_fault;
 }
 
-static bool handle_i386_read_fault_gpf(struct cpu_state *cpu) {
+static bool handle_i386_read_fault_gpf(struct cpu_state *cpu, bool reported) {
     if (current->abi == GUEST_ABI_AMD64)
         return false;
 
     guest_addr_t fault_addr = 0;
-    if (cpu->segfault_addr != 0 && !cpu->segfault_was_write) {
+    if ((reported || cpu->segfault_addr != 0) && !cpu->segfault_was_write) {
         // Read gadget explicitly reported the fault address: route it through
         // the page-fault path unconditionally (same reasoning as the write
         // helper -- a lock-free re-check races a sibling thread resolving the
         // page and would fall through to a spurious SIGSEGV). mem_ptr_fault
         // is a no-op if the page is already readable; the load re-executes.
+        // A reported address of 0 is a NULL dereference, and counts: see
+        // segfault_reported in emu/cpu.h. A non-zero address counts without
+        // the flag, as before: the interrupt gadget clears the flag, and it
+        // also carries gen.c's SEGFAULT, an instruction fetch that faulted.
         cpu->trapno = INT_PF;
         cpu->segfault_was_write = false;
         handle_page_fault_interrupt(cpu);
@@ -5864,12 +6697,12 @@ static bool handle_i386_read_fault_gpf(struct cpu_state *cpu) {
     return true;
 }
 
-static bool handle_i386_write_fault_gpf(struct cpu_state *cpu) {
+static bool handle_i386_write_fault_gpf(struct cpu_state *cpu, bool reported) {
     if (current->abi == GUEST_ABI_AMD64)
         return false;
 
     guest_addr_t fault_addr = 0;
-    if (cpu->segfault_was_write && cpu->segfault_addr != 0) {
+    if (cpu->segfault_was_write && (reported || cpu->segfault_addr != 0)) {
         // The write gadget explicitly reported a translation failure at this
         // exact address (segfault_write in gadgets-*/memory.S set segfault_addr
         // + segfault_was_write before raising INT_GPF). Route it straight into
@@ -6556,7 +7389,7 @@ static bool amd64_trap_decode_modrm(guest_addr_t *ip, struct amd64_trap_rex_pref
     return true;
 }
 
-static qword_t amd64_trap_effective_addr(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, bool fs_prefix, guest_addr_t rip_after_modrm) {
+static qword_t amd64_trap_effective_addr(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, enum amd64_seg seg_prefix, guest_addr_t rip_after_modrm) {
     qword_t addr = (qword_t) (sqword_t) modrm->disp;
     if (modrm->rip_relative)
         addr += rip_after_modrm;
@@ -6564,28 +7397,27 @@ static qword_t amd64_trap_effective_addr(struct cpu_state *cpu, const struct amd
         addr += cpu->amd64_regs[modrm->base];
     if (modrm->has_index)
         addr += cpu->amd64_regs[modrm->index] << modrm->scale;
-    if (fs_prefix)
-        addr += cpu->tls_ptr;
+    addr += amd64_seg_base(cpu, seg_prefix);
     return addr;
 }
 
-static bool amd64_trap_read_rm(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, bool fs_prefix, guest_addr_t rip_after_modrm, unsigned size, qword_t *value) {
+static bool amd64_trap_read_rm(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, enum amd64_seg seg_prefix, guest_addr_t rip_after_modrm, unsigned size, qword_t *value) {
     if (modrm->is_reg) {
         *value = amd64_trap_reg_get(cpu, modrm->rm, size);
         return true;
     }
-    return amd64_trap_mem_read(amd64_trap_effective_addr(cpu, modrm, fs_prefix, rip_after_modrm), size, value);
+    return amd64_trap_mem_read(amd64_trap_effective_addr(cpu, modrm, seg_prefix, rip_after_modrm), size, value);
 }
 
-static bool amd64_trap_write_rm(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, bool fs_prefix, guest_addr_t rip_after_modrm, unsigned size, qword_t value) {
+static bool amd64_trap_write_rm(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, enum amd64_seg seg_prefix, guest_addr_t rip_after_modrm, unsigned size, qword_t value) {
     if (modrm->is_reg) {
         amd64_trap_reg_set(cpu, modrm->rm, size, value);
         return true;
     }
-    return amd64_trap_mem_write(amd64_trap_effective_addr(cpu, modrm, fs_prefix, rip_after_modrm), size, value);
+    return amd64_trap_mem_write(amd64_trap_effective_addr(cpu, modrm, seg_prefix, rip_after_modrm), size, value);
 }
 
-static bool amd64_trap_read_xmm_rm(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, bool fs_prefix,
+static bool amd64_trap_read_xmm_rm(struct cpu_state *cpu, const struct amd64_trap_modrm *modrm, enum amd64_seg seg_prefix,
         guest_addr_t rip_after_modrm, union xmm_reg *value) {
     if (modrm->is_reg) {
         *value = cpu->xmm[modrm->rm & 0xf];
@@ -6593,7 +7425,7 @@ static bool amd64_trap_read_xmm_rm(struct cpu_state *cpu, const struct amd64_tra
     }
 
     guest_addr_t addr;
-    if (!amd64_trap_guest_addr_ok(amd64_trap_effective_addr(cpu, modrm, fs_prefix, rip_after_modrm), sizeof(*value), &addr))
+    if (!amd64_trap_guest_addr_ok(amd64_trap_effective_addr(cpu, modrm, seg_prefix, rip_after_modrm), sizeof(*value), &addr))
         return false;
     return user_read(addr, value, sizeof(*value)) == 0;
 }
@@ -6601,7 +7433,7 @@ static bool amd64_trap_read_xmm_rm(struct cpu_state *cpu, const struct amd64_tra
 static bool amd64_try_emulate_sse2_packed_integer(guest_addr_t ip, struct cpu_state *cpu) {
     struct amd64_trap_rex_prefix rex = {};
     bool operand_size_prefix = false;
-    bool fs_prefix = false;
+    enum amd64_seg seg_prefix = AMD64_SEG_NONE;
     byte_t opcode;
     guest_addr_t decode_ip = ip;
 
@@ -6619,7 +7451,11 @@ static bool amd64_try_emulate_sse2_packed_integer(guest_addr_t ip, struct cpu_st
             continue;
         }
         if (opcode == 0x64) {
-            fs_prefix = true;
+            seg_prefix = AMD64_SEG_FS;
+            continue;
+        }
+        if (opcode == 0x65) {
+            seg_prefix = AMD64_SEG_GS;
             continue;
         }
         if (opcode >= 0x40 && opcode <= 0x4f) {
@@ -6652,7 +7488,7 @@ static bool amd64_try_emulate_sse2_packed_integer(guest_addr_t ip, struct cpu_st
         if (!amd64_trap_decode_modrm(&decode_ip, rex, &modrm))
             return false;
         union xmm_reg src;
-        if (!amd64_trap_read_xmm_rm(cpu, &modrm, fs_prefix, decode_ip, &src))
+        if (!amd64_trap_read_xmm_rm(cpu, &modrm, seg_prefix, decode_ip, &src))
             return false;
         union xmm_reg *dst = &cpu->xmm[modrm.reg & 0xf];
         switch (opcode) {
@@ -6677,14 +7513,14 @@ static bool amd64_try_emulate_sse2_packed_integer(guest_addr_t ip, struct cpu_st
             return false; // mm[] has 8 entries; reject an invalid MMX encoding (-> #UD)
         union mm_reg src_mm;
         if (modrm.is_reg) {
-            src_mm = cpu->mm[modrm.rm & 7];
+            src_mm = CPU_MMX(cpu, modrm.rm & 7);
         } else {
             qword_t v;
-            if (!amd64_trap_read_rm(cpu, &modrm, fs_prefix, decode_ip, 64, &v))
+            if (!amd64_trap_read_rm(cpu, &modrm, seg_prefix, decode_ip, 64, &v))
                 return false;
             src_mm.qw = v;
         }
-        vec_madd_d64(NULL, &src_mm, &cpu->mm[modrm.reg & 7]);
+        vec_madd_d64(NULL, &src_mm, &CPU_MMX(cpu, modrm.reg & 7));
     }
 
     cpu->amd64_rip = decode_ip;
@@ -6695,7 +7531,7 @@ static bool amd64_try_emulate_sse2_packed_integer(guest_addr_t ip, struct cpu_st
 static bool amd64_try_emulate_add(guest_addr_t ip, struct cpu_state *cpu) {
     struct amd64_trap_rex_prefix rex = {};
     bool operand_size_prefix = false;
-    bool fs_prefix = false;
+    enum amd64_seg seg_prefix = AMD64_SEG_NONE;
     byte_t opcode;
     guest_addr_t decode_ip = ip;
 
@@ -6713,7 +7549,11 @@ static bool amd64_try_emulate_add(guest_addr_t ip, struct cpu_state *cpu) {
             continue;
         }
         if (opcode == 0x64) {
-            fs_prefix = true;
+            seg_prefix = AMD64_SEG_FS;
+            continue;
+        }
+        if (opcode == 0x65) {
+            seg_prefix = AMD64_SEG_GS;
             continue;
         }
         if (opcode >= 0x40 && opcode <= 0x4f) {
@@ -6736,11 +7576,11 @@ static bool amd64_try_emulate_add(guest_addr_t ip, struct cpu_state *cpu) {
         return false;
 
     qword_t lhs, rhs, result;
-    if (!amd64_trap_read_rm(cpu, &modrm, fs_prefix, decode_ip, op_size, &lhs))
+    if (!amd64_trap_read_rm(cpu, &modrm, seg_prefix, decode_ip, op_size, &lhs))
         return false;
     rhs = amd64_trap_reg_get(cpu, modrm.reg, op_size);
     result = amd64_trap_trunc(lhs + rhs, op_size);
-    if (!amd64_trap_write_rm(cpu, &modrm, fs_prefix, decode_ip, op_size, result))
+    if (!amd64_trap_write_rm(cpu, &modrm, seg_prefix, decode_ip, op_size, result))
         return false;
 
     amd64_trap_set_add_flags(cpu, lhs, rhs, result, op_size);
@@ -6764,29 +7604,35 @@ void handle_illegal_instruction_interrupt(struct cpu_state *cpu) {
             return;
     }
 
-    printk("ERROR: %d(%s) [%s] illegal instruction at %#llx: ",
-           current->pid, current->comm, guest_abi_desc(current->abi).name, (unsigned long long) ip);
-    for (int i = 0; i < 8; i++) {
-        uint8_t b;
-        if (user_get(ip + i, b))
-            break;
-        printk("%02x ", b);
-    }
-    printk("\n");
-    dump_opcode_window(ip);
-    if (current->abi == GUEST_ABI_AMD64) {
-        dump_amd64_regs(cpu);
-        dump_amd64_cc1_trace(cpu);
-        dump_amd64_cc1_jit_trace(cpu);
-        if (amd64_verbose_fault_trace_enabled()) {
-            dump_amd64_loader_state(cpu);
-            dump_amd64_store_trace(cpu);
+    if (guest_fault_reported(SIGILL_)) {
+        printk("ERROR: %d(%s) [%s] illegal instruction at %#llx: ",
+               current->pid, current->comm, guest_abi_desc(current->abi).name, (unsigned long long) ip);
+        for (int i = 0; i < 8; i++) {
+            uint8_t b;
+            if (user_get(ip + i, b))
+                break;
+            printk("%02x ", b);
         }
+        printk("\n");
+        dump_opcode_window(ip);
+        if (current->abi == GUEST_ABI_AMD64) {
+            dump_amd64_regs(cpu);
+            dump_amd64_cc1_trace(cpu);
+            dump_amd64_cc1_jit_trace(cpu);
+            if (amd64_verbose_fault_trace_enabled()) {
+                dump_amd64_loader_state(cpu);
+                dump_amd64_store_trace(cpu);
+            }
+        }
+        record_guest_fault_event("illegal-instruction", cpu, current_fault_ip(cpu), false);
+        dump_stack(8);
     }
-    record_guest_fault_event("illegal-instruction", cpu, current_fault_ip(cpu), false);
-    dump_stack(8);
+    // x86 Linux reports #UD as ILL_ILLOPN (handle_invalid_op), for 32- and
+    // 64-bit tasks alike; arm64 and riscv64 report an undefined instruction as
+    // ILL_ILLOPC.
     struct siginfo_ info = {
-        .code = ILL_ILLOPC_,
+        .code = current->abi == GUEST_ABI_AMD64 || current->abi == GUEST_ABI_I386 ?
+            ILL_ILLOPN_ : ILL_ILLOPC_,
         .fault.addr = current_fault_ip(cpu),
     };
     deliver_signal(current, SIGILL_, info);
@@ -6799,11 +7645,13 @@ static void handle_bus_interrupt(struct cpu_state *cpu) {
     // guest page is validly mapped in iSH's page table, so there is nothing for
     // mem_ptr_fault to resolve -- deliver a guest SIGBUS directly, matching
     // Linux (accessing a truncated page of a file mapping => SIGBUS/BUS_ADRERR).
-    printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (file-backed mmap truncated)\n",
-           current->pid, current->comm, guest_abi_desc(current->abi).name,
-           (unsigned long long) cpu->segfault_addr,
-           (unsigned long long) current_fault_ip(cpu));
-    record_guest_fault_event("bus-error", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    if (guest_fault_reported(SIGBUS_)) {
+        printk("ERROR: %d(%s) [%s] SIGBUS on %#llx at %#llx (file-backed mmap truncated)\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name,
+               (unsigned long long) cpu->segfault_addr,
+               (unsigned long long) current_fault_ip(cpu));
+        record_guest_fault_event("bus-error", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    }
     struct siginfo_ info = {
         .code = BUS_ADRERR_,
         .fault.addr = cpu->segfault_addr,
@@ -6811,10 +7659,32 @@ static void handle_bus_interrupt(struct cpu_state *cpu) {
     deliver_signal(current, SIGBUS_, info);
 }
 
+// A misaligned atomic (INT_ALIGN): Linux's alignment fault, SIGBUS with
+// BUS_ADRALN at the address.
+static void handle_alignment_interrupt(struct cpu_state *cpu) {
+    if (guest_fault_reported(SIGBUS_)) {
+        printk("ERROR: %d(%s) [%s] alignment fault on %#llx at %#llx\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name,
+               (unsigned long long) cpu->segfault_addr,
+               (unsigned long long) current_fault_ip(cpu));
+        record_guest_fault_event("alignment", cpu, cpu->segfault_addr, cpu->segfault_was_write);
+    }
+    struct siginfo_ info = {
+        .code = BUS_ADRALN_,
+        .fault.addr = cpu->segfault_addr,
+    };
+    deliver_signal(current, SIGBUS_, info);
+}
+
 static void handle_arithmetic_interrupt(struct cpu_state *cpu) {
-    printk("ERROR: %d(%s) [%s] arithmetic fault at 0x%x\n",
-           current->pid, current->comm, guest_abi_desc(current->abi).name, cpu->eip);
-    dump_stack(8);
+    if (guest_fault_reported(SIGFPE_)) {
+        printk("ERROR: %d(%s) [%s] arithmetic fault at 0x%x\n",
+               current->pid, current->comm, guest_abi_desc(current->abi).name, cpu->eip);
+        dump_stack(8);
+    }
+    // #DE is vector 0: the frame's REG_TRAPNO, which was whatever trap came
+    // before it.
+    cpu->trapno = INT_DIV;
     struct siginfo_ info = {
         .code = FPE_INTDIV_,
         .fault.addr = current_fault_ip(cpu),
@@ -6822,9 +7692,47 @@ static void handle_arithmetic_interrupt(struct cpu_state *cpu) {
     deliver_signal(current, SIGFPE_, info);
 }
 
+// #MF (math_error -> fpu__exception_code): the first of swd & ~cwd's IE
+// (the stack faults too), ZE, OE, DE or UE, and PE, as SIGFPE at the waiting
+// instruction, trap 16, error 0. Nothing unmasked is a spurious #MF, and
+// Linux sends nothing for it.
+static void handle_x87_math_interrupt(struct cpu_state *cpu) {
+    unsigned err = cpu->fsw & ~cpu->fcw;
+    int code;
+    if (err & 0x001)
+        code = FPE_FLTINV_;
+    else if (err & 0x004)
+        code = FPE_FLTDIV_;
+    else if (err & 0x008)
+        code = FPE_FLTOVF_;
+    else if (err & 0x012)
+        code = FPE_FLTUND_;
+    else if (err & 0x020)
+        code = FPE_FLTRES_;
+    else
+        return;
+    cpu->trapno = INT_MF;
+    deliver_signal(current, SIGFPE_, (struct siginfo_) {
+        .code = code,
+        .fault.addr = current_fault_ip(cpu),
+    });
+}
+
 static void handle_privileged_instruction_interrupt(struct cpu_state *cpu) {
     cpu->trapno = INT_GPF;
-    handle_general_protection_interrupt(cpu);
+    handle_general_protection_interrupt(cpu, 0);
+}
+
+// `int $4` (CD 04), whose gate user mode may use: #OF, a trap. Linux sends
+// SIGSEGV with force_sig -- si_code SI_KERNEL, no address -- REG_TRAPNO 4
+// and REG_ERR 0, reported after the instruction (camd, -m32 and -m64). It
+// used to reach the unhandled-interrupt exit.
+static void handle_overflow_interrupt(struct cpu_state *cpu) {
+    cpu->trapno = INT_OVERFLOW;
+    deliver_signal(current, SIGSEGV_, (struct siginfo_) {
+        .sig = SIGSEGV_,
+        .code = SI_KERNEL_,
+    });
 }
 
 void handle_timer_interrupt(__attribute__((unused)) struct cpu_state *cpu) {
@@ -6846,6 +7754,19 @@ __thread uint64_t guest_syscall_seq;
 
 void handle_interrupt(int interrupt) {
     struct cpu_state *cpu = &current->cpu;
+
+    // On this task's own thread, with no address-space lock held: the one
+    // context in which the profiler can read this task's mappings safely.
+    if (unlikely(guestprof_on))
+        guestprof_maps_checkpoint();
+
+    // A #GP whose error code is not 0 (emu/interrupt.h): keep the code for
+    // the signal frame; the rest is the same #GP.
+    word_t gp_error_code = 0;
+    if (INT_IS_GPF_CODE(interrupt)) {
+        gp_error_code = (word_t) interrupt;
+        interrupt = INT_GPF;
+    }
 
     switch (interrupt) {
         case INT_SYSCALL:
@@ -6875,16 +7796,28 @@ void handle_interrupt(int interrupt) {
             handle_page_fault_interrupt(cpu);
             break;
         case INT_GPF:
-            handle_general_protection_interrupt(cpu);
+            handle_general_protection_interrupt(cpu, gp_error_code);
+            break;
+        case INT_OVERFLOW:
+            handle_overflow_interrupt(cpu);
             break;
         case INT_BUS:
             handle_bus_interrupt(cpu);
+            break;
+        case INT_ALIGN:
+            handle_alignment_interrupt(cpu);
+            break;
+        case INT_PF_EXEC:
+            handle_exec_fault_interrupt(cpu);
             break;
         case INT_UNDEFINED:
             handle_illegal_instruction_interrupt(cpu);
             break;
         case INT_DIV:
             handle_arithmetic_interrupt(cpu);
+            break;
+        case INT_MF:
+            handle_x87_math_interrupt(cpu);
             break;
         case INT_PRIV:
             handle_privileged_instruction_interrupt(cpu);
@@ -6897,11 +7830,40 @@ void handle_interrupt(int interrupt) {
             // and kill rather than leave it pending while the brk
             // re-executes forever. send_signal is the kill()-style path
             // without that semantic.
-            deliver_signal(current, SIGTRAP_, (struct siginfo_) {
-                .sig = SIGTRAP_,
-                .code = TRAP_BRKPT_,
-                .fault.addr = current_fault_ip(cpu),
-            });
+            //
+            // The siginfo is ARCHITECTURE-DEPENDENT, and getting it wrong made
+            // gdb unusable on the x86 guests (GH #503).
+            //
+            // x86: exc_int3 calls do_trap with sicode 0, and do_trap's
+            // `if (!sicode) force_sig(signr)` produces a BARE signal -- si_code
+            // SI_KERNEL, si_addr zero. gdb's linux-nat save_stop_reason only
+            // calls a SIGTRAP its own software breakpoint when si_code says so,
+            // and only then rewinds the PC by one and restores the original
+            // instruction byte. With TRAP_BRKPT instead it treats the stop as a
+            // "random signal", leaves the PC one byte past the int3, and
+            // resumes into the middle of the clobbered instruction -- which is
+            // where the SIGILL and SIGSEGV in that report came from.
+            //
+            // arm64's BRK (brk_handler -> send_user_sigtrap) and riscv64's
+            // EBREAK (do_trap_break) DO use force_sig_fault, so they keep
+            // TRAP_BRKPT and the faulting PC. Same interrupt, different answer.
+            //
+            // MEASURED on Linux 6.12/x86_64, both -m32 and -m64:
+            //     si_signo=5 si_code=128 si_addr=(nil)
+            {
+                bool x86_guest = current->abi == GUEST_ABI_I386 ||
+                                 current->abi == GUEST_ABI_AMD64;
+                deliver_signal(current, SIGTRAP_, x86_guest ?
+                    (struct siginfo_) {
+                        .sig = SIGTRAP_,
+                        .code = SI_KERNEL_,
+                    } :
+                    (struct siginfo_) {
+                        .sig = SIGTRAP_,
+                        .code = TRAP_BRKPT_,
+                        .fault.addr = current_fault_ip(cpu),
+                    });
+            }
             break;
         case INT_DEBUG:
             deliver_signal(current, SIGTRAP_, (struct siginfo_) {
@@ -6918,14 +7880,24 @@ void handle_interrupt(int interrupt) {
             sys_exit(interrupt);
             break;
     }
+    // A PTRACE_EVENT_STOP the tracer is owed -- PTRACE_INTERRUPT's -- is taken
+    // before any signal, as Linux's get_signal takes JOBCTL_TRAP_STOP, and
+    // whatever the mask. A lockless look when nothing is owed.
+    ptrace_trap_stop_if_pending();
     // Host-side wakeups (for example thread pokes or interrupted waits) often
     // arrive with no guest-visible pending signal work. Avoid serializing all
     // runnable threads on sighand->lock in that common case.
+    //
+    // The process's shared queue is looked at only by a thread told to take
+    // it, and such a thread always goes through receive_signals, which stops
+    // it looking once nothing there is its to take. So does one with a
+    // process signal to hand on (signal_group_handoff).
     sigset_t_ pending = __atomic_load_n(&current->pending, __ATOMIC_ACQUIRE);
-    sigset_t_ group_pending = __atomic_load_n(&current->sighand->pending, __ATOMIC_ACQUIRE);
+    bool group_told = __atomic_load_n(&current->group_sigpending, __ATOMIC_ACQUIRE);
     sigset_t_ blocked = __atomic_load_n(&current->blocked, __ATOMIC_ACQUIRE);
     bool has_saved_mask = __atomic_load_n(&current->has_saved_mask, __ATOMIC_ACQUIRE);
-    if (has_saved_mask || ((pending | group_pending) & ~blocked) != 0)
+    if (has_saved_mask || group_told || current->group_handoff != 0 ||
+            (pending & ~blocked) != 0)
         receive_signals();
     // A job-control group-stop parks the task until SIGCONT (or, for a traced
     // task, until the tracer resumes it). Shared with native_checkpoint --
@@ -6933,6 +7905,12 @@ void handle_interrupt(int interrupt) {
     // handling and the second copy this used to be lacked all of the ptrace
     // half of it.
     group_stop_wait();
+    // An interrupt sent while a stop above held the task is owed from the
+    // moment that stop ends, as Linux's get_signal loops back to look again.
+    ptrace_trap_stop_if_pending();
+    // RDTSCP's and RDPID's IA32_TSC_AUX: getcpu's CPU number, which only a
+    // syscall can have changed (emu/cpu.h).
+    current->cpu.tsc_aux = (dword_t) task_current_cpu(current);
 }
 
 

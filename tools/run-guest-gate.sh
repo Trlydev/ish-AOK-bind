@@ -13,6 +13,17 @@
 # were all broken for glibc programs and green on every Alpine root. A fifth
 # leg on build/devuan-arm64-test costs one more suite run and closes it.
 #
+# The SIXTH leg, build/devuan-amd64-test, is the lesson of that fix being
+# half a fix. One glibc leg is one glibc leg on ONE guest architecture, and
+# libc choice interacts with the execution engine: each guest has its own JIT
+# frontend, so a glibc-only defect in the amd64 engine is invisible to a
+# devuan-arm64 leg and an amd64-only defect is invisible to every Alpine leg.
+# jit_writer_starvation was exactly that shape -- the amd64 frontend never
+# checked jit->write_wanted, so a compute-bound thread held jetsam_lock for
+# read across millions of blocks, and only glibc's pthread_create asked for
+# the write lock often enough to show it. It failed 8/8 on this leg while the
+# five-leg gate was green.
+#
 # Usage:
 #   tools/run-guest-gate.sh                 # every local root found, then e2e
 #   tools/run-guest-gate.sh --no-e2e        # skip the end-to-end suite
@@ -20,6 +31,13 @@
 #   tools/run-guest-gate.sh --parallel      # run the local legs at once
 #   tools/run-guest-gate.sh --unpriv        # add an UNPRIVILEGED leg (see below)
 #   tools/run-guest-gate.sh --device m4pt   # also run it on a device over ssh
+#   tools/run-guest-gate.sh --only native   # just the native-mode leg
+#
+# The native leg (native mode, docs/native_mode_plan.md) runs in a root built
+# from NOTHING each time -- no distribution at all, only what the kernel
+# provisions -- so it needs no build/*-test root and always runs. It boots
+# that root several times, because what it checks includes what a boot does:
+# the provisioning, then SmallCLUE's init as pid 1 with /etc/rc and runit.
 #
 # --unpriv adds one leg that runs the suite as an ordinary user instead of
 # root. Every other leg runs the CLI as uid 0, where a parent directory is
@@ -33,9 +51,9 @@
 # leg is the belt to that pair of braces: it also catches a test that FAILS
 # rather than skips when it cannot have privilege.
 #
-# --parallel runs the five local legs concurrently instead of one after
-# another: roughly 45 minutes rather than three hours on an 8-core Mac, and the
-# way this project has run multi-arch sweeps historically. The cost is load, and
+# --parallel runs the six local legs concurrently instead of one after
+# another: roughly 45 minutes rather than three and a half hours on an 8-core
+# Mac, and the way this project has run multi-arch sweeps historically. The cost is load, and
 # load makes the timing-sensitive tests flake -- so treat a failure under
 # --parallel as a question, not an answer, and re-run that leg on a quiet
 # machine before believing it.
@@ -93,6 +111,31 @@ leg_run() {
     echo $? > "$LOGDIR/$1.rc"
 }
 
+# A run of just the tests that need the emulator started a particular way.
+#
+# Eight tests used to skip in EVERY gate run, and all eight for the same reason:
+# the feature each covers is opt-in, and the gate started the emulator without
+# it. That is not a skip to tolerate -- it is the gate quietly declining to test
+# swap, compressed memory, the crypto and pixman accelerators, the memory guard
+# and cross-device rename, while reporting a clean sweep. A skip is an untested
+# claim wearing a pass's clothes.
+#
+# They cannot share one environment. swap_roundtrip needs a swap FILE and
+# zram_idle_reclaim needs there to be none, and both knobs are read once when
+# the emulator boots -- so a per-test env inside the runner could not work even
+# in principle. Each configuration is its own short run of only the tests it
+# makes runnable.
+# NOTE the variable names. POSIX sh functions have no locals, so `name=$1` here
+# would clobber the `name` its caller is still using -- which it did, turning
+# config-zram into config-config-zram and reading a log that does not exist.
+leg_run_config() {
+    _cfg_log=$1; _cfg_root=$2; _cfg_only=$3; shift 3
+    env "$@" "$ISH" -f "$_cfg_root" /bin/sh -c \
+        "/AOK/tests/setup-regressions.sh --run --only $_cfg_only 2>&1" \
+        > "$LOGDIR/$_cfg_log.log" 2>&1
+    echo $? > "$LOGDIR/$_cfg_log.rc"
+}
+
 # Score a finished leg from its log. Separated from leg_run so it is identical
 # whether the leg ran alone or alongside four others.
 leg_report() {
@@ -104,7 +147,11 @@ leg_report() {
     p=$(grep -cE '^[a-z0-9_]+: PASS$' "$log")
     f=$(grep -cE '^[a-z0-9_]+: FAIL' "$log")
     s=$(grep -cE ': SKIP' "$log")
-    if [ "$p" -eq 0 ] && [ "$f" -eq 0 ]; then
+    # A leg with no passes AND no failures never really ran -- but only if it
+    # had no SKIPS either. A pass whose one test skipped did run; calling that
+    # a build failure both misnames it and counts one problem twice, since the
+    # no-skips check below already reports it.
+    if [ "$p" -eq 0 ] && [ "$f" -eq 0 ] && [ "$s" -eq 0 ]; then
         echo "  $name: NOTHING RAN (rc=$rc) -- almost certainly a build failure:"
         grep -E 'error:' "$log" | head -3
         f=1
@@ -164,6 +211,62 @@ leg_run_unpriv() {
     echo $? > "$LOGDIR/$1.rc"
 }
 
+# The native-mode leg: a fresh root, provisioned by the kernel
+# (ISH_NATIVE_ROOT=1), checked by tests/manual/native_mode.sh in its phases, and
+# then the native shell suites, which have nothing else to run on there. The
+# init boot is the one step that can hang -- init only returns when told to --
+# so it is given two minutes before it is killed and reported.
+leg_run_native() {
+    _nroot=$LOGDIR/native-root
+    rm -rf "$_nroot"
+    tar -cf "$LOGDIR/empty.tar" -T /dev/null
+    {
+        if ! "$REPO/build/tools/fakefsify" "$LOGDIR/empty.tar" "$_nroot"; then
+            echo "native_mode_root: FAIL fakefsify"
+        else
+            ISH_NATIVE_ROOT=1 ISH_NATIVE_USER=tester "$ISH" -f "$_nroot" \
+                /bin/sh /AOK/tests/native_mode.sh --setup-reprovision
+            ISH_NATIVE_ROOT=1 "$ISH" -f "$_nroot" /bin/sh /AOK/tests/native_mode.sh
+            # Programs from another root: needs a glibc root to borrow from.
+            if [ -d "$REPO/build/devuan-arm64-test" ]; then
+                ISH_FAKE_MNT2="$REPO/build/devuan-arm64-test" ISH_NATIVE_ROOT=1 \
+                    "$ISH" -f "$_nroot" /bin/sh /AOK/tests/native_mode.sh --foreign-exec
+            fi
+            ISH_NATIVE_ROOT=1 "$ISH" -f "$_nroot" /bin/sh /AOK/tests/native_mode.sh --install-init
+            ISH_NATIVE_ROOT=1 "$ISH" -f "$_nroot" /sbin/init > /dev/null 2>&1 &
+            _ipid=$!
+            _waited=0
+            while kill -0 "$_ipid" 2>/dev/null && [ "$_waited" -lt 120 ]; do
+                sleep 1
+                _waited=$((_waited + 1))
+            done
+            if kill -0 "$_ipid" 2>/dev/null; then
+                kill -9 "$_ipid" 2>/dev/null
+                echo "native_mode_poweroff: FAIL init still running after 120 s"
+            else
+                echo "native_mode_poweroff: PASS"
+            fi
+            wait "$_ipid" 2>/dev/null
+            ISH_NATIVE_ROOT=1 "$ISH" -f "$_nroot" /bin/sh -c 'cat /tmp/native_mode_init.log'
+            # login records a session only on a terminal, so this one runs
+            # under script(1), which gives the guest a pty. Matched anywhere in
+            # the line: zsh's prompt marks (OSC 133) precede the first result.
+            printf 'sh /AOK/tests/native_mode.sh --login-tty\nexit\n' |
+                script -q /dev/null env ISH_NATIVE_ROOT=1 "$ISH" -f "$_nroot" /bin/login -f tester |
+                tr -d '\r' | grep -o 'native_mode_[a-z_]*: [A-Z].*'
+            for _t in native_zsh_fork_state native_stdio_redirect; do
+                if ISH_NATIVE_ROOT=1 "$ISH" -f "$_nroot" /bin/sh "/AOK/tests/$_t.sh" \
+                        > "$LOGDIR/native-$_t.out" 2>&1; then
+                    echo "$_t: PASS"
+                else
+                    echo "$_t: FAIL (see $LOGDIR/native-$_t.out)"
+                fi
+            done
+        fi
+    } > "$LOGDIR/native.log" 2>&1
+    echo 0 > "$LOGDIR/native.rc"
+}
+
 # One leg, start to finish, the way it has always worked.
 run_leg() {
     leg_wanted "$1" "$2" || return 0
@@ -175,7 +278,7 @@ run_leg() {
 echo "logs: $LOGDIR"
 echo
 
-LEG_NAMES="arm64 i386 amd64 riscv64 devuan-arm64"
+LEG_NAMES="arm64 i386 amd64 riscv64 devuan-arm64 devuan-amd64"
 leg_root() {
     case "$1" in
         arm64)        echo "$REPO/build/alpine-arm64-test" ;;
@@ -183,6 +286,7 @@ leg_root() {
         amd64)        echo "$REPO/build/alpine-amd64-test" ;;
         riscv64)      echo "$REPO/build/alpine-riscv64-test" ;;
         devuan-arm64) echo "$REPO/build/devuan-arm64-test" ;;
+        devuan-amd64) echo "$REPO/build/devuan-amd64-test" ;;
     esac
 }
 
@@ -214,6 +318,58 @@ run_leg riscv64 "$REPO/build/alpine-riscv64-test"
 #       'apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev'
 run_leg devuan-arm64 "$REPO/build/devuan-arm64-test"
 
+# ...and glibc on the OTHER guest architecture that has its own JIT frontend.
+# See the header: the amd64 engine's jetsam starvation was reachable only from
+# this combination, and neither the Alpine amd64 leg nor the glibc arm64 leg
+# could see it. Same toolchain requirement as the leg above.
+run_leg devuan-amd64 "$REPO/build/devuan-amd64-test"
+
+fi
+
+# ---- configuration passes ---------------------------------------------------
+#
+# Run on one root only: every feature here is kernel-level and architecture
+# independent, so a second architecture would re-run the same code paths for no
+# extra coverage and a lot of extra minutes. The glibc root is the one chosen,
+# for the same reason the unprivileged leg uses it.
+#
+# The memory budget is pinned rather than inherited. On a Mac the CLI's budget
+# is whatever the host has, which makes "is the guard engaged" and "is there
+# room to go cold" depend on what else is running; the compression tests need a
+# known headroom to sit in, and mem_guard_small_growth needs the guard armed at
+# all.
+config_root=$REPO/build/devuan-arm64-test
+[ -d "$config_root" ] || config_root=$REPO/build/alpine-arm64-test
+config_mnt2=$REPO/build/alpine-i386-test
+
+run_config() {
+    _rc_name=$1; _rc_only=$2; shift 2
+    printf '########## config: %s ##########\n' "$_rc_name"
+    leg_run_config "config-$_rc_name" "$config_root" "$_rc_only" "$@"
+    leg_report "config-$_rc_name"
+}
+
+if [ -d "$config_root" ] && { [ -z "$ONLY" ] || [ "$ONLY" = config ]; }; then
+    # zram: a pool and NO file, so nothing can reach flash.
+    run_config zram zswap_roundtrip,zswap_fork_cow,zram_idle_reclaim \
+        ISH_GUEST_SWAP_MB=0 ISH_GUEST_ZSWAP_MB=128 \
+        ISH_GUEST_MEM_BUDGET_MB=1200 ISH_GUEST_MEM_HEADROOM_MB=100
+    # zswap: the compressed tier in front of a real swap file.
+    run_config zswap swap_roundtrip,zswap_roundtrip,zswap_fork_cow \
+        ISH_GUEST_SWAP_MB=256 ISH_GUEST_ZSWAP_MB=128 \
+        ISH_GUEST_MEM_BUDGET_MB=1200 ISH_GUEST_MEM_HEADROOM_MB=100
+    # The growth guard only exists when there is a budget to be near the end of.
+    run_config memguard mem_guard_small_growth \
+        ISH_GUEST_MEM_BUDGET_MB=512 ISH_GUEST_MEM_HEADROOM_MB=256
+    # A genuine second fakefs mount, so rename across devices is really across.
+    if [ -d "$config_mnt2" ]; then
+        run_config crossdev mount_cross_dev ISH_FAKE_MNT2="$config_mnt2"
+    else
+        echo "  config-crossdev: NOT RUN (no second root at $config_mnt2)"
+        fail_total=$((fail_total + 1))
+    fi
+    run_config crypto aes_gcm_accel ISH_CRYPTO_ACCEL=1
+    run_config pixman pixman_accel,pixman_shim ISH_PIX_ACCEL=1
 fi
 
 # The unprivileged leg, on the glibc root: it is the one whose /tmp and user
@@ -227,6 +383,18 @@ if [ "$UNPRIV" -eq 1 ] && [ -z "$ONLY" ]; then
         leg_report unpriv
     else
         echo "  unpriv: SKIPPED (no root to run it in)"
+    fi
+fi
+
+# Native mode: no root needed, so it runs unless another leg was asked for.
+if [ -z "$ONLY" ] || [ "$ONLY" = native ]; then
+    if [ -x "$REPO/build/tools/fakefsify" ]; then
+        printf '########## native ##########\n'
+        leg_run_native
+        leg_report native
+    else
+        echo "  native: NOT RUN (no build/tools/fakefsify -- run a bare 'ninja -C build')"
+        fail_total=$((fail_total + 1))
     fi
 fi
 
@@ -247,6 +415,19 @@ if [ -n "$DEVICE" ]; then
     echo "  device  PASS=$p FAIL=$f SKIP=$s  (rc=$rc)"
     [ "$f" -gt 0 ] && grep -E '^[a-z0-9_]+: FAIL' "$LOGDIR/device.log"
     fail_total=$((fail_total + f))
+    legs_run=$((legs_run + 1))
+fi
+
+# The gadget objects, read for a vector register held across a call that can
+# reach C (a4e9b84fc: the A10X-only memset corruption). Seconds, and no guest.
+if [ -z "$ONLY" ] && [ "$(uname -sm)" = "Darwin arm64" ]; then
+    echo
+    echo '########## gadget vector registers ##########'
+    python3 "$REPO/tools/gadget-vreg-audit.py" --self-test > "$LOGDIR/gadget-vreg.log" 2>&1 &&
+        python3 "$REPO/tools/gadget-vreg-audit.py" "$REPO/build/libish_emu.a.p" >> "$LOGDIR/gadget-vreg.log" 2>&1
+    vreg_rc=$?
+    tail -4 "$LOGDIR/gadget-vreg.log"
+    [ "$vreg_rc" -ne 0 ] && fail_total=$((fail_total + 1))
     legs_run=$((legs_run + 1))
 fi
 
@@ -274,6 +455,69 @@ if [ "$RUN_E2E" -eq 1 ] && [ -z "$ONLY" ]; then
         fail_total=$((fail_total + 1))
     fi
     legs_run=$((legs_run + 1))
+fi
+
+# ---- no test may end the run un-run -----------------------------------------
+#
+# A skip is an untested claim wearing a pass's clothes, so the gate counts one
+# as a failure.
+#
+# THE RULE IS NOT "PASSED SOMEWHERE", and the first version was, which is worth
+# recording because it looked right and had a hole. Judged that way, bcd_adjust
+# slipped through: it skipped on both amd64 legs with "BCD adjusts are invalid
+# in 64-bit mode" and passed on i386, so "passed somewhere" was satisfied while
+# the test had never run on amd64 at all. Coverage on one architecture is not
+# coverage on another.
+#
+# So a skip in an ARCHITECTURE leg is excused only by a pass in a CONFIGURATION
+# pass -- those exist precisely to enable a feature the base run leaves off, and
+# they run the same code on the same guest. A skip excused by a different
+# architecture is not excused.
+#
+# The unprivileged and device legs are deliberately reduced environments whose
+# whole point is that some tests cannot run, so their skips are not counted
+# here; the arch legs already cover those tests with privilege.
+#
+# The remedy for a name appearing below is one of two, never a third: give it an
+# environment in the configuration passes, or take it off the list for the
+# architecture where it cannot run. A test that must not run is not a test.
+if [ -z "$ONLY" ] || [ "$ONLY" = config ]; then
+    : > "$LOGDIR/.skipped"
+    for name in $LEG_NAMES; do
+        [ -f "$LOGDIR/$name.log" ] || continue
+        grep -hoE '^[a-z0-9_]+: SKIP' "$LOGDIR/$name.log" | cut -d: -f1 >> "$LOGDIR/.skipped"
+    done
+    sort -u -o "$LOGDIR/.skipped" "$LOGDIR/.skipped"
+    : > "$LOGDIR/.covered"
+    for log in "$LOGDIR"/config-*.log; do
+        [ -f "$log" ] || continue
+        grep -hoE '^[a-z0-9_]+: PASS' "$log" | cut -d: -f1 >> "$LOGDIR/.covered"
+    done
+    sort -u -o "$LOGDIR/.covered" "$LOGDIR/.covered"
+    never_ran=$(comm -23 "$LOGDIR/.skipped" "$LOGDIR/.covered")
+    if [ -n "$never_ran" ]; then
+        echo
+        echo "TESTS THAT NEVER RAN -- a skip is not a pass:"
+        for t in $never_ran; do
+            echo "  $t"
+            grep -hoE "^$t: SKIP.*" "$LOGDIR"/*.log | head -1 | sed 's/^/      /'
+            fail_total=$((fail_total + 1))
+        done
+        echo "  Either give it an environment in the configuration passes, or"
+        echo "  drop it from the list for the arch where it cannot run --"
+        echo "  a test that must not run is not a test."
+    fi
+fi
+
+if [ -n "$ONLY" ] && [ "$ONLY" != config ]; then
+    # Say so rather than let a partial run read as a clean one. The
+    # configuration passes do not run under --only <leg>, so the tests they
+    # exist to enable would all be skipping, and failing the run for that would
+    # punish the user for asking a narrower question.
+    echo
+    echo "note: --only $ONLY, so the configuration passes did not run and the"
+    echo "      \"no test may be skipped\" check was not applied. Run the full"
+    echo "      gate before believing a clean result."
 fi
 
 echo

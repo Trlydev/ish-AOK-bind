@@ -34,9 +34,10 @@ and evaluates. That work is not `memcpy`-shaped and no fingerprint will ever
 match it. Under emulation it is millions of guest instructions, each one a
 dispatch (Chapter 6).
 
-Measured: an arithmetic loop under the native bash runs roughly **16x faster**
-than under the emulated shell. Subshells and command substitutions land near
-parity, for reasons Chapter 24 is entirely about.
+Measured with bash built as a native program (`-Dnative_bash=enabled`; off by
+default since build 556, Chapter 26): an arithmetic loop runs roughly **16x
+faster** than under the emulated shell. Subshells and command substitutions
+land near parity, for reasons Chapter 24 is entirely about.
 
 There is a second benefit that gets less attention and is nearly free. From
 `kernel/native.h`:
@@ -58,21 +59,30 @@ The whole mechanism is a table:
 struct native_program {
     const char *name;      // basename under /AOK/native/
     int (*main)(int argc, char *const argv[], char *const envp[]);
+    bool setuid_root;      // runs as root however invoked, as setuid-root does
+    ...                    // and a checkpoint hook, for zsh
 };
 ```
 
-and its contents in this build:
+and its contents in 557, the last seven behind build options:
 
 ```c
-{ "smallclue", smallclue_real_main },
-{ "motepad",   native_motepad_main },
-{ "bmm",       native_bmm_main },
-{ "bmt",       native_bmt_main },
+{ "smallclue",  smallclue_real_main },
+{ "sudo",       native_sudo_main, .setuid_root = true },
+{ "su",         native_su_main, .setuid_root = true },
+{ "passwd",     native_passwd_main, .setuid_root = true },
+{ "motepad",    native_motepad_main },
+{ "ktop",       native_ktop_main },
+{ "wl-present", native_wlpresent_main },
+{ "bmm",        native_bmm_main },
+{ "bmt",        native_bmt_main },
 { "rust-probe", rust_native_probe_main },
-{ "hx",        helix_native_main },
-{ "bash",      native_bash_main },
-{ "zsh",       native_zsh_main },
-{ "zsh-multio", native_zsh_multio_main },
+{ "hx",         helix_native_main },
+{ "bash",       native_bash_main },
+{ "zsh",        native_zsh_main, ... },
+{ "zsh-multio", native_zsh_multio_main, ... },
+{ "dash",       native_dash_main },
+{ "sh",         native_dash_main },
 ```
 
 Adding a program is one entry. The dispatcher does not change, and — the detail
@@ -103,6 +113,13 @@ still `df` — so the applet dispatcher inside SmallCLUE selects `df` exactly as
 busybox does on Linux. `/AOK/tools/native-links.sh` builds the whole symlink
 farm and can undo it.
 
+A `#!` line is the other way a native program acquires a name, and it works for
+the same reason: `#!/AOK/native/zsh` at the top of a script resolves to the
+same node and dispatches to the same entry point. That took a fix — the
+question used to be asked only where a program was *typed*, not everywhere one
+is *chosen*, and a script naming native bash quietly ran under dash instead.
+Chapter 15 tells it.
+
 There is a trap in that convenience, and it has bitten more than once: those
 symlinks live in the guest root and persist. A `grep` symlinked into
 `/usr/local/bin` for a quick test stays there, and `/usr/local/bin` precedes
@@ -110,6 +127,15 @@ symlinks live in the guest root and persist. A `grep` symlinked into
 its own output then reports every test as both passing and failing, and nothing
 in the output says "your PATH is poisoned". Put throwaway links somewhere off
 `PATH`, or remove them.
+
+Since 557 `native-links.sh` does that on purpose, and the provisioning scripts
+run it: every applet is linked into `/usr/local/bin` as well, so `ssh host
+cmd`, cron and init scripts — which never read `/etc/profile.d` — get the native
+commands, and a bare `sh` is native dash. That is only defensible because the
+same cycle made SmallCLUE's shadowing applets (`sed`, `grep`, `find`, `ls`,
+`tar`, `diff` and the rest) GNU-compatible and its `awk` mawk-compatible,
+checked against the originals' own output: with the links in place, a
+package's maintainer scripts run them too.
 
 ## 22.4 Why the handoff is a two-step
 

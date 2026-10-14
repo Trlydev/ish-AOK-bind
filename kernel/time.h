@@ -19,6 +19,7 @@ dword_t sys_clock_nanosleep_time64(dword_t clock_id, int_t flags, addr_t req_add
 dword_t sys_clock_nanosleep_time64_guest(dword_t clock_id, int_t flags, guest_addr_t req_addr, guest_addr_t rem_addr);
 dword_t sys_clock_gettime64(dword_t clock, addr_t tp);
 dword_t sys_clock_gettime64_guest(dword_t clock, guest_addr_t tp);
+dword_t sys_clock_settime_guest(dword_t clock, guest_addr_t tp);
 dword_t sys_clock_settime64(dword_t clock, addr_t tp);
 dword_t sys_clock_adjtime(dword_t clock, addr_t tx);
 dword_t sys_clock_adjtime64(dword_t clock, addr_t tx);
@@ -48,6 +49,12 @@ dword_t sys_clock_gettime(dword_t clock, addr_t tp);
 dword_t sys_clock_gettime_guest(dword_t clock, guest_addr_t tp);
 dword_t sys_clock_gettime_amd64(dword_t clock, addr_t tp);
 dword_t sys_clock_gettime_amd64_guest(dword_t clock, guest_addr_t tp);
+// What the vDSO's clock read returns (AOK_VCLOCK in vdso/<arch>/vdso.S): the
+// reading clock_gettime(2) would give for `clock` right now, in nanoseconds,
+// or -1 for a clock the vDSO has to leave to the system call -- a CPU-time
+// clock, an id Linux does not have, a reading before the epoch. Called from
+// the JIT, on the guest's own thread, with nothing locked.
+int64_t vdso_clock_ns(uint32_t clock);
 dword_t sys_clock_settime(dword_t clock, addr_t tp);
 dword_t sys_clock_getres(dword_t clock, addr_t res_addr);
 dword_t sys_clock_getres_guest(dword_t clock, guest_addr_t res_addr);
@@ -78,6 +85,13 @@ struct timespec64_ {
     int64_t sec;
     int64_t nsec;
 };
+// The tv_nsec of a struct timespec64_ read from the guest. For a 32-bit guest
+// (i386's *_time64 calls) it is a 32-bit long followed by 4 bytes of padding
+// that musl and glibc never fill, so only the low half counts -- Linux's
+// get_timespec64 masks it under in_compat_syscall(). Reading all 64 bits made
+// stack garbage in the padding an EINVAL: futex_time64 rejected FUTEX_WAIT_BITSET
+// deadlines on the device, where that word happened not to be zero.
+int64_t timespec64_nsec_from_guest(int64_t nsec);
 struct timezone_ {
     dword_t minuteswest;
     dword_t dsttime;

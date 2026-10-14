@@ -77,9 +77,19 @@ function scheduleViewportRefresh() {
         pendingViewportRefresh = false;
         if (!term.scrollPort_)
             return;
-        term.scrollPort_.scheduleInvalidate();
+        // Not while text is selected. invalidate() throws away every row node
+        // on screen and draws new ones, so the selection is left pointing at
+        // detached nodes: hterm then cannot find the rows it starts and ends
+        // on, and it also stops keeping an off-screen end row alive. Any output
+        // during a selection -- a prompt, a clock, tmux's status line -- cut
+        // what Copy copied down to what was on screen, or to nothing (#617).
+        // hterm's own redraw keeps the selection's rows, so it alone runs
+        // until the selection is gone; htop's stale cells can wait that long.
+        if (liveSelection() == null)
+            term.scrollPort_.scheduleInvalidate();
         term.scrollPort_.scheduleRedraw();
         syncScroll();
+        layoutComposition();
     });
 }
 exports.write = (data) => {
@@ -97,8 +107,103 @@ term.io.sendString = term.io.onVTKeyStroke = (data) => {
     native.sendInput(data);
 };
 
+// IME composition: the pinyin (or kana, or jamo) being typed before a
+// candidate is chosen. It belongs to the keyboard, not the guest, so it is
+// never written into hterm's screen: it is drawn in a node of its own laid over
+// the cursor, and only the committed text reaches the pty (native sends it).
+// Native also needs to know where the cursor is on screen, so that a hardware
+// keyboard's candidate window can sit next to it rather than in the top-left
+// corner -- the node stays in place at the cursor while hidden, and its cell is
+// reported to native whenever it moves.
+const screenDoc = term.scrollPort_.getDocument();
+const imeNode = screenDoc.createElement('div');
+imeNode.id = 'aok-ime-composition';
+imeNode.style.cssText = `
+position: absolute;
+left: calc(var(--hterm-screen-padding-size) +
+    var(--hterm-charsize-width) * var(--hterm-ime-col, 0));
+top: calc(var(--hterm-screen-padding-size) +
+    var(--hterm-charsize-height) * var(--hterm-cursor-offset-row, 0));
+min-width: var(--hterm-charsize-width);
+height: var(--hterm-charsize-height);
+line-height: var(--hterm-charsize-height);
+white-space: pre;
+visibility: hidden;
+pointer-events: none;
+z-index: 1;
+color: rgb(var(--hterm-foreground-color));
+background-color: rgb(var(--hterm-background-color));
+box-shadow: inset 0 -2px 0 rgb(var(--hterm-foreground-color));`;
+term.scrollPort_.screen_.appendChild(imeNode);
+let imeText = '';
+let lastImeRect = '';
+function layoutComposition() {
+    // Columns as hterm will lay the text out once it is committed and echoed:
+    // a wide character in a .wc-node, two cells, exactly as hterm draws it.
+    const width = imeText ? lib.wc.strWidth(imeText) : 0;
+    const cols = term.screenSize.width;
+    let col = term.screen_.cursorPosition.column;
+    // Near the right edge, slide left so the whole composition stays visible.
+    if (col + width > cols)
+        col = Math.max(0, cols - width);
+    term.setCssVar('ime-col', col);
+    const frame = term.scrollPort_.iframe_.getBoundingClientRect();
+    const r = imeNode.getBoundingClientRect();
+    const cs = term.scrollPort_.characterSize;
+    // Where the composition starts, as one cell, in web view coordinates.
+    const rect = [frame.left + r.left, frame.top + r.top, cs.width, cs.height];
+    const key = rect.join(',');
+    // The handler exists only while a TerminalView shows this terminal, which
+    // asks again (exports.layoutComposition) when it installs it.
+    if (!window.webkit.messageHandlers.imeRect) {
+        lastImeRect = '';
+        return;
+    }
+    if (key !== lastImeRect) {
+        lastImeRect = key;
+        native.imeRect(rect);
+    }
+}
+exports.layoutComposition = () => {
+    lastImeRect = '';
+    layoutComposition();
+};
+exports.setComposition = (text) => {
+    imeText = text || '';
+    imeNode.textContent = '';
+    for (const ch of imeText) {
+        if (lib.wc.charWidth(ch.codePointAt(0)) == 2) {
+            const span = screenDoc.createElement('span');
+            span.className = 'wc-node';
+            span.textContent = ch;
+            imeNode.appendChild(span);
+        } else {
+            imeNode.appendChild(screenDoc.createTextNode(ch));
+        }
+    }
+    imeNode.style.visibility = imeText ? 'visible' : 'hidden';
+    layoutComposition();
+};
+
 // hterm size updates native size
-term.io.onTerminalResize = () => native.resize();
+term.io.onTerminalResize = () => {
+    native.resize();
+    requestAnimationFrame(layoutComposition);
+};
+
+// Re-measure against the webview's CURRENT size, whether or not a resize event
+// arrived. hterm learns its size from exactly one place -- a 'resize' listener on
+// the iframe's window (hterm.ScrollPort.paintIframeContents_) -- and a web content
+// process that was suspended while the view was re-laid out, or one the system
+// reclaimed and we rebuilt, can simply never see that event. The scrollport then
+// keeps the geometry of the OLD bounds, so its last rows are drawn below the
+// terminal's real bottom edge, under the extra-keys row, and the view scrolls as
+// if it were still that tall. Returns the size it settled on, so the caller can
+// see it took.
+exports.resync = () => {
+    term.scrollPort_.resize();
+    return [term.screenSize.width, term.screenSize.height];
+};
 exports.getSize = () => [term.screenSize.width, term.screenSize.height];
 
 // selection, copying
@@ -114,10 +219,61 @@ term.scrollPort_.screen_.addEventListener('blur', (e) => {
         e.stopImmediatePropagation();
     }
 }, {capture: true});
+// A tap or click on the terminal gives it keyboard focus back: native.focus() is what makes the
+// TerminalView first responder again, and on a click nothing else does.
+//
+// The exception is a press ON a selection. That belongs to the selection view -- it is how a
+// selection is adjusted and how its menu comes up -- and taking first responder away from the
+// web view would dismiss both.
+//
+// Ask the document the rows are actually in. hterm draws them inside an <iframe>, so the
+// terminal's selection is that document's. This used to ask the top-level document, which
+// never holds terminal text but can hold a caret: a trackpad click can leave one there. From
+// then on its rangeCount was never 0 again, every click and tap returned early, and no click
+// could give the terminal keyboard focus back (#579). A collapsed range is only a caret, so it
+// does not count as a selection either.
+const screenDocument = term.scrollPort_.getDocument();
+function liveSelection() {
+    const selection = screenDocument.getSelection();
+    if (selection == null || selection.rangeCount == 0 || selection.isCollapsed)
+        return null;
+    return selection;
+}
+function selectionContainsPoint(selection, x, y) {
+    for (let i = 0; i < selection.rangeCount; i++) {
+        for (const rect of selection.getRangeAt(i).getClientRects()) {
+            if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+                return true;
+        }
+    }
+    return false;
+}
+let pressOnSelection = false;
 term.scrollPort_.screen_.addEventListener('mousedown', (e) => {
-    // Taps while there is a selection should be left to the selection view
-    if (document.getSelection().rangeCount != 0) return;
+    const selection = liveSelection();
+    pressOnSelection = selection != null && selectionContainsPoint(selection, e.clientX, e.clientY);
+    if (pressOnSelection)
+        return;
+    // A plain click away from a selection ends it. Left in place it would no longer be shown
+    // once the terminal has focus, yet Copy would still copy it. Shift-click extends a selection
+    // instead, so that one is left alone.
+    if (selection != null && !e.shiftKey)
+        selection.removeAllRanges();
     native.focus();
+});
+// Focus again once the click is over, unless it left a selection behind (a drag or a double
+// click that selected text, which is about to be copied). The press is delivered before the
+// click has finished, so anything that hands first responder to the web view during the rest of
+// it would otherwise have the last word. When the terminal already has focus this is a no-op.
+term.scrollPort_.screen_.addEventListener('mouseup', (e) => {
+    if (pressOnSelection) {
+        pressOnSelection = false;
+        return;
+    }
+    setTimeout(() => {
+        if (liveSelection() == null)
+            native.focus();
+    }, 0);
 });
 exports.setFocused = (focus) => {
     if (focus)
@@ -176,6 +332,8 @@ exports.updateStyle = ({foregroundColor, backgroundColor, fontFamily, fontSize, 
     term.getPrefs().set('color-palette-overrides', colorPaletteOverrides);
     term.getPrefs().set('cursor-blink', blinkCursor);
     term.getPrefs().set('cursor-shape', cursorShape);
+    // A new font or size moves every cell; re-measure once it has laid out.
+    requestAnimationFrame(layoutComposition);
 };
 
 exports.getCharacterSize = () => {
@@ -183,6 +341,35 @@ exports.getCharacterSize = () => {
 };
 
 exports.clearScrollback = () => term.clearScrollback();
+
+// Everything on screen and in the scrollback, as plain text.
+//
+// A checkpoint saves the GUEST; what a terminal has already printed lives here,
+// in hterm, and is not part of the guest at all -- so a resumed session used to
+// come back on an empty window with its whole history gone. This is how that
+// history is carried across.
+//
+// Plain text, deliberately: hterm has no way to hand back the attributes, so
+// colour and bold do not survive. Losing the colour of old output is a much
+// smaller loss than losing the output.
+exports.getContents = (maxRows) => {
+    const total = term.getRowCount();
+    const limit = maxRows > 0 ? maxRows : 2000;
+    const start = Math.max(0, total - limit);
+    const out = [];
+    for (let i = start; i < total; i++) {
+        out.push(term.getRowText(i));
+    }
+    // Trailing blanks are the empty screen below the cursor. Kept, a restored
+    // window opens with a page of blank lines and the history scrolled out of
+    // sight.
+    while (out.length > 0 && out[out.length - 1] === '') {
+        out.pop();
+    }
+    // CRLF, not LF: hterm treats a bare newline as a line feed with no carriage
+    // return, which staircases the restored text down and off the right edge.
+    return out.join('\r\n');
+};
 exports.setUserGesture = () => term.accessibilityReader_.hasUserGesture = true;
 // Padding between the terminal text and the webview edge. Native lowers this to 0
 // when "Maximize Screen Space" is on with an external keyboard to reclaim edge space.
@@ -256,7 +443,40 @@ hterm.FindBar.prototype.updateCounterLabel_ = function() {
 
 hterm.openUrl = (url) => native.openLink(url);
 
+// Bracketed paste (DECSET 2004) reaches the guest through NATIVE, not through
+// hterm: Cmd-V, the Paste bar button and the snippet sheet all write bytes
+// straight to the tty, so hterm's own onPasteData_ -- the thing that knows
+// about the mode and wraps the payload in \e[200~ ... \e[201~ -- never runs
+// for any of them. Without that wrapper a multi-line paste arrives as a run of
+// typed lines and the shell executes each one as it lands, and an editor with
+// the mode on cannot tell a paste from typing. hterm still PARSES the mode, so
+// publish its state and let native do the wrapping.
+//
+// reset() and softReset() replace options_ wholesale instead of going through
+// setBracketedPaste, so a `reset` that clears the mode has to be caught here
+// too, or the native flag stays stuck on with nothing to turn it off.
+function syncBracketedPaste() {
+    native.propUpdate('bracketedPasteEnabled', !!term.options_.bracketedPaste);
+}
+const realSetBracketedPaste = hterm.Terminal.prototype.setBracketedPaste;
+hterm.Terminal.prototype.setBracketedPaste = function(state) {
+    realSetBracketedPaste.call(this, state);
+    if (this === term)
+        syncBracketedPaste();
+};
+for (const resetName of ['reset', 'softReset']) {
+    const realReset = hterm.Terminal.prototype[resetName];
+    hterm.Terminal.prototype[resetName] = function(...args) {
+        const result = realReset.apply(this, args);
+        if (this === term)
+            syncBracketedPaste();
+        return result;
+    };
+}
+
+
 native.load();
 native.syncFocus();
+layoutComposition();
 
 }

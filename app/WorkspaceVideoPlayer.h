@@ -13,7 +13,7 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-@interface WorkspaceVideoPlayerToolViewController : WorkspaceThemedToolViewController <WorkspaceFileOpenable>
+@interface WorkspaceVideoPlayerToolViewController : WorkspaceThemedToolViewController <WorkspaceFileOpenable, WorkspaceStatefulTool>
 @end
 
 NS_ASSUME_NONNULL_END

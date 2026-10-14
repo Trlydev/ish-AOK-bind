@@ -14,17 +14,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "util/wait_spin.h"
 #include "debug.h"
 #include "kernel/errno.h"
+#include "kernel/checkpoint.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "kernel/native.h"
 #include "fs/dev.h"
 #include "fs/real.h"
+#include "fs/host_fifo.h"
 #include "fs/mmap_cache.h"
 #include "fs/tty.h"
 #include "util/sync.h"
 #include "emu/memory.h"
+
+// No symlink is followed on the host below a mount's root: see
+// realfs_parent_at.
+#if defined(O_NOFOLLOW_ANY) && defined(AT_SYMLINK_NOFOLLOW_ANY) && defined(RENAME_NOFOLLOW_ANY)
+#define REALFS_O_NOFOLLOW O_NOFOLLOW_ANY
+#define REALFS_AT_NOFOLLOW AT_SYMLINK_NOFOLLOW_ANY
+#define REALFS_NOFOLLOW_ANY 1
+#else
+#define REALFS_O_NOFOLLOW 0
+#define REALFS_AT_NOFOLLOW AT_SYMLINK_NOFOLLOW
+#define REALFS_NOFOLLOW_ANY 0
+#endif
 
 struct realfs_io_stats realfs_io_stats;
 
@@ -61,8 +76,24 @@ static inline void realfs_count_write(ssize_t res) {
 // full pipe still fails its callback, unwinds stdio and dies -- the behaviour
 // the deferral was built around.
 static bool realfs_guest_signal_pending(void) {
+    // A CHECKPOINT FREEZE ends a wait on a host descriptor as a signal does --
+    // the twin of the same change in fs/sock.c's socket_guest_signal_pending,
+    // and for fs/poll.c's reason: these callers exist to IGNORE a bare poke,
+    // and a freeze is the one poke that must end the wait, because the syscall
+    // has to return for the dispatcher to rewind over it and the task to park.
+    //
+    // AOK's pipes are host pipes read through here (fs/pipe.c hands them
+    // realfs_fdops), so without this anything blocked reading one -- a
+    // `while read` loop at the end of a pipeline, a `cat` -- never parked, and
+    // the checkpoint refused on "did not reach a syscall boundary".
+    //
+    // A PTRACE_EVENT_STOP the task owes its tracer ends it too, and is no more
+    // a signal than the freeze: PTRACE_INTERRUPT of a task blocked reading a
+    // pipe, whatever its mask. The read restarts after the stop.
+    if (checkpoint_freeze_pending() || task_trap_stop_pending(current))
+        return true;
     lock(&current->sighand->lock, 0);
-    sigset_t_ pending = (current->pending | current->sighand->pending) &
+    sigset_t_ pending = (current->pending | task_group_pending(current)) &
             ~task_wake_blocked(current);
     if (native_delivery_deferred())
         pending &= ~__atomic_load_n(&current->native_restart, __ATOMIC_ACQUIRE);
@@ -92,7 +123,7 @@ static void realfs_log_signal_eintr(const char *where) {
     if (!realfs_trace_signal_eintr() || current == NULL)
         return;
     lock(&current->sighand->lock, 0);
-    sigset_t_ pending = (current->pending | current->sighand->pending) & ~task_wake_blocked(current);
+    sigset_t_ pending = (current->pending | task_group_pending(current)) & ~task_wake_blocked(current);
     sigset_t_ task_pending = current->pending;
     sigset_t_ group_pending = current->sighand->pending;
     sigset_t_ blocked = current->blocked;
@@ -150,7 +181,7 @@ static void realfs_trace_path_stat(const char *op, struct mount *mount, const ch
         return;
 
     struct stat st;
-    int err = fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW);
+    int err = fstatat(mount->root_fd, fix_path(path), &st, REALFS_AT_NOFOLLOW);
     if (err < 0) {
         fprintf(stderr,
                 "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s result=%d errno=%d\n",
@@ -179,7 +210,7 @@ static void realfs_trace_task_path_stat(const char *op, struct mount *mount, con
         return;
 
     struct stat st;
-    int err = fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW);
+    int err = fstatat(mount->root_fd, fix_path(path), &st, REALFS_AT_NOFOLLOW);
     if (err < 0) {
         fprintf(stderr,
                 "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s result=%d errno=%d\n",
@@ -317,6 +348,15 @@ static void realfs_maybe_dump_apt_http_request(struct fd *fd, const void *buf, s
     if (fwrite(buf, 1, size, f) == size)
         dumped = true;
     fclose(f);
+}
+
+// Make sure the host descriptor does not block, for the reason realfs_read
+// gives. It was F_GETFL and F_SETFL before every read and every write; the
+// flag is nearly always already there, and then asking is enough.
+static void realfs_force_nonblock(int real_fd) {
+    int flags = fcntl(real_fd, F_GETFL, 0);
+    if (flags >= 0 && !(flags & O_NONBLOCK))
+        (void) fcntl(real_fd, F_SETFL, flags | O_NONBLOCK);
 }
 
 static int realfs_wait_readable(int real_fd) {
@@ -475,6 +515,57 @@ static int getpath(int fd, char *buf) {
 #endif
 }
 
+// Host lookups below a mount's root follow no symlink, anywhere in the path.
+// What reaches realfs is already resolved: fs/path.c walks the guest's
+// symlinks component by component, reading each with readlink, against the
+// guest's root (chroot, RESOLVE_IN_ROOT, RESOLVE_BENEATH and the rest). A
+// host lookup that followed links would follow one put in place of a
+// directory between that walk and this call -- out of a chroot, or out of
+// the mount to wherever on the host the link points. So every call here uses
+// Darwin's NOFOLLOW_ANY forms (macOS 11, iOS 14): any symlink in the path is
+// ELOOP, and a final one is acted on itself, never followed (measured: fstatat,
+// fchmodat, fchownat, utimensat, linkat, unlinkat and renameatx_np take a
+// final link as themselves; openat refuses one, as O_NOFOLLOW does). The
+// calls with no flags go through the parent directory, opened that way
+// (realfs_parent_at). Other hosts keep the plain flags (REALFS_O_NOFOLLOW and
+// friends, at the top of this file).
+
+// The directory a (fix_path'd) path is in, reached with no symlink on the
+// way, and the name in it: *leaf points into `path`. The mount's own root_fd
+// for a name directly in it (*owned false); otherwise a descriptor the
+// caller closes. -1 with errno set on failure.
+static int realfs_parent_at(struct mount *mount, const char *path, const char **leaf, bool *owned) {
+    *owned = false;
+    const char *slash = strrchr(path, '/');
+    if (slash == NULL || !REALFS_NOFOLLOW_ANY) {
+        *leaf = path;
+        return mount->root_fd;
+    }
+    char parent[MAX_PATH];
+    size_t len = (size_t) (slash - path);
+    if (len >= sizeof(parent)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    int fd = openat(mount->root_fd, len == 0 ? "." : parent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | REALFS_O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    *owned = true;
+    *leaf = slash + 1;
+    return fd;
+}
+
+static void realfs_parent_done(int fd, bool owned) {
+    if (owned) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+}
+
 // temporarily change directory and block other threads from doing so
 // useful for simulating mknodat on ios, dealing with long unix socket paths, etc
 lock_t fchdir_lock;
@@ -514,9 +605,24 @@ static int open_flags_fake_from_real(int flags) {
 
 struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mode) {
     int real_flags = open_flags_real_from_fake(flags);
-    if ((flags & O_CREAT_) && (mount->flags & MOUNT_ISH_SHARED_))
-        mode |= 0666;
-    int fd_no = openat(mount->root_fd, fix_path(path), real_flags, mode);
+    // A FIFO here is a host FIFO, so opening one without O_NONBLOCK waits in
+    // the host openat for the other end, and any SIGUSR1 ends that wait with
+    // EINTR -- including the address-space barrier's poke, which reaches a
+    // task in open(2) whenever it reads io_block just before TASK_MAY_BLOCK
+    // sets it. Forced with ISH_TEST_POKE_BLOCKED_TASKS, a reader opening a FIFO
+    // failed with EINTR 2ms in, with no signal sent. Only a guest signal or a
+    // checkpoint freeze may end the open, as for realfs reads and writes.
+    int fd_no;
+    for (;;) {
+        fd_no = openat(mount->root_fd, fix_path(path), real_flags | REALFS_O_NOFOLLOW, mode);
+        if (fd_no >= 0 || errno != EINTR || current == NULL)
+            break;
+        // The pending test takes a lock and can clobber errno.
+        if (realfs_guest_signal_pending()) {
+            errno = EINTR;
+            break;
+        }
+    }
     if (fd_no < 0) {
         realfs_trace_path_event("open", path, -1, flags);
         return ERR_PTR(errno_map());
@@ -526,10 +632,15 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
     struct fd *fd = fd_create(&realfs_fdops);
     fd->real_fd = fd_no;
     fd->dir = NULL;
+    // A FIFO is counted as a reader or writer (fs/host_fifo.c); fakefs opens
+    // through here too. One host fstat says whether it is one: nothing above
+    // knows yet (fakefs fills fd->stat only once the fd has its mount).
+    host_fifo_attach(fd, flags & O_ACCMODE_);
     return fd;
 }
 
 int realfs_close(struct fd *fd) {
+    host_fifo_detach(fd);
     if (fd->dir != NULL)
         closedir(fd->dir);
     int err = close(fd->real_fd);
@@ -563,11 +674,52 @@ static void copy_stat(struct statbuf *fake_stat, struct stat *real_stat) {
 #undef TIMESPEC
 }
 
+// A shared mount's files (MOUNT_ISH_SHARED_) belong, at the host, to the app's
+// own uid, whichever guest user made them, and the host can record no other
+// owner. Reported as that uid, every guest user but root was "other" to every
+// file there: uid 1000 could not use a directory it had just made in
+// /AOK/persist. So a file the app owns is reported as owned by whoever asks,
+// as macOS shows a volume whose ownership is ignored -- each guest user has an
+// owner's access to the area it shares with the others, and tools that want a
+// file to be their own (git's safe.directory, sshd's StrictModes) are content.
+static uid_t_ realfs_shared_uid(void) {
+    return current != NULL ? current->fsuid : 0;
+}
+static uid_t_ realfs_shared_gid(void) {
+    return current != NULL ? current->fsgid : 0;
+}
+
+static void realfs_shared_owner(struct mount *mount, struct statbuf *fake_stat,
+                                const struct stat *real_stat) {
+    if (mount == NULL || !(mount->flags & MOUNT_ISH_SHARED_) || real_stat->st_uid != getuid())
+        return;
+    fake_stat->uid = realfs_shared_uid();
+    fake_stat->gid = realfs_shared_gid();
+}
+
+// And the owner it is reported to have is the only one a chown can give it:
+// that changes nothing, and any other is one the host cannot record. True
+// when *err is the answer. A chown that succeeds still changes the file's
+// status time, as Linux's does even to the owner a file has; the caller gets
+// that from a host chown to the owner the host already has.
+static bool realfs_shared_chown(struct mount *mount, struct attr attr, int *err) {
+    if (mount == NULL || !(mount->flags & MOUNT_ISH_SHARED_))
+        return false;
+    if (attr.type == attr_uid)
+        *err = attr.uid == realfs_shared_uid() ? 0 : _EPERM;
+    else if (attr.type == attr_gid)
+        *err = attr.gid == realfs_shared_gid() ? 0 : _EPERM;
+    else
+        return false;
+    return true;
+}
+
 int realfs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
     struct stat real_stat;
-    if (fstatat(mount->root_fd, fix_path(path), &real_stat, AT_SYMLINK_NOFOLLOW) < 0)
+    if (fstatat(mount->root_fd, fix_path(path), &real_stat, REALFS_AT_NOFOLLOW) < 0)
         return errno_map();
     copy_stat(fake_stat, &real_stat);
+    realfs_shared_owner(mount, fake_stat, &real_stat);
     return 0;
 }
 
@@ -576,10 +728,47 @@ int realfs_fstat(struct fd *fd, struct statbuf *fake_stat) {
     if (fstat(fd->real_fd, &real_stat) < 0)
         return errno_map();
     copy_stat(fake_stat, &real_stat);
+    realfs_shared_owner(fd->mount, fake_stat, &real_stat);
     return 0;
 }
 
+// A description realfs_reopen made (fd->realfs_own_offset) reads, writes and
+// seeks by its own position, and answers for its own access mode: its host
+// descriptor is a duplicate of another description's, whose host position it
+// must not move and whose access may be more than its own.
+static ssize_t realfs_read_own(struct fd *fd, void *buf, size_t bufsize) {
+    if ((fd->flags & O_ACCMODE_) == O_WRONLY_)
+        return _EBADF;
+    off_t off = (off_t) fd->offset;
+    ssize_t res = pread(fd->real_fd, buf, bufsize, off);
+    if (res < 0)
+        return errno_map();
+    fd->offset = (unsigned long) (off + res);
+    realfs_count_read(res);
+    return res;
+}
+
+static ssize_t realfs_write_own(struct fd *fd, const void *buf, size_t bufsize) {
+    if ((fd->flags & O_ACCMODE_) == O_RDONLY_)
+        return _EBADF;
+    off_t off = (off_t) fd->offset;
+    if (fd->flags & O_APPEND_) {
+        struct stat real_stat;
+        if (fstat(fd->real_fd, &real_stat) < 0)
+            return errno_map();
+        off = real_stat.st_size;
+    }
+    ssize_t res = pwrite(fd->real_fd, buf, bufsize, off);
+    if (res < 0)
+        return errno_map();
+    fd->offset = (unsigned long) (off + res);
+    realfs_count_write(res);
+    return res;
+}
+
 ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
+    if (fd->realfs_own_offset)
+        return realfs_read_own(fd, buf, bufsize);
     if (bufsize == 0)
         return 0;
     size_t read_size = bufsize;
@@ -610,7 +799,7 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     // by SIGKILL, since the guest's own signal delivery never gets to run.
     // Observed as the exact cause of a real, SIGKILL-proof stress-ng
     // pipeherd hang (every stuck thread's backtrace stopped right here).
-    (void) fcntl(fd->real_fd, F_SETFL, fcntl(fd->real_fd, F_GETFL, 0) | O_NONBLOCK);
+    realfs_force_nonblock(fd->real_fd);
 
     // ATTEMPT FIRST, wait second. The loop used to call realfs_wait_readable()
     // before ever touching the fd, and that wait reports EINTR the moment a
@@ -622,10 +811,16 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
     // make and tells us which case we are in; only EAGAIN means "would block",
     // and only then does the signal question arise at all. See the matching
     // comment in realfs_write().
+    //
+    // And ask again for a little while before sleeping: util/wait_spin.h.
+    struct wait_spin spin;
+    int spinning = -1; // not yet tried; 1 while looking; 0 once done
     for (;;) {
         realfs_trace_io_enter("read", fd, read_size);
         ssize_t res = read(fd->real_fd, buf, read_size);
         if (res >= 0) {
+            if (spinning == 1)
+                wait_spin_end(true);
             if (res > 0 && is_adhoc_fd(fd) && S_ISFIFO(fd->stat.mode))
                 fd->realfs_fifo_had_data = true;
             realfs_trace_io("read", fd, read_size, res, buf);
@@ -636,6 +831,14 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
             continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK)
             return errno_map();
+        if (spinning < 0)
+            spinning = wait_spin_begin(&spin) ? 1 : 0;
+        if (spinning == 1) {
+            if (wait_spin_more(&spin))
+                continue;
+            wait_spin_end(false);
+            spinning = 0;
+        }
 
         int wait_res = realfs_wait_readable(fd->real_fd);
         if (wait_res < 0)
@@ -644,6 +847,8 @@ ssize_t realfs_read(struct fd *fd, void *buf, size_t bufsize) {
 }
 
 ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
+    if (fd->realfs_own_offset)
+        return realfs_write_own(fd, buf, bufsize);
     if (bufsize == 0)
         return 0;
 
@@ -661,7 +866,7 @@ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
     // See the matching comment in realfs_read(): force non-blocking
     // idempotently and never restore it, since restoring races against
     // sibling tasks sharing this same open file description (fork()).
-    (void) fcntl(fd->real_fd, F_SETFL, fcntl(fd->real_fd, F_GETFL, 0) | O_NONBLOCK);
+    realfs_force_nonblock(fd->real_fd);
 
     // ATTEMPT FIRST, wait second -- the fix for a native shell intermittently
     // reporting "echo: write error: Interrupted system call" (build 554).
@@ -705,6 +910,8 @@ ssize_t realfs_write(struct fd *fd, const void *buf, size_t bufsize) {
 }
 
 ssize_t realfs_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) {
+    if (fd->realfs_own_offset && (fd->flags & O_ACCMODE_) == O_WRONLY_)
+        return _EBADF;
     ssize_t res = pread(fd->real_fd, buf, bufsize, off);
     if (res < 0)
         return errno_map();
@@ -727,7 +934,9 @@ ssize_t realfs_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_t off)
     // match; the lost atomicity only affects concurrent pwrites to one
     // O_APPEND description, which is an exotic combination of an already
     // exotic quirk.
-    if (fd->flags & O_APPEND_) {
+    if (fd->realfs_own_offset && (fd->flags & O_ACCMODE_) == O_RDONLY_)
+        return _EBADF;
+    if (fd_pwrite_appends(fd)) {
         struct stat real_stat;
         if (fstat(fd->real_fd, &real_stat) < 0)
             return errno_map();
@@ -763,17 +972,37 @@ int realfs_readdir(struct fd *fd, struct dir_entry *entry) {
     int err = realfs_opendir(fd);
     if (err < 0)
         return err;
-    errno = 0;
-    struct dirent *dirent = readdir(fd->dir);
-    if (dirent == NULL) {
-        if (errno != 0)
-            return errno_map();
-        else
-            return 0;
-    }
+    // A host name can be longer than the guest's NAME_MAX: APFS counts its
+    // 255 in UTF-16 units, so a non-ASCII name runs to 765 bytes. It is
+    // passed through whole, as Linux does for any name shorter than PATH_MAX,
+    // and entry->name has room for every name a Darwin readdir returns (see
+    // struct dir_entry). This used to be a strcpy into 256 bytes, which
+    // smashed the getdents stack frame and aborted the whole emulator.
+    //
+    // The copy is still bounded, and a name that does not fit is skipped.
+    // That is a last resort for a Linux host, whose readdir can return a name
+    // of up to PATH_MAX; it never happens on Darwin. Cutting the name short
+    // would name a different file (255 bytes of a 765-byte name can be
+    // another file's whole name), and an error would hide the rest of the
+    // directory. The bound is a memchr rather than a strnlen because GCC
+    // warns about a strnlen bound longer than the 256 bytes a Linux libc
+    // declares for d_name, although its readdir returns the whole name.
+    struct dirent *dirent;
+    const char *name_end;
+    do {
+        errno = 0;
+        dirent = readdir(fd->dir);
+        if (dirent == NULL) {
+            if (errno != 0)
+                return errno_map();
+            else
+                return 0;
+        }
+        name_end = memchr(dirent->d_name, '\0', sizeof(entry->name));
+    } while (name_end == NULL);
     entry->inode = dirent->d_ino;
     entry->type = dirent->d_type;
-    strcpy(entry->name, dirent->d_name);
+    memcpy(entry->name, dirent->d_name, (size_t) (name_end - dirent->d_name) + 1);
     return 1;
 }
 
@@ -825,11 +1054,35 @@ off_t realfs_lseek(struct fd *fd, off_t offset, int whence) {
         struct stat st;
         if (fstat(fd->real_fd, &st) < 0)
             return errno_map();
-        if (offset < 0)
-            return _EINVAL;
-        if (offset >= st.st_size)
+        // Before the start is ENXIO too, not EINVAL (measured on Linux 6.12,
+        // ext4 and tmpfs): the offset is compared as unsigned.
+        if (offset < 0 || offset >= st.st_size)
             return _ENXIO;
-        return whence == LSEEK_DATA ? offset : st.st_size;
+        off_t res = whence == LSEEK_DATA ? offset : st.st_size;
+        // And it is a seek: the position moves there, as it does on Linux.
+        if (fd->realfs_own_offset)
+            fd->offset = (unsigned long) res;
+        else if (lseek(fd->real_fd, res, SEEK_SET) < 0)
+            return errno_map();
+        return res;
+    }
+    if (fd->realfs_own_offset) {
+        off_t base = 0;
+        if (whence == LSEEK_CUR) {
+            base = (off_t) fd->offset;
+        } else if (whence == LSEEK_END) {
+            struct stat st;
+            if (fstat(fd->real_fd, &st) < 0)
+                return errno_map();
+            base = st.st_size;
+        } else if (whence != LSEEK_SET) {
+            return _EINVAL;
+        }
+        off_t res;
+        if (__builtin_add_overflow(base, offset, &res) || res < 0)
+            return _EINVAL;
+        fd->offset = (unsigned long) res;
+        return res;
     }
     if (whence == LSEEK_SET)
         whence = SEEK_SET;
@@ -859,6 +1112,19 @@ int realfs_poll(struct fd *fd) {
     // POLLIN/POLLOUT and POLL_READ/POLL_WRITE are the same values.)
     if (S_ISREG(fd->stat.mode) || S_ISDIR(fd->stat.mode))
         return POLLIN | POLLOUT;
+
+    // A named FIFO answers from AOK's own accounting, Darwin reporting
+    // neither end's departure (fs/host_fifo.h). Only "is there room" is the
+    // host's to say.
+    if (host_fifo_tracked(fd)) {
+        int room = 0;
+        if ((fd->host_fifo_accmode & O_ACCMODE_) != O_RDONLY_) {
+            struct pollfd w = {.fd = fd->real_fd, .events = POLLOUT};
+            if (poll(&w, 1, 0) > 0)
+                room = w.revents & POLLOUT;
+        }
+        return host_fifo_poll(fd, room);
+    }
 
     struct pollfd p = {.fd = fd->real_fd, .events = 0};
 #if defined(__APPLE__)
@@ -892,9 +1158,26 @@ int realfs_poll(struct fd *fd) {
     // actual data: if POLLIN is set the readiness is real (e.g. a writer wrote
     // then closed, leaving unread bytes), and scrubbing it hid readable data
     // from poll/select -- a guest would see "not ready" with bytes waiting.
-    if (is_fifo && !fd->realfs_fifo_had_data &&
+    //
+    // A READ end only. On a write end POLLHUP is real: every reader has gone.
+    // Linux's pipe_poll says EPOLLERR for that (with EPOLLOUT while there is
+    // room) and never HUP for a writer, and scrubbing it here left such a
+    // pipe looking idle -- so `tail -f file | head -2` (GNU tail polls stdout
+    // for POLLERR to notice its reader leaving) followed forever.
+    bool write_end = (flags & O_ACCMODE) == O_WRONLY;
+    if (is_fifo && write_end && (p.revents & POLLHUP))
+        p.revents = (p.revents & ~POLLHUP) | POLLERR | POLLOUT;
+    if (is_fifo && !write_end && !fd->realfs_fifo_had_data &&
             (p.revents & POLLHUP) && !(p.revents & POLLIN))
         p.revents &= ~(POLLIN | POLLHUP | POLLOUT);
+    // And at end of file Darwin says POLLIN|POLLHUP, where Linux's pipe_poll
+    // says POLLIN only with bytes still to read (0x10 empty, 0x11 with data;
+    // measured on Linux 6.12).
+    if (is_fifo && !write_end && (p.revents & POLLHUP) && (p.revents & POLLIN)) {
+        int avail = 0;
+        if (ioctl(fd->real_fd, FIONREAD, &avail) == 0 && avail == 0)
+            p.revents &= ~POLLIN;
+    }
 
     // https://github.com/apple/darwin-xnu/blob/a449c6a3b8014d9406c2ddbdc81795da24aa7443/bsd/kern/sys_generic.c#L1856
     if (p.revents & POLLHUP)
@@ -1022,6 +1305,12 @@ int host_fd_mmap(int host_fd, struct mem *mem, page_t start, pages_t pages, off_
             munmap(memory, map_len);
         return err;
     }
+    struct pt_entry *pt = mem_pt(mem, start);
+    struct stat real_stat;
+    if (err != 0 || pt == NULL || pt->data == NULL ||
+            ((prot & P_WRITE) && !(mmap_flags & MAP_SHARED)) ||
+            fstat(host_fd, &real_stat) != 0)
+        return err;
     // Never-writable file-backed mappings can't be COW-broken or otherwise
     // mutated by the guest (write faults check P_WRITE before touching
     // anything), so it's always safe to register them: the underlying host
@@ -1030,15 +1319,17 @@ int host_fd_mmap(int host_fd, struct mem *mem, page_t start, pages_t pages, off_
     // fs/mmap_cache.h. Registering MAP_SHARED alongside MAP_PRIVATE here is
     // fine for the same reason: no P_WRITE means neither can ever be
     // dirtied by the guest.
-    if (err == 0 && !(prot & P_WRITE)) {
-        struct stat real_stat;
-        if (fstat(host_fd, &real_stat) == 0) {
-            struct pt_entry *pt = mem_pt(mem, start);
-            if (pt != NULL && pt->data != NULL) {
-                pt->data->cache_entry = mmap_cache_register(
-                        real_stat.st_dev, real_stat.st_ino, real_offset, pt->data->size);
-            }
-        }
+    if (!(prot & P_WRITE))
+        pt->data->cache_entry = mmap_cache_register(
+                real_stat.st_dev, real_stat.st_ino, real_offset, pt->data->size);
+    // What this mapping IS, so another mapping of the same file can be found
+    // from it: a W^X JIT writes code through one and runs it through the other
+    // (jit_note_code_write).
+    if (mmap_flags & MAP_SHARED) {
+        pt->data->host_file_known = true;
+        pt->data->host_dev = (uint64_t) real_stat.st_dev;
+        pt->data->host_ino = (uint64_t) real_stat.st_ino;
+        pt->data->host_offset = (uint64_t) real_offset;
     }
     return err;
 }
@@ -1046,6 +1337,16 @@ int host_fd_mmap(int host_fd, struct mem *mem, page_t start, pages_t pages, off_
 int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off_t offset, int prot, int flags) {
     enum { AMD64_REALFS_MMAP_TRACE_BUDGET = 32 };
     static unsigned amd64_realfs_mmap_trace_count;
+    // The host asks mmap's access questions of the host descriptor, which for
+    // a description realfs_reopen made may allow more than it does: readable
+    // for any mapping, writable too for a writable shared one.
+    if (fd->realfs_own_offset) {
+        int accmode = fd->flags & O_ACCMODE_;
+        if (accmode == O_WRONLY_)
+            return _EACCES;
+        if ((flags & MMAP_SHARED) && (prot & P_WRITE) && accmode != O_RDWR_)
+            return _EACCES;
+    }
     int err = host_fd_mmap(fd->real_fd, mem, start, pages, offset, prot, flags);
     if (err < 0 && current != NULL && current->abi == GUEST_ABI_AMD64 &&
             amd64_realfs_mmap_trace_count < AMD64_REALFS_MMAP_TRACE_BUDGET) {
@@ -1063,7 +1364,13 @@ int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off
 }
 
 ssize_t realfs_readlink(struct mount *mount, const char *path, char *buf, size_t bufsize) {
-    ssize_t size = readlinkat(mount->root_fd, fix_path(path), buf, bufsize);
+    const char *leaf;
+    bool owned;
+    int dir = realfs_parent_at(mount, fix_path(path), &leaf, &owned);
+    if (dir < 0)
+        return errno_map();
+    ssize_t size = readlinkat(dir, leaf, buf, bufsize);
+    realfs_parent_done(dir, owned);
     if (size < 0)
         return errno_map();
     return size;
@@ -1081,7 +1388,8 @@ int realfs_getpath(struct fd *fd, char *buf) {
 }
 
 int realfs_link(struct mount *mount, const char *src, const char *dst) {
-    int res = linkat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst), 0);
+    int res = linkat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst),
+            REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0);
     if (res < 0) {
         realfs_trace_task_path_event("link-src", src, res, 0);
         realfs_trace_task_path_event("link-dst", dst, res, 0);
@@ -1097,7 +1405,7 @@ int realfs_link(struct mount *mount, const char *src, const char *dst) {
 }
 
 int realfs_unlink(struct mount *mount, const char *path) {
-    int res = unlinkat(mount->root_fd, fix_path(path), 0);
+    int res = unlinkat(mount->root_fd, fix_path(path), REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0);
     if (res < 0) {
         realfs_trace_path_event("unlink", path, res, 0);
         realfs_trace_path_stat("unlink", mount, path);
@@ -1109,14 +1417,18 @@ int realfs_unlink(struct mount *mount, const char *path) {
 }
 
 int realfs_rmdir(struct mount *mount, const char *path) {
-    int err = unlinkat(mount->root_fd, fix_path(path), AT_REMOVEDIR);
+    int err = unlinkat(mount->root_fd, fix_path(path), AT_REMOVEDIR | (REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0));
     if (err < 0)
         return errno_map();
     return 0;
 }
 
 int realfs_rename(struct mount *mount, const char *src, const char *dst) {
+#if REALFS_NOFOLLOW_ANY
+    int err = renameatx_np(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst), RENAME_NOFOLLOW_ANY);
+#else
     int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
+#endif
     if (err < 0) {
         realfs_trace_path_event("rename-src", src, err, 0);
         realfs_trace_path_event("rename-dst", dst, err, 0);
@@ -1130,7 +1442,12 @@ int realfs_rename(struct mount *mount, const char *src, const char *dst) {
 }
 
 int realfs_symlink(struct mount *mount, const char *target, const char *link) {
-    int err = symlinkat(target, mount->root_fd, fix_path(link));
+    const char *leaf;
+    bool owned;
+    int dir = realfs_parent_at(mount, fix_path(link), &leaf, &owned);
+    int err = dir < 0 ? -1 : symlinkat(target, dir, leaf);
+    if (dir >= 0)
+        realfs_parent_done(dir, owned);
     if (err < 0) {
         realfs_trace_symlink_event(mount, target, link, err);
         return errno_map();
@@ -1142,12 +1459,16 @@ int realfs_symlink(struct mount *mount, const char *target, const char *link) {
 int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNUSED(dev)) {
     int err;
     mode_t_ perm = mode & ~S_IFMT;
-    if (mount->flags & MOUNT_ISH_SHARED_)
-        perm |= 0666;
     if (S_ISFIFO(mode)) {
-        lock_fchdir(mount->root_fd);
-        err = mkfifo(fix_path(path), perm);
+        const char *leaf;
+        bool owned;
+        int dir = realfs_parent_at(mount, fix_path(path), &leaf, &owned);
+        if (dir < 0)
+            return errno_map();
+        lock_fchdir(dir);
+        err = mkfifo(leaf, perm);
         unlock_fchdir();
+        realfs_parent_done(dir, owned);
     } else if (S_ISSOCK(mode)) {
         // A bound AF_UNIX address is an S_IFSOCK inode, and fs/sock.c creates
         // it through mknod. Refusing it here meant no guest unix socket could
@@ -1165,7 +1486,7 @@ int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNU
         err = mknod(fix_path(path), S_IFSOCK | perm, 0);
         unlock_fchdir();
     } else if (S_ISREG(mode)) {
-        err = openat(mount->root_fd, fix_path(path), O_CREAT|O_EXCL|O_RDONLY, perm);
+        err = openat(mount->root_fd, fix_path(path), O_CREAT|O_EXCL|O_RDONLY|REALFS_O_NOFOLLOW, perm);
         if (err >= 0)
             err = close(err);
     } else {
@@ -1177,7 +1498,7 @@ int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNU
 }
 
 int realfs_truncate(struct mount *mount, const char *path, off_t_ size) {
-    int fd = openat(mount->root_fd, fix_path(path), O_RDWR);
+    int fd = openat(mount->root_fd, fix_path(path), O_RDWR | REALFS_O_NOFOLLOW);
     if (fd < 0)
         return errno_map();
     int err = 0;
@@ -1191,15 +1512,27 @@ int realfs_setattr(struct mount *mount, const char *path, struct attr attr) {
     path = fix_path(path);
     int root = mount->root_fd;
     int err;
+    // (The path is resolved; its final component, when it is a link, is
+    // the link: never followed on the host.)
+    int nofollow = REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0;
+    if (realfs_shared_chown(mount, attr, &err)) {
+        if (err == 0 && fchownat(root, path, getuid(), (gid_t) -1, nofollow) < 0)
+            return errno_map();
+        return err;
+    }
     switch (attr.type) {
         case attr_uid:
-            err = fchownat(root, path, attr.uid, -1, 0);
+            err = fchownat(root, path, attr.uid, -1, nofollow);
             break;
         case attr_gid:
-            err = fchownat(root, path, attr.gid, -1, 0);
+            // The group is chown's THIRD argument. This passed it as the
+            // owner, so every chgrp on a realfs mount was a chown to the uid
+            // with the group's number -- EPERM for an ordinary host user,
+            // and the wrong owner for a privileged one.
+            err = fchownat(root, path, -1, attr.gid, nofollow);
             break;
         case attr_mode:
-            err = fchmodat(root, path, attr.mode, 0);
+            err = fchmodat(root, path, attr.mode, nofollow);
             break;
         case attr_size:
             return realfs_truncate(mount, path, attr.size);
@@ -1214,12 +1547,17 @@ int realfs_setattr(struct mount *mount, const char *path, struct attr attr) {
 int realfs_fsetattr(struct fd *fd, struct attr attr) {
     int real_fd = fd->real_fd;
     int err;
+    if (realfs_shared_chown(fd->mount, attr, &err)) {
+        if (err == 0 && fchown(real_fd, getuid(), (gid_t) -1) < 0)
+            return errno_map();
+        return err;
+    }
     switch (attr.type) {
         case attr_uid:
             err = fchown(real_fd, attr.uid, -1);
             break;
         case attr_gid:
-            err = fchown(real_fd, attr.gid, -1);
+            err = fchown(real_fd, -1, attr.gid); // the group, not the owner: see realfs_setattr
             break;
         case attr_mode:
             err = fchmod(real_fd, attr.mode);
@@ -1236,7 +1574,9 @@ int realfs_fsetattr(struct fd *fd, struct attr attr) {
 
 int realfs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime, bool follow_links) {
     struct timespec times[2] = {atime, mtime};
-    int flags = follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
+    // (generic_utime resolved the path as follow_links asked: what is left
+    // to follow on the host is nothing.)
+    int flags = REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
     realfs_trace_path_stat("utime-before", mount, path);
     int err = utimensat(mount->root_fd, fix_path(path), times, flags);
     if (err < 0) {
@@ -1257,9 +1597,12 @@ int realfs_futime(struct fd *fd, struct timespec atime, struct timespec mtime) {
 }
 
 int realfs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
-    if (mount->flags & MOUNT_ISH_SHARED_)
-        mode |= 0777;
-    int err = mkdirat(mount->root_fd, fix_path(path), mode);
+    const char *leaf;
+    bool owned;
+    int dir = realfs_parent_at(mount, fix_path(path), &leaf, &owned);
+    int err = dir < 0 ? -1 : mkdirat(dir, leaf, mode);
+    if (dir >= 0)
+        realfs_parent_done(dir, owned);
     if (err < 0)
         return errno_map();
     return 0;
@@ -1317,14 +1660,35 @@ int realfs_fsync(struct fd *fd) {
     return 0;
 }
 
+// The status flags the guest owns, answered from fd->flags rather than the
+// host. O_APPEND and O_NONBLOCK are what the guest set: realfs_read/write force
+// the HOST descriptor non-blocking for good the first time the guest blocks on
+// it (restoring it races a sibling into an unkillable host read), so the host
+// said O_NONBLOCK about a pipe the guest never made non-blocking, and the
+// get-set-restore idiom wrote that back and left the pipe non-blocking. And
+// O_DIRECTORY, O_NOFOLLOW and O_LARGEFILE are open-time flags Linux reports
+// and the host's F_GETFL never keeps.
+#define REALFS_GUEST_FLAGS (O_APPEND_ | O_NONBLOCK_ | O_DIRECTORY_ | O_NOFOLLOW_ | O_LARGEFILE_)
+
 int realfs_getflags(struct fd *fd) {
+    // Not the host's, which are the description it duplicates.
+    if (fd->realfs_own_offset)
+        return fd->flags & (O_ACCMODE_ | REALFS_GUEST_FLAGS);
     int flags = fcntl(fd->real_fd, F_GETFL);
     if (flags < 0)
         return errno_map();
-    return open_flags_fake_from_real(flags);
+    return (open_flags_fake_from_real(flags) & ~REALFS_GUEST_FLAGS) |
+        (fd->flags & REALFS_GUEST_FLAGS);
 }
 
 int realfs_setflags(struct fd *fd, dword_t flags) {
+    // Its own alone: the host's belong to the description it duplicates, and
+    // reads and writes by position look at neither O_APPEND nor O_NONBLOCK
+    // there.
+    if (fd->realfs_own_offset) {
+        fd->flags = (fd->flags & ~(O_APPEND_ | O_NONBLOCK_)) | (flags & (O_APPEND_ | O_NONBLOCK_));
+        return 0;
+    }
     int ret = fcntl(fd->real_fd, F_SETFL, open_flags_real_from_fake(flags));
     if (ret < 0)
         return errno_map();
@@ -1343,6 +1707,15 @@ int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
     size_t nread;
     switch (cmd) {
         case FIONREAD_:
+            if (fd->realfs_own_offset) {
+                // What is left past its own position, not the host's.
+                struct stat real_stat;
+                if (fstat(fd->real_fd, &real_stat) < 0)
+                    return errno_map();
+                off_t left = real_stat.st_size - (off_t) fd->offset;
+                *(dword_t *) arg = left > 0 ? (dword_t) left : 0;
+                return 0;
+            }
             err = ioctl(fd->real_fd, FIONREAD, &nread);
             if (err < 0)
                 return errno_map();
@@ -1350,6 +1723,45 @@ int realfs_ioctl(struct fd *fd, int cmd, void *arg) {
             return 0;
     }
     return _ENOTTY;
+}
+
+// See fd_ops->reopen. Darwin cannot open a file with no path afresh: /dev/fd/N
+// duplicates the descriptor, and opening by file ID (openbyid_np) takes an
+// entitlement no app is given. So the new description's host descriptor is a
+// duplicate of this one's, which shares that one's host position and status
+// flags, and it keeps its own instead (fd->realfs_own_offset). What cannot be
+// had that way is access the host descriptor lacks: a file held O_RDONLY
+// cannot be opened for writing (EACCES), where Linux, which opens the inode,
+// allows whatever the file's permissions do. fakefs shares these fd_ops, and
+// its metadata for an unlinked file is the snapshot in the struct fd, so that
+// comes along.
+static struct fd *realfs_reopen(struct fd *fd, int flags) {
+    int host = fcntl(fd->real_fd, F_GETFL);
+    if (host < 0)
+        return ERR_PTR(errno_map());
+    host &= O_ACCMODE;
+    int want = flags & O_ACCMODE_;
+    // An O_PATH description does no I/O, so any host description will do.
+    bool reads = want != O_WRONLY_ && !(flags & O_PATH_);
+    bool writes = want != O_RDONLY_ || (flags & O_TRUNC_);
+    if ((reads && host == O_WRONLY) || (writes && host == O_RDONLY))
+        return ERR_PTR(_EACCES);
+    int real_fd = dup(fd->real_fd);
+    if (real_fd < 0)
+        return ERR_PTR(errno_map());
+    struct fd *reopened = fd_create(fd->ops);
+    if (reopened == NULL) {
+        close(real_fd);
+        return ERR_PTR(_ENOMEM);
+    }
+    reopened->real_fd = real_fd;
+    reopened->dir = NULL;
+    reopened->realfs_own_offset = true;
+    reopened->fake_inode = fd->fake_inode;
+    reopened->stat = fd->stat;
+    if (fd->host_fifo != NULL)
+        host_fifo_attach(reopened, flags & O_ACCMODE_);
+    return reopened;
 }
 
 const struct fs_ops realfs = {
@@ -1380,6 +1792,7 @@ const struct fs_ops realfs = {
 };
 
 const struct fd_ops realfs_fdops = {
+    .name = "realfs",
     .read = realfs_read,
     .write = realfs_write,
     .pread = realfs_pread,
@@ -1396,4 +1809,5 @@ const struct fd_ops realfs_fdops = {
     .close = realfs_close,
     .getflags = realfs_getflags,
     .setflags = realfs_setflags,
+    .reopen = realfs_reopen,
 };

@@ -66,6 +66,17 @@ _tmp    .req x0
 _tmp2   .req x8
 _addr   .req x7
 
+// What frag.h's load and store bodies keep across read_prep/write_prep and
+// their helpers (frag.h, "A second host", names them for a host whose
+// callee-saved registers are not free): the offset, a pair store's two value
+// slots, a write-back pair's new base and its rn slot, a pair's second value.
+_fofs   .req x19
+_fslot1 .req x21
+_fslot2 .req x22
+_fnewb  .req x23
+_frn    .req x24
+_fval2  .req x25
+
 // RULE: never hold live gadget state in x18. It's the platform-reserved
 // register on Apple targets (iOS/macOS) -- the OS is allowed to trash it
 // asynchronously, so a value parked there can silently corrupt between
@@ -125,6 +136,17 @@ _addr   .req x7
 // hardware is the trade this project wants, and iSH-AOK ships one binary for
 // both. -Darm64_gret=ldar restores the other spelling; a build using it says
 // " gret=ldar" in `uname -v`.
+//
+// WHERE the barrier is needed (2026-09-29): only after loading a chain link,
+// the one word in a code stream another thread patches (jit.c publishes it with
+// a release store). Every other gadget pointer is in the block already being
+// run, written before the block could be reached -- through a chain link, or
+// by the C loop under jit->lock -- and every read of the stream is addressed
+// through _ip, which the link's value produced. So in the default (dmb) build
+// gret itself carries no barrier, and arm64_chain (control.S) issues the one
+// `dmb ishld` when execution crosses into another block. Every branch gadget
+// reaches the next block through arm64_branch_dispatch/arm64_chain. Measured on
+// an M5 with the riscv64 engine (same gret): 10-25% less per instruction.
 // A future refinement could pick per host at startup, but that needs two full
 // gadget tables, and 1.7x on old devices is worth having now.
 #if defined(ISH_ARM64_GRET_LDAPR)
@@ -152,14 +174,52 @@ _addr   .req x7
     add _ip, _ip, \pop*8
 .endif
     ldar x9, [_ip]
-#else
-    ldr x9, [_ip, \pop*8]!
-    dmb ishld
-#endif
     add _ip, _ip, 8
+#else
+    // Two instructions that both start from the old _ip, not a load that
+    // writes _ip back and an add after it. Every gadget's operands are read
+    // through _ip, so _ip is the one chain that runs through the whole
+    // stream, and each update on it is a cycle no out-of-order core can
+    // overlap: with the write-back form it was two a gadget, and a guest
+    // `add` took 2.4 cycles on an M4 whatever it depended on.
+    ldr x9, [_ip, \pop*8]    // no barrier: see arm64_chain (guest-arm64 gadgets.h)
+    add _ip, _ip, \pop*8 + 8
+#endif
     cbnz x9, 0f
     b jit_ret
 0:  br x9
+.endm
+
+// The dispatch for a gadget that has already moved _ip past its parameters
+// AND past the next gadget's word, in the one `add` it makes on entry: the
+// next gadget is at [_ip, #-8] and there is nothing left to update. A gadget
+// that can fault has to move _ip before its access (the slow paths find the
+// instruction's address in the stream behind it), and with gret that made two
+// updates of _ip a gadget; this way it is one. Such a gadget passes `8` as
+// the `ahead` argument of read_prep/write_prep and their _bullshit halves, so
+// that every call out of them is made with _ip where the slow paths expect it.
+.macro gret_ahead
+#if defined(ISH_ARM64_GRET_LDAR)
+    sub x9, _ip, #8
+    ldar x9, [x9]
+#else
+    ldr x9, [_ip, #-8]
+#endif
+    cbnz x9, 0f
+    b jit_ret
+0:  br x9
+.endm
+
+// A call from a gadget's slow path, made with _ip put back where a gadget
+// that used gret would have it (see gret_ahead).
+.macro bl_ahead target, ahead
+    .if \ahead
+    sub _ip, _ip, #\ahead
+    .endif
+    bl \target
+    .if \ahead
+    add _ip, _ip, #\ahead
+    .endif
 .endm
 
 // ---- Guest register access (memory-based; see file header) -------------
@@ -222,30 +282,38 @@ _addr   .req x7
 // convention, set up once in entry.S, not per-gadget).
 .irp type, read,write
 
-.macro \type\()_prep size, id
-    // TBI: AArch64 userspace ignores bits 56-63 on dereference. Bionic's
-    // Scudo tags heap pointers there, so the tag must be cleared before
-    // the page compare and TLB index or every tagged access faults.
+.macro \type\()_prep size, id, ahead=0
+    // ish-AOK-bind -- TBI: AArch64 userspace ignores bits 56-63 on a
+    // dereference, and bionic's Scudo tags heap pointers there, so the tag
+    // goes before the crossing test, the page compare and the TLB index, or
+    // every tagged access misses and faults. Upstream has no TBI handling.
     and x7, x7, #0x00ffffffffffffff
-    and w9, w7, #0xfff
-
-    cmp x9, #(0x1000-(\size/8))
-    // BOTH types branch to crosspage_load_\id -- this is i386's own design
-    // (jit/gadgets-aarch64/gadgets.h line 48), deliberately: for a WRITE
-    // that straddles a page boundary, arm64_crosspage_load fills
+    // An access that crosses into the next page takes crosspage_load_\id --
+    // BOTH types, i386's own design (jit/gadgets-aarch64/gadgets.h): for a
+    // WRITE that straddles a page boundary, arm64_crosspage_load fills
     // LOCAL_value with the current guest bytes, stashes the guest address
     // in LOCAL_value_addr, and redirects _addr to the LOCAL_value buffer;
     // the gadget's store instruction then writes into the buffer, and
     // write_done (below) detects _addr==LOCAL_value and calls
     // arm64_crosspage_store to flush the buffer back to guest memory
-    // using the stashed address. A previous revision of this port
-    // misdiagnosed this shared branch target as a label-collision bug and
-    // "fixed" it by branching writes directly to crosspage_store_\id --
-    // which flushes the still-uninitialized buffer and skips the actual
-    // store entirely. Corrected by re-reading i386's flow end-to-end
-    // (memory.S's crosspage_load/crosspage_store pair) rather than
-    // reasoning about the prep macro in isolation.
+    // using the stashed address. (Branching writes straight to
+    // crosspage_store_\id flushes the still-uninitialized buffer and skips
+    // the store: it was tried.)
+    //
+    // For 2, 4 and 8 bytes the crossing test is folded into the TLB compare:
+    // the tag is compared with the address's page AND its low alignment bits,
+    // so an aligned access -- which cannot cross -- hits in one compare, and
+    // anything unaligned leaves by handle_miss_\id, which sorts out whether it
+    // crosses, is merely unaligned inside its page (and probes again), or is a
+    // real miss. That is three instructions and a branch off nearly every
+    // load and store; one byte cannot cross and needs no test at all. A pair
+    // (16 bytes, aligned to 8) can cross while aligned, so it keeps the
+    // explicit test.
+    .if \size > 64
+    and w9, w7, #0xfff
+    cmp x9, #(0x1000-(\size/8))
     b.hi crosspage_load_\id
+    .endif
     .ifc \type,write
         ldr x10, [_tlb, #(-TLB_entries+TLB_mmu)]
         ldr x9, [_tlb, #(-TLB_entries+TLB_mem_changes)]
@@ -253,28 +321,27 @@ _addr   .req x7
         cmp x9, x11
         b.ne slow_write_\id
         ldrb w10, [x10, #MMU_requires_write_revalidate]
-        cbz w10, fast_write_\id
-slow_write_\id :
-        bl arm64_resolve_write_ptr
-        b back_\id
-fast_write_\id :
+        cbnz w10, slow_write_\id   // out of line (_bullshit): the store falls through
     .endif
-    // 64-bit page math throughout: this macro was copied from the i386
-    // gadget set, whose w-register page compare and unmasked `eor ..,
-    // lsr #22` index are only correct for 32-bit guest addresses. arm64
-    // guest addresses are 48-bit: the unmasked eor indexed OUTSIDE the
-    // 1024-entry TLB array (ld crashed the whole app dereferencing a
-    // garbage data_minus_addr), and the 32-bit page compare would treat
-    // any two pages 4GiB apart as aliases — silent wrong-memory access.
+    // 64-bit page math throughout: arm64 guest addresses are 48-bit, and a
+    // 32-bit page compare would treat any two pages 4GiB apart as aliases.
+    .if \size > 64 || \size == 8
     and x9, x7, #0xfffffffffffff000
-    .ifc \type,write
-        str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .else
+    and x9, x7, #(0xfffffffffffff000 | (\size/8 - 1))
     .endif
-    ubfx x10, x7, #12, #10
-    eor x10, x10, x7, lsr #22
-    and x10, x10, #(1 << TLB_BITS) - 1
-    mov w11, #TLB_ENTRY_SIZE
-    madd x10, x10, x11, _tlb
+    // TLB_INDEX (emu/tlb.h), page bits 0-9 xor bits 10-19, and the entry's
+    // address, without the mask, the constant and the multiply the first
+    // version of this took: xor the address with itself shifted and the
+    // index is one field of the result; 24 bytes an entry is times three,
+    // times eight.
+    .if TLB_ENTRY_SIZE != 24 || TLB_BITS != 10
+    .error "the TLB probe below is written for 1024 entries of 24 bytes"
+    .endif
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3
     .ifc \type,read
         ldr x11, [x10, #TLB_ENTRY_page]
     .else
@@ -282,23 +349,51 @@ fast_write_\id :
     .endif
     cmp x9, x11
     b.ne handle_miss_\id
+    .ifc \type,write
+        // (x9 is the page itself here: the compare passed)
+        str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .endif
     ldr x11, [x10, #TLB_ENTRY_data_minus_addr]
     add x7, x11, x7, uxtx
 back_\id:
 .endm
 
-.macro \type\()_bullshit size, id
+.macro \type\()_bullshit size, id, ahead=0
 handle_miss_\id :
-    bl arm64_handle_\type\()_miss
+    .if \size > 8 && \size <= 64
+    // Not a hit as probed (see \type\()_prep): crossing, unaligned, or missing.
+    and w9, w7, #0xfff
+    cmp x9, #(0x1000-(\size/8))
+    b.hi crosspage_load_\id
+    tst x7, #(\size/8 - 1)
+    b.eq 1f
+    // Unaligned inside its page: the same entry, compared with the page alone.
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    .ifc \type,write
+        str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    .endif
+    ldr x11, [x10, #TLB_ENTRY_data_minus_addr]
+    add x7, x11, x7, uxtx
     b back_\id
+1:
+    .endif
+    bl_ahead arm64_handle_\type\()_miss, \ahead
+    b back_\id
+.ifc \type,write
+slow_write_\id :
+    bl_ahead arm64_resolve_write_ptr, \ahead
+    b back_\id
+.endif
 crosspage_load_\id :
     mov x27, #(\size/8)
-    bl arm64_crosspage_load
+    bl_ahead arm64_crosspage_load, \ahead
     b back_\id
 .ifc \type,write
 crosspage_store_\id :
     mov x27, #(\size/8)
-    bl arm64_crosspage_store
+    bl_ahead arm64_crosspage_store, \ahead
     b back_write_done_\id
 .endif
 .endm

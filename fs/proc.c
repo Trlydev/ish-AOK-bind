@@ -1,6 +1,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <pthread.h>
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/fs.h"
 #include "fs/proc.h"
@@ -23,6 +24,43 @@ static void proc_prepare_child_entry(struct proc_entry *parent, unsigned long in
     child->parent = parent->meta;
 }
 
+// /proc/<n> for any live task, thread or process, as Linux's proc_pid_lookup
+// resolves it. The /proc listing names processes only (fs/proc/root.c), so a
+// thread's directory can't be found by walking it. Zombies resolve too, as
+// they are listed. Kernel threads have no task, and are left to the walk.
+static bool proc_lookup_task_dir(const char *component, struct proc_entry *next_entry) {
+    if (component[0] < '1' || component[0] > '9')
+        return false;
+    unsigned long id = 0;
+    for (const char *c = component; *c != '\0'; c++) {
+        if (*c < '0' || *c > '9' || id > MAX_PID)
+            return false;
+        id = id * 10 + (unsigned long) (*c - '0');
+    }
+    if (id > MAX_PID)
+        return false;
+    // The number is the reader's pid namespace's (kernel/pid_ns.h); what the
+    // entry keeps is the machine's, which is what everything under it looks
+    // the task up by again, whoever is reading by then.
+    complex_lockt(&pids_lock, 0);
+    struct task *named = pid_get_task_zombie((dword_t) id);
+    pid_t_ machine_pid = named != NULL ? named->pid : 0;
+    unlock(&pids_lock);
+    if (named == NULL)
+        return false;
+    *next_entry = (struct proc_entry) {&proc_pid, .pid = machine_pid};
+    return true;
+}
+
+bool proc_entry_may_read(struct proc_entry *entry) {
+    struct task *task = pid_get_task_global_ref(entry->pid);
+    if (task == NULL)
+        return true;
+    bool ok = task_ptrace_may_access(task, PTRACE_MODE_READ_ | PTRACE_MODE_FSCREDS_);
+    task_ref_cnt_mod(task, -1);
+    return ok;
+}
+
 static int proc_lookup(const char *path, struct proc_entry *entry) {
     entry->meta = &proc_root;
     char component[MAX_NAME + 1];
@@ -32,10 +70,21 @@ static int proc_lookup(const char *path, struct proc_entry *entry) {
             err = _ENOTDIR;
             break;
         }
+        // Nothing inside /proc/<pid>/fd or fdinfo is anyone else's to look
+        // up: Linux's proc_fd_permission refuses the directory itself, so
+        // stat, readlink and open of /proc/<pid>/fd/N all fail EACCES.
+        if (entry->meta->ptrace_read && !proc_entry_may_read(entry)) {
+            err = _EACCES;
+            break;
+        }
 
         unsigned long index = 0;
         struct proc_entry next_entry = {0};
         char entry_name[MAX_NAME];
+        if (entry->meta == &proc_root && proc_lookup_task_dir(component, &next_entry)) {
+            proc_prepare_child_entry(entry, 0, &next_entry);
+            goto found;
+        }
         while (proc_dir_read(entry, &index, &next_entry)) {
             proc_prepare_child_entry(entry, index, &next_entry);
 
@@ -73,6 +122,10 @@ static struct fd *proc_open(struct mount *UNUSED(mount), const char *path, int U
     int err = proc_lookup(path, &entry);
     if (err < 0)
         return ERR_PTR(err);
+    if (entry.meta->ptrace_read && !proc_entry_may_read(&entry)) {
+        proc_entry_cleanup(&entry);
+        return ERR_PTR(_EACCES);
+    }
     struct fd *fd = fd_create(&procfs_fdops);
     fd->proc.entry = entry;
     fd->proc.data.data = NULL;
@@ -140,11 +193,18 @@ static int proc_fstat(struct fd *fd, struct statbuf *stat) {
     return proc_entry_stat(&fd->proc.entry, stat);
 }
 
-static int proc_refresh_data(struct fd *fd) {
+static int proc_check_regular(struct fd *fd) {
     mode_t_ mode = proc_entry_mode(&fd->proc.entry);
     if (S_ISDIR(mode))
         return _EISDIR;
     assert(S_ISREG(mode));
+    return 0;
+}
+
+static int proc_refresh_data(struct fd *fd) {
+    int err = proc_check_regular(fd);
+    if (err < 0)
+        return err;
 
     struct proc_entry *entry = &fd->proc.entry;
     // pread/pwrite-backed entries (e.g. /proc/<pid>/mem) have no buffered
@@ -161,16 +221,72 @@ static int proc_refresh_data(struct fd *fd) {
         fd->proc.data.data = malloc(fd->proc.data.capacity); // default size
     }
     fd->proc.data.size = 0;
-    int err = entry->meta->show(entry, &fd->proc.data);
+    fd->proc.data_valid = false;
+    err = entry->meta->show(entry, &fd->proc.data);
     if (err < 0)
         return err;
+    fd->proc.data_valid = true;
     return 0;
 }
 
-static off_t_ proc_seek(struct fd *fd, off_t_ off, int whence) {
-    int err = proc_refresh_data(fd);
+// Linux renders a procfs file ONCE per read pass and serves the rest of the
+// pass out of that one buffer: single_open's seq_file fills seq_file::buf at
+// the read that starts at offset 0, and every later read of the pass copies
+// from it (fs/seq_file.c, seq_read_iter). AOK used to re-run show() on every
+// read(2) AND every lseek(2), so a reader taking a /proc file in small pieces
+// spliced together as many different renderings as it made calls. That is
+// invisible while the renderings have the same shape, and corrupts the file
+// the moment a field earlier in it changes WIDTH: the tail shifts under the
+// reader, and the byte at the offset it asks for next is the one it already
+// has (a duplicate) or the one after (a loss). Observed in a Devuan guest,
+// where dash's `read` builtin reads one byte at a time:
+//
+//     while read -r k v; do [ "$k" = btime ] && echo "BTIME=$v"; done </proc/stat
+//
+// printed BTIME=17990071649 for a btime of 1790071649 -- one duplicated
+// digit, because a counter printed above btime grew a digit between two of
+// those reads.
+//
+// So hold the rendering for the pass that is reading it, and re-render
+// exactly where Linux re-renders, which is what keeps a poller that re-reads
+// the same fd seeing new data:
+//
+//   * a read that starts at offset 0. seq_read_iter resets index and count
+//     whenever ki_pos == 0, so the usual lseek(0)+read refresh loop -- and a
+//     pread at 0 -- always gets a fresh rendering.
+//   * a read that does not continue where the previous one stopped: after an
+//     lseek, or a pread at an unrelated offset. seq_read_iter calls
+//     traverse() for any position other than the one it left off at, and
+//     traverse() re-runs show() from the start of the file.
+//
+// Anything else is the same pass still reading the same file, and gets the
+// bytes that belong to the snapshot it started.
+static int proc_data_for_read(struct fd *fd, off_t off) {
+    int err = proc_check_regular(fd);
     if (err < 0)
         return err;
+    if (fd->proc.data_valid && off != 0 && off == fd->proc.data_pos)
+        return 0;
+    return proc_refresh_data(fd);
+}
+
+static off_t_ proc_seek(struct fd *fd, off_t_ off, int whence) {
+    int err = proc_check_regular(fd);
+    if (err < 0)
+        return err;
+
+    // Only LSEEK_END needs the file's length, and a procfs file has none
+    // until it has been rendered. Linux answers EINVAL for it outright
+    // (seq_lseek handles SEEK_SET and SEEK_CUR only); AOK has always answered
+    // it from the rendered size, and guests size buffers with it, so keep
+    // answering -- just don't drag a render into the seeks that need no
+    // length. The LSEEK_CUR that sys_read_buf issues after every read(2) is
+    // one of those, and re-rendering there was half of the splicing above.
+    if (whence == LSEEK_END && !fd->proc.data_valid) {
+        err = proc_refresh_data(fd);
+        if (err < 0)
+            return err;
+    }
 
     err = generic_seek(fd, off, whence, fd->proc.data.size);
     if (err < 0)
@@ -184,22 +300,45 @@ static ssize_t proc_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) {
         struct proc_data data = {buf, bufsize, bufsize};
         return fd->proc.entry.meta->pread(&fd->proc.entry, &data, off, fd->flags);
     }
-    
-    int err = proc_refresh_data(fd);
+
+    // A file there is nothing to read from: binfmt_misc's `register`, which
+    // only takes writes. Linux gives it a write op and no read op, so open
+    // succeeds -- for root, whatever its 0200 says -- and read(2) is EINVAL,
+    // even for zero bytes, because vfs_read refuses a file it cannot read
+    // before it looks at the count. Here it rendered nothing, left the buffer
+    // unallocated, and an assert below aborted the app -- the one regular
+    // entry with neither show nor pread, so the only way the assert could
+    // fire, and what build 557's Organizer crash on iPhone14,5 (an arm64
+    // guest's read of a /proc file) points at.
+    if (fd->proc.entry.meta->show == NULL && S_ISREG(proc_entry_mode(&fd->proc.entry)))
+        return _EINVAL;
+
+    // seq_read_iter returns before it even takes the seq_file's lock when
+    // there is nothing to copy into, so an empty read renders nothing and
+    // moves nothing. Rendering here would throw away the pass's snapshot for
+    // a call that cannot consume a byte of it.
+    if (bufsize == 0)
+        return 0;
+
+    int err = proc_data_for_read(fd, off);
     if (err < 0)
         return err;
 
+    // No buffer is a rendering with nothing in it: an empty read, not a
+    // reason to take the app down.
     const char *data = fd->proc.data.data;
-    assert(data != NULL);
 
-    size_t remaining = fd->proc.data.size - off;
-    if ((size_t) off > fd->proc.data.size)
-        remaining = 0;
+    size_t remaining = 0;
+    if (data != NULL && off >= 0 && (size_t) off <= fd->proc.data.size)
+        remaining = fd->proc.data.size - (size_t) off;
     size_t n = bufsize;
     if (n > remaining)
         n = remaining;
 
-    memcpy(buf, data + off, n);
+    if (n > 0)
+        memcpy(buf, data + off, n);
+    // Where the next read has to start to be served from this same rendering.
+    fd->proc.data_pos = off + (off_t) n;
     return n;
 }
 
@@ -255,6 +394,11 @@ static ssize_t proc_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_t
     if (err < 0)
         return err;
 
+    // The write changed what this file says, so whatever rendering a read
+    // pass on this same fd was holding is now history. Drop it rather than
+    // let the next read continue out of it: an O_RDWR sysctl fd that writes
+    // and reads back is the whole reason both ops exist on one description.
+    fd->proc.data_valid = false;
     return bufsize;
 }
 
@@ -296,6 +440,7 @@ static int proc_poll(struct fd *fd) {
 }
 
 const struct fd_ops procfs_fdops = {
+    .name = "procfs",
     .pread = proc_pread,
     .pwrite = proc_pwrite,
     .lseek = proc_seek,
@@ -304,14 +449,20 @@ const struct fd_ops procfs_fdops = {
     .close = proc_close,
 };
 
-static ssize_t proc_readlink(struct mount *UNUSED(mount), const char *path, char *buf, size_t bufsize) {
+static ssize_t proc_readlink_common(const char *path, char *buf, size_t bufsize, bool shown) {
     struct proc_entry entry = {0};
     int err = proc_lookup(path, &entry);
     if (err < 0)
         return err;
+    entry.shown = shown;
     if (!S_ISLNK(proc_entry_mode(&entry))) {
         proc_entry_cleanup(&entry);
         return _EINVAL;
+    }
+    // cwd, root, exe and the ns links: Linux's proc_fd_access_allowed.
+    if (entry.meta->ptrace_read && !proc_entry_may_read(&entry)) {
+        proc_entry_cleanup(&entry);
+        return _EACCES;
     }
 
     char target[MAX_PATH + 1];
@@ -325,6 +476,15 @@ static ssize_t proc_readlink(struct mount *UNUSED(mount), const char *path, char
         bufsize = target_len;
     memcpy(buf, target, bufsize);
     return bufsize;
+}
+
+// The fs op, which fs/path.c calls to follow a link during a walk.
+static ssize_t proc_readlink(struct mount *UNUSED(mount), const char *path, char *buf, size_t bufsize) {
+    return proc_readlink_common(path, buf, bufsize, false);
+}
+
+ssize_t proc_readlink_shown(const char *path, char *buf, size_t bufsize) {
+    return proc_readlink_common(path, buf, bufsize, true);
 }
 
 static int proc_unlink(struct mount *UNUSED(mount), const char *path) {
@@ -363,8 +523,19 @@ void proc_printf(struct proc_data *buf, const char *format, ...) {
     proc_buf_append(buf, data, size);
 }
 
+// may_block: generic.c and stat.c do not hold inodes_lock across a call in
+// here (kernel/fs.h). There is nothing of procfs's for that lock to guard --
+// no file on a host, no metadata beside it -- and what a handler waits for
+// is a task's lock, pids_lock or a memory lock, each of which someone can be
+// holding while they wait for inodes_lock. One such ring stopped a guest for
+// good: an open of /proc/<pid>/fdinfo held inodes_lock and waited for the
+// task's lock; the task held it in a copy-on-write fault and waited for its
+// memory lock; and two readers of its smaps_rollup held that, waiting for
+// inodes_lock to ask whether a mapped file still had its name
+// (tests/manual/proc_pid_exit_race.c, on the i386 leg of a suite run).
 const struct fs_ops procfs = {
     .name = "proc", .magic = 0x9fa0,
+    .may_block = true,
     .mount = proc_mount,
     .open = proc_open,
     .getpath = proc_getpath,

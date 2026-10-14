@@ -17,8 +17,7 @@
 //    P_ALL/P_PID/P_PGID ("Failed to wait for ...10-arch: Invalid argument").
 //
 // Known deviations NOT asserted: read() on a non-symlink O_PATH fd succeeds
-// on AOK (Linux: EBADF); openat2 resolve flags return EINVAL (systemd falls
-// back to openat). Also passes on real Linux.
+// on AOK (Linux: EBADF). Also passes on real Linux.
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdint.h>

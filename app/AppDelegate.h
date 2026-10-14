@@ -61,3 +61,85 @@ extern NSString *const ProcessExitedNotification;
 // call repeatedly.
 void ISHSuspendGuardEnterBackground(void);
 void ISHSuspendGuardEnterForeground(void);
+
+// ---- suspend to disk (kernel/checkpoint.c) --------------------------------
+//
+// Where a suspended session lives, and taking one on demand. The automatic
+// half -- save on backgrounding, resume on launch -- needs no caller; these
+// are for a user asking for it NOW, from the Workspace.
+//
+// ISHSuspendSessionSaveNow BLOCKS: it freezes every guest task, writes the
+// image and thaws before returning. Call it off the main thread. It returns 0,
+// or a guest _E* code with /proc/ish/checkpoint's last_refusal naming the
+// cause. The guest is unharmed either way -- a checkpoint is a copy.
+NSString *ISHSuspendSessionImagePath(void);
+// The name an AUTOMATIC save uses -- the system taking the session when it
+// kills the app, as opposed to a Save or Suspend the user asked for. One fixed
+// name per root, so those replace each other instead of filling the slots. See
+// the definition in AppDelegate.m.
+NSString *ISHSuspendAutomaticSessionImagePath(void);
+// The image this launch resumed from, or nil for an ordinary boot. The Workspace
+// asks so it can apply THAT image's arrangement rather than the newest one on
+// file -- picking the older of two sessions used to come back wearing the newer
+// session's scrollback.
+NSString *_Nullable ISHSessionRestoredImagePath(void);
+// leaveOutGPU: save everything except the processes holding the GPU or the
+// Wayland view, with their children (CKPT_SAVE_LEAVE_OUT). Without it such
+// a save is refused; ask first with ISHSuspendSessionConfirmGPUThen.
+int ISHSuspendSessionSaveNow(BOOL leaveOutGPU);
+
+// True once the guest's init has exited (reboot, poweroff, halt, or init dying)
+// for the rest of this launch. Nothing restarts it in place.
+bool ISHGuestHalted(void);
+
+// Save the session and terminate the app, so the next launch resumes it. Does
+// not return on success. A SAVE is a copy and the guest carries on; this is the
+// departure.
+int ISHSuspendSessionSuspendAndExit(BOOL leaveOutGPU);
+
+// Before a Save or Suspend the user asked for: when the Wayland desktop or
+// another GPU program is running, which cannot be saved, say so and ask --
+// "Suspend Anyway" calls `proceed(YES)` (save everything else), Cancel does
+// nothing. With nothing on the GPU, `proceed(NO)` straight away. `verb` is the
+// button's word: @"Suspend" or @"Save". Main thread.
+void ISHSuspendSessionConfirmGPUThen(UIViewController *host, NSString *verb,
+                                     void (^proceed)(BOOL leaveOutGPU));
+
+// ---- saved sessions -----------------------------------------------------
+// A session belongs to the root it was saved on. These are the current root's
+// (the booted one, or before the boot the default), plus any image no root can
+// resume, offered only to delete: saved by another build (loadable NO) or on a
+// root that is gone (orphan YES). Each entry: path, name, date, bytes, tasks,
+// hostname, loadable, root, rootName, orphan. Newest first.
+NSArray<NSDictionary *> *ISHSessionSlots(void);
+// The identity sessions saved on the named root record
+// (checkpoint_root_identity). 0 if it has none.
+uint64_t ISHSessionRootIdentityNamed(NSString *_Nullable name);
+// How many sessions were saved on this root, and deleting them all -- which
+// deleting the root does, since nothing else can resume them.
+NSUInteger ISHSessionCountForRoot(uint64_t root);
+void ISHSessionsDeleteForRoot(uint64_t root);
+// How many are worth keeping on this device right now, space considered.
+NSUInteger ISHSessionSlotLimit(void);
+// Which slot the next save writes to; nil resets to "pick one".
+void ISHSessionSetCurrentSlot(NSString *_Nullable path);
+// The slot this launch should resume, chosen before the guest boots. nil means
+// start fresh, and the boot will not look for an image at all.
+void ISHSessionSetResumeChoice(NSString *_Nullable path);
+// YES while nothing has been chosen and there is something to choose between.
+BOOL ISHSessionResumeChoicePending(void);
+
+// Ask which saved session to resume -- or none -- from whichever root happens to
+// be on screen, and report the answer on the main queue. The argument is the
+// image to delete once a session is actually running, or nil to keep it.
+void ISHSessionPresentResumePicker(UIViewController *_Nonnull host,
+                                   void (^_Nonnull completion)(NSString *_Nullable imageToConsume));
+// Delete an image the user asked to be rid of. Called once there is a running
+// session to show for it, never at the moment of choosing: consuming it first
+// destroys the only copy whenever the restore then fails.
+void ISHSessionConsumeResumedImage(NSString *_Nullable path);
+// Refuse +ensureBooted while the question above is unanswered. Armed by whoever
+// is going to ask, and lifts itself the moment an answer is recorded.
+// ensureBooted is dispatch_once, so a boot that slips in first is permanent --
+// the answer given afterwards then has nothing left to decide.
+void ISHSessionHoldBootUntilResumeChoice(void);

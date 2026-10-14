@@ -12,23 +12,41 @@
 # shown by `ls /AOK/tools` (after the bundled iSH_benchmark entries).
 
 native-links.sh
+native-applets.conf
 persist-links.sh
 provision-ultimate-alpine.sh
 provision-ultimate-devuan.sh
 provision-ultimate-archlinux.sh
+provision-ultimate-pscal.sh
 mount-root.sh
 ish-report.sh
 ish-remote.sh
 manage-roots.sh
+suspend.sh
 setup-wayland.sh
+setup-wayland-extras.sh
+setup-gpu.sh
+setup-wayfire.sh
+setup-xfce.sh
+select-desktop.sh
+setup-locale.sh
+setup-games.sh
+aok-sdl-game 0555
 start-wayland.sh
+fix-neatvnc 0555
 ktop/ktop.c
 ktop/Makefile
 ktop/build.sh
 ktop/README.md
 pixman/ish_pixman_shim.c
 pixman/build-shim.sh
+wayland/ish_wl_release_guard.c
+wayland/build-release-guard.sh
+wayland/build-wf-panel.sh
+wayland/build-wayvnc.sh
 pixman/README.md
+pixman/pixman.h
+pixman/pixman-version.h
 crypto/install-crypto-accel.sh
 crypto/ish_provider.c
 crypto/README.md

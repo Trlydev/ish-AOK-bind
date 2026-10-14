@@ -1,5 +1,6 @@
 #import "DisplayRFBClient.h"
 #import <Network/Network.h>
+#include "fs/virtgpu.h"
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -25,6 +26,24 @@ static const int32_t DisplayRFBEncodingCopyRect = 1;
 static const int32_t DisplayRFBEncodingCursor = -239;
 static const int32_t DisplayRFBEncodingDesktopSize = -223;
 static const int32_t DisplayRFBEncodingExtendedDesktopSize = -308;
+
+// ExtendedDesktopSize rect x/y fields: why the size changed, and for a reply
+// to a SetDesktopSize, how that request went.
+static const uint16_t DisplayRFBResizeReasonThisClient = 1;
+static const uint16_t DisplayRFBResizeStatusSuccess = 0;
+static const uint16_t DisplayRFBResizeStatusProhibited = 1;
+// neatvnc's own status: the request was handed to the compositor and the
+// real size will follow later as a server-initiated rect.
+static const uint16_t DisplayRFBResizeStatusRequestForwarded = 4;
+
+// How long a forwarded SetDesktopSize may stay unanswered before another one
+// is allowed. A resize landed within 0.1 s on an idle guest, but took 8 s
+// while the session was still starting up.
+static const int64_t DisplayRFBDesktopSizeRequestTimeoutNanoseconds = 10 * NSEC_PER_SEC;
+
+// How long the server has to have sent nothing before a SetDesktopSize may go
+// out while an update request is outstanding. See -_sendWantedDesktopSizeIfSafe.
+static const int64_t DisplayRFBDesktopSizeQuietNanoseconds = 1 * NSEC_PER_SEC;
 
 static NSString *rfb_hex_dump(const uint8_t *bytes, size_t length) {
     NSMutableString *hex = [NSMutableString stringWithCapacity:length * 3];
@@ -76,6 +95,8 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
     // it) from sending a second FramebufferUpdateRequest and starting a second,
     // concurrent read loop that races the legitimate one on the same stream.
     BOOL _hasPendingFrame;
+    BOOL _updatesPaused;        // framebufferUpdatesPaused, on _queue
+    BOOL _requestHeldBack;      // a request the pause kept from being sent
 
     uint8_t *_Nullable _framebuffer; // BGRA8888, framebufferWidth*framebufferHeight*4
     NSString *_Nullable _lastUpdateHeaderHex; // diagnostic: raw pad+count bytes of the in-progress FramebufferUpdate
@@ -104,10 +125,41 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
     // stuck server still fails eventually instead of tolerating forever.
     BOOL _tolerateOutOfBoundsRects;
     unsigned _toleratedUpdatesSinceResize;
-    // Ask for a non-incremental update on the next acknowledge, so a fresh
-    // full frame at the new size replaces the zeroed post-resize buffer
-    // without trusting the server's damage tracking across a mode change.
-    BOOL _needsFullUpdateRequest;
+
+    // When SetDesktopSize may go out. neatvnc 0.9.1 (Debian 13, Devuan 6)
+    // encodes a client's pending damage against the current buffer without
+    // clamping it (fixed upstream in 0.9.2, "server: Clamp damage to fb
+    // size"). Damage bigger than a buffer that just shrank makes the raw
+    // encoder read past the end of it, and wayvnc dies with SIGSEGV, on
+    // native Linux as well.
+    //
+    // This client used to put that damage there itself, every time. A
+    // non-incremental FramebufferUpdateRequest adds the client's whole region,
+    // and makes neatvnc re-announce the size, which adds the size of the frame
+    // then in flight. So: after the connect-time request, every request is
+    // incremental (neatvnc ignores the region of those). And no SetDesktopSize
+    // goes out until that first request has been answered with pixels
+    // (_hasReceivedPixelUpdate), or while an earlier one is still unanswered
+    // (_desktopSizeRequestPending). The size asked for meanwhile waits in
+    // _wantedDesktopWidth/Height, latest wins.
+    //
+    // That is not enough on its own for 0.9.1: damage from screen activity
+    // queued while a frame is being encoded does the same when the resize
+    // lands just then, whatever the client sends. start-wayland.sh therefore
+    // runs wayvnc with --disable-resizing for neatvnc before 0.9.2.
+    //
+    // A second neatvnc bug decides WHEN a SetDesktopSize may be sent: see
+    // -_sendWantedDesktopSizeIfSafe.
+    BOOL _hasReceivedPixelUpdate;
+    BOOL _currentUpdateHasPixels;
+    BOOL _currentUpdateIsResizeReplyOnly;
+    BOOL _receivingServerMessage;
+    dispatch_time_t _lastServerMessageTime;
+    BOOL _desktopSizeRequestPending;
+    BOOL _desktopSizeProhibited;
+    dispatch_time_t _desktopSizeRequestDeadline;
+    uint16_t _wantedDesktopWidth;
+    uint16_t _wantedDesktopHeight;
 }
 
 - (instancetype)init {
@@ -208,7 +260,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
     // connection even after reporting ready, so this needs real headroom
     // rather than the tight window tuned for a healthy system.
     if (attempt >= 120) {
-        [self _failWithMessage:@"Timed out connecting to wayvnc"];
+        [self _failWithMessage:NSLocalizedString(@"Timed out connecting to wayvnc", @"Wayland display error (wayvnc is a program name)")];
         return;
     }
     nw_connection_cancel(connection);
@@ -257,11 +309,11 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
         if (self->_connection != connection)
             return;
         if (error != NULL) {
-            [self _failWithMessage:@"Connection error while reading from wayvnc"];
+            [self _failWithMessage:NSLocalizedString(@"Connection error while reading from wayvnc", @"Wayland display error (wayvnc is a program name)")];
             return;
         }
         if (content == nil || dispatch_data_get_size(content) < length) {
-            [self _failWithMessage:is_complete ? @"wayvnc closed the connection" : @"Short read from wayvnc"];
+            [self _failWithMessage:is_complete ? NSLocalizedString(@"wayvnc closed the connection", @"Wayland display error (wayvnc is a program name)") : NSLocalizedString(@"Short read from wayvnc", @"Wayland display error (wayvnc is a program name)")];
             return;
         }
         const void *bytes = NULL;
@@ -285,7 +337,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                                                   DISPATCH_DATA_DESTRUCTOR_DEFAULT),
                             NW_CONNECTION_DEFAULT_STREAM_CONTEXT, false, ^(nw_error_t _Nullable error) {
             if (error != NULL) {
-                [self _failWithMessage:@"Failed to send protocol version"];
+                [self _failWithMessage:NSLocalizedString(@"Failed to send protocol version", @"Wayland display connection error")];
                 return;
             }
             [self _readSecurityTypes];
@@ -303,7 +355,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                 uint32_t reasonLength = rfb_read_u32(lenBytes);
                 [self _readExactly:reasonLength completion:^(const uint8_t *reasonBytes) {
                     NSString *reason = [[NSString alloc] initWithBytes:reasonBytes length:reasonLength encoding:NSUTF8StringEncoding];
-                    [self _failWithMessage:[NSString stringWithFormat:@"wayvnc refused the connection: %@", reason ?: @"unknown reason"]];
+                    [self _failWithMessage:[NSString stringWithFormat:NSLocalizedString(@"wayvnc refused the connection: %@", @"Wayland display error; %@ is the server's reason"), reason ?: NSLocalizedString(@"unknown reason", @"Fallback when the server gives no reason")]];
                 }];
             }];
             return;
@@ -317,7 +369,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                 }
             }
             if (!offersNone) {
-                [self _failWithMessage:@"wayvnc did not offer security type None (no-auth)"];
+                [self _failWithMessage:NSLocalizedString(@"wayvnc did not offer security type None (no-auth)", @"Wayland display connection error")];
                 return;
             }
             static const uint8_t chooseNone[1] = {1};
@@ -326,7 +378,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                                                       DISPATCH_DATA_DESTRUCTOR_DEFAULT),
                                 NW_CONNECTION_DEFAULT_STREAM_CONTEXT, false, ^(nw_error_t _Nullable error) {
                 if (error != NULL) {
-                    [self _failWithMessage:@"Failed to select security type"];
+                    [self _failWithMessage:NSLocalizedString(@"Failed to select security type", @"Wayland display connection error")];
                     return;
                 }
                 [self _readSecurityResult];
@@ -343,7 +395,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                 uint32_t reasonLength = rfb_read_u32(lenBytes);
                 [self _readExactly:reasonLength completion:^(const uint8_t *reasonBytes) {
                     NSString *reason = [[NSString alloc] initWithBytes:reasonBytes length:reasonLength encoding:NSUTF8StringEncoding];
-                    [self _failWithMessage:[NSString stringWithFormat:@"wayvnc security handshake failed: %@", reason ?: @"unknown reason"]];
+                    [self _failWithMessage:[NSString stringWithFormat:NSLocalizedString(@"wayvnc security handshake failed: %@", @"Wayland display error; %@ is the server's reason"), reason ?: NSLocalizedString(@"unknown reason", @"Fallback when the server gives no reason")]];
                 }];
             }];
             return;
@@ -387,13 +439,13 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
 
 - (void)_finishConnectWithWidth:(uint16_t)width height:(uint16_t)height name:(NSString *_Nullable)name {
     if (width == 0 || height == 0) {
-        [self _failWithMessage:@"wayvnc reported an empty desktop size"];
+        [self _failWithMessage:NSLocalizedString(@"wayvnc reported an empty desktop size", @"Wayland display connection error")];
         return;
     }
     free(_framebuffer);
     _framebuffer = calloc((size_t) width * height, 4);
     if (_framebuffer == NULL) {
-        [self _failWithMessage:@"Failed to allocate framebuffer"];
+        [self _failWithMessage:NSLocalizedString(@"Failed to allocate framebuffer", @"Wayland display error")];
         return;
     }
     _framebufferWidth = width;
@@ -481,14 +533,30 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
 
 #pragma mark - Server message loop
 
+// The start and end of each server message, for the quiet-server test in
+// -_sendWantedDesktopSizeIfSafe. The end of one is also when a size held back
+// during it may go out.
+- (void)_noteServerMessageStarted {
+    _receivingServerMessage = YES;
+    _lastServerMessageTime = dispatch_time(DISPATCH_TIME_NOW, 0);
+}
+
+- (void)_noteServerMessageEnded {
+    _receivingServerMessage = NO;
+    _lastServerMessageTime = dispatch_time(DISPATCH_TIME_NOW, 0);
+    [self _sendWantedDesktopSizeIfSafe];
+}
+
 - (void)_readNextServerMessage {
     [self _readExactly:1 completion:^(const uint8_t *bytes) {
         DisplayRFBServerMessageType type = bytes[0];
+        [self _noteServerMessageStarted];
         switch (type) {
             case DisplayRFBServerMessageFramebufferUpdate:
                 [self _readFramebufferUpdateHeader];
                 return;
             case DisplayRFBServerMessageBell:
+                [self _noteServerMessageEnded];
                 [self _readNextServerMessage];
                 return;
             case DisplayRFBServerMessageServerCutText:
@@ -509,6 +577,8 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
 - (void)_readFramebufferUpdateHeader {
     [self _readExactly:3 completion:^(const uint8_t *bytes) {
         self->_lastUpdateHeaderHex = rfb_hex_dump(bytes, 3);
+        self->_currentUpdateHasPixels = NO;
+        self->_currentUpdateIsResizeReplyOnly = YES;
         uint16_t rectCount = rfb_read_u16(&bytes[1]);
         [self _readRectAtIndex:0 of:rectCount];
     }];
@@ -526,12 +596,28 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
             if (self->_toleratedUpdatesSinceResize > 5)
                 self->_tolerateOutOfBoundsRects = NO;
         }
+        // Pixels mean the server has encoded a frame, which consumed the
+        // damage of the connect-time full request. See _hasReceivedPixelUpdate.
+        if (self->_currentUpdateHasPixels)
+            self->_hasReceivedPixelUpdate = YES;
+        // neatvnc answers a SetDesktopSize with an update of its own, sent
+        // straight away rather than in reply to an update request. Nothing in
+        // it changes the framebuffer, and acknowledging it would send a second
+        // request, leaving the server one request ahead of this client: free
+        // to send a frame at the moment -_sendWantedDesktopSizeIfSafe counts on
+        // there being none.
+        if (total > 0 && self->_currentUpdateIsResizeReplyOnly) {
+            [self _noteServerMessageEnded];
+            [self _readNextServerMessage];
+            return;
+        }
         // Whole FramebufferUpdate processed: notify, then go quiet on the
         // wire until the delegate calls -acknowledgeFramebufferRead. See
         // the header doc -- this is the backpressure mechanism, not just an
         // optimization: we deliberately don't ask for (or read) more pixel
         // data until whatever consumed this frame says it's safe to.
         self->_hasPendingFrame = YES;
+        [self _noteServerMessageEnded];
         __weak typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
@@ -547,6 +633,11 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
         uint16_t w = rfb_read_u16(&bytes[4]);
         uint16_t h = rfb_read_u16(&bytes[6]);
         int32_t encoding = (int32_t) rfb_read_u32(&bytes[8]);
+        // Only an answer to our own SetDesktopSize that changes nothing keeps
+        // the update "reply only", see the end of the update above.
+        if (!(encoding == DisplayRFBEncodingExtendedDesktopSize && x == DisplayRFBResizeReasonThisClient
+              && y != DisplayRFBResizeStatusSuccess))
+            self->_currentUpdateIsResizeReplyOnly = NO;
 
         // Cursor's x/y are a hotspot offset within the cursor image, not a
         // framebuffer position -- must branch before the framebuffer-bounds
@@ -556,19 +647,19 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
             return;
         }
 
-        // Desktop-size pseudo-rects: w/h carry the new size, x/y are not a
-        // position (ExtendedDesktopSize reuses them as reason/status --
-        // deliberately ignored: wayvnc 0.10.1 returns a nonstandard status
-        // while demonstrably applying the resize, so the only thing treated
-        // as authoritative is the size itself; see the plan doc). Both must
-        // branch before the zero-area check: ExtendedDesktopSize always
-        // carries a screen-list payload that has to be consumed even if the
-        // size happens to be unchanged or degenerate.
+        // Desktop-size pseudo-rects: w/h carry the size, x/y are not a
+        // position (ExtendedDesktopSize reuses them as reason/status, see
+        // -_readExtendedDesktopSizeRect...). Both must branch before the
+        // zero-area check: ExtendedDesktopSize always carries a screen-list
+        // payload that has to be consumed even if the size happens to be
+        // unchanged or degenerate.
         if (encoding == DisplayRFBEncodingExtendedDesktopSize) {
-            [self _readExtendedDesktopSizeRectWithWidth:w height:h index:index total:total];
+            [self _readExtendedDesktopSizeRectWithWidth:w height:h reason:x status:y index:index total:total];
             return;
         }
         if (encoding == DisplayRFBEncodingDesktopSize) {
+            if (w != 0 && h != 0 && (w != self->_framebufferWidth || h != self->_framebufferHeight))
+                self->_desktopSizeRequestPending = NO;
             if (![self _applyDesktopSizeWidth:w height:h])
                 return;
             [self _readRectAtIndex:index + 1 of:total];
@@ -594,6 +685,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
             // so consume and discard rather than either failing or trying
             // to clip content that's about to be fully repainted anyway.
             if (self->_tolerateOutOfBoundsRects && encoding == DisplayRFBEncodingCopyRect) {
+                self->_currentUpdateHasPixels = YES;
                 [self _readExactly:4 completion:^(const uint8_t *ignored) {
                     (void) ignored;
                     [self _readRectAtIndex:index + 1 of:total];
@@ -601,6 +693,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                 return;
             }
             if (self->_tolerateOutOfBoundsRects && encoding == DisplayRFBEncodingRaw) {
+                self->_currentUpdateHasPixels = YES;
                 [self _readExactly:(uint32_t) w * h * 4 completion:^(const uint8_t *ignored) {
                     (void) ignored;
                     [self _readRectAtIndex:index + 1 of:total];
@@ -620,6 +713,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
         // indefinitely past the update where the server actually settles.
         self->_tolerateOutOfBoundsRects = NO;
         if (encoding == DisplayRFBEncodingCopyRect) {
+            self->_currentUpdateHasPixels = YES;
             [self _readCopyRectSourceForDestX:x y:y w:w h:h index:index total:total];
             return;
         }
@@ -630,6 +724,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                 self->_lastUpdateHeaderHex, rfb_hex_dump(bytes, 12)]];
             return;
         }
+        self->_currentUpdateHasPixels = YES;
         uint32_t byteCount = (uint32_t) w * h * 4;
         [self _readExactly:byteCount completion:^(const uint8_t *pixels) {
             size_t srcStride = (size_t) w * 4;
@@ -740,7 +835,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
         return YES; // layout announcement with no size change (e.g. the initial ExtendedDesktopSize)
     uint8_t *newFramebuffer = calloc((size_t) width * height, 4);
     if (newFramebuffer == NULL) {
-        [self _failWithMessage:@"Failed to allocate resized framebuffer"];
+        [self _failWithMessage:NSLocalizedString(@"Failed to allocate resized framebuffer", @"Wayland display error")];
         return NO;
     }
     free(_framebuffer);
@@ -749,22 +844,25 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
     _framebufferHeight = height;
     // The whole (currently zeroed) buffer is the dirty region: whatever the
     // delegate uploads next must cover everything, not a stale sub-rect of
-    // the old geometry.
+    // the old geometry. No non-incremental request is sent to refill it:
+    // neatvnc damages the whole new desktop itself when it announces a size,
+    // and a non-incremental request is what crashes neatvnc 0.9.1 (see
+    // _hasReceivedPixelUpdate).
     _dirtyRect = CGRectMake(0, 0, width, height);
     _tolerateOutOfBoundsRects = YES;
     _toleratedUpdatesSinceResize = 0;
-    _needsFullUpdateRequest = YES;
     return YES;
 }
 
 - (void)_readExtendedDesktopSizeRectWithWidth:(uint16_t)width height:(uint16_t)height
+                                        reason:(uint16_t)reason status:(uint16_t)status
                                          index:(uint16_t)index total:(uint16_t)total {
     // Payload: 1 byte screen count + 3 bytes padding, then 16 bytes per
     // screen (id u32, x u16, y u16, w u16, h u16, flags u32).
     [self _readExactly:4 completion:^(const uint8_t *header) {
         uint8_t screenCount = header[0];
         if (screenCount == 0) {
-            if (![self _applyDesktopSizeWidth:width height:height])
+            if (![self _handleExtendedDesktopSizeWidth:width height:height reason:reason status:status])
                 return;
             [self _readRectAtIndex:index + 1 of:total];
             return;
@@ -774,42 +872,145 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
             // SetDesktopSize; wayvnc's single headless output is one screen.
             self->_screenId = rfb_read_u32(&screens[0]);
             self->_screenFlags = rfb_read_u32(&screens[12]);
-            if (![self _applyDesktopSizeWidth:width height:height])
+            if (![self _handleExtendedDesktopSizeWidth:width height:height reason:reason status:status])
                 return;
             [self _readRectAtIndex:index + 1 of:total];
         }];
     }];
 }
 
+// x is the reason for the change and y the status of a client's request. The
+// answer to our own SetDesktopSize is not a size change unless its status is
+// success: neatvnc (0.9.1 and 1.0) answers a request it hands to the
+// compositor at once with status 4, "forwarded", carrying the size ASKED FOR,
+// not the size the desktop has. Taking that as the new size is what turned one
+// request into a crash: the client adopted it, the next frame said 1280x720
+// again and it flipped back, and its full requests at each size raced the real
+// resize. The real size follows as a server-initiated rect (reason 0, status
+// 0) once the compositor has applied it, on both wayvnc 0.9.1 and 0.10.0.
+// Refusals (1-3) end the request, and "prohibited" (a wayvnc started with
+// --disable-resizing, see start-wayland.sh) ends asking for this connection.
+// Returns NO only on a fatal allocation failure.
+- (BOOL)_handleExtendedDesktopSizeWidth:(uint16_t)width height:(uint16_t)height
+                                 reason:(uint16_t)reason status:(uint16_t)status {
+    if (reason == DisplayRFBResizeReasonThisClient && status != DisplayRFBResizeStatusSuccess) {
+        if (status != DisplayRFBResizeStatusRequestForwarded)
+            _desktopSizeRequestPending = NO;
+        if (status == DisplayRFBResizeStatusProhibited)
+            _desktopSizeProhibited = YES;
+        return YES;
+    }
+    if (reason == DisplayRFBResizeReasonThisClient
+        || (width != 0 && height != 0 && (width != _framebufferWidth || height != _framebufferHeight)))
+        _desktopSizeRequestPending = NO;
+    return [self _applyDesktopSizeWidth:width height:height];
+}
+
 - (void)requestDesktopSizeWidth:(uint16_t)width height:(uint16_t)height {
+    if (width != 0 && height != 0 &&
+            virtgpu_present_input(_guestPort, VIRTGPU_INPUT_RESIZE, width, height, NULL, 0) == 0)
+        return;
     dispatch_async(_queue, ^{
-        if (!self->_connected || self->_connection == nil)
-            return;
         if (width == 0 || height == 0)
             return;
-        if (width == self->_framebufferWidth && height == self->_framebufferHeight)
+        self->_wantedDesktopWidth = width;
+        self->_wantedDesktopHeight = height;
+        [self _sendWantedDesktopSizeIfSafe];
+    });
+}
+
+// Sends the size last asked for once that is safe, see _hasReceivedPixelUpdate.
+// Runs on _queue: after every request, after every update, when a pending
+// request times out, and when a quiet server has been quiet long enough.
+//
+// It also has to be sent while no frame is on its way. neatvnc writes its
+// answer to a SetDesktopSize in four pieces (the 0.9.1 and 1.0.0 source
+// alike). When a frame finishes sending during one of those writes, the
+// frame's completion queues the server's next message -- a cursor update, say
+// -- between the pieces, and the stream desynchronises. In a recorded session
+// with wayvnc 0.10.0 the answer's screen list came 688 bytes late, after a
+// whole cursor update, and this client failed on a "65535x65297" rect. The size
+// had been sent in the middle of a 2560x1440 frame. So the size goes out at the
+// one moment no frame can be on its way: an update has been read and not yet
+// acknowledged (_hasPendingFrame), when this client has no request
+// outstanding. Updates that only answer a SetDesktopSize are never
+// acknowledged, so there is never a spare one. On a desktop too still to send
+// any update, the fallback is a server that has sent nothing for a second: an
+// update it had started would have begun arriving by then.
+- (void)_sendWantedDesktopSizeIfSafe {
+    uint16_t width = _wantedDesktopWidth;
+    uint16_t height = _wantedDesktopHeight;
+    if (width == 0 || height == 0 || !_connected || _connection == nil)
+        return;
+    if (_desktopSizeProhibited
+        || (width == _framebufferWidth && height == _framebufferHeight && !_desktopSizeRequestPending)) {
+        _wantedDesktopWidth = 0;
+        _wantedDesktopHeight = 0;
+        return;
+    }
+    if (!_hasReceivedPixelUpdate)
+        return;
+    if (_desktopSizeRequestPending) {
+        // A compositor that never applies a forwarded request must not block
+        // resizing for the rest of the connection.
+        if (dispatch_time(DISPATCH_TIME_NOW, 0) < _desktopSizeRequestDeadline)
             return;
-        // SetDesktopSize (251): 1 type, 1 pad, u16 w, u16 h, 1 screen count,
-        // 1 pad, then one 16-byte screen entry echoing the tracked identity
-        // at the new dimensions. Nothing local changes here -- the resize
-        // takes effect only when the server confirms it with a
-        // DesktopSize/ExtendedDesktopSize rect (which can arrive an update
-        // or two later; the apply is asynchronous server-side).
-        uint8_t msg[8 + 16];
-        msg[0] = DisplayRFBClientMessageSetDesktopSize;
-        msg[1] = 0;
-        rfb_write_u16(&msg[2], width);
-        rfb_write_u16(&msg[4], height);
-        msg[6] = 1;
-        msg[7] = 0;
-        rfb_write_u32(&msg[8], self->_screenId);
-        rfb_write_u16(&msg[12], 0);
-        rfb_write_u16(&msg[14], 0);
-        rfb_write_u16(&msg[16], width);
-        rfb_write_u16(&msg[18], height);
-        rfb_write_u32(&msg[20], self->_screenFlags);
-        nw_connection_send(self->_connection, dispatch_data_create(msg, sizeof(msg), self->_queue, DISPATCH_DATA_DESTRUCTOR_DEFAULT),
-                            NW_CONNECTION_DEFAULT_STREAM_CONTEXT, false, ^(nw_error_t _Nullable sendError) {});
+        _desktopSizeRequestPending = NO;
+        if (width == _framebufferWidth && height == _framebufferHeight) {
+            _wantedDesktopWidth = 0;
+            _wantedDesktopHeight = 0;
+            return;
+        }
+    }
+    __weak typeof(self) weakSelf = self;
+    if (!_hasPendingFrame) {
+        dispatch_time_t quietFrom = dispatch_time(_lastServerMessageTime, DisplayRFBDesktopSizeQuietNanoseconds);
+        if (_receivingServerMessage)
+            return; // the end of this message is a safe point or restarts the clock
+        if (dispatch_time(DISPATCH_TIME_NOW, 0) < quietFrom) {
+            dispatch_after(quietFrom, _queue, ^{
+                [weakSelf _sendWantedDesktopSizeIfSafe];
+            });
+            return;
+        }
+    }
+    _wantedDesktopWidth = 0;
+    _wantedDesktopHeight = 0;
+    _desktopSizeRequestPending = YES;
+    _desktopSizeRequestDeadline = dispatch_time(DISPATCH_TIME_NOW, DisplayRFBDesktopSizeRequestTimeoutNanoseconds);
+    dispatch_after(_desktopSizeRequestDeadline, _queue, ^{
+        [weakSelf _sendWantedDesktopSizeIfSafe];
+    });
+    // SetDesktopSize (251): 1 type, 1 pad, u16 w, u16 h, 1 screen count,
+    // 1 pad, then one 16-byte screen entry echoing the tracked identity
+    // at the new dimensions. Nothing local changes here -- the resize
+    // takes effect only when the server announces it with a
+    // DesktopSize/ExtendedDesktopSize rect (which can arrive an update
+    // or two later; the apply is asynchronous server-side).
+    uint8_t msg[8 + 16];
+    msg[0] = DisplayRFBClientMessageSetDesktopSize;
+    msg[1] = 0;
+    rfb_write_u16(&msg[2], width);
+    rfb_write_u16(&msg[4], height);
+    msg[6] = 1;
+    msg[7] = 0;
+    rfb_write_u32(&msg[8], _screenId);
+    rfb_write_u16(&msg[12], 0);
+    rfb_write_u16(&msg[14], 0);
+    rfb_write_u16(&msg[16], width);
+    rfb_write_u16(&msg[18], height);
+    rfb_write_u32(&msg[20], _screenFlags);
+    nw_connection_send(_connection, dispatch_data_create(msg, sizeof(msg), _queue, DISPATCH_DATA_DESTRUCTOR_DEFAULT),
+                        NW_CONNECTION_DEFAULT_STREAM_CONTEXT, false, ^(nw_error_t _Nullable sendError) {});
+}
+
+- (void)deliverServerCutText:(NSString *)text {
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        typeof(self) strongSelf = weakSelf;
+        if (strongSelf == nil || text.length == 0)
+            return;
+        [strongSelf.delegate rfbClient:strongSelf didReceiveServerCutText:text];
     });
 }
 
@@ -825,6 +1026,7 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
                     return;
                 [strongSelf.delegate rfbClient:strongSelf didReceiveServerCutText:text];
             });
+            [self _noteServerMessageEnded];
             [self _readNextServerMessage];
         }];
     }];
@@ -842,19 +1044,40 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
             return;
         self->_hasPendingFrame = NO;
         self->_dirtyRect = CGRectNull;
-        // After a desktop resize, the next request is non-incremental: the
-        // buffer was reallocated zeroed, so a full frame at the new size is
-        // needed regardless of what the server considers damaged.
-        BOOL fullUpdate = self->_needsFullUpdateRequest;
-        self->_needsFullUpdateRequest = NO;
-        [self _sendFramebufferUpdateRequestIncremental:!fullUpdate];
+        // Always incremental, even right after a desktop resize. See
+        // -_applyDesktopSizeWidth:height:.
+        if (self->_updatesPaused)
+            self->_requestHeldBack = YES;
+        else
+            [self _sendFramebufferUpdateRequestIncremental:YES];
         [self _readNextServerMessage];
+    });
+}
+
+- (BOOL)framebufferUpdatesPaused {
+    __block BOOL paused;
+    dispatch_sync(_queue, ^{
+        paused = self->_updatesPaused;
+    });
+    return paused;
+}
+
+- (void)setFramebufferUpdatesPaused:(BOOL)paused {
+    dispatch_async(_queue, ^{
+        self->_updatesPaused = paused;
+        if (!paused && self->_requestHeldBack && self->_connected && self->_connection != nil) {
+            self->_requestHeldBack = NO;
+            [self _sendFramebufferUpdateRequestIncremental:YES];
+        }
     });
 }
 
 #pragma mark - Input
 
 - (void)sendPointerEventAtX:(uint16_t)x y:(uint16_t)y buttonMask:(uint8_t)buttonMask {
+    if (virtgpu_present_input(_guestPort, VIRTGPU_INPUT_POINTER, (uint32_t) x | (uint32_t) y << 16,
+                              buttonMask, NULL, 0) == 0)
+        return;
     dispatch_async(_queue, ^{
         if (self->_connection == nil)
             return;
@@ -869,6 +1092,8 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
 }
 
 - (void)sendKeyEvent:(uint32_t)keysym down:(BOOL)down {
+    if (virtgpu_present_input(_guestPort, VIRTGPU_INPUT_KEY, keysym, down ? 1 : 0, NULL, 0) == 0)
+        return;
     dispatch_async(_queue, ^{
         if (self->_connection == nil)
             return;
@@ -895,6 +1120,10 @@ static inline void rfb_write_u32(uint8_t *p, uint32_t hostValue) {
 }
 
 - (void)sendClientCutText:(NSString *)text {
+    NSData *utf8 = [text dataUsingEncoding:NSUTF8StringEncoding];
+    if (utf8 != nil && utf8.length <= UINT32_MAX &&
+            virtgpu_present_input(_guestPort, VIRTGPU_INPUT_CLIPBOARD, 0, 0, utf8.bytes, (uint32_t) utf8.length) == 0)
+        return;
     NSData *latin1 = [text dataUsingEncoding:NSISOLatin1StringEncoding allowLossyConversion:YES];
     if (latin1 == nil)
         return;

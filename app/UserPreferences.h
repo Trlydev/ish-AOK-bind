@@ -62,6 +62,10 @@ extern NSString *const kThemeBackgroundColor;
 @property BOOL hideStatusBar;
 @property BOOL showTerminalQuickButtons;
 @property BOOL autoShowKeyboard;
+// The Wayland display takes a finger as a touchpad (drag moves the pointer
+// from where it is, tap clicks, two fingers scroll or right-click) rather
+// than as the pointer itself. Off by default. GH #628.
+@property BOOL displayTouchpadMode;
 @property NSInteger workspaceLaunchCount;
 @property (nonatomic) Theme *theme;
 @property (nonatomic) Palette *palette;
@@ -69,6 +73,14 @@ extern NSString *const kThemeBackgroundColor;
 @property BOOL shouldDisableDimming;
 @property BOOL shouldEnableMulticore;
 @property BOOL shouldEnableHLE;
+// Keep translated code beyond the process that made it (jit.c's exec cache).
+// Off by default: turning it on turns the guest's ASLR off.
+@property BOOL shouldEnableJITCache;
+// What happens to a program from another installed root (/AOK/roots/<name>/...)
+// whose loader is not in the booted one: "root" runs it inside its root,
+// "libs" runs it here with that root's libraries, "off" fails as Linux does.
+// kernel/foreign_exec.c; applied the moment it changes.
+@property (nonatomic, copy) NSString *foreignExecMode;
 @property BOOL shouldEnableCryptoAccel;
 @property BOOL shouldEnablePixAccel;
 @property BOOL shouldEnableExtraLocking;
@@ -89,12 +101,48 @@ extern NSString *const kThemeBackgroundColor;
 // Read once per launch. Changing either takes effect at the next launch; a
 // running pager is deliberately not resizable in place.
 @property BOOL shouldEnableSwap;
+
+// Suspend to disk (kernel/checkpoint.c). When the app is backgrounded it
+// writes the whole guest -- every process, its memory, its descriptors, and
+// whatever a native shell says about itself -- to one file, and the next
+// launch resumes from it instead of booting.
+//
+// OFF by default, on the same reasoning swap is: it spends the user's storage
+// and, if a session cannot be described, it can lose one. A checkpoint that
+// refuses says so in /proc/ish/checkpoint and the app boots normally, so the
+// worst case is the behaviour you get with this off.
+@property BOOL shouldSuspendToDisk;
 // 0 means "the user has not chosen a size", which is the registered default
 // and keeps swap off. Clamped to 0...ISHSwapMaxSizeMB on the way in AND on the
 // way out: the iOS Settings pane (app/Settings.bundle/Root.plist) writes this
 // key into NSUserDefaults with none of our code running, so the setter is not
 // the only writer and cannot be the only place the range is enforced.
 @property NSInteger swapSizeMB;
+
+// Swap to an external USB drive instead of the app's container. When ON,
+// swap reads/writes go to a .aok-swap file in a user-chosen directory on
+// a plugged-in USB drive, via a security-scoped bookmark. The bookmark is
+// presented through a UIDocumentPickerViewController the first time the
+// user enables this; subsequent launches restore it automatically.
+//
+// Both take effect at the next launch, like shouldEnableSwap and swapSizeMB.
+// If the bookmark is stale or the drive is not attached, swap stays off and
+// the status text says why.
+@property BOOL shouldEnableSwapOnExternal;
+@property (nonatomic, nullable) NSData *swapExternalBookmark;
+@property (nonatomic) NSString *swapExternalPath;
+
+// Compressed memory (kernel/zswap.h). A cache in FRONT of the swap area: a
+// frame that compresses is kept in RAM instead of written to flash, which costs
+// no write budget and comes back about two orders of magnitude faster than a
+// disk read. Measured 2.2-2.8x on real workloads, at 1.9 us per decompress on
+// an M4 and 3.1 us on an A9.
+//
+// Needs swap on -- it fronts the area rather than replacing it -- and is off
+// with its own switch even then, because it spends the user's RAM and how much
+// is their decision. Same 0-means-off rule as swapSizeMB.
+@property BOOL shouldEnableCompressedMemory;
+@property NSInteger compressedMemorySizeMB;
 @property BOOL shouldEnableLLMClient;
 @property (nonatomic) NSString *llmProvider;
 @property (nonatomic) NSString *llmServerURL;
@@ -107,6 +155,18 @@ extern NSString *const kThemeBackgroundColor;
 // the single source of truth for every request the client actually makes --
 // these two only describe the saved set to pick from.
 @property (nonatomic) NSArray<NSDictionary<NSString *, NSString *> *> *llmDestinations;
+// Saved command-line snippets for the terminal's snippet sheet: an array of
+// {id, name, text, run} dictionaries, keyed by the constants in Snippets.h.
+@property (nonatomic) NSArray<NSDictionary<NSString *, id> *> *snippets;
+// SHA-256, hex, of the snippet JSON as it was last written to or read from the
+// guest-visible mirror. This is what makes "the guest file changed underneath
+// us" an answerable question rather than a guess -- see +[ISHSnippetStore
+// syncWithGuest:].
+@property (nonatomic) NSString *snippetsSyncedDigest;
+// The keys on the extra-keys toolbar above the on-screen keyboard (#609), as
+// the user arranged them; nil when they never have, which is the built-in
+// layout -- see ISHToolbarKeysCurrentLayout, which is what everything reads.
+@property (nonatomic, nullable) NSDictionary<NSString *, NSArray *> *toolbarKeys;
 @property (nonatomic) NSString *llmActiveDestinationID;
 @property BOOL llmToolsEnabled;
 @property NSInteger llmToolTimeoutSeconds;
@@ -126,6 +186,10 @@ extern NSString *const kThemeBackgroundColor;
 // Cell height as a multiple of the font's measured maximum extent. 1 is that
 // height unchanged, which is what every build before this one did.
 @property NSNumber *lineHeight;
+// Points left clear below the terminal while no on-screen keyboard covers the
+// bottom of the screen (#616): its last rows otherwise sit in the Home
+// indicator's swipe area. 0, the default, is the layout as it always was.
+@property NSNumber *terminalBottomPadding;
 @property (readonly) NSNumber *defaultFontSize;
 @property ColorScheme colorScheme;
 @property (readonly) BOOL requestingDarkAppearance;
@@ -138,6 +202,30 @@ extern NSString *const kThemeBackgroundColor;
 @property NSArray<NSString *> *launchCommand;
 @property NSArray<NSString *> *bootCommand;
 @property (nonatomic) NSString *customDnsServers;
+// The Wayland desktop's two size settings, which are deliberately separate.
+//
+// displayDesktopScale is how many desktop PIXELS the applet asks for per point
+// of the surface showing it: 1 is one pixel per point (what this has always
+// done), 2 and 3 ask for that many times as many, and 0 means the device's own
+// nativeScale. More pixels cost quadratically -- wayvnc encodes every frame in
+// software inside the guest -- so this stays at 1 unless asked.
+//
+// displayUIScale is the scale the compositor reports to its clients, which
+// decides how big things LOOK. 0 means "match the resolution", which keeps text
+// and windows the physical size they are now and just renders them sharply; 1
+// with a raised resolution instead fits proportionally more on screen at
+// proportionally smaller size. Applied in the guest with wlr-randr.
+@property NSInteger displayDesktopScale;
+@property NSInteger displayUIScale;
+// When YES, AOK never writes the guest's /etc/resolv.conf and never binds the
+// local DNS responder at 127.0.0.53:53, leaving name resolution entirely to the
+// guest. The default (NO) rewrites the file on every network path change, which
+// is what most roots want -- but a root running its own resolver (dnsmasq,
+// systemd-resolved, unbound) owns that file and wants that port, and the
+// rewrite bumps the file's mtime on every cellular path update, which those
+// resolvers poll for. Checked before customDnsServers, so a list left behind in
+// preferences cannot resurrect the rewrite.
+@property BOOL shouldDisableResolvConfRewrite;
 // When YES, new terminal sessions launched with the default "/bin/login -f root" command log in
 // as the unprivileged UID 1000 account instead, matching how a real Linux desktop is normally
 // used. Sessions with a customized launch command are unaffected. The headless command surfaces
@@ -168,11 +256,50 @@ extern NSString *const kPreferenceInitialWindowKey;
 // and the area is preallocated in the container, so a bigger number is a
 // bigger hole in the user's free space rather than a bigger win.
 extern const NSInteger ISHSwapMaxSizeMB;
+extern const NSInteger ISHCompressedMemoryMaxSizeMB;
+// The ceiling actually enforced: a quarter of this device's RAM, floored at
+// 64 MB and capped at ISHCompressedMemoryMaxSizeMB. The pool is resident
+// memory and competes with what it saves, so a fixed number is wrong on a
+// small device -- see the definition.
+NSInteger ISHCompressedMemoryMaxForDevice(void);
 
 // "Open Everything as Default User" targets whatever account this rootfs already has at UID
 // 1000 (the conventional "first regular user" UID on Debian/Devuan/Alpine) -- no account is
 // provisioned/created by iSH itself. See +[AppDelegate defaultUserAccountName], which looks up
 // the actual account name (or returns nil if none exists) at each use.
 extern const int ISHDefaultUserAccountUID;
+
+// ---- The extra-keys toolbar's keys (#609) ------------------------------
+//
+// A layout is two ordered lists, one per place on the bar: ISHToolbarKeyGroupLeft
+// runs from the bar's left edge, ISHToolbarKeyGroupCenter is centred between two
+// equal flexible spaces. The app's own controls (Settings, Files, Paste, Hide
+// Keyboard and the rest) keep the right-hand end and are not part of it.
+//
+// Each key is a dictionary: a built-in one names itself with ISHToolbarKeyBuiltin
+// (see ISHToolbarBuiltinKeyIDs); a custom one has ISHToolbarKeyTitle, what the
+// key shows, and ISHToolbarKeySends, the text it types in the escaped form
+// ISHToolbarKeyDecodeSends reads. ISHToolbarKeyNarrow (BOOL, default YES) is
+// whether it is shown on a narrow bar, an iPhone held upright.
+extern NSString *const ISHToolbarKeyGroupLeft;
+extern NSString *const ISHToolbarKeyGroupCenter;
+extern NSString *const ISHToolbarKeyBuiltin;
+extern NSString *const ISHToolbarKeyTitle;
+extern NSString *const ISHToolbarKeySends;
+extern NSString *const ISHToolbarKeyNarrow;
+// Today's bar, exactly: Tab, Control, Escape and the arrows at the left; - . / :
+// ! | centred, with only . and / on a narrow bar.
+NSDictionary<NSString *, NSArray *> *ISHToolbarKeysDefaultLayout(void);
+// `layout` made safe to build from: unknown or repeated built-ins and custom keys
+// with nothing to show or send are dropped. nil gives the default layout.
+NSDictionary<NSString *, NSArray *> *ISHToolbarKeysValidatedLayout(NSDictionary * _Nullable layout);
+// The saved layout, validated, or the default.
+NSDictionary<NSString *, NSArray *> *ISHToolbarKeysCurrentLayout(void);
+NSArray<NSString *> *ISHToolbarBuiltinKeyIDs(void);
+NSString *ISHToolbarBuiltinKeyName(NSString *key);   // "Tab"
+NSString *ISHToolbarBuiltinKeySymbol(NSString *key); // "⇥"
+// A custom key's text as typed: \e Escape, \t Tab, \n Return, \r, \\ and
+// \xHH for any byte up to 7F; anything else stands for itself.
+NSString *ISHToolbarKeyDecodeSends(NSString *sends);
 
 NS_ASSUME_NONNULL_END

@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
@@ -160,8 +161,8 @@ struct newstat64 stat_convert_newstat64(struct statbuf stat) {
     newstat.ino = stat.inode;
     newstat.mode = stat.mode;
     newstat.nlink = stat.nlink;
-    newstat.uid = stat.uid;
-    newstat.gid = stat.gid;
+    newstat.uid = current_uid_shown(stat.uid);
+    newstat.gid = current_gid_shown(stat.gid);
     newstat.rdev = stat.rdev;
     newstat.size = stat.size;
     newstat.blksize = stat.blksize;
@@ -181,8 +182,8 @@ static struct amd64_stat_ stat_convert_amd64(struct statbuf stat) {
     out.ino = stat.inode;
     out.nlink = stat.nlink;
     out.mode = stat.mode;
-    out.uid = stat.uid;
-    out.gid = stat.gid;
+    out.uid = current_uid_shown(stat.uid);
+    out.gid = current_gid_shown(stat.gid);
     out.rdev = stat.rdev;
     out.size = stat.size;
     out.blksize = stat.blksize;
@@ -202,8 +203,8 @@ static struct arm64_stat_ stat_convert_arm64(struct statbuf stat) {
     out.ino = stat.inode;
     out.mode = stat.mode;
     out.nlink = stat.nlink;
-    out.uid = stat.uid;
-    out.gid = stat.gid;
+    out.uid = current_uid_shown(stat.uid);
+    out.gid = current_gid_shown(stat.gid);
     out.rdev = stat.rdev;
     out.size = stat.size;
     out.blksize = (sdword_t) stat.blksize;
@@ -221,8 +222,8 @@ static int stat_convert_newstat(struct statbuf stat, struct newstat *out) {
     if (stat.dev > UINT32_MAX ||
             stat.mode > UINT16_MAX ||
             stat.nlink > UINT16_MAX ||
-            stat.uid > UINT16_MAX ||
-            stat.gid > UINT16_MAX ||
+            current_uid_shown(stat.uid) > UINT16_MAX ||
+            current_gid_shown(stat.gid) > UINT16_MAX ||
             stat.rdev > UINT32_MAX ||
             stat.size > UINT32_MAX ||
             stat.blksize > UINT32_MAX ||
@@ -238,8 +239,8 @@ static int stat_convert_newstat(struct statbuf stat, struct newstat *out) {
     newstat.ino = (dword_t) stat.inode;
     newstat.mode = stat.mode;
     newstat.nlink = stat.nlink;
-    newstat.uid = stat.uid;
-    newstat.gid = stat.gid;
+    newstat.uid = current_uid_shown(stat.uid);
+    newstat.gid = current_gid_shown(stat.gid);
     newstat.rdev = stat.rdev;
     newstat.size = stat.size;
     newstat.blksize = stat.blksize;
@@ -254,7 +255,7 @@ static int stat_convert_newstat(struct statbuf stat, struct newstat *out) {
     return 0;
 }
 
-static void statx_timestamp_convert(struct statx_timestamp_ *timestamp, dword_t sec, dword_t nsec) {
+static void statx_timestamp_convert(struct statx_timestamp_ *timestamp, sqword_t sec, dword_t nsec) {
     timestamp->tv_sec = sec;
     timestamp->tv_nsec = nsec;
     timestamp->__reserved = 0;
@@ -265,8 +266,8 @@ static struct statx_ stat_convert_statx(struct statbuf stat) {
     statx.stx_mask = STATX_BASIC_STATS_;
     statx.stx_blksize = stat.blksize;
     statx.stx_nlink = stat.nlink;
-    statx.stx_uid = stat.uid;
-    statx.stx_gid = stat.gid;
+    statx.stx_uid = current_uid_shown(stat.uid);
+    statx.stx_gid = current_gid_shown(stat.gid);
     statx.stx_mode = stat.mode;
     statx.stx_ino = stat.inode;
     statx.stx_size = stat.size;
@@ -294,12 +295,17 @@ int generic_fstat(struct fd *fd, struct statbuf *stat) {
     // O_PATH symlink fds have no backend open file; stat the link by path.
     if (fd_is_opath_link(fd))
         return opath_link_fstat(fd, stat);
+    // An O_PATH handle on a description: the description's.
+    if (fd_is_opath_held(fd))
+        return generic_fstat(fd_opath_held_target(fd), stat);
     memset(stat, 0, sizeof(*stat));
     int err = fd->mount->fs->fstat(fd, stat);
     if (err >= 0)
         stat_stamp_fake_dev(fd->mount, stat);
     return err;
 }
+
+static int stat_normalized(char *path, struct statbuf *stat, bool *is_mount_root, int *mnt_id);
 
 int generic_statat_full(struct fd *at, const char *path_raw, struct statbuf *stat, int flags,
         bool *is_mount_root, int *mnt_id) {
@@ -326,9 +332,13 @@ int generic_statat_full(struct fd *at, const char *path_raw, struct statbuf *sta
     if (empty_path && (path_raw[0] == '\0') && at != AT_PWD) {
         if (mnt_id) {
             struct mount *at_mount = fd_is_opath_link(at) ? opath_link_get_mount(at) : at->mount;
-            if (at_mount != NULL)
+            if (at->mnt_id != 0)
+                *mnt_id = at->mnt_id;
+            else if (at_mount != NULL)
                 *mnt_id = mount_id(at_mount);
         }
+        if (is_mount_root)
+            *is_mount_root = at->mnt_root;
         return generic_fstat(at, stat);
     } else {
         const char *resolve_path =
@@ -350,14 +360,21 @@ int generic_statat_full(struct fd *at, const char *path_raw, struct statbuf *sta
         if (err < 0)
             return err;
     }
+    return stat_normalized(path, stat, is_mount_root, mnt_id);
+}
 
-    struct mount *mount = find_mount_and_trim_path(path);
+// The stat of a path path_normalize has already resolved.
+static int stat_normalized(char *path, struct statbuf *stat, bool *is_mount_root, int *mnt_id) {
+    int err;
+    // The mount the path is ON, which for a bind is the bind and not the
+    // origin that `mount` resolves to: see find_mount_and_trim_path_seen.
+    int seen_id;
+    bool seen_root;
+    struct mount *mount = find_mount_and_trim_path_seen(path, NULL, &seen_id, &seen_root, NULL);
     if (mount == NULL)
         return _ENOENT;
-    // find_mount_and_trim_path trims the mount point prefix off path in
-    // place; an empty remainder means path was exactly the mount's root.
     if (is_mount_root)
-        *is_mount_root = path[0] == '\0';
+        *is_mount_root = seen_root;
     memset(stat, 0, sizeof(*stat));
     // fakefs_stat reads its SQLite ish_stat metadata and the real host stat()
     // as two separate, unlocked steps; without inodes_lock here, a concurrent
@@ -379,9 +396,18 @@ int generic_statat_full(struct fd *at, const char *path_raw, struct statbuf *sta
     if (err >= 0)
         stat_stamp_fake_dev(mount, stat);
     if (mnt_id)
-        *mnt_id = mount_id(mount);
+        *mnt_id = seen_id;
     mount_release(mount);
     return err;
+}
+
+// See kernel/fs.h.
+int generic_lstat_realroot(const char *path_raw, struct statbuf *stat) {
+    char path[MAX_PATH];
+    int err = path_normalize(AT_PWD, path_raw, path, N_SYMLINK_NOFOLLOW | N_REALROOT | N_DETACHED_OK);
+    if (err < 0)
+        return err;
+    return stat_normalized(path, stat, NULL, NULL);
 }
 
 int generic_statat_ext(struct fd *at, const char *path_raw, struct statbuf *stat, int flags, bool *is_mount_root) {

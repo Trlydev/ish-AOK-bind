@@ -9,17 +9,18 @@
 #include <arpa/nameser.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <ctype.h>
 #include <dlfcn.h>
 #include <notify.h>
 #include <pthread.h>
 #include <sys/stat.h>
-#include <ftw.h>
 #include <sys/socket.h>
 #include <sys/utsname.h>
 #include <unistd.h>
 #import <SystemConfiguration/SystemConfiguration.h>
+#include <stdatomic.h>
 #if __has_include(<Network/Network.h>)
 #import <Network/Network.h>
 #endif
@@ -37,13 +38,22 @@
 #import "PasteboardDevice.h"
 #import "URLDevice.h"
 #import "LocationDevice.h"
+#import "AudioPlayerEngine.h"
+#import "SwapFilePicker.h"
 #import "NSObject+SaneKVO.h"
 #import "Roots.h"
+#import "Terminal.h"
 #import "TerminalViewController.h"
+#include "kernel/checkpoint.h"
+#include "kernel/BatteryStatus.h"
 #import "UserPreferences.h"
 #import "UIApplication+OpenURL.h"
+#import "UIViewController+Extras.h"
 #import "WorkspaceViewController.h"
+#import "WorkspaceTestHooks.h"
 #include "kernel/init.h"
+#include "kernel/native_root.h"
+#include "kernel/foreign_exec.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "fs/dyndev.h"
@@ -53,6 +63,7 @@
 #include "kernel/dma_heap.h"
 #include "kernel/property_area.h"
 #include "kernel/logd_sink.h"
+#include "fs/virtgpu.h"
 #include "tools/fakefs.h"
 #include "fs/path.h"
 #include "fs/real.h"
@@ -62,7 +73,9 @@
 #include "app/LocationDevice.h"
 #include "fs/fake-db.h"
 #include "kernel/swap.h"
+#include "kernel/zswap.h"
 #include "fs/sockrestart.h"
+#include "fs/sock.h"
 #import <os/log.h>
 #import <os/lock.h>
 #include "platform/platform.h"
@@ -73,6 +86,64 @@ static os_log_t ISHSuspendLog(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{ log = os_log_create("app.ish.iSH-AOK", "suspend"); });
     return log;
+}
+
+// The directory holding the swap file on external storage, while this process
+// is using it. Security-scoped access is started once, when the file is opened,
+// and stopped only if the pager did not take the file: the pager holds the file
+// until the process ends, and access that iOS grants to a running process is
+// not taken back while it is in the background.
+static NSURL *_Nullable swapExternalURL;
+
+static void ISHReleaseExternalSwapAccess(void) {
+    [swapExternalURL stopAccessingSecurityScopedResource];
+    swapExternalURL = nil;
+}
+
+// Opens `.aok-swap` in the directory the user chose for swap (Settings, then the
+// picker ISHSuspendGuardEnterForeground shows), or returns -1 and says why. A
+// stale bookmark is renewed while access is held, as Apple asks, so a drive
+// that was renamed or reformatted is followed rather than lost.
+static int ISHOpenExternalSwapFile(void) {
+    UserPreferences *prefs = UserPreferences.shared;
+    NSData *bookmark = prefs.swapExternalBookmark;
+    if (bookmark == nil) {
+        NSLog(@"swap: external storage is on but no directory has been chosen; swap stays off");
+        return -1;
+    }
+    BOOL stale = NO;
+    NSError *error = nil;
+    NSURL *url = [NSURL URLByResolvingBookmarkData:bookmark
+                                           options:0
+                                     relativeToURL:nil
+                               bookmarkDataIsStale:&stale
+                                             error:&error];
+    if (url == nil) {
+        NSLog(@"swap: the swap directory cannot be found (is the drive attached?): %@; swap stays off", error);
+        return -1;
+    }
+    // NO here is not a refusal by itself: a directory that needs no grant (one
+    // inside the app's own storage) answers NO and is still usable. Whether the
+    // open below succeeds is the real answer; `accessing` only says whether
+    // there is a grant to give back.
+    BOOL accessing = [url startAccessingSecurityScopedResource];
+    if (stale) {
+        NSData *renewed = [url bookmarkDataWithOptions:0 includingResourceValuesForKeys:nil relativeToURL:nil error:nil];
+        if (renewed != nil)
+            prefs.swapExternalBookmark = renewed;
+    }
+    NSString *path = [url.path stringByAppendingPathComponent:@".aok-swap"];
+    int fd = open(path.fileSystemRepresentation, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        NSLog(@"swap: cannot open %@: %s; swap stays off", path, strerror(errno));
+        if (accessing)
+            [url stopAccessingSecurityScopedResource];
+        return -1;
+    }
+    if (accessing)
+        swapExternalURL = url;
+    NSLog(@"swap: using %@", path);
+    return fd;
 }
 
 // Runs `work` holding a background-task assertion, so iOS does not suspend us
@@ -126,8 +197,12 @@ static void ISHDispatchBootWork(NSString *name, void (^work)(void)) {
 @property BOOL localDnsServerRunning;
 @property (strong, nonatomic) dispatch_source_t localDnsServerReadSource;
 @property (strong, nonatomic) dispatch_queue_t localDnsServerQueue;
+// Where the relay forwards: resolv.conf's servers less any loopback one
+// (sockaddr bytes), set by each DNS refresh. Atomic: read per query.
+@property (copy) NSArray<NSData *> *dnsUpstreamServers;
 @property (strong, nonatomic) ISHMetricKitSubscriber *metricKitSubscriber;
 @property BOOL dnsRefreshQueued;
+@property NSUInteger dnsRefreshFailures;
 @property BOOL dnsRefreshRunning;
 @property BOOL waitingForInitialRootImport;
 
@@ -440,6 +515,123 @@ static NSData *ISHBuildBonjourDnsResponse(const uint8_t *queryBytes, size_t quer
     return response;
 }
 
+// The largest UDP reply the guest asked for: 512 bytes, or the size in its
+// EDNS OPT record.
+static size_t ISHDnsClientUdpLimit(ns_msg *message) {
+    size_t limit = NS_PACKETSZ;
+    int additional = ns_msg_count(*message, ns_s_ar);
+    for (int i = 0; i < additional; i++) {
+        ns_rr rr;
+        if (ns_parserr(message, ns_s_ar, i, &rr) != 0)
+            break;
+        if (ns_rr_type(rr) == ns_t_opt && ns_rr_class(rr) > limit)
+            limit = ns_rr_class(rr);
+    }
+    return limit;
+}
+
+// A reply carrying no records: the query's ID and question, with QR, RA and
+// the given flags and rcode. Sent instead of silence, because a guest resolver
+// that hears nothing waits its whole timeout (5 s in glibc) before trying the
+// next nameserver.
+static NSData *ISHBuildDnsEmptyResponse(const uint8_t *queryBytes, size_t queryLength,
+                                        uint16_t flags, uint16_t rcode) {
+    if (queryBytes == NULL || queryLength < NS_HFIXEDSZ)
+        return nil;
+    const uint8_t *eom = queryBytes + queryLength;
+    int nameLength = dn_skipname(queryBytes + NS_HFIXEDSZ, eom);
+    if (nameLength < 0 || NS_HFIXEDSZ + (size_t) nameLength + NS_QFIXEDSZ > queryLength)
+        return nil;
+    size_t questionEnd = NS_HFIXEDSZ + (size_t) nameLength + NS_QFIXEDSZ;
+
+    NSMutableData *response = [NSMutableData dataWithBytes:queryBytes length:questionEnd];
+    uint8_t *header = response.mutableBytes;
+    uint16_t queryFlags = ISHReadBigEndianUInt16(queryBytes + 2);
+    uint16_t responseFlags = (uint16_t) (0x8000 | 0x0080 | flags | (rcode & 0x000f)); // QR, RA
+    responseFlags |= queryFlags & (0x7800 | 0x0100); // opcode, RD
+    ISHWriteBigEndianUInt16(header + 2, responseFlags);
+    ISHWriteBigEndianUInt16(header + 4, 1);
+    ISHWriteBigEndianUInt16(header + 6, 0);
+    ISHWriteBigEndianUInt16(header + 8, 0);
+    ISHWriteBigEndianUInt16(header + 10, 0);
+    return response;
+}
+
+// The nameservers a resolv.conf names, as sockaddrs, leaving out loopback:
+// the relay must never forward to itself or to another relay on this host.
+static NSArray<NSData *> *ISHDnsUpstreamServers(NSString *resolvConf) {
+    NSMutableArray<NSData *> *servers = [NSMutableArray array];
+    for (NSString *line in [resolvConf componentsSeparatedByString:@"\n"]) {
+        NSArray<NSString *> *fields = [[line stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet]
+            componentsSeparatedByCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (fields.count < 2 || ![fields[0] isEqualToString:@"nameserver"])
+            continue;
+        struct addrinfo hints = {0};
+        hints.ai_flags = AI_NUMERICHOST;
+        hints.ai_socktype = SOCK_DGRAM;
+        struct addrinfo *result = NULL;
+        if (getaddrinfo(fields[1].UTF8String, "53", &hints, &result) != 0 || result == NULL)
+            continue;
+        BOOL loopback = NO;
+        if (result->ai_family == AF_INET)
+            loopback = (ntohl(((struct sockaddr_in *) result->ai_addr)->sin_addr.s_addr) >> 24) == 127;
+        else if (result->ai_family == AF_INET6)
+            loopback = IN6_IS_ADDR_LOOPBACK(&((struct sockaddr_in6 *) result->ai_addr)->sin6_addr);
+        if (!loopback)
+            [servers addObject:[NSData dataWithBytes:result->ai_addr length:result->ai_addrlen]];
+        freeaddrinfo(result);
+    }
+    return servers;
+}
+
+// The guest's query, exactly as it sent it, to each server in turn; the
+// first reply carrying its ID is returned whatever its rcode, so the guest
+// hears NXDOMAIN and empty answers too. libresolv cannot do this on an iOS
+// device: with no /etc/resolv.conf its res_ninit falls back to a nameserver
+// on this host, and every query failed (5th-generation iPad, 2026-10-01).
+static NSData *ISHForwardDnsQuery(const uint8_t *query, size_t length, NSArray<NSData *> *servers) {
+    const int timeoutMs = 2000;
+    NSMutableData *reply = [NSMutableData dataWithLength:65536];
+    for (NSData *server in servers) {
+        const struct sockaddr *address = server.bytes;
+        int fd = socket(address->sa_family, SOCK_DGRAM, 0);
+        if (fd < 0)
+            continue;
+        if (connect(fd, address, (socklen_t) server.length) != 0 ||
+                send(fd, query, length, 0) != (ssize_t) length) {
+            close(fd);
+            continue;
+        }
+        struct timespec start;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000;
+            if (elapsed >= timeoutMs)
+                break;
+            struct pollfd pfd = {.fd = fd, .events = POLLIN};
+            int ready = poll(&pfd, 1, (int) (timeoutMs - elapsed));
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready <= 0)
+                break;
+            ssize_t got = recv(fd, reply.mutableBytes, reply.length, 0);
+            if (got < 0 && errno == EINTR)
+                continue;
+            if (got < 0)
+                break;
+            const uint8_t *bytes = reply.bytes;
+            if (got >= NS_HFIXEDSZ && bytes[0] == query[0] && bytes[1] == query[1]) {
+                close(fd);
+                return [NSData dataWithBytes:bytes length:(NSUInteger) got];
+            }
+        }
+        close(fd);
+    }
+    return nil;
+}
+
 static void ios_handle_exit(struct task *task, int code) {
     // we are interested in init and in children of init
     // this is called with pids_lock as an implementation side effect, please do not cite as an example of good API design
@@ -488,6 +680,202 @@ static void ios_handle_exit(struct task *task, int code) {
                                                             object:nil
                                                           userInfo:@{@"pid": @(pid),
                                                                      @"code": @(code)}];
+    });
+}
+
+// ---- guest halt ------------------------------------------------------------
+//
+// `reboot`, `poweroff` and `halt` end in init exiting: AOK's reboot(2) refuses,
+// so busybox init (like any init whose reboot call returns) just exits. AOK
+// cannot boot a second machine inside the same process, so for the rest of this
+// launch the guest is gone, and a new launch is the reboot.
+//
+// Before this hook existed the kernel host-SIGKILLed whatever task outlived
+// init, which took the whole app with it, and a terminal opened afterwards
+// crashed on the dead init (#587). The kernel now stops those tasks with a guest
+// SIGKILL and refuses new ones; what is left for the app is to not keep trying,
+// and to say what happened instead of looking broken.
+static atomic_bool ishGuestHalted;
+
+bool ISHGuestHalted(void) {
+    return atomic_load(&ishGuestHalted);
+}
+
+static NSString *ISHGuestHaltDescription(int status) {
+    if ((status & 0x7f) == 0) {
+        int code = (status >> 8) & 0xff;
+        return code == 0 ? @"init exited" : [NSString stringWithFormat:@"init exited with status %d", code];
+    }
+    return [NSString stringWithFormat:@"init was killed by signal %d", status & 0x7f];
+}
+
+// ---- native mode: the everyday account -------------------------------------
+//
+// A native-mode root starts with root alone. The first time it boots, the app
+// asks for the name of the account at ISHDefaultUserAccountUID -- the one "Open
+// Everything as Default User" switches Workspace terminals to -- or for Skip,
+// which leaves root only. Asked at boot, not at install, because a root can be
+// installed headlessly (manage-roots.sh); asked again at the next launch if it
+// was dismissed unanswered. Nothing waits for it: init and /etc/rc are already
+// running, and the Session Shell is root's whatever the answer.
+
+static BOOL ISHNativeRootGuestCall(void (^call)(void)) {
+    struct task *previous = NULL;
+    BOOL borrowed = [AppDelegate pushUsableInitTaskAsCurrent:&previous];
+    if (borrowed)
+        call();
+    [AppDelegate popCurrentTask:previous];
+    return borrowed;
+}
+
+static BOOL ISHNativeRootNeedsUserPrompt(void) {
+    __block BOOL needs = NO;
+    ISHNativeRootGuestCall(^{
+        needs = !native_root_has_default_user() && !native_root_default_user_skipped();
+    });
+    return needs;
+}
+
+static void ISHPresentNativeUserPrompt(int attempt, NSString *problem) {
+    if (ISHGuestHalted() || !ISHNativeRootNeedsUserPrompt())
+        return;
+    UIViewController *host = ISHActivePresentationViewController();
+    if (host == nil || host.presentedViewController != nil) {
+        // No scene yet, or something is up already (the resume picker, a boot
+        // alert). Wait for it rather than stack on top -- for a minute, and
+        // after that the next launch asks.
+        if (attempt < 120) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ISHPresentNativeUserPrompt(attempt + 1, problem);
+            });
+        }
+        return;
+    }
+    NSString *message =
+        NSLocalizedString(@"This filesystem has no Linux distribution, only the programs built into iSH-AOK. "
+        @"It starts with a root account, which the Session Shell always uses.\n\n"
+        @"Choose a name for your everyday account. Workspace terminals open as this user "
+        @"when \"Open Everything as Default User\" is on. The password is optional; "
+        @"without one, sudo works only after you set one with passwd.", @"Create Your Account alert message");
+    if (problem.length != 0)
+        message = [NSString stringWithFormat:@"%@\n\n%@", problem, message];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Create Your Account", @"Alert title for creating the default user account")
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = NSLocalizedString(@"user name", @"Create Your Account field placeholder");
+        field.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        field.autocorrectionType = UITextAutocorrectionTypeNo;
+        field.spellCheckingType = UITextSpellCheckingTypeNo;
+        field.textContentType = UITextContentTypeUsername;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = NSLocalizedString(@"password (optional)", @"Create Your Account field placeholder");
+        field.secureTextEntry = YES;
+        field.textContentType = UITextContentTypeNewPassword;
+    }];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = NSLocalizedString(@"password again", @"Create Your Account field placeholder");
+        field.secureTextEntry = YES;
+        field.textContentType = UITextContentTypeNewPassword;
+    }];
+    __weak UIAlertController *weakAlert = alert;
+    // Skip is an ordinary button, not the Cancel action. A Cancel-style action
+    // is what Escape on a hardware keyboard -- or any other dismissal UIKit
+    // makes on the user's behalf -- triggers, and this answer is remembered:
+    // seen in the simulator, a Skip nobody chose meant the question never came
+    // back.
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Skip (Root Only)", @"Create Your Account button")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        ISHNativeRootGuestCall(^{
+            native_root_skip_default_user();
+        });
+        [ISHDiagnosticsStore recordBreadcrumb:@"native.user.skipped"];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Create", @"Create Your Account button")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        UIAlertController *shown = weakAlert;
+        NSString *name = [shown.textFields[0].text
+            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+        NSString *password = shown.textFields[1].text ?: @"";
+        NSString *again = shown.textFields[2].text ?: @"";
+        NSString *retry = nil;
+        if (![password isEqualToString:again]) {
+            retry = NSLocalizedString(@"The two passwords were different.", @"Create Your Account error");
+        } else {
+            __block int err = 0;
+            __block BOOL valid = NO;
+            ISHNativeRootGuestCall(^{
+                valid = native_root_user_name_valid(name.UTF8String);
+                if (valid)
+                    err = native_root_add_user(name.UTF8String, password.UTF8String);
+            });
+            if (!valid) {
+                retry = [NSString stringWithFormat:
+                    NSLocalizedString(@"\"%@\" can't be used. A name starts with a lower-case letter or _, "
+                    @"has at most 32 of a-z, 0-9, _ and -, and is not already taken.", @"Create Your Account error; %@ is the rejected name"), name];
+            } else if (err < 0) {
+                retry = [NSString stringWithFormat:NSLocalizedString(@"The account could not be created (%@).", @"Create Your Account error; %@ is an error description"),
+                         [AppDelegate descriptionForISHErrno:err]];
+            } else {
+                [ISHDiagnosticsStore recordBreadcrumb:@"native.user.created"
+                                              details:@{@"password": @(password.length != 0)}];
+            }
+        }
+        if (retry != nil) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ISHPresentNativeUserPrompt(0, retry);
+            });
+        }
+    }]];
+    alert.preferredAction = alert.actions.lastObject;   // Create
+    [host presentViewController:alert animated:YES completion:nil];
+}
+
+static void ISHPresentGuestHaltedAlert(int status, int attempt) {
+    UIViewController *host = ISHActivePresentationViewController();
+    if (host == nil || host.presentedViewController != nil) {
+        // No scene yet, or something is already up (a resume picker, another
+        // alert). Try again shortly rather than stack on top of it.
+        if (attempt < 20) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (0.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ISHPresentGuestHaltedAlert(status, attempt + 1);
+            });
+        }
+        return;
+    }
+    NSString *message = [NSString stringWithFormat:
+        NSLocalizedString(@"The Linux system has shut down (%@). That is what reboot, poweroff and halt do.\n\n"
+        @"iSH-AOK can't start it again while the app is running. Quit, then open iSH-AOK again to boot it.", @"System Halted alert message; %@ says how init ended"),
+        ISHGuestHaltDescription(status)];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"System Halted", @"Alert title after the guest shuts down")
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Not Now", @"Alert button") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Quit iSH-AOK", @"System Halted alert button")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *action) {
+        [ISHDiagnosticsStore recordBreadcrumb:@"guest.halted.quit"];
+        exit(0);
+    }]];
+    [host presentViewController:alert animated:YES completion:nil];
+}
+
+// halt_hook. Runs on init's thread with pids_lock and init's general_lock held
+// (kernel/exit.c), so it takes no locks and waits for nothing: set the flag and
+// hand the rest to the main queue. The kernel's checkpoint suspend also calls
+// it, immediately before exit(0), where this is harmless.
+static void ios_handle_halt(int status) {
+    atomic_store(&ishGuestHalted, true);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [ISHDiagnosticsStore recordBreadcrumb:@"guest.halted"
+                                      details:@{@"status": @(status),
+                                                @"description": ISHGuestHaltDescription(status)}];
+        ISHPresentGuestHaltedAlert(status, 0);
     });
 }
 
@@ -665,7 +1053,7 @@ static NSString *ISHDescriptionForErrno(intptr_t err) {
 
 static NSString *BootFailureSentence(NSString *text) {
     if (text.length == 0)
-        return @"Boot failed.";
+        return NSLocalizedString(@"Boot failed.", @"Terminal overlay when boot fails without a specific reason");
     unichar last = [text characterAtIndex:text.length - 1];
     if (last == '.' || last == '!' || last == '?')
         return text;
@@ -684,14 +1072,14 @@ static NSString *BootFailureMessage(NSString *reason, intptr_t err, NSDictionary
     NSString *path = details[@"path"];
     NSString *command = details[@"command"];
     if (root.length != 0)
-        [lines addObject:[NSString stringWithFormat:@"Root: %@", root]];
+        [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Root: %@", @"Boot failure details line; %@ is a filesystem name"), root]];
     if (guestABI.length != 0)
-        [lines addObject:[NSString stringWithFormat:@"Guest ABI: %@", guestABI]];
+        [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Guest ABI: %@", @"Boot failure details line; %@ is an architecture"), guestABI]];
     if (path.length != 0)
-        [lines addObject:[NSString stringWithFormat:@"Path: %@", path]];
+        [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Path: %@", @"Boot failure details line; %@ is a path"), path]];
     if (command.length != 0)
-        [lines addObject:[NSString stringWithFormat:@"Command: %@", command]];
-    [lines addObject:[NSString stringWithFormat:@"Error: %@", ISHDescriptionForErrno(err)]];
+        [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Command: %@", @"Boot failure details line; %@ is a command"), command]];
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Error: %@", @"Boot failure details line; %@ is an error description"), ISHDescriptionForErrno(err)]];
 
     if (recovery.length != 0) {
         [lines addObject:@""];
@@ -729,7 +1117,7 @@ static intptr_t RecordBootFailure(intptr_t err,
     if (err > 0)
         err = -err;
     NSString *safeStage = stage.length != 0 ? stage : @"boot.failed";
-    NSString *safeTitle = title.length != 0 ? title : @"Boot failed";
+    NSString *safeTitle = title.length != 0 ? title : NSLocalizedString(@"Boot failed", @"Boot failure alert title");
     NSDictionary<NSString *, id> *safeDetails = BootFailureDetails(safeStage, err, safeTitle, reason, recovery, details);
     bootFailureTitle = safeTitle;
     bootFailureMessage = BootFailureMessage(reason, err, safeDetails, recovery);
@@ -742,37 +1130,37 @@ static intptr_t RecordBootFailure(intptr_t err,
 
 static NSString *BootMountRecovery(intptr_t err) {
     if (err == _EINVAL) {
-        return @"The filesystem metadata database may be incompatible or corrupt. Choose another filesystem or reimport this one.";
+        return NSLocalizedString(@"The filesystem metadata database may be incompatible or corrupt. Choose another filesystem or reimport this one.", @"Boot failure recovery advice");
     }
     if (err == _EACCES || err == _EPERM) {
-        return @"iOS denied access to the filesystem files. Restart the app; if it still fails, choose another filesystem or reimport this one.";
+        return NSLocalizedString(@"iOS denied access to the filesystem files. Restart the app; if it still fails, choose another filesystem or reimport this one.", @"Boot failure recovery advice");
     }
     if (err == _ENOSPC) {
-        return @"Free storage space on the device, then restart iSH-AOK.";
+        return NSLocalizedString(@"Free storage space on the device, then restart iSH-AOK.", @"Boot failure recovery advice");
     }
-    return @"Choose another filesystem or reimport this one.";
+    return NSLocalizedString(@"Choose another filesystem or reimport this one.", @"Boot failure recovery advice");
 }
 
 static NSString *BootExecRecovery(intptr_t err, NSString *guestABI) {
     if (err == _ENOENT) {
-        return @"The configured boot command is missing inside the root. Check Settings -> Boot Command or reimport the filesystem.";
+        return NSLocalizedString(@"The configured boot command is missing inside the root. Check Settings -> Boot Command or reimport the filesystem.", @"Boot failure recovery advice");
     }
     if (err == _EACCES || err == _EPERM) {
-        return @"The configured boot command exists but is not executable. Fix its permissions or choose a different boot command.";
+        return NSLocalizedString(@"The configured boot command exists but is not executable. Fix its permissions or choose a different boot command.", @"Boot failure recovery advice");
     }
     if (err == _ENOEXEC) {
         if ([guestABI isEqualToString:@"amd64"]) {
-            return @"This root is marked x86_64/amd64, but the boot command is not a supported x86_64 executable or script. Check Settings -> Boot Command or reimport the filesystem.";
+            return NSLocalizedString(@"This root is marked x86_64/amd64, but the boot command is not a supported x86_64 executable or script. Check Settings -> Boot Command or reimport the filesystem.", @"Boot failure recovery advice");
         }
         if ([guestABI isEqualToString:@"riscv64"]) {
-            return @"This root is marked riscv64, but the boot command is not a supported riscv64 executable or script. Check Settings -> Boot Command or reimport the filesystem.";
+            return NSLocalizedString(@"This root is marked riscv64, but the boot command is not a supported riscv64 executable or script. Check Settings -> Boot Command or reimport the filesystem.", @"Boot failure recovery advice");
         }
-        return @"The configured boot command is not a supported Linux executable or script. Check Settings -> Boot Command.";
+        return NSLocalizedString(@"The configured boot command is not a supported Linux executable or script. Check Settings -> Boot Command.", @"Boot failure recovery advice");
     }
     if (err == _ENOMEM) {
-        return @"The device did not have enough memory to start init. Close other apps and restart iSH-AOK.";
+        return NSLocalizedString(@"The device did not have enough memory to start init. Close other apps and restart iSH-AOK.", @"Boot failure recovery advice");
     }
-    return @"Check Settings -> Boot Command, or choose/reimport the filesystem.";
+    return NSLocalizedString(@"Check Settings -> Boot Command, or choose/reimport the filesystem.", @"Boot failure recovery advice");
 }
 
 static BOOL BootCommandIsDefaultInit(NSArray<NSString *> *command) {
@@ -849,6 +1237,12 @@ static NSData *BootEnvironmentForCommand(NSString *commandPath) {
         @"LOGNAME=root",
         [NSString stringWithFormat:@"SHELL=%@", shell],
         @"PATH=/AOK/persist/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        // A UTF-8 locale for everything started from here -- init, its
+        // services, and a Wayland session the app starts, whose programs never
+        // pass through login and so never see /etc/environment (btop, #620,
+        // refused to start there). C.UTF-8 is built into glibc and needs no data
+        // under musl. LANG only: LC_ALL would outrank anything set later.
+        @"LANG=C.UTF-8",
         @"PS1=# ",
         @"COLUMNS=80",
         @"LINES=24",
@@ -949,6 +1343,8 @@ static void *FallbackConsoleInitThread(void *context) {
 
     while (true) {
         intptr_t err = become_new_init_child();
+        if (err < 0 && ISHGuestHalted())
+            return NULL;
         if (err < 0) {
             printk("ERROR: fallback init could not create console shell child: %ld\n", (long) err);
             sleep(1);
@@ -1381,6 +1777,243 @@ static int EnsureRegularFileNonEmpty(const char *path, const char *contents, mod
     return 0;
 }
 
+// ---- the guest's time zone follows the device's ---------------------------
+//
+// A root brings a zone of its own -- Devuan's /etc/localtime names Etc/UTC, an Arch
+// tarball has none -- and that file is the guest's only source: the kernel reports
+// tz 0, as Linux does (kernel/time.c). So a Devuan root on a Mac in London told the
+// time an hour behind the menu bar. Each boot now points /etc/localtime at the
+// device's zone, but only while the choice is still AOK's to make:
+//
+//   - there is no /etc/localtime;
+//   - it is the distribution's UTC, and AOK has never set a zone in this root;
+//   - it is still the zone AOK set last time, so a root follows a device that
+//     travels.
+//
+// Any other zone is somebody's choice, and stays. So does everything in a root that
+// lacks the zone's file: no tzdata (a fresh Alpine), or one too old for the name.
+//
+// What AOK set is recorded in /etc/aok-localtime -- in the root, not in the app's
+// preferences, because the question it answers is about this root's /etc/localtime.
+// It sits beside that file, travels with the root through export, import and
+// snapshots, and is where someone wondering why the link moved will look. Its mere
+// existence is what tells the distribution's UTC from a UTC chosen after AOK had set
+// a zone, so it is never removed.
+//
+// The link is absolute, /usr/share/zoneinfo/<zone>, as Debian's tzdata writes it and
+// reads it back. /etc/timezone is rewritten to match where it exists and never
+// created: Debian 13's tzdata stopped creating it and keeps it current only where it
+// is present, and a stale copy contradicts the link for anything that reads both --
+// Python's tzlocal warns when they differ.
+static const char kGuestLocaltimeMarker[] = "/etc/aok-localtime";
+
+// An IANA name that is safe to put after /usr/share/zoneinfo/: no leading or
+// trailing slash, no empty, "." or ".." component, nothing outside the characters
+// zone names use. The name comes from the host, but it becomes a path in the guest.
+static bool GuestZoneNameIsSafe(const char *name) {
+    size_t len = strlen(name);
+    if (len == 0 || len >= 128 || name[0] == '/' || name[len - 1] == '/')
+        return false;
+    for (const char *p = name; *p != '\0'; p++) {
+        if (!isalnum((unsigned char) *p) && strchr("/_+-.", *p) == NULL)
+            return false;
+    }
+    for (const char *component = name;;) {
+        const char *slash = strchr(component, '/');
+        size_t clen = slash != NULL ? (size_t) (slash - component) : strlen(component);
+        if (clen == 0 || (clen == 1 && component[0] == '.') ||
+                (clen == 2 && component[0] == '.' && component[1] == '.'))
+            return false;
+        if (slash == NULL)
+            return true;
+        component = slash + 1;
+    }
+}
+
+// The zone a /etc/localtime link names: whatever follows "zoneinfo/". That covers
+// /usr/share/zoneinfo/<zone> (Debian, Arch, this code), ../usr/share/zoneinfo/<zone>
+// (timedatectl) and /etc/zoneinfo/<zone> (Alpine's setup-timezone). The posix/ and
+// right/ trees name the same zones.
+static bool GuestZoneNameFromLink(const char *target, char *zone, size_t size) {
+    const char *name = NULL;
+    for (const char *at = strstr(target, "zoneinfo/"); at != NULL; at = strstr(at + 1, "zoneinfo/")) {
+        if (at == target || at[-1] == '/')
+            name = at + strlen("zoneinfo/");
+    }
+    if (name == NULL)
+        return false;
+    if (strncmp(name, "posix/", 6) == 0 || strncmp(name, "right/", 6) == 0)
+        name += 6;
+    size_t len = strlen(name);
+    if (len == 0 || len >= size)
+        return false;
+    memcpy(zone, name, len + 1);
+    return true;
+}
+
+static bool GuestZoneIsUTC(const char *zone) {
+    return strcmp(zone, "UTC") == 0 || strcmp(zone, "Etc/UTC") == 0;
+}
+
+// Up to SIZE bytes of a guest file. The length read, or a negative errno.
+static ssize_t ReadGuestFile(const char *path, char *buf, size_t size) {
+    struct fd *fd = generic_open(path, O_RDONLY_, 0);
+    if (IS_ERR(fd))
+        return (ssize_t) PTR_ERR(fd);
+    size_t total = 0;
+    while (total < size) {
+        ssize_t n = fd->ops->read(fd, buf + total, size - total);
+        if (n < 0) {
+            fd_close(fd);
+            return n;
+        }
+        if (n == 0)
+            break;
+        total += (size_t) n;
+    }
+    fd_close(fd);
+    return (ssize_t) total;
+}
+
+// Replace PATH with CONTENTS: written beside it, then renamed over it, so a boot cut
+// short leaves the old file or the new one and never a truncated one.
+static int WriteGuestFileReplacing(const char *path, const char *contents, mode_t_ mode) {
+    char temp[MAX_PATH];
+    snprintf(temp, sizeof(temp), "%s.aok-new", path);
+    generic_unlinkat(AT_PWD, temp);
+    struct fd *fd = generic_open(temp, O_WRONLY_ | O_CREAT_ | O_TRUNC_, mode & 07777);
+    if (IS_ERR(fd))
+        return (int) PTR_ERR(fd);
+    size_t len = strlen(contents);
+    ssize_t written = fd->ops->write(fd, contents, len);
+    fd_close(fd);
+    if (written < 0 || (size_t) written != len) {
+        generic_unlinkat(AT_PWD, temp);
+        return written < 0 ? (int) written : _EIO;
+    }
+    int err = generic_renameat(AT_PWD, temp, AT_PWD, path, 0);
+    if (err < 0)
+        generic_unlinkat(AT_PWD, temp);
+    return err;
+}
+
+// Whether the regular file at PATH holds exactly the zone ZONE's data. For a
+// /etc/localtime that is a copy rather than a link, which is how some images and
+// older Alpine instructions leave it.
+static bool GuestFileIsZone(const char *path, const char *zone) {
+    char zonefile[MAX_PATH];
+    snprintf(zonefile, sizeof(zonefile), "/usr/share/zoneinfo/%s", zone);
+    struct statbuf a, b;
+    if (generic_statat(AT_PWD, path, &a, 0) < 0 || generic_statat(AT_PWD, zonefile, &b, 0) < 0)
+        return false;
+    // A zone file is a few KB; anything much bigger is not one.
+    if (!S_ISREG(a.mode) || !S_ISREG(b.mode) || a.size != b.size || a.size == 0 || a.size > (1 << 20))
+        return false;
+    size_t size = (size_t) a.size;
+    char *left = malloc(size), *right = malloc(size);
+    bool same = left != NULL && right != NULL &&
+                ReadGuestFile(path, left, size) == (ssize_t) size &&
+                ReadGuestFile(zonefile, right, size) == (ssize_t) size &&
+                memcmp(left, right, size) == 0;
+    free(left);
+    free(right);
+    return same;
+}
+
+// The zone /etc/aok-localtime records, if the file exists at all. A marker that
+// exists but names nothing readable still means "AOK has set a zone here".
+static bool ReadGuestLocaltimeMarker(char *zone, size_t size) {
+    zone[0] = '\0';
+    char buf[512];
+    ssize_t n = ReadGuestFile(kGuestLocaltimeMarker, buf, sizeof(buf) - 1);
+    if (n < 0)
+        return n != _ENOENT;
+    buf[n] = '\0';
+    char *save = NULL;
+    for (char *line = strtok_r(buf, "\n", &save); line != NULL; line = strtok_r(NULL, "\n", &save)) {
+        line[strcspn(line, " \t\r")] = '\0';
+        if (line[0] == '\0' || line[0] == '#')
+            continue;
+        if (strlen(line) < size)
+            strcpy(zone, line);
+        break;
+    }
+    return true;
+}
+
+static void ProvisionGuestTimeZone(void) {
+    char zone[128];
+    if (!hostTimeZoneName(zone, sizeof(zone)) || !GuestZoneNameIsSafe(zone))
+        return;
+    char zonefile[MAX_PATH];
+    snprintf(zonefile, sizeof(zonefile), "/usr/share/zoneinfo/%s", zone);
+    struct statbuf stat;
+    if (generic_statat(AT_PWD, zonefile, &stat, 0) < 0 || !S_ISREG(stat.mode))
+        return;
+
+    char applied[128];
+    bool applied_before = ReadGuestLocaltimeMarker(applied, sizeof(applied));
+
+    bool apply = false;
+    int err = generic_statat(AT_PWD, "/etc/localtime", &stat, AT_SYMLINK_NOFOLLOW_);
+    if (err == _ENOENT) {
+        apply = true;
+    } else if (err < 0) {
+        return;
+    } else if (S_ISLNK(stat.mode)) {
+        char target[MAX_PATH];
+        ssize_t len = generic_readlinkat(AT_PWD, "/etc/localtime", target, sizeof(target) - 1);
+        if (len < 0)
+            return;
+        target[len] = '\0';
+        char current[128];
+        // A link to something that is not a zone is an arrangement of somebody's own.
+        if (!GuestZoneNameFromLink(target, current, sizeof(current)))
+            return;
+        if (strcmp(current, zone) == 0)
+            return;
+        apply = applied_before ? strcmp(current, applied) == 0 : GuestZoneIsUTC(current);
+    } else if (S_ISREG(stat.mode)) {
+        if (GuestFileIsZone("/etc/localtime", zone))
+            return;
+        if (applied_before)
+            apply = applied[0] != '\0' && GuestFileIsZone("/etc/localtime", applied);
+        else
+            apply = GuestFileIsZone("/etc/localtime", "Etc/UTC") || GuestFileIsZone("/etc/localtime", "UTC");
+    }
+    if (!apply)
+        return;
+
+    // The link goes in beside the old file and is renamed over it, as tzdata does,
+    // so there is no moment without an /etc/localtime.
+    static const char temp[] = "/etc/localtime.aok-new";
+    generic_unlinkat(AT_PWD, temp);
+    if (generic_symlinkat(zonefile, AT_PWD, temp) < 0)
+        return;
+    if (generic_renameat(AT_PWD, temp, AT_PWD, "/etc/localtime", 0) < 0) {
+        generic_unlinkat(AT_PWD, temp);
+        return;
+    }
+
+    // Recorded only once the link is in place: if the boot dies between the two, the
+    // root has the right zone and merely stops following, rather than keeping UTC.
+    char marker[512];
+    // The same text the provision-ultimate-* scripts write.
+    snprintf(marker, sizeof(marker),
+             "# /etc/localtime names this zone because it is the device's. iSH-AOK\n"
+             "# moves it along with the device, at boot, for as long as it still names\n"
+             "# this zone; choose any other and it is left alone from then on. Keep this\n"
+             "# file: without it a UTC /etc/localtime looks like the distribution's own.\n"
+             "%s\n", zone);
+    WriteGuestFileReplacing(kGuestLocaltimeMarker, marker, 0644);
+
+    if (generic_statat(AT_PWD, "/etc/timezone", &stat, AT_SYMLINK_NOFOLLOW_) >= 0 && S_ISREG(stat.mode)) {
+        char line[160];
+        snprintf(line, sizeof(line), "%s\n", zone);
+        WriteGuestFileReplacing("/etc/timezone", line, stat.mode & 07777);
+    }
+}
+
 // Provision the /etc files a distro image ships empty, before init starts, on EVERY
 // boot path (real /sbin/init and the fake-init fallback) -- called from ensureBooted.
 // Docker-exported distro images ship /etc/hostname and /etc/hosts empty and the guest's
@@ -1416,6 +2049,83 @@ static void ProvisionGuestHostFiles(void) {
     // tools/build-devuan-minirootfs.sh, or provisioned by provision-ultimate-*.sh)
     // keeps exactly what it has.
     EnsureRegularFileNonEmpty("/etc/environment", "LANG=C.UTF-8\n", 0644);
+
+    // The same default for the logins PAM never touches, in every root rather
+    // than only the Devuan images that ship it: ssh (sshd runs with UsePAM no),
+    // Alpine's busybox login, and a launch command that is a bare shell. Only
+    // fills a vacuum, so a locale the ssh client forwards or PAM set wins. zsh
+    // reads none of /etc/profile.d, so its global zshenv gets the same line --
+    // /etc/zshenv, the file native zsh falls back to, and only when the distro
+    // has no /etc/zsh/zshenv of its own and nothing is there yet.
+    static const char locale_sh[] =
+        "# Written by iSH-AOK: a UTF-8 locale when nothing else named one. Reaches\n"
+        "# sessions PAM never touches (ssh, busybox login). Rewritten only when\n"
+        "# missing or empty; to turn it off, replace this with a comment.\n"
+        "[ -n \"${LANG:-}${LC_ALL:-}\" ] || export LANG=C.UTF-8\n";
+    struct statbuf localeDir;
+    if (generic_statat(AT_PWD, "/etc/profile.d", &localeDir, 0) >= 0 && S_ISDIR(localeDir.mode))
+        EnsureRegularFileNonEmpty("/etc/profile.d/00-aok-locale.sh", locale_sh, 0644);
+    struct statbuf distroZshenv;
+    if (generic_statat(AT_PWD, "/etc/zsh/zshenv", &distroZshenv, 0) < 0)
+        EnsureRegularFileNonEmpty("/etc/zshenv", locale_sh, 0644);
+
+    // /AOK/persist/bin on a login shell's PATH. BootEnvironmentForCommand puts
+    // it first, but that PATH never reaches the terminal: "/bin/login -f root"
+    // builds a fresh environment and the login shell's /etc/profile then sets
+    // PATH outright (Alpine and Devuan alike). So in the app's own terminals
+    // `ws-wayland`, `ws-clock` and every program a user dropped into
+    // /AOK/persist/bin answered "not found". Every distro's /etc/profile sources
+    // /etc/profile.d/*.sh after setting PATH, which makes this the one place that
+    // reaches app terminals, ssh logins and `su -` in every root. "10" sorts after
+    // native-links.sh's 05 snippet, so the user's own programs stay first, as in
+    // the app's PATH. Written only when missing or empty; a user who wants it gone
+    // replaces the contents with a comment. Non-login contexts (cron, init
+    // services, `ssh host cmd`) and zsh, which never reads /etc/profile.d, are
+    // what /AOK/tools/persist-links.sh is for.
+    struct statbuf profileDir;
+    if (generic_statat(AT_PWD, "/etc/profile.d", &profileDir, 0) >= 0 && S_ISDIR(profileDir.mode)) {
+        EnsureRegularFileNonEmpty("/etc/profile.d/10-aok-persist-bin.sh",
+            "# Written by iSH-AOK: puts /AOK/persist/bin (your own programs, and the\n"
+            "# ws-* Workspace launchers) first on PATH in login shells. Rewritten only\n"
+            "# when missing or empty; to turn it off, replace this with a comment.\n"
+            "if [ -d /AOK/persist/bin ]; then\n"
+            "    case \":$PATH:\" in\n"
+            "        *:/AOK/persist/bin:*) ;;\n"
+            "        *) PATH=\"/AOK/persist/bin:$PATH\"; export PATH ;;\n"
+            "    esac\n"
+            "fi\n",
+            0644);
+        // An Arch root, which cannot install a package until
+        // /AOK/fixes/arch/fix-pacman.sh has been run (pacman's Landlock
+        // sandbox, a dangling resolv.conf, an empty keyring: fs/aok.c has the
+        // README). The script shipped in the very build a tester reported
+        // "pacman fails, tried DisableSandbox, didn't help" from -- nothing
+        // told them it was there. An interactive login says so, for as long
+        // as any of the three is still true, and then never again.
+        struct statbuf pacmanConf;
+        if (generic_statat(AT_PWD, "/etc/pacman.conf", &pacmanConf, 0) >= 0) {
+            EnsureRegularFileNonEmpty("/etc/profile.d/20-aok-arch-pacman.sh",
+                "# Written by iSH-AOK: tells an interactive login that pacman needs a\n"
+                "# one-time setup in this root, until /AOK/fixes/arch/fix-pacman.sh has\n"
+                "# done it. Rewritten only when missing or empty; to turn it off,\n"
+                "# replace this with a comment.\n"
+                "case $- in\n"
+                "    *i*)\n"
+                "        if [ -f /etc/pacman.conf ] && [ -r /AOK/fixes/arch/fix-pacman.sh ] && {\n"
+                "                ! grep -q '^DisableSandbox' /etc/pacman.conf ||\n"
+                "                [ ! -e /etc/resolv.conf ] ||\n"
+                "                [ ! -s /etc/pacman.d/gnupg/trustdb.gpg ]; }; then\n"
+                "            echo 'iSH-AOK: pacman needs a one-time setup before it can install anything here.'\n"
+                "            echo '         As root:  sh /AOK/fixes/arch/fix-pacman.sh'\n"
+                "            echo '         Why:      /AOK/fixes/arch/README.txt'\n"
+                "        fi ;;\n"
+                "esac\n",
+                0644);
+        }
+    }
+
+    // The clock's zone, which a root ships as UTC or not at all.
+    ProvisionGuestTimeZone();
 
     // Seed the kernel hostname from /etc/hostname right now instead of
     // waiting for the guest's own hostname.sh, which runs a minute or more
@@ -1478,11 +2188,6 @@ static int EnsureSymlink(const char *path, const char *target) {
     return (int) len;
 }
 
-// nftw callback backing FixSharedDirectoryPermissions: widens every entry's
-// mode to be world-rw (world-rwx for directories), preserving any bits
-// already set (e.g. an existing execute bit on a script). Symlinks are left
-// alone (FTW_PHYS below reports them as FTW_SL rather than following them)
-// so this can't be used to reach outside the tree via a symlink target.
 // "It wasn't there" is the ordinary first-launch outcome for a directory we are
 // about to create, not a failure worth logging.
 static BOOL ISHIsFileNotFoundError(NSError *error) {
@@ -1490,27 +2195,6 @@ static BOOL ISHIsFileNotFoundError(NSError *error) {
         return YES;
     return [error.domain isEqualToString:NSCocoaErrorDomain] &&
            (error.code == NSFileNoSuchFileError || error.code == NSFileReadNoSuchFileError);
-}
-
-static int FixSharedDirectoryPermissionsCallback(const char *fpath, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
-    (void)ftwbuf;
-    if (typeflag == FTW_D || typeflag == FTW_DP)
-        chmod(fpath, sb->st_mode | 0777);
-    else if (typeflag == FTW_F)
-        chmod(fpath, sb->st_mode | 0666);
-    return 0;
-}
-
-// /AOK/persist is a realfs mount backed by this single host directory, owned
-// at the host layer by the app's own uid -- never by whatever uid a guest
-// process happens to be running as (see MOUNT_ISH_SHARED_ in kernel/fs.h).
-// MOUNT_ISH_SHARED_ keeps every node created *after* this fix world-writable,
-// but content already on disk from before it (or copied in by hand, e.g. via
-// the Files app) predates that and can carry restrictive host-default modes.
-// Recursively widening permissions here, on every launch, heals that: it's
-// cheap for the modest trees /AOK/persist actually holds, and idempotent.
-static void FixSharedDirectoryPermissions(const char *path) {
-    nftw(path, FixSharedDirectoryPermissionsCallback, 16, FTW_PHYS);
 }
 
 // One tiny launcher per Workspace applet, written into /AOK/persist/bin so a
@@ -1537,14 +2221,28 @@ static void ISHWriteWorkspaceLaunchers(NSURL *binURL) {
     // the user, so anything of theirs that happens to share a name is left
     // alone rather than silently replaced.
     static NSString *const marker = @"# iSH-AOK Workspace launcher -- generated, edits are overwritten";
-    NSArray<NSString *> *tools = @[@"motepad", @"filemanager", @"markdown", @"imageviewer",
-                                   @"videoplayer", @"audio", @"browser", @"llm",
-                                   @"filesystems", @"storage", @"monitor", @"networks",
-                                   @"status", @"settings", @"themes", @"launcher",
-                                   @"clock", @"info", @"diagnostics", @"sessions"];
-    for (NSString *tool in tools) {
+    // Launcher name -> the tool name /proc/ish/workspace takes. Mostly the
+    // same word. Three applets were renamed on screen after their tool names
+    // were fixed, and a user looks for the name they see: the Wayland applet
+    // is the tool "display", Desktops is "workspaces" and Quick Actions is
+    // "shortcuts". Each is on the bridge's list (ISHWorkspaceOpenableToolIdentifiers
+    // in WorkspaceViewController.m); a launcher for a tool that is not would
+    // only ever print EINVAL.
+    NSDictionary<NSString *, NSString *> *launchers = @{
+        @"motepad": @"motepad", @"filemanager": @"filemanager", @"markdown": @"markdown",
+        @"imageviewer": @"imageviewer", @"videoplayer": @"videoplayer", @"audio": @"audio",
+        @"music": @"audio", @"equalizer": @"equalizer", @"eq": @"equalizer",
+        @"browser": @"browser", @"llm": @"llm", @"filesystems": @"filesystems",
+        @"storage": @"storage", @"monitor": @"monitor", @"networks": @"networks",
+        @"status": @"status", @"settings": @"settings", @"themes": @"themes",
+        @"launcher": @"launcher", @"clock": @"clock", @"info": @"info",
+        @"diagnostics": @"diagnostics", @"sessions": @"sessions",
+        @"wayland": @"display", @"desktops": @"workspaces", @"quickactions": @"shortcuts",
+    };
+    for (NSString *name in [launchers.allKeys sortedArrayUsingSelector:@selector(compare:)]) {
+        NSString *tool = launchers[name];
         NSURL *url = [binURL URLByAppendingPathComponent:
-            [NSString stringWithFormat:@"ws-%@", tool]];
+            [NSString stringWithFormat:@"ws-%@", name]];
         NSString *existing = [NSString stringWithContentsOfURL:url
                                                       encoding:NSUTF8StringEncoding error:NULL];
         if (existing != nil && ![existing containsString:marker])
@@ -1561,16 +2259,17 @@ static void ISHWriteWorkspaceLaunchers(NSURL *binURL) {
             @"esac\n"
             @"if [ $# -gt 0 ]; then\n"
             @"    # The bridge takes absolute paths only: by the time the request\n"
-            @"    # reaches the app, this shell's cwd means nothing to it.\n"
-            @"    case \"$1\" in /*) p=$1 ;; *) p=\"$PWD/$1\" ;; esac\n"
+            @"    # reaches the app, this shell's cwd means nothing to it. A web\n"
+            @"    # address goes as it is (the video player plays streams).\n"
+            @"    case \"$1\" in /*|http://*|https://*) p=$1 ;; *) p=\"$PWD/$1\" ;; esac\n"
             @"    printf 'open %@ %%s\\n' \"$p\" > /proc/ish/workspace\n"
             @"else\n"
             @"    printf 'open %@\\n' > /proc/ish/workspace\n"
-            @"fi\n", marker, tool, tool, tool];
+            @"fi\n", marker, name, tool, tool];
         NSError *writeError = nil;
         if (![script writeToURL:url atomically:YES
                        encoding:NSUTF8StringEncoding error:&writeError]) {
-            NSLog(@"Could not write Workspace launcher ws-%@: %@", tool, writeError);
+            NSLog(@"Could not write Workspace launcher ws-%@: %@", name, writeError);
             continue;
         }
         chmod(url.fileSystemRepresentation, 0755);
@@ -1859,6 +2558,7 @@ static NSURL *AOKSharedFakefsDirectoryURL(void) {
     summary[@"hostMachine"] = DiagnosticsHostMachine() ?: @"";
     summary[@"systemVersion"] = UIDevice.currentDevice.systemVersion ?: @"";
     summary[@"defaultRoot"] = Roots.instance.defaultRoot ?: @"";
+    summary[@"bootedRoot"] = Roots.instance.bootedRoot ?: @"";
     summary[@"rootCount"] = @(Roots.instance.roots.count);
     summary[@"needsInitialRootSelection"] = @(Roots.instance.needsInitialRootSelection);
     if (Roots.instance.initialBundledRootImportError != nil)
@@ -1881,11 +2581,19 @@ static NSURL *AOKSharedFakefsDirectoryURL(void) {
     NSMutableString *report = [NSMutableString string];
     NSDictionary<NSString *, id> *summary = [self currentSummaryDictionary];
     [report appendString:@"iSH-AOK Diagnostics\n\n"];
+    // When this snapshot was taken. The pane does not refresh itself any more --
+    // it would drop the reader's selection mid-copy (see rebuildReport in
+    // AboutViewController.m) -- so "how old is this?" became a question the
+    // report has to answer for itself, both on screen and in an exported bundle
+    // that may be read days later.
+    [report appendFormat:@"Report taken: %@\n", DiagnosticsISO8601StringFromDate([NSDate date]) ?: @"unknown"];
     [report appendFormat:@"App: %@ (Build %@)\n", summary[@"appVersion"], summary[@"build"]];
     [report appendFormat:@"Device: %@ / %@ / %@\n", summary[@"deviceName"], summary[@"deviceModel"], summary[@"hostMachine"]];
     [report appendFormat:@"OS: iOS %@\n", summary[@"systemVersion"]];
     [report appendFormat:@"Free Space: %@\n", summary[@"freeSpace"] ?: @"unknown"];
     [report appendFormat:@"Default Root: %@\n", summary[@"defaultRoot"] ?: @"(none)"];
+    if ([summary[@"bootedRoot"] length] != 0)
+        [report appendFormat:@"Booted Root: %@\n", summary[@"bootedRoot"]];
     [report appendFormat:@"Roots: %@\n", summary[@"rootCount"]];
     [report appendFormat:@"Needs Initial Root Selection: %@\n", [summary[@"needsInitialRootSelection"] boolValue] ? @"yes" : @"no"];
     if (summary[@"initialRootImportError"] != nil)
@@ -2165,7 +2873,6 @@ static NSDictionary *MetricKitDiagnosticSummary(MXDiagnostic *diagnostic, NSStri
 
         _metricManager = metricManager;
         [metricManager addSubscriber:self];
-        NSLog(@"MetricKit diagnostic subscriber registered");
     }
 }
 
@@ -2274,7 +2981,7 @@ static NSDictionary *MetricKitDiagnosticSummary(MXDiagnostic *diagnostic, NSStri
 static bool PushInitTaskAsCurrent(struct task **previousCurrent) {
     *previousCurrent = current;
 
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
 
     if (init != NULL) {
         bool usable = false;
@@ -2298,6 +3005,20 @@ static void PopCurrentTask(struct task *previousCurrent) {
     if (borrowedCurrent != NULL) {
         task_ref_cnt_mod(borrowedCurrent, -1);
     }
+}
+
+// "Keep Screen Turned On". It was applied once, at launch, and that is not
+// enough: the system's idea of the idle timer and the app's can part company
+// while the app is inactive (reported 2026-10-12: the setting on, the screen
+// locking after two minutes), and an assignment of the value the property
+// already holds is then a no-op. So it is put again every time a scene
+// becomes active, and through NO first so the YES is a change.
+void ISHApplyIdleTimerPreference(void) {
+    UIApplication *app = UIApplication.sharedApplication;
+    BOOL keepOn = UserPreferences.shared.shouldDisableDimming;
+    if (keepOn)
+        app.idleTimerDisabled = NO;
+    app.idleTimerDisabled = keepOn;
 }
 
 @implementation AppDelegate
@@ -2404,6 +3125,12 @@ static BOOL ISHPublishSwapConfiguration(NSInteger *outSizeMB) {
     NSInteger sizeMB = prefs.swapSizeMB; // already clamped to 0...ISHSwapMaxSizeMB
     BOOL enabled = prefs.shouldEnableSwap;
     swap_set_preference(enabled ? true : false, (unsigned) sizeMB);
+    // The compressed tier rides the same publish, for the same reason and with
+    // the same contract: it only RECORDS, and zswap_startup acts on it. Both
+    // are read once at boot, so a preference changed in the same turn as a boot
+    // must already be recorded when the boot path looks.
+    zswap_set_preference(prefs.shouldEnableCompressedMemory ? true : false,
+                         (unsigned) prefs.compressedMemorySizeMB);
     if (outSizeMB != NULL)
         *outSizeMB = sizeMB;
     return enabled;
@@ -2415,12 +3142,734 @@ static UIViewController *CreateRootSelectionViewController(void) {
     return navigationController;
 }
 
+// Where a suspended session lives: one file in the app group container, beside
+// the roots rather than inside one, so that an exported or copied root does not
+// carry a session with it.
+//
+// But every session BELONGS to one root (GH #607). It is its processes' view of
+// that filesystem: descriptors reopen by path, mappings name its files. The
+// image records the root it was saved on (checkpoint_root_identity: the root's
+// data directory, which survives a rename and is never shared by a copy); the
+// picker offers only the sessions of the root about to boot; the kernel
+// refuses a resume on any other root before changing anything; and deleting a
+// root deletes its sessions. None of that existed before: one list served every
+// root, and a Devuan session resumed after switching to Alpine read and wrote
+// Alpine's files.
+// ---- session slots ------------------------------------------------------
+//
+// More than one saved session, because one is a strange number for something
+// this cheap: the images are a few megabytes and the alternative to keeping the
+// old one is throwing it away every time you save.
+//
+// A DIRECTORY of images rather than a naming convention on one file, so that
+// listing them is a directory read and deleting one cannot disturb another.
+// Each slot describes ITSELF -- checkpoint_peek reads the header -- rather than
+// carrying a sidecar, because an image can be written by the app or by the
+// guest (/AOK/tools/suspend.sh) and only one of those would keep a sidecar up
+// to date.
+static NSString *ISHSessionsDirectory(void) {
+    NSURL *container = ContainerURL();
+    if (container == nil)
+        return nil;
+    NSString *dir = [container URLByAppendingPathComponent:@"sessions"].path;
+    [NSFileManager.defaultManager createDirectoryAtPath:dir
+                            withIntermediateDirectories:YES
+                                             attributes:nil
+                                                  error:nil];
+    return dir;
+}
+
+// The single suspend.img earlier builds wrote, folded into the new layout the
+// first time this runs. Moved rather than copied: two files that both claim to
+// be "the" session is exactly the ambiguity the directory removes.
+static void ISHSessionMigrateLegacyImage(void) {
+    NSURL *container = ContainerURL();
+    NSString *dir = ISHSessionsDirectory();
+    if (container == nil || dir == nil)
+        return;
+    NSString *legacy = [container URLByAppendingPathComponent:@"suspend.img"].path;
+    if (![NSFileManager.defaultManager fileExistsAtPath:legacy])
+        return;
+    NSString *dest = [dir stringByAppendingPathComponent:@"session-1.img"];
+    if ([NSFileManager.defaultManager fileExistsAtPath:dest]) {
+        [NSFileManager.defaultManager removeItemAtPath:legacy error:nil];
+        return;
+    }
+    NSError *err = nil;
+    if (![NSFileManager.defaultManager moveItemAtPath:legacy toPath:dest error:&err])
+        os_log_error(ISHSuspendLog(), "could not migrate the old session image: %{public}@", err);
+}
+
+// The identity a session saved on this root records. 0 if it has none.
+uint64_t ISHSessionRootIdentityNamed(NSString *_Nullable name) {
+    if (name.length == 0)
+        return 0;
+    NSURL *data = [[Roots.instance rootUrl:name] URLByAppendingPathComponent:@"data" isDirectory:YES];
+    return checkpoint_root_identity(data.fileSystemRepresentation);
+}
+
+// The root whose sessions these are: the one running, or before the boot, the
+// one about to.
+static uint64_t ISHSessionCurrentRoot(void) {
+    return ISHSessionRootIdentityNamed(Roots.instance.bootedRoot ?: Roots.instance.rootToBoot);
+}
+
+// This launch's sessions. Newest first, because the one you want is almost
+// always the last one you made.
+//
+// The current root's, and never another root's: those are still good for that
+// root, and are listed when it is the one selected. Also listed is whatever no
+// root can resume -- an image from another build, or one whose root has since
+// gone -- so that it can be deleted, and so that it takes up a slot and is
+// recycled like any other.
+NSArray<NSDictionary *> *ISHSessionSlots(void) {
+    ISHSessionMigrateLegacyImage();
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return @[];
+    NSArray<NSString *> *names =
+        [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
+    uint64_t current = ISHSessionCurrentRoot();
+    NSMutableSet<NSNumber *> *installed = nil;   // only when an image needs it
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    for (NSString *name in names) {
+        if (![name.pathExtension isEqualToString:@"img"])
+            continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        NSDictionary *attrs = [NSFileManager.defaultManager attributesOfItemAtPath:path error:nil];
+        struct checkpoint_image_info info;
+        if (checkpoint_peek(path.fileSystemRepresentation, &info) < 0)
+            continue;   // not an image, or truncated -- not a slot
+        BOOL orphan = NO;
+        if (info.loadable && info.root != 0 && current != 0 && info.root != current) {
+            if (installed == nil) {
+                installed = [NSMutableSet set];
+                for (NSString *root in [Roots.instance.roots.array copy])
+                    [installed addObject:@(ISHSessionRootIdentityNamed(root))];
+            }
+            if ([installed containsObject:@(info.root)])
+                continue;   // another root's
+            orphan = YES;
+        }
+        [out addObject:@{
+            @"path": path,
+            @"name": name.stringByDeletingPathExtension,
+            @"date": attrs[NSFileModificationDate] ?: NSDate.distantPast,
+            @"bytes": attrs[NSFileSize] ?: @0,
+            @"tasks": @(info.tasks),
+            @"hostname": @(info.hostname),
+            @"loadable": @(info.loadable != false),
+            @"root": @(info.root),
+            @"rootName": @(info.root_name),
+            @"orphan": @(orphan),
+        }];
+    }
+    [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [b[@"date"] compare:a[@"date"]];
+    }];
+    return out;
+}
+
+// Whether a slot can be resumed at all. The others are offered only to delete.
+static BOOL ISHSessionSlotResumable(NSDictionary *slot) {
+    return [slot[@"loadable"] boolValue] && ![slot[@"orphan"] boolValue];
+}
+
+// The sessions saved on one root, whichever root is current.
+static NSArray<NSString *> *ISHSessionPathsForRoot(uint64_t root) {
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil || root == 0)
+        return @[];
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *name in [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil]) {
+        if (![name.pathExtension isEqualToString:@"img"])
+            continue;
+        NSString *path = [dir stringByAppendingPathComponent:name];
+        struct checkpoint_image_info info;
+        if (checkpoint_peek(path.fileSystemRepresentation, &info) == 0 && info.loadable &&
+                info.root == root)
+            [out addObject:path];
+    }
+    return out;
+}
+
+NSUInteger ISHSessionCountForRoot(uint64_t root) {
+    return ISHSessionPathsForRoot(root).count;
+}
+
+// A root's sessions go with it. Nothing else could ever resume them: a root
+// imported again later is a different root, whatever it is called.
+void ISHSessionsDeleteForRoot(uint64_t root) {
+    for (NSString *path in ISHSessionPathsForRoot(root)) {
+        BOOL removed = [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+        ISHWorkspaceForgetLayoutForSessionImage(path);
+        [ISHDiagnosticsStore recordBreadcrumb:@"session.deletedWithRoot"
+                                      details:@{@"image": path.lastPathComponent,
+                                                @"removed": @(removed)}];
+    }
+}
+
+// How many slots are worth keeping, given what is left on the disk.
+//
+// "If there is enough space" is the rule, so it is asked rather than assumed:
+// an image is roughly the size of the guest's resident memory, and filling a
+// device with sessions is a worse failure than keeping fewer of them.
+#define ISH_SESSION_SLOT_CEILING 5
+NSUInteger ISHSessionSlotLimit(void) {
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return 1;
+    NSDictionary *fs = [NSFileManager.defaultManager attributesOfFileSystemForPath:dir error:nil];
+    unsigned long long free = [fs[NSFileSystemFreeSize] unsignedLongLongValue];
+    if (free == 0)
+        return ISH_SESSION_SLOT_CEILING;   // could not tell; do not punish the user for that
+    // Room for the ceiling at 64 MB each, plus 512 MB left for everything else.
+    unsigned long long budget = free > (512ULL << 20) ? free - (512ULL << 20) : 0;
+    NSUInteger affordable = (NSUInteger) (budget / (64ULL << 20));
+    if (affordable < 1)
+        affordable = 1;    // always at least the one you are about to write
+    return affordable < ISH_SESSION_SLOT_CEILING ? affordable : ISH_SESSION_SLOT_CEILING;
+}
+
+// Which slot the NEXT save writes to. The one this launch resumed from, so a
+// session keeps its own slot across suspends rather than wandering; otherwise
+// the first free number, and when they are all taken, the oldest.
+static NSString *ishSessionCurrentSlot = nil;
+
+// The image this launch was rebuilt from, for whoever needs its arrangement.
+static NSString *ishSessionRestoredImage = nil;
+NSString *ISHSessionRestoredImagePath(void) { return ishSessionRestoredImage; }
+
+NSString *ISHSuspendSessionImagePath(void) {
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return nil;
+    if (ishSessionCurrentSlot != nil)
+        return ishSessionCurrentSlot;
+    NSArray<NSDictionary *> *slots = ISHSessionSlots();
+    NSUInteger limit = ISHSessionSlotLimit();
+    if (slots.count < limit) {
+        for (NSUInteger n = 1; ; n++) {
+            NSString *candidate = [dir stringByAppendingPathComponent:
+                                   [NSString stringWithFormat:@"session-%lu.img", (unsigned long) n]];
+            if (![NSFileManager.defaultManager fileExistsAtPath:candidate]) {
+                ishSessionCurrentSlot = candidate;
+                return candidate;
+            }
+        }
+    }
+    // Full: the oldest is the one with the least to lose.
+    ishSessionCurrentSlot = slots.lastObject[@"path"];
+    return ishSessionCurrentSlot;
+}
+
+void ISHSessionSetCurrentSlot(NSString *path) {
+    ishSessionCurrentSlot = path;
+}
+
+// The name an AUTOMATIC save writes to: the one taken when iOS backgrounds and
+// then kills the app, as opposed to a Save or a Suspend somebody asked for.
+//
+// Without this they pile up. ISHSuspendSessionImagePath() hands out the first
+// FREE number when nothing is pinned, which is right for a save the user meant
+// -- each one is a thing they chose to keep -- and wrong for one the system
+// took on its own. Boot, get killed, boot, get killed, and the picker fills
+// with sessions nobody asked for, pushing out the ones they did: slots are
+// finite, and the oldest is recycled once they are all taken.
+//
+// A session RESUMED from a slot still writes back to that slot, because
+// replacing where it came from does not accumulate either. Only the unpinned
+// case needs a home, and it is a fixed name, so each automatic save replaces
+// the last one rather than adding to them.
+//
+// It deliberately does not pin: a Save the user asks for LATER in the same
+// launch should take a numbered slot of its own and not land on top of this.
+//
+// One per root: with a single name, an automatic save on one root replaced the
+// one another root had.
+NSString *ISHSuspendAutomaticSessionImagePath(void) {
+    if (ishSessionCurrentSlot != nil)
+        return ishSessionCurrentSlot;
+    NSString *dir = ISHSessionsDirectory();
+    if (dir == nil)
+        return nil;
+    uint64_t root = ISHSessionCurrentRoot();
+    NSString *name = root != 0
+        ? [NSString stringWithFormat:@"session-auto-%llu.img", (unsigned long long) root]
+        : @"session-auto.img";
+    return [dir stringByAppendingPathComponent:name];
+}
+
+// The choice, made once per launch and BEFORE the guest boots.
+//
+// Not a preference: it is about this launch only. `decided` is separate from
+// `path` because "start fresh" is a real answer and nil is not the absence of
+// one -- without it, choosing New Session and then reaching the boot would look
+// exactly like never having been asked.
+static NSString *ishSessionResumeChoice = nil;
+static BOOL ishSessionResumeDecided = NO;
+
+void ISHSessionSetResumeChoice(NSString *path) {
+    ishSessionResumeChoice = path;
+    ishSessionResumeDecided = YES;
+    // A resumed session keeps writing to the slot it came from.
+    ISHSessionSetCurrentSlot(path);
+}
+
+BOOL ISHSessionResumeChoicePending(void) {
+    if (ishSessionResumeDecided)
+        return NO;
+    if (!UserPreferences.shared.shouldSuspendToDisk)
+        return NO;
+    return ISHSessionSlots().count > 0;
+}
+
+// ---- the resume question -------------------------------------------------
+//
+// Asked from wherever the app happened to start, which is why it lives beside
+// the slot bookkeeping rather than inside a view controller.
+//
+// It used to belong to TerminalViewController -- the one root that needs it
+// least. Workspace-at-start and the standalone Wayland display open no terminal
+// at launch, so nobody asked, and whatever reached the guest first booted a
+// fresh one underneath them. Reported as the dialog "not showing up on restart.
+// In workspace at start mode anyway", and the thread dump settled it: init-1,
+// login-3, bash-14, and no "resumed a suspended session" line. A fresh boot --
+// so the answer given afterwards had nothing left to decide.
+
+// Nothing may boot while the question is open.
+//
+// Armed rather than implied, because "a choice is pending" is not the same as
+// "somebody is going to be asked": a Shortcut or other background entry point
+// boots with nobody looking at a dialog, and must still resume the newest slot
+// the way a single suspend.img always did. Whoever puts the question on screen
+// arms this; ISHSessionSetResumeChoice lifts it by answering.
+static BOOL ishSessionBootHeldForChoice = NO;
+
+void ISHSessionHoldBootUntilResumeChoice(void) {
+    if (ISHSessionResumeChoicePending())
+        ishSessionBootHeldForChoice = YES;
+}
+
+void ISHSessionConsumeResumedImage(NSString *path) {
+    if (path.length == 0)
+        return;
+    NSError *removeError = nil;
+    BOOL removed = [NSFileManager.defaultManager removeItemAtPath:path error:&removeError];
+    ISHWorkspaceForgetLayoutForSessionImage(path);
+    [ISHDiagnosticsStore recordBreadcrumb:@"session.resumed.imageConsumed"
+                                  details:@{@"removed": @(removed),
+                                            @"error": removeError.localizedDescription ?: @""}];
+}
+
+// Keep the saved copy, or consume it?
+//
+// A resumed image is not automatically finished with: iSH-AOK goes on writing
+// to the slot it came from, so the copy on disk stays resumable. That is the
+// safe default and it is what people want after a crash -- but it also means
+// the same session can be resumed twice, which gives two live copies of one
+// machine, and an image nobody intends to use again just sits there.
+//
+// So the choice is offered rather than assumed, and "delete" means AFTER the
+// restore has worked: consuming it first would destroy the only copy if the
+// restore then failed.
+static void ISHSessionPresentResumeDisposition(UIViewController *host,
+                                               NSDictionary *slot,
+                                               void (^completion)(NSString *_Nullable)) {
+    NSString *path = slot[@"path"];
+    UIAlertController *sheet = [UIAlertController
+        alertControllerWithTitle:NSLocalizedString(@"Resume this session", @"Resume disposition alert title")
+                         message:NSLocalizedString(@"Keep the saved copy so it can be resumed again, "
+                                 @"or remove it once this session is running?", @"Resume disposition alert message")
+                  preferredStyle:UIAlertControllerStyleAlert];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Resume and Save", @"Resume disposition button: keep the saved copy")
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(__unused UIAlertAction *a) {
+        ISHSessionSetResumeChoice(path);
+        // Un-pin the slot, or "Save" lasts about a minute.
+        //
+        // ISHSessionSetResumeChoice pins the current slot to the image that was
+        // resumed, on the reasoning that a resumed session keeps writing where
+        // it came from. That is right for a session being suspended over and
+        // over, and exactly wrong here: the next Suspend and Exit would write
+        // straight over the copy the user just asked to keep. Reported as
+        // "I said save and the previous suspend was gone".
+        //
+        // Unpinned, the next save takes a fresh slot and the kept copy stays
+        // resumable. Slots are finite (ISHSessionSlotLimit), so repeating this
+        // eventually recycles the oldest -- which is the honest meaning of
+        // "keep" on a device with a disk.
+        ISHSessionSetCurrentSlot(nil);
+        completion(nil);
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Resume and Delete", @"Resume disposition button: delete the saved copy")
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(__unused UIAlertAction *a) {
+        ISHSessionSetResumeChoice(path);
+        // The slot STAYS pinned here: the image is about to be deleted, so
+        // letting this session write back over that name reuses the freed slot
+        // instead of consuming another one.
+        // Handed back, not done: the file is removed once there is a running
+        // session to show for it.
+        completion(path);
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Back", @"Button that returns to the resume picker")
+                                              style:UIAlertActionStyleCancel
+                                            handler:^(__unused UIAlertAction *a) {
+        // Nothing has been decided yet, so the picker can simply come back.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ISHSessionPresentResumePicker(host, completion);
+        });
+    }]];
+
+    [host presentViewController:sheet animated:YES completion:nil];
+}
+
+// Resume which session, or none.
+//
+// Presented BEFORE the guest boots, because the answer decides whether it boots
+// at all or is rebuilt from an image -- there is no undoing that once
+// ensureBooted has run.
+// One row's worth of description, shared by the resume picker and the delete
+// sheet so the same session reads the same way in both.
+static NSString *ISHSessionSlotTitle(NSDictionary *slot, NSDateFormatter *when) {
+    NSString *stamp = [when stringFromDate:slot[@"date"]];
+    if (![slot[@"loadable"] boolValue])
+        return [NSString stringWithFormat:NSLocalizedString(@"%@ (saved by a different build; can't be restored)", @"Saved session row; %@ is the date"), stamp];
+    if ([slot[@"orphan"] boolValue])
+        return [NSString stringWithFormat:NSLocalizedString(@"%@ (saved on %@, which is gone; can't be restored)", @"Saved session row; date, then filesystem name"), stamp,
+                [slot[@"rootName"] length] != 0 ? slot[@"rootName"] : NSLocalizedString(@"a filesystem", @"Saved session row, when the filesystem name is unknown")];
+    // An automatic save is named, because "which of these did I choose to keep"
+    // is the question somebody deleting them is trying to answer.
+    NSString *automatic = [slot[@"name"] hasPrefix:@"session-auto"] ? NSLocalizedString(@", auto-saved", @"Appended to a saved session row") : @"";
+    NSString *format = [slot[@"tasks"] unsignedLongValue] == 1
+        ? NSLocalizedString(@"%@ — %@ process, %@%@", @"Saved session row; hostname, process count (1), date, then an optional auto-saved note")
+        : NSLocalizedString(@"%@ — %@ processes, %@%@", @"Saved session row; hostname, process count, date, then an optional auto-saved note");
+    return [NSString stringWithFormat:format,
+            slot[@"hostname"], slot[@"tasks"], stamp, automatic];
+}
+
+// Remove one saved session: the image, its Workspace layout, and the pin that
+// would have aimed the next save at it.
+static void ISHSessionDeleteSlot(NSDictionary *slot) {
+    NSString *path = slot[@"path"];
+    NSError *removeError = nil;
+    BOOL removed = [NSFileManager.defaultManager removeItemAtPath:path error:&removeError];
+    ISHWorkspaceForgetLayoutForSessionImage(path);
+    // If the next save was aimed here, it no longer is: the name is free, and
+    // leaving it pinned would silently re-create the image the user just asked
+    // to be rid of.
+    if ([ISHSuspendSessionImagePath() isEqualToString:path])
+        ISHSessionSetCurrentSlot(nil);
+    [ISHDiagnosticsStore recordBreadcrumb:@"session.deleted"
+                                  details:@{@"removed": @(removed),
+                                            @"error": removeError.localizedDescription ?: @""}];
+}
+
+// The only saved session: confirm, delete it, and launch as if there had been
+// none. With one session a picker of one, then an empty one, was two screens
+// to get rid of something the user had already said they did not want.
+static void ISHSessionConfirmDeleteOnly(UIViewController *host, NSDictionary *slot,
+                                        void (^completion)(NSString *_Nullable)) {
+    NSDateFormatter *when = [[NSDateFormatter alloc] init];
+    when.dateStyle = NSDateFormatterShortStyle;
+    when.timeStyle = NSDateFormatterShortStyle;
+    ISHActionSheet *sheet = [ISHActionSheet
+        alertWithTitle:NSLocalizedString(@"Delete this saved session?", @"Alert title")
+               message:[NSString stringWithFormat:NSLocalizedString(@"%@\n\nIt cannot be resumed afterwards. "
+                                                  @"iSH-AOK then starts a new session.", @"Delete saved session message; %@ describes the session"),
+                                                  ISHSessionSlotTitle(slot, when)]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Delete and Start New", @"Delete saved session button")
+                        style:UIAlertActionStyleDestructive
+                      handler:^(__unused UIAlertAction *a) {
+        ISHSessionDeleteSlot(slot);
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"Alert button")
+                        style:UIAlertActionStyleCancel
+                      handler:^(__unused UIAlertAction *a) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ISHSessionPresentResumePicker(host, completion);
+        });
+    }];
+    [sheet presentFromViewController:host source:nil];
+}
+
+// Remove saved sessions without resuming anything.
+//
+// The picker could only ever get rid of an image by resuming it first
+// ("Resume and Delete") or by picking one this build cannot load. There was no
+// way to say "that one is finished with" from the screen that lists them, so
+// the only way to free a slot was to start a session you did not want.
+static void ISHSessionPresentDeletePicker(UIViewController *host,
+                                          void (^completion)(NSString *_Nullable)) {
+    NSArray<NSDictionary *> *slots = ISHSessionSlots();
+    if (slots.count == 0) {   // deleted the last one; nothing left to choose from
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+        return;
+    }
+    ISHActionSheet *sheet = [ISHActionSheet
+        alertWithTitle:NSLocalizedString(@"Delete a saved session", @"Delete saved session picker title")
+               message:NSLocalizedString(@"This removes the saved copy from this device. The session it "
+                       @"holds cannot be resumed afterwards.", @"Delete saved session picker message")];
+    NSDateFormatter *when = [[NSDateFormatter alloc] init];
+    when.dateStyle = NSDateFormatterShortStyle;
+    when.timeStyle = NSDateFormatterShortStyle;
+
+    for (NSDictionary *slot in slots) {
+        [sheet addActionWithTitle:ISHSessionSlotTitle(slot, when)
+                            style:UIAlertActionStyleDestructive
+                          handler:^(__unused UIAlertAction *a) {
+            ISHSessionDeleteSlot(slot);
+            // Back to the list, so several can go in one visit.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ISHSessionPresentDeletePicker(host, completion);
+            });
+        }];
+    }
+    [sheet addActionWithTitle:NSLocalizedString(@"Back", @"Button that returns to the resume picker")
+                        style:UIAlertActionStyleCancel
+                      handler:^(__unused UIAlertAction *a) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ISHSessionPresentResumePicker(host, completion);
+        });
+    }];
+    [sheet presentFromViewController:host source:nil];
+}
+
+void ISHSessionPresentResumePicker(UIViewController *host,
+                                   void (^completion)(NSString *_Nullable)) {
+    NSArray<NSDictionary *> *slots = ISHSessionSlots();
+    // Asked for by something that has nothing to offer: answer it rather than
+    // showing an empty sheet, so the caller's completion still runs and the
+    // boot hold still lifts.
+    if (slots.count == 0) {
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+        return;
+    }
+    // ISH_SESSION_RESUME=newest|fresh -- answer this without a tap, for
+    // driving a device from a Mac (`devicectl device process launch
+    // --environment-variables`). The sheet has no timeout, by design: it holds
+    // the boot until someone decides. With nobody at the screen that looked
+    // exactly like a launch that hung for anywhere from one minute to twenty.
+    // "newest" takes the newest image this build can load the way "Resume and
+    // Delete" does -- the ordinary suspend-and-resume cycle -- and "fresh"
+    // the way "Start a New Session" does. Unset, nothing changes.
+    const char *autoChoice = getenv("ISH_SESSION_RESUME");
+    if (autoChoice != NULL && autoChoice[0] != '\0') {
+        if (strcmp(autoChoice, "newest") == 0) {
+            for (NSDictionary *slot in slots) {   // newest first
+                if (!ISHSessionSlotResumable(slot))
+                    continue;
+                os_log(ISHSuspendLog(), "session resume: ISH_SESSION_RESUME chose %{public}@",
+                       [slot[@"path"] lastPathComponent]);
+                ISHSessionSetResumeChoice(slot[@"path"]);
+                completion(slot[@"path"]);
+                return;
+            }
+        }
+        os_log(ISHSuspendLog(), "session resume: ISH_SESSION_RESUME=%{public}s, booting fresh",
+               autoChoice);
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+        return;
+    }
+    [ISHDiagnosticsStore recordBreadcrumb:@"session.resumePicker.presented"
+                                  details:@{@"slots": @(slots.count),
+                                            @"host": NSStringFromClass(host.class)}];
+    // An ISHActionSheet alert, because this one holds the boot. A Mac draws an
+    // action sheet as one row of buttons, and an alert may be drawn the same
+    // way (not checked on a Mac). Several saved sessions, each titled with a
+    // hostname, a process count and a date, would not fit in that row. So on
+    // a Mac this becomes a list that has to be answered.
+    ISHActionSheet *sheet = [ISHActionSheet
+        alertWithTitle:NSLocalizedString(@"Resume a session?", @"Resume picker title")
+               message:slots.count == 1
+                       ? NSLocalizedString(@"iSH-AOK saved this session. Pick it up, or start fresh.", @"Resume picker message, one saved session")
+                       : NSLocalizedString(@"iSH-AOK has saved sessions. Pick one up, or start fresh.", @"Resume picker message, several saved sessions")];
+
+    NSDateFormatter *when = [[NSDateFormatter alloc] init];
+    when.dateStyle = NSDateFormatterShortStyle;
+    when.timeStyle = NSDateFormatterShortStyle;
+
+    for (NSDictionary *slot in slots) {
+        // An image this build cannot load, or whose root is gone, is offered
+        // as nothing but a deletion: choosing it would boot instead, which
+        // looks like the resume silently failing.
+        BOOL loadable = ISHSessionSlotResumable(slot);
+        [sheet addActionWithTitle:ISHSessionSlotTitle(slot, when)
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
+            if (!loadable) {
+                ISHSessionSetResumeChoice(nil);
+                [NSFileManager.defaultManager removeItemAtPath:slot[@"path"] error:nil];
+                completion(nil);
+                return;
+            }
+            // Next runloop turn: this sheet is still dismissing, and presenting
+            // the second one from inside its own handler races that.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ISHSessionPresentResumeDisposition(host, slot, completion);
+            });
+        }];
+    }
+
+    // One session: straight to "are you sure", then a regular launch. Several:
+    // the picker, to choose which.
+    NSDictionary *onlySlot = slots.count == 1 ? slots.firstObject : nil;
+    [sheet addActionWithTitle:onlySlot != nil ? NSLocalizedString(@"Delete Saved Session\u2026", @"Resume picker action, one saved session")
+                                              : NSLocalizedString(@"Delete a Saved Session\u2026", @"Resume picker action, several saved sessions")
+                        style:UIAlertActionStyleDestructive
+                      handler:^(__unused UIAlertAction *a) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (onlySlot != nil)
+                ISHSessionConfirmDeleteOnly(host, onlySlot, completion);
+            else
+                ISHSessionPresentDeletePicker(host, completion);
+        });
+    }];
+
+    [sheet addActionWithTitle:NSLocalizedString(@"Start a New Session", @"Resume picker action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *a) {
+        // The images are KEPT. "New session" is about this launch, not about
+        // throwing away what is on disk -- deleting somebody's saved work
+        // because they wanted a fresh prompt is not a thing to do quietly.
+        ISHSessionSetResumeChoice(nil);
+        completion(nil);
+    }];
+
+    [sheet presentFromViewController:host source:nil];
+}
+
+int ISHSuspendSessionSaveNow(BOOL leaveOutGPU) {
+    // Nothing to save once init has exited: no machine is left to freeze.
+    if (ISHGuestHalted())
+        return _ESRCH;
+    NSString *image = ISHSuspendSessionImagePath();
+    if (image == nil)
+        return _ENOENT;
+    // The windows, in the same act as the guest. A checkpoint that describes
+    // the processes but not the arrangement showing them comes back as a
+    // running machine nobody can see -- which is exactly what a Workspace
+    // suspend did before this: every shell alive, no terminals on screen.
+    ISHWorkspaceCaptureLayoutForSuspend(image);
+    return checkpoint_save_external_flags(image.fileSystemRepresentation,
+                                          leaveOutGPU ? CKPT_SAVE_LEAVE_OUT : 0);
+}
+
+void ISHSuspendSessionConfirmGPUThen(UIViewController *host, NSString *verb,
+                                     void (^proceed)(BOOL leaveOutGPU)) {
+    char names[192];
+    unsigned holders = checkpoint_gpu_holders(names, sizeof(names));
+    if (holders == 0 || host == nil) {
+        proceed(NO);
+        return;
+    }
+    // verb is a token, "Suspend" or "Save" (the only two callers), not display
+    // text: each combination is a whole sentence so it can be translated.
+    BOOL suspending = [verb isEqualToString:@"Suspend"];
+    NSString *format;
+    if (suspending) {
+        format = holders == 1
+            ? NSLocalizedString(@"%s is using the GPU, and what it holds there lives in the app, outside the session. "
+                                @"Suspend anyway and everything else is saved, but the Wayland desktop and "
+                                @"every program in it will be gone when the session resumes — any unsaved work in them is lost.",
+                                @"GPU warning before suspending; %s names one program")
+            : NSLocalizedString(@"%s are using the GPU, and what they hold there lives in the app, outside the session. "
+                                @"Suspend anyway and everything else is saved, but the Wayland desktop and "
+                                @"every program in it will be gone when the session resumes — any unsaved work in them is lost.",
+                                @"GPU warning before suspending; %s names several programs");
+    } else {
+        format = holders == 1
+            ? NSLocalizedString(@"%s is using the GPU, and what it holds there lives in the app, outside the session. "
+                                @"Save anyway and everything else is saved, but the Wayland desktop and "
+                                @"every program in it keep running now, and will be missing from a resume of this save — any unsaved work in them is lost.",
+                                @"GPU warning before saving; %s names one program")
+            : NSLocalizedString(@"%s are using the GPU, and what they hold there lives in the app, outside the session. "
+                                @"Save anyway and everything else is saved, but the Wayland desktop and "
+                                @"every program in it keep running now, and will be missing from a resume of this save — any unsaved work in them is lost.",
+                                @"GPU warning before saving; %s names several programs");
+    }
+    NSString *message = [NSString stringWithFormat:format, names];
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"The Wayland desktop can't be saved", @"GPU warning alert title")
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:suspending ? NSLocalizedString(@"Suspend Anyway", @"GPU warning button")
+                                                               : NSLocalizedString(@"Save Anyway", @"GPU warning button")
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(__unused UIAlertAction *a) {
+        proceed(YES);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"Alert button")
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    // Next turn: callers are inside another alert's handler, and presenting
+    // while that one is still going away is dropped as "already presenting".
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *top = host;
+        while (top.presentedViewController != nil && !top.presentedViewController.isBeingDismissed)
+            top = top.presentedViewController;
+        [top presentViewController:alert animated:YES completion:nil];
+    });
+}
+
+// Write the session and GO, which is a different thing from saving one.
+//
+// A save is a copy: the image is written and the guest carries straight on, so
+// two saves in a row are two photographs of a machine that never stopped. A
+// suspend is a departure -- the point is to put the machine down and have the
+// next launch be the one that continues it. Without this the only way to do
+// that was /AOK/tools/suspend.sh from inside the guest, which already ends in
+// the same exit(0) (kernel/checkpoint.c's halt path; the app's halt_hook only
+// records a flag there).
+//
+// Exiting immediately rather than after a beat, and that is deliberate: the
+// image describes the guest as it was when the freeze stopped it, while the
+// filesystem keeps changing for as long as the app is alive. Every millisecond
+// between the two is a millisecond the root can drift from the image.
+int ISHSuspendSessionSuspendAndExit(BOOL leaveOutGPU) {
+    if (ISHGuestHalted())
+        return _ESRCH;
+    NSString *image = ISHSuspendSessionImagePath();
+    if (image == nil)
+        return _ENOENT;
+    ISHWorkspaceCaptureLayoutForSuspend(image);
+    int err = checkpoint_save_external_flags(image.fileSystemRepresentation,
+                                             leaveOutGPU ? CKPT_SAVE_LEAVE_OUT : 0);
+    if (err < 0)
+        return err;
+    os_log(ISHSuspendLog(), "session suspended on request; exiting");
+    exit(0);
+}
+
 static TerminalViewController *CreateTerminalViewController(void) {
     UIViewController *viewController = [[UIStoryboard storyboardWithName:@"Terminal" bundle:nil] instantiateInitialViewController];
     return [viewController isKindOfClass:TerminalViewController.class] ? (TerminalViewController *) viewController : nil;
 }
 
 + (intptr_t)ensureBooted {
+    // Held, if somebody is about to ask which session to resume.
+    //
+    // Everything below happens exactly once, so the first caller through here
+    // settles whether this launch boots fresh or is rebuilt from an image. In
+    // Workspace mode that first caller was never the picker: an applet reaching
+    // the guest, or the Wayland display connecting, got here while the question
+    // was still on screen -- and the restore could no longer run.
+    if (ishSessionBootHeldForChoice) {
+        if (ISHSessionResumeChoicePending()) {
+            [ISHDiagnosticsStore recordBreadcrumb:@"boot.held.sessionChoice"];
+            return _EAGAIN;
+        }
+        ishSessionBootHeldForChoice = NO;
+    }
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         [ISHDiagnosticsStore recordLaunchStage:@"boot.ensure.begin"];
@@ -2436,9 +3885,9 @@ static TerminalViewController *CreateTerminalViewController(void) {
         } else {
             bootError = RecordBootFailure(_ESRCH,
                                           @"boot.delegate.missing",
-                                          @"Boot failed before app setup",
-                                          @"The application delegate was not available when boot was requested.",
-                                          @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
+                                          NSLocalizedString(@"Boot failed before app setup", @"Boot failure alert title"),
+                                          NSLocalizedString(@"The application delegate was not available when boot was requested.", @"Boot failure reason"),
+                                          NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
                                           nil);
         }
         if (bootError < 0) {
@@ -2447,6 +3896,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                                                            @"errorDescription": ISHDescriptionForErrno(bootError)}];
         } else {
             [ISHDiagnosticsStore recordLaunchStage:@"boot.ensure.end"];
+            if ([Roots.instance isNativeRootNamed:Roots.instance.bootedRoot]) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    ISHPresentNativeUserPrompt(0, nil);
+                });
+            }
         }
     });
     return bootError;
@@ -2461,50 +3915,68 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [ISHDiagnosticsStore recordLaunchStage:@"boot.swap.configured"
                                    details:@{@"enabled": @(swapEnabled),
                                              @"sizeMB": @(swapSizeMB)}];
-    NSString *defaultRoot = Roots.instance.defaultRoot;
-    if (defaultRoot == nil) {
+    NSString *bootRoot = Roots.instance.rootToBoot;
+    if (bootRoot == nil) {
         return RecordBootFailure(_ENOENT,
                                  @"boot.root.none",
-                                 @"No boot filesystem is selected",
-                                 @"iSH-AOK cannot boot because no active filesystem is configured.",
-                                 @"Open Filesystems and choose or import a root filesystem.",
+                                 NSLocalizedString(@"No boot filesystem is selected", @"Boot failure alert title"),
+                                 NSLocalizedString(@"iSH-AOK cannot boot because no active filesystem is configured.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Open Filesystems and choose or import a root filesystem.", @"Boot failure recovery advice"),
                                  @{@"rootCount": @(Roots.instance.roots.count)});
+    }
+    // ISH_BOOT_ROOT names the root outright, so a name with no root behind it
+    // stops here, by name, rather than booting some other root in its place.
+    if (Roots.instance.bootRootOverride != nil) {
+        NSArray<NSString *> *installed = Roots.instance.roots.array ?: @[];
+        if (![installed containsObject:bootRoot]) {
+            return RecordBootFailure(_ENOENT,
+                                     @"boot.root.override.missing",
+                                     NSLocalizedString(@"The requested boot filesystem does not exist", @"Boot failure alert title"),
+                                     [NSString stringWithFormat:NSLocalizedString(@"ISH_BOOT_ROOT asks for \"%@\", which is not an installed filesystem.", @"Boot failure reason"), bootRoot],
+                                     [NSString stringWithFormat:NSLocalizedString(@"Launch without ISH_BOOT_ROOT, or name one of: %@.", @"Boot failure recovery advice"),
+                                      [installed componentsJoinedByString:@", "]],
+                                     @{@"root": bootRoot,
+                                       @"installed": installed});
+        }
+        [ISHDiagnosticsStore recordLaunchStage:@"boot.root.override"
+                                       details:@{@"root": bootRoot,
+                                                 @"defaultRoot": Roots.instance.defaultRoot ?: @""}];
     }
     // From here on this root is /, whatever the user later sets the default to.
     // Roots consults this before letting a rename or delete touch a root's
     // backing store; see -[Roots bootedRoot].
-    Roots.instance.bootedRoot = defaultRoot;
+    Roots.instance.bootedRoot = bootRoot;
     NSError *rootLockError = nil;
-    int rootLockFd = ISHAppGroupAcquireNamedLock(@"root", defaultRoot, YES, &rootLockError);
+    int rootLockFd = ISHAppGroupAcquireNamedLock(@"root", bootRoot, YES, &rootLockError);
     if (rootLockFd < 0) {
         [ISHDiagnosticsStore recordLaunchStage:@"boot.root.lock.failed"
-                                       details:@{@"root": defaultRoot,
+                                       details:@{@"root": bootRoot,
                                                  @"error": rootLockError.localizedDescription ?: @"unknown"}];
     } else {
         [ISHDiagnosticsStore recordLaunchStage:@"boot.root.locked"
-                                       details:@{@"root": defaultRoot}];
+                                       details:@{@"root": bootRoot}];
     }
     @try {
     [ISHDiagnosticsStore recordLaunchStage:@"boot.root.selected"
-                                   details:@{@"root": defaultRoot}];
-    NSString *guestABI = [Roots.instance guestABIForRootNamed:defaultRoot];
+                                   details:@{@"root": bootRoot}];
+    NSString *guestABI = [Roots.instance guestABIForRootNamed:bootRoot];
     if ([guestABI isEqualToString:@"amd64"]) {
-        NSLog(@"Attempting experimental amd64 guest boot for root %@", defaultRoot);
+        NSLog(@"Attempting experimental amd64 guest boot for root %@", bootRoot);
         [ISHDiagnosticsStore recordLaunchStage:@"boot.root.amd64"
-                                       details:@{@"root": defaultRoot}];
+                                       details:@{@"root": bootRoot}];
     }
 
-    NSURL *root = [Roots.instance rootUrl:defaultRoot];
+    NSURL *root = [Roots.instance rootUrl:bootRoot];
     NSURL *rootData = [root URLByAppendingPathComponent:@"data" isDirectory:YES];
     NSURL *rootMetadata = [root URLByAppendingPathComponent:@"meta.db" isDirectory:NO];
     BOOL isDirectory = NO;
     if (![NSFileManager.defaultManager fileExistsAtPath:root.path isDirectory:&isDirectory] || !isDirectory) {
         return RecordBootFailure(_ENOENT,
                                  @"boot.root.directory.missing",
-                                 @"Selected filesystem is missing",
-                                 @"The active filesystem points to a root directory that is not present on disk.",
-                                 @"Choose another filesystem or reimport this one.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Selected filesystem is missing", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The active filesystem points to a root directory that is not present on disk.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Choose another filesystem or reimport this one.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": root.path ?: @""});
     }
@@ -2512,10 +3984,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (![NSFileManager.defaultManager fileExistsAtPath:rootData.path isDirectory:&isDirectory] || !isDirectory) {
         return RecordBootFailure(_ENOENT,
                                  @"boot.root.data.missing",
-                                 @"Selected filesystem is incomplete",
-                                 @"The active filesystem directory exists, but its data directory is missing.",
-                                 @"Choose another filesystem or reimport this one.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Selected filesystem is incomplete", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The active filesystem directory exists, but its data directory is missing.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Choose another filesystem or reimport this one.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": rootData.path ?: @""});
     }
@@ -2523,10 +3995,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (![NSFileManager.defaultManager fileExistsAtPath:rootMetadata.path isDirectory:&isDirectory] || isDirectory) {
         return RecordBootFailure(_ENOENT,
                                  @"boot.root.metadata.missing",
-                                 @"Selected filesystem metadata is missing",
-                                 @"The active filesystem data exists, but its fakefs metadata database is missing.",
-                                 @"Choose another filesystem or reimport this one.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Selected filesystem metadata is missing", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The active filesystem data exists, but its fakefs metadata database is missing.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Choose another filesystem or reimport this one.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": rootMetadata.path ?: @""});
     }
@@ -2539,15 +4011,15 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err < 0) {
         return RecordBootFailure(err,
                                  @"boot.root.mount.failed",
-                                 @"Boot failed while mounting the filesystem",
-                                 @"iSH-AOK found the selected filesystem, but fakefs could not mount it.",
+                                 NSLocalizedString(@"Boot failed while mounting the filesystem", @"Boot failure alert title"),
+                                 NSLocalizedString(@"iSH-AOK found the selected filesystem, but fakefs could not mount it.", @"Boot failure reason"),
                                  BootMountRecovery(err),
-                                 @{@"root": defaultRoot,
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": rootData.path ?: @""});
     }
     [ISHDiagnosticsStore recordLaunchStage:@"boot.root.mounted"
-                                   details:@{@"root": defaultRoot}];
+                                   details:@{@"root": bootRoot}];
 
     fs_register(&iosfs);
     fs_register(&iosfs_unsafe);
@@ -2557,17 +4029,31 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err < 0) {
         return RecordBootFailure(err,
                                  @"boot.first_process.failed",
-                                 @"Boot failed while creating init",
-                                 @"The filesystem was mounted, but the emulator could not create the first guest process.",
+                                 NSLocalizedString(@"Boot failed while creating init", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but the emulator could not create the first guest process.", @"Boot failure reason"),
                                  err == _ENOMEM
-                                     ? @"Close other apps and restart iSH-AOK."
-                                     : @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
-                                 @{@"root": defaultRoot,
+                                     ? NSLocalizedString(@"Close other apps and restart iSH-AOK.", @"Boot failure recovery advice")
+                                     : NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @""});
     }
     [ISHDiagnosticsStore recordLaunchStage:@"boot.first_process.ready"];
 
+    // Native mode (docs/native_mode_plan.md): a root with no distribution in
+    // it. Its init is arm64 -- an image-less first task is i386 by default,
+    // and every native program is arm64 host code -- and its directories have
+    // to exist before the /dev, /run and /tmp repairs below assume them. The
+    // links into /AOK/native wait for /AOK, further down.
+    BOOL nativeRoot = [Roots.instance isNativeRootNamed:bootRoot];
+    if (nativeRoot) {
+        native_root_adopt_abi(current);
+        native_root_make_dirs();
+        [ISHDiagnosticsStore recordLaunchStage:@"boot.root.native"
+                                       details:@{@"root": bootRoot}];
+    }
+
     FsInitialize();
+
 
     // Repair or recreate the core device nodes the app owns. This keeps older
     // roots working when a device major/minor changes in a later app build.
@@ -2601,6 +4087,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
     EnsureCharacterDevice("/dev/random", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_RANDOM_MINOR));
     EnsureCharacterDevice("/dev/urandom", S_IFCHR|0666, dev_make(MEM_MAJOR, DEV_URANDOM_MINOR));
     EnsureCharacterDevice("/dev/fuse", S_IFCHR|0666, dev_make(MISC_MAJOR, DEV_FUSE_MINOR));
+    // The GPU render node (fs/virtgpu.c, #484), when the renderer is linked in.
+    if (virtgpu_available()) {
+        generic_mkdirat(AT_PWD, "/dev/dri", 0755);
+        EnsureCharacterDevice("/dev/dri/renderD128", S_IFCHR|0666, dev_make(DRM_MAJOR, DEV_VIRTGPU_RENDER_MINOR));
+    }
     // The kernel log. The driver has always been here (fs/mem.c) but the node
     // never was, so every syslog daemon that starts with "open the kernel log"
     // failed on it -- busybox's klogd and rsyslog's imklog both read
@@ -2672,14 +4163,12 @@ static TerminalViewController *CreateTerminalViewController(void) {
     generic_unlinkat(AT_PWD, "/var/run");
     generic_symlinkat("/run", AT_PWD, "/var/run");
     
-    // Create directories/links to simulate /sys stuff for battery monitoring
-    generic_mkdirat(AT_PWD, "/sys/class", 0755);
-    generic_mkdirat(AT_PWD, "/sys/class/power_supply", 0755);
-    generic_mkdirat(AT_PWD, "/sys/class/power_supply/BAT0", 0755);
+    // The battery is published by sysfs itself now (/sys/class/power_supply,
+    // fs/proc/root.c). What used to be here built BAT0 as directories and
+    // symlinks inside the root's own /sys, which the sysfs mount below hid on
+    // every boot.
     generic_mkdirat(AT_PWD, "/AOK", 0555);
-    generic_symlinkat("/proc/ish/BAT0_capacity", AT_PWD, "/sys/class/power_supply/BAT0/capacity");
-    generic_symlinkat("/proc/ish/BAT0_status", AT_PWD, "/sys/class/power_supply/BAT0/status");
-    
+
     
     
     // Register clipboard device driver and create device node for it
@@ -2687,10 +4176,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err != 0) {
         return RecordBootFailure(err,
                                  @"boot.device.clipboard.failed",
-                                 @"Boot failed while registering clipboard device",
-                                 @"The filesystem was mounted, but iSH-AOK could not register /dev/clipboard.",
-                                 @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while registering clipboard device", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not register /dev/clipboard.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": @"/dev/clipboard"});
     }
@@ -2700,10 +4189,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err != 0) {
         return RecordBootFailure(err,
                                  @"boot.device.location.failed",
-                                 @"Boot failed while registering location device",
-                                 @"The filesystem was mounted, but iSH-AOK could not register /dev/location.",
-                                 @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while registering location device", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not register /dev/location.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": @"/dev/location"});
     }
@@ -2716,10 +4205,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err != 0) {
         return RecordBootFailure(err,
                                  @"boot.device.url.failed",
-                                 @"Boot failed while registering URL device",
-                                 @"The filesystem was mounted, but iSH-AOK could not register /dev/url.",
-                                 @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while registering URL device", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not register /dev/url.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": @"/dev/url"});
     }
@@ -2729,10 +4218,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err != 0) {
         return RecordBootFailure(err,
                                  @"boot.device.audio.failed",
-                                 @"Boot failed while registering audio device",
-                                 @"The filesystem was mounted, but iSH-AOK could not register /dev/dsp.",
-                                 @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while registering audio device", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not register /dev/dsp.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": @"/dev/dsp"});
     }
@@ -2743,10 +4232,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err != 0) {
         return RecordBootFailure(err,
                                  @"boot.device.rtc.failed",
-                                 @"Boot failed while registering clock device",
-                                 @"The filesystem was mounted, but iSH-AOK could not register /dev/rtc0.",
-                                 @"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while registering clock device", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not register /dev/rtc0.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Restart iSH-AOK. If this repeats, open Diagnostics from recovery mode.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": @"/dev/rtc0"});
     }
@@ -2754,6 +4243,26 @@ static TerminalViewController *CreateTerminalViewController(void) {
     EnsureSymlink("/dev/rtc", "/dev/rtc0");
 
     do_mount(&aokfs, NSBundle.mainBundle.resourcePath.UTF8String, "/AOK", "", MS_READONLY_);
+    // A native root is provisioned at every boot, now that /AOK/native is
+    // there to link to: the build's programs on PATH, the /etc files a root
+    // needs (only where missing), the rc scripts (kernel/native_root.c). And
+    // the host's time zone database at /usr/share/zoneinfo, before the zone
+    // is written to /etc/localtime (ProvisionGuestHostFiles, below).
+    if (nativeRoot) {
+        int nativeErr = native_root_provision();
+        int zoneErr = native_root_mount_zoneinfo();
+        [ISHDiagnosticsStore recordLaunchStage:@"boot.root.native.provisioned"
+                                       details:@{@"root": bootRoot,
+                                                 @"error": @(nativeErr),
+                                                 @"zoneinfoError": @(zoneErr)}];
+    }
+    // Any root: an account whose login shell is a native program this build
+    // does not ship (/AOK/native/bash, dropped in September) gets one that
+    // exists, or sshd, login and su all turn it away (kernel/native_root.c).
+    int shellsRepaired = native_root_repair_login_shells();
+    if (shellsRepaired != 0)
+        [ISHDiagnosticsStore recordLaunchStage:@"boot.root.login_shells_repaired"
+                                       details:@{@"root": bootRoot, @"result": @(shellsRepaired)}];
     // Every /AOK mount's source is a host container path: long, mostly a UUID,
     // and useless to the guest, so each names itself instead -- the same thing
     // Linux's own virtual filesystems do, where proc reports "proc" and a tmpfs
@@ -2767,9 +4276,11 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                                     attributes:nil
                                                          error:&persistError]) {
             // /AOK/persist is shared by every guest uid but owned at the host
-            // layer by the app's own uid -- see MOUNT_ISH_SHARED_ (kernel/fs.h)
-            // for why that means it needs to be forced world-writable rather
-            // than relying on ordinary Unix ownership.
+            // by the app's own uid, so realfs reports each file there as owned
+            // by whoever asks -- see MOUNT_ISH_SHARED_ (kernel/fs.h). It used
+            // to be widened to world-writable on every launch instead, which
+            // undid any chmod made there: an ssh key could never stay 0600.
+            //
             // bin/lib/etc, created empty on every launch so they are simply
             // THERE to drop things into -- from the guest or from the Files
             // app -- rather than something a user has to know to mkdir.
@@ -2797,7 +4308,6 @@ static TerminalViewController *CreateTerminalViewController(void) {
             }
             ISHWriteWorkspaceLaunchers([aokPersistURL
                 URLByAppendingPathComponent:@"bin" isDirectory:YES]);
-            FixSharedDirectoryPermissions(aokPersistURL.fileSystemRepresentation);
             int persistMountErr = do_mount(&realfs, aokPersistURL.fileSystemRepresentation, "/AOK/persist", "", MOUNT_ISH_SHARED_);
             if (persistMountErr >= 0)
                 mount_set_display_source("/AOK/persist", "persist");
@@ -2916,9 +4426,8 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                    withIntermediateDirectories:YES
                                                     attributes:nil
                                                          error:&rootsError]) {
-            // See the matching comment at the /AOK/persist mount above --
-            // same single-host-owner-shared-by-every-guest-uid situation.
-            chmod(aokRootsURL.fileSystemRepresentation, 0777);
+            // Shared by every guest uid, as /AOK/persist is: see the comment
+            // at that mount above.
             int rootsMountErr = do_mount(&realfs, aokRootsURL.fileSystemRepresentation, "/AOK/roots", "", MOUNT_ISH_SHARED_);
             if (rootsMountErr >= 0)
                 mount_set_display_source("/AOK/roots", "roots");
@@ -3005,6 +4514,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [self scheduleDnsRefresh:@"boot"];
     
     exit_hook = ios_handle_exit;
+    halt_hook = ios_handle_halt;
     die_handler = ios_handle_die;
 #if !TARGET_OS_SIMULATOR
     NSString *sockTmp = [NSTemporaryDirectory() stringByAppendingString:@"ishsock"];
@@ -3033,16 +4543,243 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // create_stdio's device check miss the 5:1 node and fall back to
     // opening tty1 directly, auto-attaching it to PID 1's session -- which
     // permanently blocked getty@tty1's TIOCSCTTY, leaving every systemd
+    // ---- suspend to disk: resume, if there is a session to resume -----------
+    //
+    // AFTER the tty driver is registered just above, and that ordering is not
+    // cosmetic: a restored process can have a terminal open, and re-opening
+    // one goes through tty_device_open, which ASSERTS on a major with no
+    // driver. Placed earlier, every resume killed the app with SIGABRT on
+    // that assert -- the crash report names tty_device_open directly.
+    //
+    // Still before the boot command, because a restored
+    // guest brings its own descriptors and its own first program: everything
+    // below this point is what a FRESH boot needs, and a resume needs none of
+    // it. The image is consumed by being restored -- leaving it would resume
+    // the same moment again on the launch after this one, hiding a session the
+    // user had since suspended over the top of it.
+    //
+    // A failure here is not a boot failure. The image may be from another
+    // build (kernel/checkpoint.c refuses one by fingerprint rather than
+    // reinterpreting it), or describe something this build cannot rebuild. The
+    // right answer to all of that is the behaviour the user gets with this
+    // switch off: boot normally.
+    // How a restored session gets a terminal a person can see. Installed
+    // before the restore, because the restore is what calls it: a session that
+    // was on a pseudo-terminal comes back on a NEW one, and the terminal view
+    // controller adopts that instead of starting a shell of its own. Without
+    // it, every restored session collapsed onto /dev/console -- alive and
+    // correct, on a terminal nobody was looking at, while the window the user
+    // could see held a shell that had just been started.
+    checkpoint_open_session_tty = ISHOpenTerminalForRestoredSession;
+    // The slot the picker settled on, not "the" image: a launch that was asked
+    // and answered "New Session" must not resume anything, and one that was
+    // never asked (a Shortcut, a background entry point -- nobody is looking at
+    // a dialog there) falls back to the newest slot this root can resume, which
+    // is what a single suspend.img used to mean.
+    NSString *resumeImage = nil;
+    if (ishSessionResumeDecided) {
+        resumeImage = ishSessionResumeChoice;
+    } else {
+        for (NSDictionary *slot in ISHSessionSlots()) {   // newest first
+            if (ISHSessionSlotResumable(slot)) {
+                resumeImage = slot[@"path"];
+                break;
+            }
+        }
+        if (resumeImage != nil)
+            ISHSessionSetCurrentSlot(resumeImage);
+    }
+    // Where this launch's saves go, the guest's own `suspend` included: the slot
+    // the choice pinned -- the resumed image after "Resume and Delete" or a
+    // launch nobody asked -- or a fresh one. After "Resume and Save" nothing is
+    // pinned, so the copy that was kept is not the one written over. It used to
+    // be: the save path was the resumed image whatever the answer.
+    //
+    // And never a thing to resume. With every slot taken the fresh one is the
+    // OLDEST saved session, and whatever was at the save path used to be
+    // restored -- so "Start a New Session" resumed the oldest session instead,
+    // every time on a device full enough to allow only one slot.
+    NSString *sessionImage = ISHSuspendSessionImagePath();
+    // The same switch gates the guest's own control of this. Published rather
+    // than read from the kernel, because UserPreferences is Objective-C and
+    // fs/proc/ish.c is not; re-published on every activation below, so
+    // flipping it in Settings takes effect without a relaunch.
+    checkpoint_set_guest_control(UserPreferences.shared.shouldSuspendToDisk);
+    // Say what this launch decided about resuming, ALWAYS, before acting on it.
+    //
+    // Every way of not resuming was silent: the preference being off, no image
+    // path at all, and -- the one that matters -- the file not being where the
+    // restore looks for it. A launch that skipped for any of those reasons was
+    // byte-for-byte indistinguishable from one that tried and failed, and from
+    // one where nothing had been suspended in the first place. Reported three
+    // times as "no session on restore" with nothing in the log either way,
+    // because the only diagnostic covered the branch that was never reached.
+    BOOL sessionExists = resumeImage != nil &&
+            [NSFileManager.defaultManager fileExistsAtPath:resumeImage];
+    os_log(ISHSuspendLog(),
+           "session resume: pref=%{public}d decided=%{public}d image=%{public}@ exists=%{public}d "
+           "saves=%{public}@",
+           UserPreferences.shared.shouldSuspendToDisk ? 1 : 0,
+           ishSessionResumeDecided ? 1 : 0,
+           resumeImage != nil ? resumeImage.lastPathComponent : @"(none)",
+           sessionExists ? 1 : 0,
+           sessionImage != nil ? sessionImage.lastPathComponent : @"(none)");
+    [ISHDiagnosticsStore recordBreadcrumb:@"session.resume.decision"
+                                  details:@{@"pref": @(UserPreferences.shared.shouldSuspendToDisk),
+                                            @"decided": @(ishSessionResumeDecided),
+                                            @"image": resumeImage != nil
+                                                    ? resumeImage.lastPathComponent : @"none",
+                                            @"exists": @(sessionExists)}];
+    // What is actually on disk, when the thing we were told to resume is not.
+    // A slot mismatch -- written as one name, looked for under another -- looks
+    // exactly like "nothing was suspended" unless the directory is listed.
+    if (resumeImage != nil && !sessionExists) {
+        NSString *dir = resumeImage.stringByDeletingLastPathComponent;
+        NSArray<NSString *> *found =
+                [NSFileManager.defaultManager contentsOfDirectoryAtPath:dir error:nil];
+        os_log_error(ISHSuspendLog(),
+                     "session resume: %{public}@ is not there; %{public}@ holds %{public}@",
+                     resumeImage.lastPathComponent, dir.lastPathComponent,
+                     found.count != 0 ? [found componentsJoinedByString:@", "] : @"nothing");
+    }
+    if (UserPreferences.shared.shouldSuspendToDisk && sessionImage != nil) {
+        checkpoint_set_session(sessionImage.fileSystemRepresentation);
+        if (sessionExists) {
+            int rerr = checkpoint_restore(resumeImage.fileSystemRepresentation);
+            if (rerr >= 0) {
+                ishSessionRestoredImage = resumeImage;
+                // Anything that came back degraded -- a listener that could
+                // not be rebound -- recorded where a Diagnostics export can
+                // show it. The guest's own /proc/ish/checkpoint says the same.
+                char restoreNote[256];
+                checkpoint_get_restore_note(restoreNote, sizeof(restoreNote));
+                if (restoreNote[0] != '\0')
+                    [ISHDiagnosticsStore recordBreadcrumb:@"session.restore.degraded"
+                                                  details:@{@"note": @(restoreNote)}];
+            }
+            // Consumed here only when nobody chose to keep it.
+            //
+            // Restoring used to delete the image unconditionally, on the
+            // reasoning that an image resumed twice gives two live copies of one
+            // machine. That predates the picker, and it quietly defeated it:
+            // "Resume and Save" kept nothing, because the boot had already
+            // removed the file by the time the answer was acted on. Reported as
+            // "tried resume and save ... and upon restart the previous suspend
+            // was gone".
+            //
+            // So: a launch nobody was asked (a Shortcut, a background entry
+            // point) still consumes it, and a restore that FAILED still drops
+            // the image rather than re-offering something that cannot be loaded.
+            // Otherwise the disposition owns it -- "Resume and Delete" removes it
+            // through ISHSessionConsumeResumedImage once there is a running
+            // session to show for it.
+            // A restore that FAILED used to say nothing at all: no log, no
+            // breadcrumb, no alert -- and then the image was deleted, so
+            // there was nothing left to look at either. From the outside that
+            // is indistinguishable from "the suspend never happened", which
+            // is exactly how it was reported: the session simply was not
+            // there, twice, with no clue as to why.
+            if (rerr < 0) {
+                struct checkpoint_status st;
+                checkpoint_get_status(&st);
+                os_log_error(ISHSuspendLog(),
+                             "session NOT restored from %{public}@: %{public}d %{public}s",
+                             resumeImage.lastPathComponent, rerr,
+                             st.last_refusal[0] != '\0' ? st.last_refusal : "(no reason recorded)");
+                [ISHDiagnosticsStore recordBreadcrumb:@"session.restore.failed"
+                                              details:@{@"errno": @(rerr),
+                                                        @"reason": st.last_refusal[0] != '\0'
+                                                                ? @(st.last_refusal) : @"none"}];
+            }
+            if (rerr == _EXDEV) {
+                // Another root's session. The kernel refused it before changing
+                // anything, and it is still good for that root, so it stays
+                // where it is -- and stops being this launch's slot, or the
+                // next save would write over it.
+                if ([sessionImage isEqualToString:resumeImage]) {
+                    ISHSessionSetCurrentSlot(nil);
+                    sessionImage = ISHSuspendSessionImagePath();
+                    if (sessionImage != nil)
+                        checkpoint_set_session(sessionImage.fileSystemRepresentation);
+                }
+            } else if (!ishSessionResumeDecided || rerr < 0) {
+                // Kept, not destroyed, when it failed. It must not be OFFERED
+                // again -- that is what the removal was for -- but deleting
+                // the one artifact that could explain the failure makes the
+                // next report as unactionable as the last. One generation is
+                // enough; the previous casualty is replaced.
+                if (rerr < 0) {
+                    NSString *aside = [resumeImage stringByAppendingPathExtension:@"failed"];
+                    [NSFileManager.defaultManager removeItemAtPath:aside error:nil];
+                    NSError *moveErr = nil;
+                    if ([NSFileManager.defaultManager moveItemAtPath:resumeImage
+                                                              toPath:aside
+                                                               error:&moveErr]) {
+                        os_log(ISHSuspendLog(), "kept the unrestorable image at %{public}@",
+                               aside.lastPathComponent);
+                    } else {
+                        [NSFileManager.defaultManager removeItemAtPath:resumeImage error:nil];
+                    }
+                } else {
+                    [NSFileManager.defaultManager removeItemAtPath:resumeImage error:nil];
+                }
+            }
+            if (rerr >= 0) {
+                // The machine services a resume needs as much as a boot does.
+                // Neither is part of the boot COMMAND -- they are the pager and
+                // the jetsam early-warning, and a resumed guest runs on the same
+                // device under the same pressure as a booted one. Only the swap
+                // AREA is fresh: the image carries every guest page, because
+                // walking the page tables faults them all back in first.
+                host_mem_pressure_start();
+                swap_startup();
+                // And init itself. checkpoint_restore starts every task in the
+                // image EXCEPT the first, because the first IS `current` and
+                // the entry point decides how to run it -- the CLI runs it on
+                // the thread it is already on (main.c's task_run_current), and
+                // the app gives it a thread, exactly as the boot path below
+                // does after do_execve. Without this, pid 1 came back with no
+                // thread at all: it reaped nothing, respawned nothing, and
+                // could not be frozen, so the FIRST save after a resume refused
+                // with "pid 1 (init) did not reach a syscall boundary".
+                if (task_start(current) < 0) {
+                    os_log_error(ISHSuspendLog(),
+                                 "resumed, but could not give init a thread");
+                    [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resume.initThreadFailed"];
+                    return RecordBootFailure(_EAGAIN,
+                                             @"boot.suspend.resume.initThreadFailed",
+                                             NSLocalizedString(@"Resume failed while starting init", @"Boot failure alert title"),
+                                             NSLocalizedString(@"The suspended session was restored, but iSH-AOK could not create a thread to run it.", @"Boot failure reason"),
+                                             NSLocalizedString(@"Close other apps to free memory, then restart iSH-AOK.", @"Boot failure recovery advice"),
+                                             @{@"root": bootRoot});
+                }
+                // `current` is left pointing at init, exactly as the boot path
+                // below leaves it after its own task_start -- the two paths
+                // have to agree, because app code on this thread reads it. See
+                // the note in TerminalViewController's startSession.
+                os_log(ISHSuspendLog(), "resumed a suspended session");
+                [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resumed"
+                                               details:@{@"root": bootRoot}];
+                return 0;
+            }
+            os_log_error(ISHSuspendLog(),
+                         "could not resume the suspended session (%{public}d); booting",
+                         rerr);
+            [ISHDiagnosticsStore recordLaunchStage:@"boot.suspend.resume_failed"
+                                           details:@{@"err": @(rerr)}];
+        }
+    }
+
     // boot without a console login prompt (agetty parked pre-exec in
     // acquire_terminal, "[(agetty)]" in ps).
     err = create_stdio("/dev/console", TTY_ALTERNATE_MAJOR, DEV_CONSOLE_MINOR);
     if (err < 0) {
         return RecordBootFailure(err,
                                  @"boot.stdio.failed",
-                                 @"Boot failed while opening console",
-                                 @"The filesystem was mounted, but iSH-AOK could not attach init to /dev/console.",
-                                 @"The root's /dev entries may be damaged. Choose another filesystem or reimport this one.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while opening console", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not attach init to /dev/console.", @"Boot failure reason"),
+                                 NSLocalizedString(@"The root's /dev entries may be damaged. Choose another filesystem or reimport this one.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"path": @"/dev/console"});
     }
@@ -3052,14 +4789,14 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (command.count == 0 || command[0].length == 0) {
         return RecordBootFailure(_EINVAL,
                                  @"boot.command.empty",
-                                 @"Boot command is empty",
-                                 @"iSH-AOK cannot start init because the configured boot command is empty.",
-                                 @"Set a boot command in Settings. The default is /sbin/init.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot command is empty", @"Boot failure alert title"),
+                                 NSLocalizedString(@"iSH-AOK cannot start init because the configured boot command is empty.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Set a boot command in Settings. The default is /sbin/init.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @""});
     }
     command = BootCommandWithInitFallback(command,
-                                          @{@"root": defaultRoot,
+                                          @{@"root": bootRoot,
                                             @"guestABI": guestABI ?: @""});
     NSString *commandString = [command componentsJoinedByString:@" "];
     NSArray<NSString *> *argvCommand = bootUsesNativeFakeInit ? FakeInitLoginShellArgvForCommand(command) : command;
@@ -3090,10 +4827,35 @@ static TerminalViewController *CreateTerminalViewController(void) {
     // 40 MB free -- and it is also the only thing that leaves a breadcrumb in
     // the log before the kill.
     host_mem_pressure_start();
+    // Swap on external storage: open the file on the drive the user chose and
+    // hand it to the pager before it starts. If the drive is not there, swap
+    // stays OFF for this launch rather than quietly moving into the container
+    // -- the user picked the drive to keep that flash out of it.
+    BOOL externalSwapWanted = swapEnabled && UserPreferences.shared.shouldEnableSwapOnExternal;
+    BOOL externalSwapReady = NO;
+    if (externalSwapWanted) {
+        int fd = ISHOpenExternalSwapFile();
+        if (fd >= 0) {
+            swap_set_external_fd(fd);
+            externalSwapReady = YES;
+        } else {
+            swap_set_preference(false, (unsigned) swapSizeMB);
+        }
+    }
     swap_startup();
+    // A file the startup did not take is still ours: close it, and let go of
+    // the drive so it can be ejected.
+    int unusedSwapFd = swap_take_unused_external_fd();
+    if (unusedSwapFd >= 0) {
+        close(unusedSwapFd);
+        ISHReleaseExternalSwapAccess();
+        externalSwapReady = NO;
+    }
     [ISHDiagnosticsStore recordLaunchStage:@"boot.swap.started"
                                    details:@{@"requested": @(swapEnabled),
                                              @"requestedSizeMB": @(swapSizeMB),
+                                             @"externalRequested": @(externalSwapWanted),
+                                             @"externalReady": @(externalSwapReady),
                                              @"running": @(swap_enabled())}];
     if (bootUsesNativeFakeInit) {
         FakeInitPrepareGuestRoot();
@@ -3101,15 +4863,15 @@ static TerminalViewController *CreateTerminalViewController(void) {
         if (err < 0) {
             return RecordBootFailure(err,
                                      @"boot.init.supervisor.failed",
-                                     @"Boot failed while starting fallback console",
-                                     @"The filesystem was mounted, but iSH-AOK could not start its fallback console supervisor.",
-                                     @"Restart iSH-AOK. If this repeats, choose another filesystem or reimport this one.",
-                                     @{@"root": defaultRoot,
+                                     NSLocalizedString(@"Boot failed while starting fallback console", @"Boot failure alert title"),
+                                     NSLocalizedString(@"The filesystem was mounted, but iSH-AOK could not start its fallback console supervisor.", @"Boot failure reason"),
+                                     NSLocalizedString(@"Restart iSH-AOK. If this repeats, choose another filesystem or reimport this one.", @"Boot failure recovery advice"),
+                                     @{@"root": bootRoot,
                                        @"guestABI": guestABI ?: @"",
                                        @"command": commandString ?: @""});
         }
         [ISHDiagnosticsStore recordLaunchStage:@"boot.init.fake.started"
-                                       details:@{@"root": defaultRoot,
+                                       details:@{@"root": bootRoot,
                                                  @"guestABI": guestABI ?: @"",
                                                  @"command": commandString ?: @"",
                                                  @"argv": [argvCommand componentsJoinedByString:@" "] ?: @""}];
@@ -3119,10 +4881,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (err < 0) {
         return RecordBootFailure(err,
                                  @"boot.init.exec.failed",
-                                 @"Boot failed while starting init",
-                                 @"The filesystem was mounted, but the configured boot command could not be executed.",
+                                 NSLocalizedString(@"Boot failed while starting init", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The filesystem was mounted, but the configured boot command could not be executed.", @"Boot failure reason"),
                                  BootExecRecovery(err, guestABI),
-                                 @{@"root": defaultRoot,
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"command": commandString ?: @""});
     }
@@ -3130,10 +4892,10 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (task_start(current) < 0) {
         return RecordBootFailure(_EAGAIN,
                                  @"boot.init.start.failed",
-                                 @"Boot failed while starting init",
-                                 @"The boot command was loaded, but iSH-AOK could not create a thread to run it.",
-                                 @"Close other apps to free memory, then restart iSH-AOK.",
-                                 @{@"root": defaultRoot,
+                                 NSLocalizedString(@"Boot failed while starting init", @"Boot failure alert title"),
+                                 NSLocalizedString(@"The boot command was loaded, but iSH-AOK could not create a thread to run it.", @"Boot failure reason"),
+                                 NSLocalizedString(@"Close other apps to free memory, then restart iSH-AOK.", @"Boot failure recovery advice"),
+                                 @{@"root": bootRoot,
                                    @"guestABI": guestABI ?: @"",
                                    @"command": commandString ?: @""});
     }
@@ -3157,16 +4919,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
     if (ISHIsBonjourLocalHostname(qname))
         return ISHBuildBonjourDnsResponse(queryBytes, queryLength, qname, qtype);
 
-    struct __res_state state = {0};
-    if (res_ninit(&state) != 0)
-        return nil;
-
-    u_char response[NS_PACKETSZ * 8];
-    int responseLength = res_nquery(&state, qname.UTF8String, ns_c_in, qtype, response, sizeof(response));
-    res_nclose(&state);
-    if (responseLength <= 0)
-        return nil;
-    return [NSData dataWithBytes:response length:(NSUInteger) responseLength];
+    return ISHForwardDnsQuery(queryBytes, queryLength, self.dnsUpstreamServers);
 }
 
 - (void)handleLocalDnsPacket {
@@ -3195,30 +4948,73 @@ static TerminalViewController *CreateTerminalViewController(void) {
     NSString *qname = [NSString stringWithUTF8String:ns_rr_name(question)];
     if (qname.length == 0)
         return;
+    uint16_t qtype = ns_rr_type(question);
+    size_t udpLimit = ISHDnsClientUdpLimit(&message);
+    NSData *query = [NSData dataWithBytes:buffer length:(NSUInteger) received];
+    NSData *peerAddress = [NSData dataWithBytes:&peer length:peerLength];
+    int fd = self.localDnsServerFD;
 
-    NSData *response = [self forwardDnsQuery:buffer
-                                      length:(size_t) received
-                                       qname:qname
-                                       qtype:ns_rr_type(question)];
-    if (response.length == 0)
-        return;
-
-    sendto(self.localDnsServerFD, response.bytes, response.length, 0, (struct sockaddr *) &peer, peerLength);
+    // Answered off the relay's serial queue: a slow or silent upstream costs
+    // that one query its timeout, not every query queued behind it.
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        typeof(self) self = weakSelf;
+        if (self == nil)
+            return;
+        const uint8_t *bytes = query.bytes;
+        NSData *response = [self forwardDnsQuery:bytes length:query.length qname:qname qtype:qtype];
+        if (response.length == 0) {
+            // No upstream answer at all: say so, so the guest moves on now.
+            response = ISHBuildDnsEmptyResponse(bytes, query.length, 0, ns_r_servfail);
+        } else if (response.length > udpLimit) {
+            // Too big for the guest's buffer: TC tells it to retry over TCP,
+            // which this relay does not serve, so it moves on to the next
+            // nameserver.
+            response = ISHBuildDnsEmptyResponse(bytes, query.length, 0x0200, ns_r_noerror);
+        }
+        // The relay may have been stopped meanwhile, and its descriptor number
+        // reused: answer only on the socket the query came in on.
+        if (response.length == 0 || self.localDnsServerFD != fd)
+            return;
+        sendto(fd, response.bytes, response.length, 0, (const struct sockaddr *) peerAddress.bytes,
+               (socklen_t) peerAddress.length);
+    });
 }
 
+// Where guests find the relay: systemd-resolved's stub address, mapped by the
+// loopback NAT (fs/sock.c) onto the relay's real 127.0.0.1:<ephemeral>.
+// Not 127.0.0.1:53: a guest's own resolver wants that port, and a relay the
+// app had lost track of (localDnsServerFD reset under it, below) held it so
+// that every later bind failed EADDRINUSE.
+#define ISH_DNS_RELAY_GUEST_ADDR "127.0.0.53"
+
+// ensureLocalDnsServer and stopLocalDnsServer run on the main thread
+// (configureDns) and on the DNS refresh queue at once: the boot refresh
+// started the relay while launch went on. Both hold @synchronized(self),
+// which scheduleDnsRefresh already uses, so neither sees the other halfway.
 - (void)stopLocalDnsServer {
-    int fd = self.localDnsServerFD;
-    self.localDnsServerFD = -1;
-    if (self.localDnsServerReadSource != nil) {
-        dispatch_source_cancel(self.localDnsServerReadSource);
-        self.localDnsServerReadSource = nil;
-    } else if (fd >= 0) {
-        close(fd);
+    @synchronized (self) {
+        int fd = self.localDnsServerFD;
+        self.localDnsServerFD = -1;
+        if (self.localDnsServerRunning)
+            inet_nat_unregister_host(htonl(0x7f000035), htons(53), SOCK_DGRAM_);
+        if (self.localDnsServerReadSource != nil) {
+            dispatch_source_cancel(self.localDnsServerReadSource);
+            self.localDnsServerReadSource = nil;
+        } else if (fd >= 0) {
+            close(fd);
+        }
+        self.localDnsServerRunning = NO;
     }
-    self.localDnsServerRunning = NO;
 }
 
 - (BOOL)ensureLocalDnsServer {
+    @synchronized (self) {
+        return [self ensureLocalDnsServerLocked];
+    }
+}
+
+- (BOOL)ensureLocalDnsServerLocked {
     if (self.localDnsServerRunning && self.localDnsServerFD >= 0)
         return YES;
 
@@ -3235,13 +5031,27 @@ static TerminalViewController *CreateTerminalViewController(void) {
     struct sockaddr_in addr = {0};
     addr.sin_len = sizeof(addr);
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(53);
+    addr.sin_port = 0;
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
+    socklen_t addrLength = sizeof(addr);
+    if (bind(fd, (struct sockaddr *) &addr, sizeof(addr)) != 0 ||
+            getsockname(fd, (struct sockaddr *) &addr, &addrLength) != 0) {
+        int err = errno;
+        NSLog(@"dns: local relay cannot bind 127.0.0.1: %s", strerror(err));
         close(fd);
         [ISHDiagnosticsStore recordBreadcrumb:@"dns.localServer.failed"
                                       details:@{@"stage": @"bind",
-                                                @"errno": @(errno)}];
+                                                @"errno": @(err)}];
+        return NO;
+    }
+    int natErr = inet_nat_register_host(htonl(0x7f000035), htons(53), addr.sin_port, SOCK_DGRAM_);
+    if (natErr < 0) {
+        // A guest resolver already answers there; leave it be.
+        NSLog(@"dns: " ISH_DNS_RELAY_GUEST_ADDR ":53 is taken in the guest (%d)", natErr);
+        close(fd);
+        [ISHDiagnosticsStore recordBreadcrumb:@"dns.localServer.failed"
+                                      details:@{@"stage": @"nat",
+                                                @"errno": @(-natErr)}];
         return NO;
     }
 
@@ -3266,13 +5076,17 @@ static TerminalViewController *CreateTerminalViewController(void) {
     self.localDnsServerRunning = YES;
     dispatch_resume(source);
     [ISHDiagnosticsStore recordBreadcrumb:@"dns.localServer.started"
-                                  details:@{@"address": @"127.0.0.1:53"}];
+                                  details:@{@"address": @ISH_DNS_RELAY_GUEST_ADDR ":53",
+                                            @"hostPort": @(ntohs(addr.sin_port))}];
     return YES;
 }
 
 - (void)configureDns {
     [ISHDiagnosticsStore recordBreadcrumb:@"dns.configure.begin"];
-    [self ensureLocalDnsServer];
+    // Not even at boot: the responder holds 127.0.0.53:53 in the guest's
+    // loopback NAT, which a guest resolver asking for it gets EADDRINUSE from.
+    if (!UserPreferences.shared.shouldDisableResolvConfRewrite)
+        [self ensureLocalDnsServer];
     [self scheduleDnsRefresh:@"manual"];
     if (!self.dnsNotifyRegistered) {
         ISHDnsConfigurationNotifyKeyFunc notifyKeyFunc = ISHDnsConfigurationNotifyKeySymbol();
@@ -3357,6 +5171,20 @@ static TerminalViewController *CreateTerminalViewController(void) {
 }
 
 - (void)performDnsRefresh:(NSString *)reason {
+    // The guest owns its own resolv.conf when the user says so. Checked before
+    // the custom list below, so a list left behind in preferences cannot bring
+    // the rewrite back, and paired with releasing 127.0.0.53:53: a root running
+    // its own resolver wants the file AND the port, and holding one without the
+    // other is the half-configured state that breaks it.
+    if (UserPreferences.shared.shouldDisableResolvConfRewrite) {
+        [self stopLocalDnsServer];
+        [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.skipped"
+                                      details:@{@"reason": reason ?: @"unknown",
+                                                @"source": @"disabled"}];
+        [self finishDnsRefreshAndRescheduleIfNeeded:reason];
+        return;
+    }
+
     NSString *dnsSource = @"dnsinfo";
     NSMutableString *resolvConf = nil;
     BOOL customOverrideActive = NO;
@@ -3393,7 +5221,7 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                           details:@{@"reason": reason ?: @"unknown",
                                                     @"source": dnsSource,
                                                     @"stage": @"res_ninit"}];
-            [self finishDnsRefreshAndRescheduleIfNeeded:reason];
+            [self finishDnsRefresh:reason failed:YES];
             return;
         }
 
@@ -3441,15 +5269,17 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                           details:@{@"reason": reason ?: @"unknown",
                                                     @"source": dnsSource,
                                                     @"stage": @"no-servers"}];
-            [self finishDnsRefreshAndRescheduleIfNeeded:reason];
+            [self finishDnsRefresh:reason failed:YES];
             return;
         }
     }
 
+    self.dnsUpstreamServers = ISHDnsUpstreamServers(resolvConf ?: @"");
+
     if (includeLocalDnsServer) {
         if (resolvConf == nil)
             resolvConf = [NSMutableString new];
-        [resolvConf insertString:@"nameserver 127.0.0.1\n" atIndex:0];
+        [resolvConf insertString:@"nameserver " ISH_DNS_RELAY_GUEST_ADDR "\n" atIndex:0];
     }
 
     [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.generated"
@@ -3457,53 +5287,114 @@ static TerminalViewController *CreateTerminalViewController(void) {
                                             @"source": dnsSource,
                                             @"summary": ISHDnsBreadcrumbSummary(dnsSource, reason, resolvConf) ?: @""}];
 
-    struct task *previousCurrent;
-    if (!PushInitTaskAsCurrent(&previousCurrent)) {
+    // Under an assertion, so that iOS does not suspend us partway through.
+    // Every step from here on is a fakefs transaction, which holds a SQLite lock
+    // in the shared container, and iOS kills an app suspended while holding one
+    // (RUNNINGBOARD 0xdead10cc). This refresh runs on network changes, which
+    // cluster around backgrounding and locking the device: three of the five
+    // 554/555 kill reports caught it here, in fakefs_open or closing the file.
+    __block BOOL pushed = NO;
+    __block BOOL wrote = NO;
+    ISHRunHoldingBackgroundAssertion(@"dns-refresh", ^{
+        struct task *previousCurrent;
+        if (!PushInitTaskAsCurrent(&previousCurrent))
+            return;
+        pushed = YES;
+        struct fd *fd = generic_open("/etc/resolv.conf", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0666);
+        if (IS_ERR(fd) && PTR_ERR(fd) == _ENOENT) {
+            // Newer roots often ship /etc/resolv.conf as a symlink into /run.
+            // If that target tree does not exist in the guest, replace the
+            // symlink with a plain file so libc can still resolve names.
+            generic_unlinkat(AT_PWD, "/etc/resolv.conf");
+            fd = generic_open("/etc/resolv.conf", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0666);
+        }
+        // This arm decides the verdict: everything above it can fail, and the
+        // file is only actually on disk once this write has happened.
+        if (!IS_ERR(fd)) {
+            fd->ops->write(fd, resolvConf.UTF8String, [resolvConf lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
+            fd_close(fd);
+            wrote = YES;
+            [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.wrote"
+                                          details:@{@"reason": reason ?: @"unknown",
+                                                    @"source": dnsSource,
+                                                    @"summary": ISHDnsBreadcrumbSummary(dnsSource, reason, resolvConf) ?: @""}];
+        } else {
+            [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.failed"
+                                          details:@{@"reason": reason ?: @"unknown",
+                                                    @"source": dnsSource,
+                                                    @"stage": @"open-resolv-conf",
+                                                    @"errno": @(PTR_ERR(fd))}];
+        }
+        PopCurrentTask(previousCurrent);
+    });
+    if (!pushed) {
         [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.failed"
                                       details:@{@"reason": reason ?: @"unknown",
                                                 @"source": dnsSource,
                                                 @"stage": @"push-init"}];
-        [self finishDnsRefreshAndRescheduleIfNeeded:reason];
+        [self finishDnsRefresh:reason failed:YES];
         return;
     }
-
-    struct fd *fd = generic_open("/etc/resolv.conf", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0666);
-    if (IS_ERR(fd) && PTR_ERR(fd) == _ENOENT) {
-        // Newer roots often ship /etc/resolv.conf as a symlink into /run.
-        // If that target tree does not exist in the guest, replace the symlink
-        // with a plain file so libc can still resolve names.
-        generic_unlinkat(AT_PWD, "/etc/resolv.conf");
-        fd = generic_open("/etc/resolv.conf", O_WRONLY_ | O_CREAT_ | O_TRUNC_, 0666);
-    }
-    if (!IS_ERR(fd)) {
-        fd->ops->write(fd, resolvConf.UTF8String, [resolvConf lengthOfBytesUsingEncoding:NSUTF8StringEncoding]);
-        fd_close(fd);
-        [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.wrote"
-                                      details:@{@"reason": reason ?: @"unknown",
-                                                @"source": dnsSource,
-                                                @"summary": ISHDnsBreadcrumbSummary(dnsSource, reason, resolvConf) ?: @""}];
-    } else {
-        [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.failed"
-                                      details:@{@"reason": reason ?: @"unknown",
-                                                @"source": dnsSource,
-                                                @"stage": @"open-resolv-conf",
-                                                @"errno": @(PTR_ERR(fd))}];
-    }
-    PopCurrentTask(previousCurrent);
-    [self finishDnsRefreshAndRescheduleIfNeeded:reason];
+    [self finishDnsRefresh:reason failed:!wrote];
 }
 
-- (void)finishDnsRefreshAndRescheduleIfNeeded:(NSString *)reason {
+// A refresh that FAILED used to be the end of it: this only ever re-ran when
+// another refresh had been queued while one was in flight, so the four failure
+// exits in performDnsRefresh above simply stopped.
+//
+// The common failure is a race, not a verdict. The boot refresh runs from
+// configureDns while the guest is still coming up, and writing the file needs
+// an init task to be current -- lose that race and PushInitTaskAsCurrent fails,
+// nothing is written, and nothing tries again until the device happens to
+// change network. A freshly imported root therefore has NO /etc/resolv.conf at
+// all, which is what two users hit: apk reporting "DNS: transient error" on
+// Alpine i386, and the same on Devuan.
+//
+// So a failure is retried, with a backoff, a bounded number of times. The
+// delays are short at first because the race resolves in about the time the
+// guest takes to mount its root, and the cap stops a genuinely DNS-less device
+// from retrying for ever.
+static const NSUInteger ISHDnsRefreshRetryLimit = 8;
+
+- (void)finishDnsRefresh:(NSString *)reason failed:(BOOL)failed {
     BOOL shouldReschedule = NO;
+    NSUInteger attempt = 0;
     @synchronized (self) {
         shouldReschedule = self.dnsRefreshQueued;
         self.dnsRefreshQueued = NO;
         self.dnsRefreshRunning = NO;
+        if (failed)
+            self.dnsRefreshFailures += 1;
+        else
+            self.dnsRefreshFailures = 0;   // a success clears the budget
+        attempt = self.dnsRefreshFailures;
     }
     if (shouldReschedule) {
         NSString *nextReason = [NSString stringWithFormat:@"%@-coalesced", reason ?: @"dns"];
         [self scheduleDnsRefresh:nextReason];
+        return;
     }
+    if (!failed || attempt > ISHDnsRefreshRetryLimit)
+        return;
+    // 1, 2, 4, 8, 16, then 30s -- capped so this cannot become a busy loop.
+    NSTimeInterval delay = (NSTimeInterval) (1u << MIN(attempt - 1, (NSUInteger) 5));
+    if (delay > 30.0)
+        delay = 30.0;
+    [ISHDiagnosticsStore recordBreadcrumb:@"dns.refresh.retryScheduled"
+                                  details:@{@"reason": reason ?: @"unknown",
+                                            @"attempt": @(attempt),
+                                            @"delay": @(delay)}];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (delay * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf scheduleDnsRefresh:[NSString stringWithFormat:@"%@-retry", reason ?: @"dns"]];
+    });
+}
+
+// The old spelling, kept so nothing else has to change: a caller that does not
+// say otherwise succeeded.
+- (void)finishDnsRefreshAndRescheduleIfNeeded:(NSString *)reason {
+    [self finishDnsRefresh:reason failed:NO];
 }
 
 + (intptr_t)bootError {
@@ -3536,6 +5427,18 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [NSUserDefaults.standardUserDefaults setInteger:1 forKey:kSkipStartupMessage];
 }
 
+// The relay's descriptor starts at -1 here, before anything can start it. It
+// was set in didFinishLaunching, which runs after willFinishLaunching has
+// booted the guest -- and the boot's DNS refresh had already started the relay
+// on another thread by then. The reset made the app forget it: every later
+// start bound a second relay and failed (EADDRINUSE), and resolv.conf lost
+// the relay for the whole session (5th-generation iPad, 2026-10-01).
+- (instancetype)init {
+    if ((self = [super init]))
+        _localDnsServerFD = -1;
+    return self;
+}
+
 - (BOOL)application:(UIApplication *)application willFinishLaunchingWithOptions:(NSDictionary<UIApplicationLaunchOptionsKey,id> *)launchOptions {
     [ISHDiagnosticsStore recordLaunchStage:@"application.willFinishLaunching"
                                    details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
@@ -3547,6 +5450,12 @@ static TerminalViewController *CreateTerminalViewController(void) {
         [defaults removeObjectForKey:kPreferenceLaunchCommandKey];
         [defaults setBool:NO forKey:@"hail mary"];
     }
+    // The battery, thermal state and time zone the kernel reports, cached on the
+    // main queue (kernel/BatteryStatus.m). First, because this is the earliest
+    // anything can boot the guest, and the boot reads the zone to set
+    // /etc/localtime. Ahead of the recovery check too, so that no later path to
+    // ensureBooted has to know whether it ran; it costs a few property reads.
+    ISHHostStatusStart();
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"recovery"])
         return YES;
 
@@ -3554,7 +5463,17 @@ static TerminalViewController *CreateTerminalViewController(void) {
     [ISHDiagnosticsStore recordLaunchStage:@"roots.loaded"
                                    details:@{@"needsInitialRootSelection": @(Roots.instance.needsInitialRootSelection),
                                              @"defaultRoot": Roots.instance.defaultRoot ?: @""}];
-    if (!Roots.instance.needsInitialRootSelection) {
+    // Held back when there is a saved session to choose between, because the
+    // choice decides whether this boots at all or is rebuilt from an image, and
+    // ensureBooted is dispatch_once -- whoever calls it first settles it.
+    // TerminalViewController asks, then boots.
+    //
+    // Launching WITHOUT booting is already a path the app takes: it is what
+    // happens on a first run, while the root picker is up (the condition right
+    // here). This is the second reason to take it.
+    if (!Roots.instance.needsInitialRootSelection && ISHSessionResumeChoicePending()) {
+        [ISHDiagnosticsStore recordLaunchStage:@"boot.deferred.sessionChoice"];
+    } else if (!Roots.instance.needsInitialRootSelection) {
         bootError = [AppDelegate ensureBooted];
         NSMutableDictionary<NSString *, id> *bootCheckDetails = [NSMutableDictionary dictionaryWithObject:@(bootError)
                                                                                                     forKey:@"bootError"];
@@ -3582,10 +5501,14 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
 }
 
 - (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
+    // tests/workspace/restore_test.sh's remote control; inert without
+    // ISH_WORKSPACE_TEST=1 in the environment.
+    ISHWorkspaceTestHooksStart();
     [ISHDiagnosticsStore recordLaunchStage:@"application.didFinishLaunching"
                                    details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
     [ISHDiagnosticsStore recordBreadcrumb:@"application.didFinishLaunching"
                                   details:launchOptions.count != 0 ? @{@"launchOptions": launchOptions.description} : nil];
+    ISHInstallHomeScreenQuickActions();
     // Re-donate the App Shortcuts phrases (app/ISHAppShortcuts.swift). Looked
     // up at runtime rather than through the generated Swift header: that
     // header belongs to the app target, and this file compiles earlier, in
@@ -3612,7 +5535,6 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
     if ([NSUserDefaults.standardUserDefaults boolForKey:@"FASTLANE_SNAPSHOT"])
         [UIView setAnimationsEnabled:NO];
 
-    self.localDnsServerFD = -1;
     NSString *ishVersion = [NSString stringWithFormat:@"iSH-AOK %@ (%@)",
                          [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"],
                          [NSBundle.mainBundle objectForInfoDictionaryKey:(NSString *) kCFBundleVersionKey]];
@@ -3630,7 +5552,7 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
     [UserPreferences.shared observe:@[@"shouldDisableDimming"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
-            UIApplication.sharedApplication.idleTimerDisabled = UserPreferences.shared.shouldDisableDimming;
+            ISHApplyIdleTimerPreference();
         });
     }];
     
@@ -3640,11 +5562,29 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
             doEnableMulticore = UserPreferences.shared.shouldEnableMulticore;
         });
     }];
+    // Programs from other roots (kernel/foreign_exec.c): read by every exec,
+    // so a change applies to the next program started, nothing restarted.
+    [UserPreferences.shared observe:@[@"foreignExecMode"] options:NSKeyValueObservingOptionInitial
+                              owner:self usingBlock:^(typeof(self) self) {
+        NSString *mode = UserPreferences.shared.foreignExecMode;
+        int parsed = foreign_exec_parse_mode(mode.UTF8String, strlen(mode.UTF8String));
+        if (parsed >= 0)
+            foreign_exec_set_mode((enum foreign_exec_mode) parsed);
+    }];
     [UserPreferences.shared observe:@[@"shouldEnableHLE"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
             extern bool doEnableHLE;
             doEnableHLE = UserPreferences.shared.shouldEnableHLE;
+        });
+    }];
+    // The cache of translated code (jit.c's exec cache). On turns the guest's
+    // ASLR off with it, which is what the setting's footer tells the user.
+    [UserPreferences.shared observe:@[@"shouldEnableJITCache"] options:NSKeyValueObservingOptionInitial
+                              owner:self usingBlock:^(typeof(self) self) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            extern void jit_xcache_set_enabled(bool on);
+            jit_xcache_set_enabled(UserPreferences.shared.shouldEnableJITCache);
         });
     }];
     [UserPreferences.shared observe:@[@"shouldEnableCryptoAccel"] options:NSKeyValueObservingOptionInitial
@@ -3673,7 +5613,7 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
     // is recorded for the next boot and does not reach a running pager -- swap
     // is sized once at launch and is deliberately not resizable in place
     // (docs/simulated_swap_plan.md section 3.13).
-    [UserPreferences.shared observe:@[@"shouldEnableSwap", @"swapSizeMB"] options:NSKeyValueObservingOptionInitial
+    [UserPreferences.shared observe:@[@"shouldEnableSwap", @"swapSizeMB", @"shouldEnableCompressedMemory", @"compressedMemorySizeMB"] options:NSKeyValueObservingOptionInitial
                               owner:self usingBlock:^(typeof(self) self) {
         ISHPublishSwapConfiguration(NULL);
     }];
@@ -3825,11 +5765,21 @@ static UINavigationController *CreateAboutNavigationController(BOOL recoveryMode
 // suspending us, without leaving a still-running app with a frozen guest
 // filesystem. See the dispatch_after in the expiration handler.
 static const NSTimeInterval kISHQuiesceMaxHoldSeconds = 5.0;
+// The least background time a fresh assertion must have left for the gate to be
+// lifted under it. Its expiration handler has to quiesce again before the time
+// is gone, and that drains fakefs and the pager for up to two seconds each.
+static const NSTimeInterval kISHQuiesceMinRunwaySeconds = 10.0;
 
 // Held rather than compared against UIBackgroundTaskInvalid, which is a const
 // variable and so cannot initialize a static.
 static UIBackgroundTaskIdentifier suspendGuardTask;
+// Set while the backgrounding save is still writing. The quiesce below
+// must not freeze the filesystem under it.
+static atomic_bool ishSessionSaveInFlight;
 static bool suspendGuardHeld = false;
+// The guard's assertion ran out while the backgrounding save was still writing,
+// so the filesystem was not quiesced; the save's own end does it. Main thread.
+static bool ishQuiesceDeferredForSave = false;
 
 static void ISHEndSuspendGuard(void) {
     if (!suspendGuardHeld)
@@ -3837,6 +5787,207 @@ static void ISHEndSuspendGuard(void) {
     UIBackgroundTaskIdentifier claimed = suspendGuardTask;
     suspendGuardHeld = false;
     [UIApplication.sharedApplication endBackgroundTask:claimed];
+}
+
+// What is keeping iSH-AOK running in the background, if anything. Then it is not
+// about to be suspended, and freezing the guest's filesystem would only stall it.
+static const char *ISHBackgroundKeepAlive(void) {
+    if (ISHLocationKeepsAppAlive())
+        return "location updates";
+    if (ISHAudioKeepsAppAlive())
+        return "audio playback";
+    return NULL;
+}
+
+static void ISHBeginSuspendGuardAssertion(void);
+static void ISHQuiesceHoldElapsed(unsigned generation);
+// The gate is engaged by ISHQuiesceForSuspension and has not been lifted
+// since; which engagement, so that a look scheduled by an earlier one does
+// nothing; and whether "staying quiesced" has been logged for this one. Main
+// thread.
+static bool ishQuiesced;
+static unsigned ishQuiesceGeneration;
+static bool ishQuiesceStayLogged;
+
+// Watch for the NEXT suspension.
+//
+// The guard's assertion is the only warning iOS gives, and it is spent once it
+// expires. An app that went on running after that -- kept alive by location
+// updates or audio, or simply given more time -- was later suspended with
+// nothing quiescing the filesystem first, in the middle of whatever transaction
+// the guest or the DNS refresh had open: RUNNINGBOARD 0xdead10cc, eight times on
+// 554 and 555 in two weeks. So for as long as we stay backgrounded, hold a fresh
+// assertion. The listening sockets are recorded again because lifting the gate
+// put them back.
+static void ISHRearmSuspendGuardIfBackgrounded(void) {
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateBackground)
+        return;
+    if (suspendGuardHeld)
+        return;
+    suspendGuardHeld = true;
+    unsigned saved = sockrestart_on_suspend();
+    os_log(ISHSuspendLog(), "still backgrounded: guard re-armed, %{public}u listening sockets recorded", saved);
+    ISHBeginSuspendGuardAssertion();
+}
+
+// Suspension looks imminent: park new fakefs transactions and drain the ones in
+// flight, and stop pager eviction.
+static void ISHQuiesceForSuspension(void) {
+    ishQuiesced = true;
+    ishQuiesceStayLogged = false;
+    unsigned generation = ++ishQuiesceGeneration;
+    unsigned stragglers = 0;
+    bool drained = fakefs_quiesce_begin(2000, &stragglers);
+    // The pager writes guest memory to a file, so it needs the same treatment
+    // and for the same reason: being mid-write when iOS freezes us is not a
+    // state to be in. It stops new EVICTION only -- a fault already in flight
+    // has to finish, or the frame it is restoring stays PROT_NONE with its bytes
+    // only on disk. A no-op when swap is off, which is the default.
+    bool swapDrained = swap_quiesce_begin(2000);
+
+    os_log(ISHSuspendLog(), "quiesced for suspension: drained=%{public}d straggling=%{public}u swap=%{public}d",
+           drained, stragglers, swapDrained);
+    [ISHDiagnosticsStore recordBreadcrumb:@"application.fakefsQuiesced"
+                                  details:@{@"drained": @(drained), @"straggling": @(stragglers),
+                                            @"swapDrained": @(swapDrained)}];
+
+    // Look again in a while, in case iOS did not suspend us after all.
+    //
+    // If it does, this block cannot run until we resume, so the filesystem
+    // stays quiesced across the suspension -- which is the whole point, and
+    // nothing is executing meanwhile anyway. If it does not, see
+    // ISHQuiesceHoldElapsed.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        ISHQuiesceHoldElapsed(generation);
+    });
+}
+
+// The gate has been engaged for kISHQuiesceMaxHoldSeconds and we are still
+// running. Main thread.
+//
+// Staying quiesced for as long as the app sits in the background is not
+// harmless: an incoming ssh session is accepted and then blocks before it can
+// reach a shell, because fork, exec, PAM and the home directory all need a
+// fakefs transaction, so the device silently stops serving while looking
+// perfectly healthy. So the gate comes off again -- but ONLY with something
+// holding off the suspension, and that is the rule this function exists for:
+//
+//     the gate is open  =>  foreground, or kept alive, or an assertion held
+//
+// It used to lift the gate first, from a background queue, and take the next
+// assertion afterwards on the main thread. Between the two nothing held iOS
+// off and the guest was writing again. iOS does not suspend the moment the
+// last assertion ends; under load it took just over the five seconds the gate
+// was held, and landed in that gap: RUNNINGBOARD 0xdead10cc on the 558
+// candidate (iPhone 12, 2026-10-10), a guest `tar` inside fakefs_open ->
+// db_commit -> sqlite3_step while the main thread was still in
+// beginBackgroundTask for the re-arm.
+//
+// An assertion taken once the background time has run out is no assertion --
+// its expiration fires at once -- so it counts only with time left on it.
+// With none to be had, iOS may suspend at any moment, and the right state for
+// that is the one we are in: stay quiesced, and look again.
+static void ISHQuiesceHoldElapsed(unsigned generation) {
+    // Lifted since (the foreground does it), or engaged again by a later
+    // quiesce, which scheduled a look of its own.
+    if (!ishQuiesced || generation != ishQuiesceGeneration)
+        return;
+    UIApplication *application = UIApplication.sharedApplication;
+    if (application.applicationState != UIApplicationStateBackground) {
+        // On the way to the foreground: ISHSuspendGuardEnterForeground lifts
+        // the gate. Lifting it here as well costs nothing and covers a
+        // transition that has not reported yet.
+        ishQuiesced = false;
+        fakefs_quiesce_end();
+        swap_quiesce_end();
+        return;
+    }
+    const char *keepAlive = ISHBackgroundKeepAlive();
+    if (keepAlive == NULL) {
+        bool began = !suspendGuardHeld;
+        if (began) {
+            suspendGuardHeld = true;
+            ISHBeginSuspendGuardAssertion();
+        }
+        NSTimeInterval left = application.backgroundTimeRemaining;
+        if (suspendGuardTask == UIBackgroundTaskInvalid || left < kISHQuiesceMinRunwaySeconds) {
+            if (began)
+                ISHEndSuspendGuard();
+            if (!ishQuiesceStayLogged)
+                os_log(ISHSuspendLog(), "still running after %{public}.0fs quiesced, with %{public}.1fs of background time: staying quiesced",
+                       kISHQuiesceMaxHoldSeconds, left);
+            ishQuiesceStayLogged = true;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ISHQuiesceHoldElapsed(generation);
+            });
+            return;
+        }
+    }
+    ishQuiesced = false;
+    fakefs_quiesce_end();
+    swap_quiesce_end();
+    // Rebuild the listeners here too. Not because they were damaged -- if this
+    // runs, iOS never froze us -- but so the saved list does not stay populated
+    // across into the next backgrounding, where it would suppress a fresh save.
+    os_log(ISHSuspendLog(), "listening sockets rebuilt (never suspended): %{public}u",
+           sockrestart_on_resume());
+    if (keepAlive != NULL) {
+        os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded, kept alive by %{public}s; gate lifted",
+               kISHQuiesceMaxHoldSeconds, keepAlive);
+        ISHRearmSuspendGuardIfBackgrounded();
+        return;
+    }
+    // The assertion taken above is the guard for the next suspension, and the
+    // listening sockets are recorded again because lifting the gate put them
+    // back.
+    unsigned saved = sockrestart_on_suspend();
+    os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded; gate lifted under a new assertion, %{public}u listening sockets recorded",
+           kISHQuiesceMaxHoldSeconds, saved);
+}
+
+// The save that the guard's expiration deferred to has finished, or run out of
+// time. Its assertion is the last one, so suspension follows once it ends.
+static void ISHQuiesceIfDeferredForSave(void) {
+    if (!ishQuiesceDeferredForSave)
+        return;
+    ishQuiesceDeferredForSave = false;
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateBackground)
+        return;
+    os_log(ISHSuspendLog(), "session save done after the guard expired; quiescing now");
+    ISHQuiesceForSuspension();
+}
+
+// The assertion itself. suspendGuardHeld is already set by the caller.
+static void ISHBeginSuspendGuardAssertion(void) {
+    suspendGuardTask = [UIApplication.sharedApplication beginBackgroundTaskWithName:@"fakefs-quiesce"
+                                                                  expirationHandler:^{
+        const char *keepAlive = ISHBackgroundKeepAlive();
+        if (atomic_load(&ishSessionSaveInFlight)) {
+            // Quiescing the filesystem under a save would stall the very work
+            // the other assertion is holding time open for. But not quiescing at
+            // all left nothing to do it later: the save finished, thawed the
+            // guest, and the app was suspended with transactions open. The save
+            // quiesces when it ends instead.
+            ishQuiesceDeferredForSave = true;
+            os_log(ISHSuspendLog(), "assertion expired while the session save is still writing; quiescing when it finishes");
+        } else if (keepAlive != NULL) {
+            // Still running, so not quiescing. Watch for the suspension that
+            // comes when this stops.
+            os_log(ISHSuspendLog(), "assertion expired, still kept alive by %{public}s; not quiescing", keepAlive);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                ISHRearmSuspendGuardIfBackgrounded();
+            });
+        } else {
+            ISHQuiesceForSuspension();
+        }
+        ISHEndSuspendGuard();
+    }];
 }
 
 // Driven from the SCENE delegate; see the note in AppDelegate.h for why it
@@ -3858,88 +6009,149 @@ void ISHSuspendGuardEnterBackground(void) {
         return;
     suspendGuardHeld = true;
     os_log(ISHSuspendLog(), "backgrounded, holding assertion until suspension is imminent");
-    suspendGuardTask = [application beginBackgroundTaskWithName:@"fakefs-quiesce" expirationHandler:^{
-        // Only quiesce if nothing is keeping us alive. With background location
-        // updates running the app genuinely keeps executing and is NOT about to
-        // be suspended, so freezing guest filesystem I/O here would stall
-        // long-running background work for no reason -- and this assertion
-        // expires on its own schedule regardless of that.
-        if (ISHLocationKeepsAppAlive()) {
-            os_log(ISHSuspendLog(), "assertion expired, still kept alive by location updates; not quiescing");
-        } else {
-            unsigned stragglers = 0;
-            bool drained = fakefs_quiesce_begin(2000, &stragglers);
-            // The pager writes guest memory to a file, so it needs the same
-            // treatment and for the same reason: being mid-write when iOS
-            // freezes us is not a state to be in. It stops new EVICTION only --
-            // a fault already in flight has to finish, or the frame it is
-            // restoring stays PROT_NONE with its bytes only on disk. A no-op
-            // when swap is off, which is the default.
-            bool swapDrained = swap_quiesce_begin(2000);
 
-            // A listening socket does not survive suspension. iOS tears down
-            // the underlying host socket while we are frozen, and nothing in
-            // the guest is told: the fd stays open and bound, the process
-            // stays alive, and /proc/net/tcp shows the socket sitting in
-            // TCP_CLOSE instead of LISTEN. Every connection is then refused by
-            // a server that looks, from inside the guest, perfectly healthy.
-            //
-            // Seen on a device 2026-09-06: sshd left running overnight was
-            // still there in ps the next morning, with its listener at
-            // 00000000:0016 in state 07, and every ssh attempt from the Mac
-            // refused on all five of the phone's addresses. Restarting sshd by
-            // hand put it back to state 0A.
-            //
-            // This records what each listener was bound to; the matching
-            // sockrestart_on_resume rebuilds it and dup2()s it back over the
-            // same fd, so the server never learns it happened.
-            sockrestart_on_suspend();
-            os_log(ISHSuspendLog(), "quiesced for suspension: drained=%{public}d straggling=%{public}u swap=%{public}d",
-                   drained, stragglers, swapDrained);
-            [ISHDiagnosticsStore recordBreadcrumb:@"application.fakefsQuiesced"
-                                          details:@{@"drained": @(drained), @"straggling": @(stragglers),
-                                                    @"swapDrained": @(swapDrained)}];
+    // Record every listening socket NOW, not when suspension looks imminent.
+    //
+    // A listening socket does not survive suspension: iOS tears the host socket
+    // down while we are frozen and nothing in the guest is told, so the fd stays
+    // open and bound, the process stays alive, and /proc/net/tcp shows the
+    // listener in TCP_CLOSE (07) instead of LISTEN (0A). Every connection is
+    // then refused by a server that looks, from inside, perfectly healthy --
+    // observed on a device with sshd left running overnight.
+    //
+    // The first version of this saved from the background-task EXPIRATION
+    // handler, alongside the fakefs quiesce, on the reasoning that that is the
+    // closest thing to an "about to be suspended" signal. It failed on device:
+    // iOS can destroy the sockets before that handler runs, so the listener was
+    // already dead by the time we tried to record it and resume had nothing to
+    // rebuild. Saving only READS each socket's name, type, protocol and backlog
+    // -- it destroys nothing and costs nothing -- so there is no reason to wait
+    // for a signal that may arrive too late, or not at all.
+    unsigned savedListeners = sockrestart_on_suspend();
+    os_log(ISHSuspendLog(), "listening sockets recorded for restore: %{public}u", savedListeners);
 
-            // Never hold the gate open indefinitely.
+    // ---- suspend to disk ---------------------------------------------------
+    //
+    // HERE, beside the listener save, and for the same reason it is here: this
+    // runs the moment the app is backgrounded, while everything still works.
+    // The background-task expiration handler below is the closest thing iOS
+    // gives to "about to be suspended", and sockrestart learned the hard way
+    // that it can be too late -- iOS may already have taken things away.
+    //
+    // Synchronous, and that is the point: checkpoint_save_external freezes
+    // every guest task, writes the image and thaws, all before this method
+    // returns, so the file is on disk before iOS is free to freeze us. The
+    // guest is unharmed either way -- a checkpoint is a copy -- and if it
+    // refuses (a native program that cannot describe itself, a descriptor with
+    // no restore rule) it says so and the next launch simply boots.
+    if (UserPreferences.shared.shouldSuspendToDisk && !ISHGuestHalted()) {
+        // The automatic name: this is the system taking the session, not the
+        // user saving it. See ISHSuspendAutomaticSessionImagePath.
+        NSString *image = ISHSuspendAutomaticSessionImagePath();
+        if (image != nil) {
+            // OFF this thread, under an assertion of its own.
             //
-            // If iOS really does suspend us, this block cannot run until we
-            // resume, so the filesystem stays quiesced across the suspension --
-            // which is the whole point, and nothing is executing meanwhile
-            // anyway. But if iOS does NOT suspend us (something else is keeping
-            // the app alive, or it simply grants more time), then waiting for
-            // -sceneWillEnterForeground: to lift the gate freezes the guest
-            // filesystem for as long as the app sits in the background. That is
-            // not a subtle degradation: an incoming ssh session gets accepted
-            // and then blocks before it can reach a shell, because fork, exec,
-            // PAM and the home directory all need a fakefs transaction, so the
-            // device silently stops serving while looking perfectly healthy.
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t) (kISHQuiesceMaxHoldSeconds * NSEC_PER_SEC)),
-                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-                fakefs_quiesce_end();
-                swap_quiesce_end();
-                // Rebuild the listeners here too. Not because they were
-                // damaged -- if this block runs, iOS never froze us -- but
-                // because sockrestart_on_suspend asserts the saved list is
-                // empty, so leaving it populated would turn the NEXT
-                // suspension into an abort.
-                sockrestart_on_resume();
-                os_log(ISHSuspendLog(), "still running after %{public}.0fs backgrounded; gate lifted",
-                       kISHQuiesceMaxHoldSeconds);
+            // It used to run right here, synchronously, on the reasoning that
+            // the image should be on disk before iOS can freeze us. The
+            // reasoning was right; the thread was wrong. This is a scene
+            // delegate callback, and iOS kills an app that does not return from
+            // one promptly. The freeze alone may take CKPT_FREEZE_TIMEOUT_MS,
+            // and a real session writes tens of megabytes after that, so a big
+            // enough guest could not be saved without risking the watchdog.
+            //
+            // A background task assertion is the supported way to keep running
+            // after backgrounding -- but it does not extend the watchdog, so
+            // buying the time and leaving this thread are two separate things
+            // and both are needed.
+            atomic_store(&ishSessionSaveInFlight, true);
+            __block UIBackgroundTaskIdentifier saveTask = UIBackgroundTaskInvalid;
+            saveTask = [application beginBackgroundTaskWithName:@"session-save"
+                                             expirationHandler:^{
+                // Out of time. Nothing to unwind: the image is written to a
+                // temporary and renamed into place only once it is whole, so
+                // being killed here leaves the previous session intact.
+                os_log_error(ISHSuspendLog(), "session save ran out of background time");
+                atomic_store(&ishSessionSaveInFlight, false);
+                ISHQuiesceIfDeferredForSave();
+                if (saveTask != UIBackgroundTaskInvalid) {
+                    [UIApplication.sharedApplication endBackgroundTask:saveTask];
+                    saveTask = UIBackgroundTaskInvalid;
+                }
+            }];
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                // Captured from the BACKGROUND queue, not before it.
+                //
+                // It reads UIKit and so hops to main internally -- but it also
+                // collects what each terminal has printed, and that answer
+                // comes back from a web view ON MAIN. Called from the main
+                // thread it could not wait for its own completions, so the
+                // history would be silently skipped; from here it can.
+                // `image`, not another call: the layout has to be filed under the
+                // path the image is actually written to. The second call used to
+                // agree only because the first one PINNED the slot as a side
+                // effect, so a path that does not pin would have filed the
+                // arrangement against a different name and lost it on resume.
+                ISHWorkspaceCaptureLayoutForSuspend(image);
+                // Nobody to ask: the app is going to the background, and may
+                // not come back. Save what can be saved; the Wayland desktop
+                // and GPU programs are left out and keep running.
+                int cerr = checkpoint_save_external_flags(image.fileSystemRepresentation,
+                                                          CKPT_SAVE_LEAVE_OUT);
+                struct checkpoint_status ck;
+                checkpoint_get_status(&ck);
+                if (cerr == 0) {
+                    os_log(ISHSuspendLog(),
+                           "session written: %{public}lu tasks, %{public}lu pages",
+                           ck.tasks, ck.pages);
+                    [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspended"
+                                                  details:@{@"tasks": @(ck.tasks),
+                                                            @"pages": @(ck.pages)}];
+                } else {
+                    os_log_error(ISHSuspendLog(),
+                                 "session not written (%{public}d): %{public}s",
+                                 cerr, ck.last_refusal);
+                    [ISHDiagnosticsStore recordBreadcrumb:@"application.sessionSuspendRefused"
+                                                  details:@{@"err": @(cerr),
+                                                            @"why": @(ck.last_refusal)}];
+                }
+                atomic_store(&ishSessionSaveInFlight, false);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    // Before the assertion goes: once it does, nothing is
+                    // holding off the suspension.
+                    ISHQuiesceIfDeferredForSave();
+                    if (saveTask != UIBackgroundTaskInvalid) {
+                        [application endBackgroundTask:saveTask];
+                        saveTask = UIBackgroundTaskInvalid;
+                    }
+                });
             });
         }
-        ISHEndSuspendGuard();
-    }];
+    }
+    [ISHDiagnosticsStore recordBreadcrumb:@"application.sockrestartSaved"
+                                  details:@{@"listeners": @(savedListeners)}];
+    // Only quiesce if nothing is keeping us alive, and not under a save; see
+    // the expiration handler.
+    ISHBeginSuspendGuardAssertion();
 }
 
 void ISHSuspendGuardEnterForeground(void) {
+    // Back before the save it was waiting for finished: there is no suspension
+    // to quiesce for.
+    ishQuiesceDeferredForSave = false;
     // Lift the gate before anything else: guest tasks may be parked on it.
+    ishQuiesced = false;
     fakefs_quiesce_end();
     swap_quiesce_end();
-    // Put the listening sockets back. A no-op unless suspension was actually
-    // imminent enough for the expiration handler to have saved them, which is
-    // why this is safe to call on every foreground transition.
-    sockrestart_on_resume();
+    // Put the listening sockets back. A no-op unless backgrounding recorded
+    // some, which is why this is safe on every foreground transition.
+    unsigned rebuilt = sockrestart_on_resume();
+    // Every foreground transition lands here, launch included, and almost none
+    // has anything to rebuild. Log the ones that did; the breadcrumb below
+    // keeps the count either way.
+    if (rebuilt != 0)
+        os_log(ISHSuspendLog(), "listening sockets rebuilt on foreground: %{public}u", rebuilt);
+    [ISHDiagnosticsStore recordBreadcrumb:@"application.sockrestartRestored"
+                                  details:@{@"listeners": @(rebuilt)}];
     ISHEndSuspendGuard();
 }
 
@@ -3955,6 +6167,56 @@ void ISHSuspendGuardEnterForeground(void) {
 
 - (void)applicationWillEnterForeground:(UIApplication *)application {
     [ISHDiagnosticsStore recordBreadcrumb:@"application.willEnterForeground"];
+    // Re-published here because changing it is what put us in the background:
+    // the iOS Settings app is a different app, so flipping the switch there
+    // and coming back is exactly this path. Without it the guest's own control
+    // of suspend would only follow the switch across a relaunch.
+    checkpoint_set_guest_control(UserPreferences.shared.shouldSuspendToDisk);
+    // External swap was switched on in Settings with no directory chosen yet:
+    // ask for one now. Settings.bundle cannot run code, so coming back from the
+    // Settings app is the first chance. The picker holds itself until it
+    // answers (SwapFilePicker). Cancelling turns the switch back off, so a user
+    // who changed their mind is not asked again on every return to the app.
+    // The choice takes effect at the next launch, like the rest of swap.
+    UserPreferences *prefs = UserPreferences.shared;
+    // Switched off: forget the directory, so switching it on again asks afresh.
+    // That is the only way to move swap to a different folder or drive.
+    if (!prefs.shouldEnableSwapOnExternal && prefs.swapExternalBookmark != nil) {
+        prefs.swapExternalBookmark = nil;
+        prefs.swapExternalPath = @"";
+    }
+    static BOOL swapPickerShowing;
+    if (prefs.shouldEnableSwapOnExternal && prefs.swapExternalBookmark == nil && !swapPickerShowing) {
+        UIViewController *presenter = ISHActivePresentationViewController();
+        if (presenter != nil) {
+            swapPickerShowing = YES;
+            [[SwapFilePicker new] presentFrom:presenter completion:^(NSURL *url) {
+                swapPickerShowing = NO;
+                if (url == nil) {
+                    prefs.shouldEnableSwapOnExternal = NO;
+                    NSLog(@"swap: no directory chosen; external swap switched back off");
+                    return;
+                }
+                // A bookmark of a picked URL is made while holding its access.
+                BOOL accessing = [url startAccessingSecurityScopedResource];
+                NSError *error = nil;
+                NSData *bookmark = [url bookmarkDataWithOptions:0
+                                 includingResourceValuesForKeys:nil
+                                                  relativeToURL:nil
+                                                          error:&error];
+                if (accessing)
+                    [url stopAccessingSecurityScopedResource];
+                if (bookmark == nil) {
+                    NSLog(@"swap: cannot remember %@: %@", url.path, error);
+                    prefs.shouldEnableSwapOnExternal = NO;
+                    return;
+                }
+                prefs.swapExternalBookmark = bookmark;
+                prefs.swapExternalPath = url.path;
+                NSLog(@"swap: external swap directory chosen: %@ (used from the next launch)", url.path);
+            }];
+        }
+    }
 }
 
 @end

@@ -4,7 +4,7 @@ Most of what you run under iSH-AOK is a guest binary. The emulator reads its
 instructions and translates them, block by block, into instructions the iPhone
 can run. That translation is most of the cost of running anything here.
 
-A **native program** skips it. Programs like `bash`, `zsh` and SmallCLUE's
+A **native program** skips it. Programs like `zsh`, `dash` and SmallCLUE's
 toolbox are compiled into iSH-AOK itself, as ordinary arm64 code, and when the
 guest `execve`s one, the emulator calls that code directly instead of loading a
 guest image. There is no translation, because there is nothing to translate.
@@ -13,8 +13,16 @@ You reach them through `/AOK/native`:
 
 ```sh
 ls /AOK/native
-# bash  bmm  bmt  hx  ktop  libs  motepad  rust-probe  smallclue  zsh  zsh-multio
+# bmm  bmt  dash  hx  ktop  motepad  passwd  rust-probe  sh  smallclue  su  sudo  wl-present  zsh  zsh-multio
 ```
+
+What is actually there depends on how the build was configured, so read the
+directory rather than this page. The shipped app build enables `hx` (helix,
+`AOK_NATIVE_HELIX=YES` in `app/iSH.xcconfig`) but not `bash`
+(`AOK_NATIVE_BASH=NO`, as of 556 — see "Native bash and licensing" in the
+project `README.md`); a plain CLI/meson build defaults both `native_helix` and
+`native_bash` to `disabled` unless you pass `-Dnative_helix=enabled` /
+`-Dnative_bash=enabled`.
 
 Everything else — `ssh`, `wc`, `vi` — is a symlink to
 `/AOK/native/smallclue`, which picks its applet from the name it was invoked
@@ -61,8 +69,8 @@ test for whether a given function needs that treatment is not "is it pure?" but:
 > **can this function's answer differ between the host and the guest?**
 
 `getenv`, `getpwuid`, `gethostbyname`, `setlocale`, `uname`, `sysctl`, `isatty`,
-`tcgetattr` — every one of them answered about an iPhone until it was made to
-answer about your rootfs. In practice this means a native program reads *your*
+`tcgetattr`, `localtime` — every one of them answered about an iPhone until it
+was made to answer about your rootfs. In practice this means a native program reads *your*
 `/etc/passwd`, *your* `/etc/resolv.conf`, *your* terminfo, and writes to *your*
 files, with your guest uid and your guest permissions.
 
@@ -74,7 +82,10 @@ The rule is checked rather than trusted: `tools/check-native-libc.py`, run over
 the built objects, reports every host-libc symbol a native program references
 that is not on an explicit allowlist. It is a gate someone runs, not something
 wired into the build, and it covers the routed surface rather than proving there
-is nothing left — the timezone, for one, is still the host's.
+is nothing left. Local time is the most recent arrival: since 557 a native
+program converts times in the *guest's* zone — `TZ`, else `/etc/localtime`, read
+from your root's own zoneinfo — so native `ls -l` and `date` agree with the
+distro's.
 
 ## When a program is not in this build
 
@@ -91,7 +102,7 @@ do. So a script may reasonably assume those and should check for the rest.
 The files that *do* exist are worth a look:
 
 ```sh
-head -2 /AOK/native/bash
+head -2 /AOK/native/zsh
 # #!/bin/sh
 # # Placeholder for a program implemented natively inside iSH-AOK.
 ```
@@ -108,21 +119,86 @@ diagnostic rather than a program.
 | `/AOK/native/smallclue` | a busybox-style toolbox; the applet is chosen by the name it is invoked under |
 | `ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id` | OpenSSH, as applets of SmallCLUE — note it is built **without OpenSSL**, so the [crypto accelerator](crypto-accel.md) does not apply to it |
 | `vi` | the Nextvi editor, an applet of SmallCLUE |
-| `/AOK/native/bash` | bash 5.2. GPLv3, which is why it has a build switch at all |
-| `/AOK/native/zsh` | zsh, with fork-by-relaunch; `zsh --version` for the exact one |
+| `git` | SmallCLUE's git, on libgit2 (built in since 558): init, clone and fetch over HTTPS, add, commit, status, diff, log, branch, checkout. Not yet `git@host:` (ssh) remotes |
+| `tput`, `reset`, `free`, `printenv`, `login`, `mount`, `umount` | applets added for [native mode](native-mode.md) (558): `tput` reads terminfo itself, `free` reports as procps does, `mount`/`umount` take util-linux's options and reach the guest kernel's mount(2) |
+| `init`, `runit`, `sv`, `halt`, `poweroff`, `reboot` | SmallCLUE's service system: pid 1 in a native-mode root, which runs `/etc/rc` and supervises `/etc/service`. On a distribution root its own init keeps the job |
+| `/AOK/native/bash` | bash 5.2, **not in the shipped app since build 556**. GPLv3, which is why it has a build switch at all; a build made with `-Dnative_bash=enabled` still has it. Your guest `/bin/bash` is unaffected |
+| `/AOK/native/zsh` | zsh, with fork-by-relaunch; `zsh --version` for the exact one. The only native program that can describe its own state, so the only one a [suspend](suspend.md) brings back where it was |
+| `/AOK/native/dash`, `/AOK/native/sh` | dash, the POSIX shell most scripts are written against. BSD-licensed. Its fork-by-relaunch hands the child the parse *tree* rather than the command text, so quoting cannot be lost on the way. Your `/bin/sh` is untouched — but see [native-setup.md](native-setup.md), since the link step is what makes a bare `sh` mean this shell |
 | `/AOK/native/zsh-multio` | a helper for zsh's MULTIOS redirections, which need a process that is not the shell to hold the descriptors |
 | `/AOK/native/motepad` | a modeless terminal text editor, the counterpart to Workspace's MotePad applet — see [motepad.md](motepad.md) |
 | `/AOK/native/ktop` | the process viewer, with no build step — the same source that ships at `/AOK/tools/ktop`, compiled as host code. See [ktop.md](ktop.md) |
 | `/AOK/native/hx` | [helix](https://helix-editor.com), a modal editor with syntax highlighting and multiple selections. MPL-2.0, so like bash it has a build switch; registered as `hx`, which is what helix calls itself. Its grammars and themes are served from `/AOK/native/libs` |
 | `/AOK/native/rust-probe` | a probe that exercises the Rust-on-the-shim path, not a tool you have a use for. Present because the Rust support it checks is what `hx` is built on |
 | `/AOK/native/bmm`, `/AOK/native/bmt` | the CPU and thread microbenchmarks, so the same workload can be timed with and without emulation — see [benchmarks.md](benchmarks.md) |
+| `/AOK/native/wl-present` | shows the Wayland desktop in the app without VNC: it takes the compositor's frames and hands the app's keyboard, pointer, clipboard and window size back. `start-wayland.sh` runs it; see [workspace.md](workspace.md#the-gpu) |
+| `/AOK/native/su`, `/AOK/native/sudo`, `/AOK/native/passwd` | SmallCLUE's su, sudo and passwd, each shipped as its own **setuid-root** program rather than an applet of the multicall binary — see below |
 
-SmallCLUE's applets are *smaller* implementations, not drop-in replacements for
-the distro's. They cover the common cases and diverge on individual flags — the
-kind of difference no audit of the sources finds, because the command is present
-and works, just not with that one option. That is worth knowing before you put
-them ahead of your distro's tools on `PATH`; see
-[native-setup.md](native-setup.md), which is also where the escape hatches are.
+SmallCLUE's applets used to be *smaller* implementations that diverged from the
+distro's on individual flags. As of 557 the ones that stand in for a distro tool
+are checked against GNU instead: `ls`, `cp`, `mv`, `rm`, `ln`, `cat`, `chmod`,
+`touch`, `stat`, `date`, `head`, `tail`, `wc`, `sort`, `uniq`, `cmp`, `tr`,
+`nl`, `seq`, `dd`, `od`, `fold`, `tac`, `split`, `du`, `sum`, `env`,
+`realpath`, `readlink`, `rmdir`, `stty`, `xargs`, `find`, `grep`, `diff`,
+`sed` (all of POSIX plus GNU's extensions), `gzip`/`gunzip`/`zcat` and `tar`
+against GNU coreutils, findutils, grep, diffutils, sed, gzip and tar, and `awk`
+against mawk 1.3.4, Debian's default. Each has golden cases recorded from the
+real tool in `/AOK/tests` (`native_coreutils.c`, `native_sed.c`,
+`native_stty.c`); error messages use glibc's
+wording. That matters because [native-setup.md](native-setup.md) puts them
+ahead of your distro's tools on `PATH`, so package scripts run them too — and
+that page is also where the escape hatches are, if one still differs.
+
+Two pattern-matching details worth knowing, both since 558:
+
+- **Native programs match wildcards as glibc does, not as Darwin does.**
+  `fnmatch` is routed to `kernel/native_fnmatch.c`, which follows glibc's, so
+  a `[` that opens no bracket expression matches itself and a trailing lone `\`
+  is handled glibc's way. Darwin's refused both: `find -name 'a[b'` found
+  nothing, and `ls -I`, `grep --include`, `diff -x`, `tar --wildcards`, `git`
+  and `scp` failed on such a name.
+- **Native dash uses its own pattern matcher.** `case`, `${var#pattern}` and
+  the rest go through dash's `pmatch`, so `${t#socket:[}` strips what it
+  should — matching Devuan's dash line for line.
+
+## `su`, `sudo` and `passwd`: the only setuid-root native programs
+
+`ls -l /AOK/native/sudo` shows `-rwsr-xr-x`; every other native program is
+`-r-xr-xr-x`. That bit means a real gain of the host euid to root
+(`fs/aok.c`), which is exactly why `/AOK/native/smallclue` itself can never
+carry it: SmallCLUE is a multicall binary that picks its applet from `argv[0]`,
+so a setuid copy of it would hand `smallclue sh` a root shell to anyone who
+asked. `su`, `sudo` and `passwd` are three separate programs that supply their
+own `argv[0]` at the call site and never take it from the caller
+(`kernel/native.c`), so `/AOK/native/sudo` can only ever be `sudo`.
+
+They authenticate against the **booted root's own** `/etc/shadow`, read
+through the same shim every other guest-facing lookup uses, and check the
+password with a real `$5$`/`$6$` SHA-crypt implementation
+(`kernel/sha_crypt.c`) built on CommonCrypto, checked against Drepper's
+published test vectors — Darwin's own `crypt()` is DES-only and cannot read a
+modern shadow line at all, so this had to be built rather than borrowed. A
+locked account (`*` or `!...`) is not a hash any password produces, so it
+never authenticates by accident. `sudo` still consults `/etc/sudoers` the same
+way the applet always did; the difference is that it can now actually reach
+root when a rule allows it. `$1$`, `$2b$` and Debian 12's default `$y$`
+(yescrypt) are not implemented and are refused rather than guessed at.
+
+`passwd` changes passwords from build 559; before that it printed "passwd: not
+supported on this platform" and changed nothing. Root may set any account's
+password; anyone else changes their own and is asked for the old one first.
+It rewrites only the account's line of `/etc/shadow`, keeping the file's mode
+and owner.
+
+## When a native program crashes
+
+A native program that calls `abort()` — a failed assertion, or a Rust program
+that panics — dies of `SIGABRT` like any other process, after its own handler
+for the signal has had its turn, and your shell says "Aborted". The app stays
+up. Before 559 such a call went to the host and took the whole app with it.
+
+A native program's threads share one task, so when one of them aborts, the
+program ends there, its other threads included.
 
 ## Where this is not the fast path
 

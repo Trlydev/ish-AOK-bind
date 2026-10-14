@@ -1,19 +1,68 @@
 // I don't remember if the interpreter was supposed to use this in addition to the jit
+#include <fenv.h>
 #include <math.h>
 #include <string.h>
 #include "emu/cpu.h"
 #include "emu/float80.h"
+#include "emu/fpenv.h"
 #include "emu/fpu.h"
 #include "emu/fxsave.h"
 
 #define ST(i) cpu->fp[(cpu->top + i) % 8]
 
+// Around every arithmetic helper: float80 reports what the operation raised
+// (f80_exceptions in status-word order, f80_inexact for PE) and which way it
+// rounded, and it lands in the status word. The exception flags are sticky --
+// only FNCLEX, FNINIT and FLDENV/FRSTOR clear them -- while C1 describes the
+// most recent operation alone, so it is assigned rather than accumulated.
+// FPU_END_FLAGS is for the operations whose C1 means something else.
+#define FPU_BEGIN() do { f80_inexact = 0; f80_rounded_up = 0; f80_exceptions = 0; } while (0)
+#define FPU_END_FLAGS() do {                            \
+    cpu->fsw |= (f80_exceptions & 0x1f) | (f80_inexact ? 0x20 : 0); \
+} while (0)
+#define FPU_END() do {                                  \
+    FPU_END_FLAGS();                                    \
+    cpu->c1 = f80_rounded_up ? 1 : 0;                   \
+} while (0)
+
+// The operations still computed in host double (the transcendentals) run in
+// the host's own round-to-nearest, whatever the guest's SSE mode has put in
+// the host FPCR, and what they raise stays out of the guest's MXCSR -- an
+// x87 instruction reports to the x87 status word only.
+static double host_libm2(double (*fn)(double, double), double x, double y) {
+    fenv_t env;
+    feholdexcept(&env);
+    fesetround(FE_TONEAREST);
+    double r = fn(x, y);
+    fesetenv(&env);
+    return r;
+}
+static double host_libm1(double (*fn)(double), double x) {
+    fenv_t env;
+    feholdexcept(&env);
+    fesetround(FE_TONEAREST);
+    double r = fn(x);
+    fesetenv(&env);
+    return r;
+}
+// A memory operand, widened bit for bit (see f80_from_float).
+#define FPU_M(x) _Generic((x), float: f80_from_float, double: f80_from_double)(x)
+
+// A transcendental result is inexact unless it is the exact zero it has at 0.
+static void fpu_transcendental_inexact(struct cpu_state *cpu, float80 result) {
+    if (!f80_iszero(result) && !f80_isnan(result))
+        cpu->pe = 1;
+}
+
+// The interpreter's x87 keeps the tag the gadgets keep (cpu->x87_valid).
 static void fpu_push(struct cpu_state *cpu, float80 f) {
     cpu->top--;
     ST(0) = f;
+    cpu->x87_valid |= (byte_t) (1u << cpu->top);
 }
 #define fpush(f) fpu_push(cpu, f)
 void fpu_pop(struct cpu_state *cpu) {
+    cpu->x87_valid &= (byte_t) ~(1u << cpu->top);
     cpu->top++;
 }
 
@@ -28,6 +77,12 @@ void fpu_incstp(struct cpu_state *cpu) {
     // element as free. We don't have stack tagging yet so in practice there's
     // no difference.
     cpu->top++;
+}
+
+// FDECSTP (D9 F6), fincstp's mirror: TOP moves down one and nothing else
+// happens. Missing, like FPTAN and FYL2XP1 below, so it raised SIGILL.
+void fpu_decstp(struct cpu_state *cpu) {
+    cpu->top--;
 }
 
 // loads
@@ -50,11 +105,16 @@ void fpu_ild64(struct cpu_state *cpu, int64_t *i) {
     fpush(f80_from_int(*i));
 }
 
+// FLD m32/m64 raise IE for a signalling NaN and DE for a denormal.
 void fpu_ldm32(struct cpu_state *cpu, float32 *f) {
-    fpush(f80_from_double(*f));
+    FPU_BEGIN();
+    fpush(f80_from_float(*f));
+    FPU_END();
 }
 void fpu_ldm64(struct cpu_state *cpu, float64 *f) {
-    fpush(f80_from_double(*f));
+    FPU_BEGIN();
+    fpush(FPU_M(*f));
+    FPU_END();
 }
 void fpu_ldm80(struct cpu_state *cpu, float80 *f) {
     fpush(*f);
@@ -66,20 +126,30 @@ void fpu_st(struct cpu_state *cpu, int i) {
     ST(i) = ST(0);
 }
 
+// FIST: a value that does not fit is the integer indefinite, and invalid --
+// which also means nothing about rounding is reported.
+static int64_t fpu_fit_int(int64_t res, int64_t min, int64_t max) {
+    if (res < min || res > max) {
+        f80_exceptions |= F80_EXC_INVALID;
+        f80_inexact = f80_rounded_up = 0;
+        return min;
+    }
+    return res;
+}
 void fpu_ist16(struct cpu_state *cpu, int16_t *i) {
-    int64_t res = f80_to_int(ST(0));
-    if (res < INT16_MIN || res > INT16_MAX)
-        res = INT16_MIN;
-    *i = (int16_t) res;
+    FPU_BEGIN();
+    *i = (int16_t) fpu_fit_int(f80_to_int(ST(0)), INT16_MIN, INT16_MAX);
+    FPU_END();
 }
 void fpu_ist32(struct cpu_state *cpu, int32_t *i) {
-    int64_t res = f80_to_int(ST(0));
-    if (res < INT32_MIN || res > INT32_MAX)
-        res = INT32_MIN;
-    *i = (int32_t) res;
+    FPU_BEGIN();
+    *i = (int32_t) fpu_fit_int(f80_to_int(ST(0)), INT32_MIN, INT32_MAX);
+    FPU_END();
 }
 void fpu_ist64(struct cpu_state *cpu, int64_t *i) {
+    FPU_BEGIN();
     *i = f80_to_int(ST(0));
+    FPU_END();
 }
 
 // fisttp (SSE3): store ST(0) as an integer with truncation toward zero,
@@ -88,33 +158,40 @@ void fpu_ist64(struct cpu_state *cpu, int64_t *i) {
 void fpu_istt16(struct cpu_state *cpu, int16_t *i) {
     enum f80_rounding_mode old_mode = f80_rounding_mode;
     f80_rounding_mode = round_chop;
-    int64_t res = f80_to_int(ST(0));
+    FPU_BEGIN();
+    *i = (int16_t) fpu_fit_int(f80_to_int(ST(0)), INT16_MIN, INT16_MAX);
+    FPU_END();
     f80_rounding_mode = old_mode;
-    if (res < INT16_MIN || res > INT16_MAX)
-        res = INT16_MIN;
-    *i = (int16_t) res;
 }
 void fpu_istt32(struct cpu_state *cpu, int32_t *i) {
     enum f80_rounding_mode old_mode = f80_rounding_mode;
     f80_rounding_mode = round_chop;
-    int64_t res = f80_to_int(ST(0));
+    FPU_BEGIN();
+    *i = (int32_t) fpu_fit_int(f80_to_int(ST(0)), INT32_MIN, INT32_MAX);
+    FPU_END();
     f80_rounding_mode = old_mode;
-    if (res < INT32_MIN || res > INT32_MAX)
-        res = INT32_MIN;
-    *i = (int32_t) res;
 }
 void fpu_istt64(struct cpu_state *cpu, int64_t *i) {
     enum f80_rounding_mode old_mode = f80_rounding_mode;
     f80_rounding_mode = round_chop;
+    FPU_BEGIN();
     *i = f80_to_int(ST(0));
+    FPU_END();
     f80_rounding_mode = old_mode;
 }
 
+// FST m32/m64 round in the x87's own mode, straight to the destination: the
+// single-precision store used to round to double first and then again on
+// the host, in the host's (the guest's SSE) mode.
 void fpu_stm32(struct cpu_state *cpu, float32 *f) {
-    *f = f80_to_double(ST(0));
+    FPU_BEGIN();
+    *f = f80_to_float(ST(0));
+    FPU_END();
 }
 void fpu_stm64(struct cpu_state *cpu, float64 *f) {
+    FPU_BEGIN();
     *f = f80_to_double(ST(0));
+    FPU_END();
 }
 void fpu_stm80(struct cpu_state *cpu, float80 *f) {
     // intel guarantees this will only write 10 bytes, not 12 or anything weird like that
@@ -146,56 +223,84 @@ FCMOVcc(nu, !PF)
 
 // math
 
-// The status word's PE is a sticky exception flag: any operation whose result
-// had to be rounded sets it, and only fclex/fldenv clear it. C1 is not sticky
-// -- it reports the rounding direction of the most recent operation -- so it is
-// assigned each time rather than accumulated. f80_inexact/f80_rounded_up are
-// set by the rounding path in float80.c.
-#define FPU_ROUND_BEGIN() do { f80_inexact = 0; f80_rounded_up = 0; } while (0)
-#define FPU_ROUND_END() do {                    \
-    if (f80_inexact)                            \
-        cpu->pe = 1;                            \
-    cpu->c1 = f80_rounded_up ? 1 : 0;           \
-} while (0)
-
-
 void fpu_prem(struct cpu_state *cpu) {
+    FPU_BEGIN();
     ST(0) = f80_mod(ST(0), ST(1));
+    FPU_END_FLAGS();
     cpu->c2 = 0; // say we finished the entire remainder
 }
 
+// FPREM1 (D9 F5): the IEEE-754 remainder, which rounds the implied quotient to
+// nearest-even where FPREM truncates it. It was missing entirely -- f80_rem had
+// been declared for it and never written -- so every FPREM1 raised SIGILL.
+// glibc's remainder()/remquo() and drem() are the callers that matter.
+void fpu_prem1(struct cpu_state *cpu) {
+    FPU_BEGIN();
+    ST(0) = f80_rem(ST(0), ST(1));
+    FPU_END_FLAGS();
+    cpu->c2 = 0; // complete reduction, as fpu_prem also reports
+}
+
+// ST(1) is truncated inside f80_fscale. Converting it to a C int here made a
+// scale of 2^32, an infinity and a NaN all 0.
 void fpu_scale(struct cpu_state *cpu) {
-    enum f80_rounding_mode old_mode = f80_rounding_mode;
-    f80_rounding_mode = round_chop;
-    int scale = f80_to_int(ST(1));
-    f80_rounding_mode = old_mode;
-    ST(0) = f80_scale(ST(0), scale);
+    FPU_BEGIN();
+    ST(0) = f80_fscale(ST(0), ST(1));
+    FPU_END();
 }
 
 void fpu_rndint(struct cpu_state *cpu) {
     if (f80_isinf(ST(0)) || f80_isnan(ST(0)))
         return;
-    FPU_ROUND_BEGIN();
+    FPU_BEGIN();
     ST(0) = f80_round(ST(0));
-    FPU_ROUND_END();
+    FPU_END();
 }
 
 void fpu_sqrt(struct cpu_state *cpu) {
-    FPU_ROUND_BEGIN();
+    FPU_BEGIN();
     ST(0) = f80_sqrt(ST(0));
-    FPU_ROUND_END();
+    FPU_END();
+    // Real FSQRT leaves C1 clear even when it rounds up (PE set): an AMD
+    // (camd) and an Intel i9 (mint) agree on all 36000 cases of
+    // tests/manual/x86/x87_fsqrt.c -- every rounding mode and precision --
+    // with C1 = 0 throughout, where this set it on ~12000 of them.
+    cpu->c1 = 0;
 }
 
 void fpu_yl2x(struct cpu_state *cpu) {
-    FPU_ROUND_BEGIN();
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
+    FPU_BEGIN();
     ST(1) = f80_mul(ST(1), f80_log2(ST(0)));
-    FPU_ROUND_END();
+    FPU_END();
+    fpu_pop(cpu);
+}
+
+// FYL2XP1 (D9 F9): ST(1) = ST(1) * log2(ST(0) + 1), then pop. It exists for
+// accuracy when ST(0) is tiny, where forming 1 + ST(0) first throws the
+// answer away; f80_log2p1 never forms it.
+void fpu_yl2xp1(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
+    FPU_BEGIN();
+    ST(1) = f80_mul(ST(1), f80_log2p1(ST(0)));
+    FPU_END();
     fpu_pop(cpu);
 }
 
 void fpu_2xm1(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
     // an example of the ancient chinese art of chi ting
-    ST(0) = f80_from_double(pow(2, f80_to_double(ST(0))) - 1);
+    ST(0) = f80_from_double(host_libm2(pow, 2, f80_to_double(ST(0))) - 1);
+    fpu_transcendental_inexact(cpu, ST(0));
+}
+
+// FCOM, FCOMI and FTST are signalling compares: any NaN is an invalid
+// operation. FUCOM and FUCOMI raise IE only for a signalling one.
+static void fpu_compare_invalid(struct cpu_state *cpu, float80 a, float80 b, bool quiet) {
+    if (!f80_is_supported(a) || !f80_is_supported(b) ||
+            f80_issnan(a) || f80_issnan(b) ||
+            (!quiet && (f80_isnan(a) || f80_isnan(b))))
+        cpu->ie = 1;
 }
 
 static void fpu_comparei(struct cpu_state *cpu, float80 x) {
@@ -214,16 +319,34 @@ static void fpu_compare(struct cpu_state *cpu, float80 x) {
         cpu->c0 = cpu->c2 = cpu->c3 = 1;
 }
 void fpu_com(struct cpu_state *cpu, int i) {
+    fpu_compare_invalid(cpu, ST(0), ST(i), false);
+    fpu_compare(cpu, ST(i));
+}
+void fpu_ucom(struct cpu_state *cpu, int i) {
+    fpu_compare_invalid(cpu, ST(0), ST(i), true);
     fpu_compare(cpu, ST(i));
 }
 void fpu_comi(struct cpu_state *cpu, int i) {
+    fpu_compare_invalid(cpu, ST(0), ST(i), false);
+    fpu_comparei(cpu, ST(i));
+}
+void fpu_ucomi(struct cpu_state *cpu, int i) {
+    fpu_compare_invalid(cpu, ST(0), ST(i), true);
     fpu_comparei(cpu, ST(i));
 }
 void fpu_comm32(struct cpu_state *cpu, float *f) {
-    fpu_compare(cpu, f80_from_double(*f));
+    FPU_BEGIN();
+    float80 x = f80_from_float(*f);
+    FPU_END_FLAGS();
+    fpu_compare_invalid(cpu, ST(0), x, false);
+    fpu_compare(cpu, x);
 }
 void fpu_comm64(struct cpu_state *cpu, double *f) {
-    fpu_compare(cpu, f80_from_double(*f));
+    FPU_BEGIN();
+    float80 x = FPU_M(*f);
+    FPU_END_FLAGS();
+    fpu_compare_invalid(cpu, ST(0), x, false);
+    fpu_compare(cpu, x);
 }
 void fpu_icom16(struct cpu_state *cpu, int16_t *i) {
     fpu_compare(cpu, f80_from_int(*i));
@@ -232,6 +355,7 @@ void fpu_icom32(struct cpu_state *cpu, int32_t *i) {
     fpu_compare(cpu, f80_from_int(*i));
 }
 void fpu_tst(struct cpu_state *cpu) {
+    fpu_compare_invalid(cpu, ST(0), fpu_consts[fconst_zero], false);
     fpu_compare(cpu, fpu_consts[fconst_zero]);
 }
 
@@ -243,116 +367,272 @@ void fpu_chs(struct cpu_state *cpu) {
     ST(0) = f80_neg(ST(0));
 }
 
+// Round-to-nearest fast paths (float80.c's f80_add_fast/f80_mul_fast/
+// f80_div_fast): two normal operands and a normal result, which is nearly
+// every x87 add, subtract, multiply and divide. They report PE and C1 exactly as FPU_BEGIN/FPU_END
+// would and decline everything else, which then takes the general path below.
+static inline int fpu_fast_precision(struct cpu_state *cpu) {
+    if (cpu->rc != round_to_nearest)
+        return 0;
+    return cpu->pc == 0 ? 24 : cpu->pc == 2 ? 53 : 64; // f80_precision_from_pc
+}
+static inline bool fpu_fast_add(struct cpu_state *cpu, float80 a, float80 b, float80 *dst) {
+    int p = fpu_fast_precision(cpu);
+    float80 r;
+    bool inexact, up;
+    if (p == 0 || !f80_add_fast(a, b, p, &r, &inexact, &up))
+        return false;
+    *dst = r;
+    if (inexact)
+        cpu->fsw |= 0x20;
+    cpu->c1 = up;
+    return true;
+}
+static inline bool fpu_fast_div(struct cpu_state *cpu, float80 a, float80 b, float80 *dst) {
+    int p = fpu_fast_precision(cpu);
+    float80 r;
+    bool inexact, up;
+    if (p == 0 || !f80_div_fast(a, b, p, &r, &inexact, &up))
+        return false;
+    *dst = r;
+    if (inexact)
+        cpu->fsw |= 0x20;
+    cpu->c1 = up;
+    return true;
+}
+static inline bool fpu_fast_mul(struct cpu_state *cpu, float80 a, float80 b, float80 *dst) {
+    int p = fpu_fast_precision(cpu);
+    float80 r;
+    bool inexact, up;
+    if (p == 0 || !f80_mul_fast(a, b, p, &r, &inexact, &up))
+        return false;
+    *dst = r;
+    if (inexact)
+        cpu->fsw |= 0x20;
+    cpu->c1 = up;
+    return true;
+}
+
 void fpu_add(struct cpu_state *cpu, int srci, int dsti) {
-    FPU_ROUND_BEGIN();
+    if (fpu_fast_add(cpu, ST(dsti), ST(srci), &ST(dsti)))
+        return;
+    FPU_BEGIN();
     ST(dsti) = f80_add(ST(dsti), ST(srci));
-    FPU_ROUND_END();
+    FPU_END();
 }
 void fpu_sub(struct cpu_state *cpu, int srci, int dsti) {
-    FPU_ROUND_BEGIN();
+    if (fpu_fast_add(cpu, ST(dsti), f80_neg(ST(srci)), &ST(dsti)))
+        return;
+    FPU_BEGIN();
     ST(dsti) = f80_sub(ST(dsti), ST(srci));
-    FPU_ROUND_END();
+    FPU_END();
 }
 void fpu_subr(struct cpu_state *cpu, int srci, int dsti) {
-    FPU_ROUND_BEGIN();
+    if (fpu_fast_add(cpu, ST(srci), f80_neg(ST(dsti)), &ST(dsti)))
+        return;
+    FPU_BEGIN();
     ST(dsti) = f80_sub(ST(srci), ST(dsti));
-    FPU_ROUND_END();
+    FPU_END();
 }
 void fpu_mul(struct cpu_state *cpu, int srci, int dsti) {
-    FPU_ROUND_BEGIN();
+    if (fpu_fast_mul(cpu, ST(dsti), ST(srci), &ST(dsti)))
+        return;
+    FPU_BEGIN();
     ST(dsti) = f80_mul(ST(dsti), ST(srci));
-    FPU_ROUND_END();
+    FPU_END();
 }
 void fpu_div(struct cpu_state *cpu, int srci, int dsti) {
-    FPU_ROUND_BEGIN();
+    if (fpu_fast_div(cpu, ST(dsti), ST(srci), &ST(dsti)))
+        return;
+    FPU_BEGIN();
     ST(dsti) = f80_div(ST(dsti), ST(srci));
-    FPU_ROUND_END();
+    FPU_END();
 }
 void fpu_divr(struct cpu_state *cpu, int srci, int dsti) {
-    FPU_ROUND_BEGIN();
+    if (fpu_fast_div(cpu, ST(srci), ST(dsti), &ST(dsti)))
+        return;
+    FPU_BEGIN();
     ST(dsti) = f80_div(ST(srci), ST(dsti));
-    FPU_ROUND_END();
+    FPU_END();
 }
 
 void fpu_iadd16(struct cpu_state *cpu, int16_t *i) {
+    if (fpu_fast_add(cpu, ST(0), f80_from_int(*i), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_add(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_isub16(struct cpu_state *cpu, int16_t *i) {
+    if (fpu_fast_add(cpu, ST(0), f80_neg(f80_from_int(*i)), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_sub(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_isubr16(struct cpu_state *cpu, int16_t *i) {
+    if (fpu_fast_add(cpu, f80_from_int(*i), f80_neg(ST(0)), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_sub(f80_from_int(*i), ST(0));
+    FPU_END();
 }
 void fpu_imul16(struct cpu_state *cpu, int16_t *i) {
+    if (fpu_fast_mul(cpu, ST(0), f80_from_int(*i), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_mul(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_idiv16(struct cpu_state *cpu, int16_t *i) {
+    if (fpu_fast_div(cpu, ST(0), f80_from_int(*i), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_div(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_idivr16(struct cpu_state *cpu, int16_t *i) {
+    if (fpu_fast_div(cpu, f80_from_int(*i), ST(0), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_div(f80_from_int(*i), ST(0));
+    FPU_END();
 }
 
 void fpu_iadd32(struct cpu_state *cpu, int32_t *i) {
+    if (fpu_fast_add(cpu, ST(0), f80_from_int(*i), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_add(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_isub32(struct cpu_state *cpu, int32_t *i) {
+    if (fpu_fast_add(cpu, ST(0), f80_neg(f80_from_int(*i)), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_sub(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_isubr32(struct cpu_state *cpu, int32_t *i) {
+    if (fpu_fast_add(cpu, f80_from_int(*i), f80_neg(ST(0)), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_sub(f80_from_int(*i), ST(0));
+    FPU_END();
 }
 void fpu_imul32(struct cpu_state *cpu, int32_t *i) {
+    if (fpu_fast_mul(cpu, ST(0), f80_from_int(*i), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_mul(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_idiv32(struct cpu_state *cpu, int32_t *i) {
+    if (fpu_fast_div(cpu, ST(0), f80_from_int(*i), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_div(ST(0), f80_from_int(*i));
+    FPU_END();
 }
 void fpu_idivr32(struct cpu_state *cpu, int32_t *i) {
+    if (fpu_fast_div(cpu, f80_from_int(*i), ST(0), &ST(0)))
+        return;
+    FPU_BEGIN();
     ST(0) = f80_div(f80_from_int(*i), ST(0));
+    FPU_END();
 }
 
 void fpu_addm32(struct cpu_state *cpu, float32 *f) {
-    ST(0) = f80_add(ST(0), f80_from_double(*f));
+    if (fpu_fast_add(cpu, ST(0), FPU_M(*f), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_add(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_subm32(struct cpu_state *cpu, float32 *f) {
-    ST(0) = f80_sub(ST(0), f80_from_double(*f));
+    if (fpu_fast_add(cpu, ST(0), f80_neg(FPU_M(*f)), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_sub(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_subrm32(struct cpu_state *cpu, float32 *f) {
-    ST(0) = f80_sub(f80_from_double(*f), ST(0));
+    if (fpu_fast_add(cpu, FPU_M(*f), f80_neg(ST(0)), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_sub(FPU_M(*f), ST(0));
+    FPU_END();
 }
 void fpu_mulm32(struct cpu_state *cpu, float32 *f) {
-    ST(0) = f80_mul(ST(0), f80_from_double(*f));
+    if (fpu_fast_mul(cpu, ST(0), FPU_M(*f), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_mul(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_divm32(struct cpu_state *cpu, float32 *f) {
-    ST(0) = f80_div(ST(0), f80_from_double(*f));
+    if (fpu_fast_div(cpu, ST(0), FPU_M(*f), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_div(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_divrm32(struct cpu_state *cpu, float32 *f) {
-    ST(0) = f80_div(f80_from_double(*f), ST(0));
+    if (fpu_fast_div(cpu, FPU_M(*f), ST(0), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_div(FPU_M(*f), ST(0));
+    FPU_END();
 }
 
 void fpu_addm64(struct cpu_state *cpu, float64 *f) {
-    ST(0) = f80_add(ST(0), f80_from_double(*f));
+    if (fpu_fast_add(cpu, ST(0), FPU_M(*f), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_add(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_subm64(struct cpu_state *cpu, float64 *f) {
-    ST(0) = f80_sub(ST(0), f80_from_double(*f));
+    if (fpu_fast_add(cpu, ST(0), f80_neg(FPU_M(*f)), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_sub(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_subrm64(struct cpu_state *cpu, float64 *f) {
-    ST(0) = f80_sub(f80_from_double(*f), ST(0));
+    if (fpu_fast_add(cpu, FPU_M(*f), f80_neg(ST(0)), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_sub(FPU_M(*f), ST(0));
+    FPU_END();
 }
 void fpu_mulm64(struct cpu_state *cpu, float64 *f) {
-    ST(0) = f80_mul(ST(0), f80_from_double(*f));
+    if (fpu_fast_mul(cpu, ST(0), FPU_M(*f), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_mul(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_divm64(struct cpu_state *cpu, float64 *f) {
-    ST(0) = f80_div(ST(0), f80_from_double(*f));
+    if (fpu_fast_div(cpu, ST(0), FPU_M(*f), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_div(ST(0), FPU_M(*f));
+    FPU_END();
 }
 void fpu_divrm64(struct cpu_state *cpu, float64 *f) {
-    ST(0) = f80_div(f80_from_double(*f), ST(0));
+    if (fpu_fast_div(cpu, FPU_M(*f), ST(0), &ST(0)))
+        return;
+    FPU_BEGIN();
+    ST(0) = f80_div(FPU_M(*f), ST(0));
+    FPU_END();
 }
 
 void fpu_patan(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
     // there's no native atan2 for 80-bit float yet.
-    ST(1) = f80_from_double(atan2(f80_to_double(ST(1)), f80_to_double(ST(0))));
+    ST(1) = f80_from_double(host_libm2(atan2, f80_to_double(ST(1)), f80_to_double(ST(0))));
+    fpu_transcendental_inexact(cpu, ST(1));
     fpu_pop(cpu);
 }
 
@@ -372,39 +652,54 @@ static bool fpu_trig_out_of_range(struct cpu_state *cpu, double arg) {
 }
 
 void fpu_sin(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
     double arg = f80_to_double(ST(0));
     if (fpu_trig_out_of_range(cpu, arg))
         return;
-    FPU_ROUND_BEGIN();
-    ST(0) = f80_from_double(sin(arg));
-    FPU_ROUND_END();
+    ST(0) = f80_from_double(host_libm1(sin, arg));
+    fpu_transcendental_inexact(cpu, ST(0));
 }
 void fpu_cos(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
     double arg = f80_to_double(ST(0));
     if (fpu_trig_out_of_range(cpu, arg))
         return;
-    FPU_ROUND_BEGIN();
-    ST(0) = f80_from_double(cos(arg));
-    FPU_ROUND_END();
+    ST(0) = f80_from_double(host_libm1(cos, arg));
+    fpu_transcendental_inexact(cpu, ST(0));
+}
+// FPTAN (D9 F2): ST(0) = tan(ST(0)), then push 1.0 -- an 8087 leftover, so
+// that an FDIVR after it gives the cotangent. Everything that uses it pops the
+// 1.0 straight off again (32-bit HotSpot's Math.tan does exactly that). An
+// operand out of range sets C2 and leaves the stack alone, as for fsin.
+void fpu_ptan(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
+    double arg = f80_to_double(ST(0));
+    if (fpu_trig_out_of_range(cpu, arg))
+        return;
+    ST(0) = f80_from_double(host_libm1(tan, arg));
+    fpu_transcendental_inexact(cpu, ST(0));
+    fpush(fpu_consts[fconst_one]);
 }
 void fpu_sincos(struct cpu_state *cpu) {
+    fpu_sync_control(cpu);  // the x87.S gadgets change fcw without telling float80
     // ST(0) is replaced by sin, then cos is pushed, so on exit ST(0) is cos
     // and ST(1) is sin. Like fsin/fcos this goes through double rather than
     // computing at 80-bit precision.
     double arg = f80_to_double(ST(0));
     if (fpu_trig_out_of_range(cpu, arg))
         return;
-    FPU_ROUND_BEGIN();
-    ST(0) = f80_from_double(sin(arg));
-    fpush(f80_from_double(cos(arg)));
-    FPU_ROUND_END();
+    ST(0) = f80_from_double(host_libm1(sin, arg));
+    fpu_transcendental_inexact(cpu, ST(0));
+    fpush(f80_from_double(host_libm1(cos, arg)));
+    cpu->pe = 1;
 }
 
 void fpu_xtract(struct cpu_state *cpu) {
-    int exp;
-    float80 signif;
+    float80 exp, signif;
+    FPU_BEGIN();
     f80_xtract(ST(0), &exp, &signif);
-    ST(0) = f80_from_int(exp);
+    FPU_END();
+    ST(0) = exp;
     fpush(signif);
 }
 
@@ -450,10 +745,18 @@ static int f80_precision_from_pc(unsigned pc) {
     }
 }
 
-void fpu_ldcw16(struct cpu_state *cpu, uint16_t *i) {
-    cpu->fcw = *i;
+// float80's rounding mode and precision live in host-thread-local variables;
+// the control word they follow belongs to the guest thread. fpenv_enter calls
+// this on every entry to guest code, since sigreturn, ptrace, exec, fork and
+// checkpoints all change cpu->fcw without an x87 instruction.
+void fpu_sync_control(struct cpu_state *cpu) {
     f80_rounding_mode = cpu->rc;
     f80_precision = f80_precision_from_pc(cpu->pc);
+}
+
+void fpu_ldcw16(struct cpu_state *cpu, uint16_t *i) {
+    cpu->fcw = *i;
+    fpu_sync_control(cpu);
 }
 
 struct fpu_env32 {
@@ -479,8 +782,7 @@ void fpu_ldenv32(struct cpu_state *cpu, struct fpu_env32 *env) {
     cpu->fsw = env->status;
     // frstor/fldenv restore the control word too, so the live rounding and
     // precision state has to follow it.
-    f80_rounding_mode = cpu->rc;
-    f80_precision = f80_precision_from_pc(cpu->pc);
+    fpu_sync_control(cpu);
 }
 
 struct fpu_state32 {
@@ -511,25 +813,26 @@ void fpu_restore32(struct cpu_state *cpu, struct fpu_state32 *state) {
 // skipped -- no fault, no diagnostic, just stale state -- while CPUID kept
 // advertising fxsr and sse. tests/manual/x86/cpuid_xsave.c is what caught it
 // and is what keeps it caught.
+// MXCSR's flags are gathered from the host as the guest reads them, and its
+// rounding mode goes onto the host as the guest writes it (emu/fpenv.c).
 void fpu_fxsave32(struct cpu_state *cpu, struct fxsave_area *area) {
+    fpenv_x86_sync_mxcsr(cpu);
     fxsave_fill(cpu, area, 8);
 }
 
 void fpu_fxrestore32(struct cpu_state *cpu, struct fxsave_area *area) {
     fxsave_restore(cpu, area, 8);
+    fpenv_x86_load_mxcsr(cpu);
 }
 
-// SSE runs round-to-nearest with every exception masked, so the control bits
-// are stored rather than honored -- the same deal cpu_state's mxcsr comment
-// describes. Storing them still matters: a read-modify-write of the control
-// word has to round-trip, and software reads MXCSR back to decide whether it
-// is running on a CPU that accepted what it wrote.
 void fpu_stmxcsr32(struct cpu_state *cpu, dword_t *value) {
+    fpenv_x86_sync_mxcsr(cpu);
     *value = cpu->mxcsr;
 }
 
 void fpu_ldmxcsr32(struct cpu_state *cpu, dword_t *value) {
     cpu->mxcsr = *value & 0xffff;
+    fpenv_x86_load_mxcsr(cpu);
 }
 
 // FNINIT: control word back to 0x037f (all exceptions masked, round to
@@ -541,10 +844,13 @@ void fpu_ldmxcsr32(struct cpu_state *cpu, dword_t *value) {
 void fpu_init(struct cpu_state *cpu) {
     cpu->fcw = 0x037f;
     cpu->fsw = 0;
-    f80_rounding_mode = cpu->rc;
-    f80_precision = f80_precision_from_pc(cpu->pc);
+    cpu->x87_valid = 0;
+    fpu_sync_control(cpu);
 }
 
+// FNCLEX clears the exception flags, the stack fault, ES and B. This cleared
+// `sf` -- the sign flag of EFLAGS, not the status word's stack fault (stf) --
+// so a branch on the sign after FNCLEX could go the wrong way.
 void fpu_clex(struct cpu_state *cpu) {
-    cpu->pe = cpu->ue = cpu->oe = cpu->ze = cpu->de = cpu->ie = cpu->es = cpu->sf = cpu->b = 0;
+    cpu->pe = cpu->ue = cpu->oe = cpu->ze = cpu->de = cpu->ie = cpu->es = cpu->stf = cpu->b = 0;
 }

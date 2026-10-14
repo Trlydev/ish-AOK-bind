@@ -157,7 +157,7 @@ which is why this outline is worth trusting:
   the emulator turned out to be behavior real Linux shares.
 - How this book uses that record.
 
-*Anchors:* `docs/TODO.md`, `docs/release-notes-since-iSH-AOK_*.md`.
+*Anchors:* `docs/TODO.md`, `docs/release-notes/release-notes-since-iSH-AOK_*.md`.
 
 ---
 
@@ -173,8 +173,9 @@ which is why this outline is worth trusting:
   TLB in `emu/tlb.c`, and why a TLB matters more here than a page table walk
   costs on real hardware.
 - **Lazy anonymous mmap**: reservations versus page tables — a mapping is either
-  reserved or materialized, never both, and never split. The invariant and why
-  violating it produced the bugs it did.
+  reserved or materialized, never both. A fault never splits a reservation; a
+  drop may, under a slot limit that keeps splits from starving new
+  reservations. The invariant and why violating it produced the bugs it did.
 - Copy-on-write, `MAP_SHARED`, and the three separate ways a shared mapping quietly
   stopped being shared.
 - Floating point: `float80.c` and the x87 80-bit problem on hosts that do not have
@@ -231,8 +232,8 @@ correct in isolation and wrong at a page boundary.
 - The interpreters (`emu/*_interp.c`) are legacy; the `engine` build option now
   offers only `jit`. What that means for anyone reading old code.
 
-*Anchors:* `docs/amd64_port_plan.md`, `docs/aarch64_guest_plan.md`,
-`docs/riscv64_guest_plan.md`, `jit/guest-arm64/`, `jit/guest-riscv64/`,
+*Anchors:* `docs/historical/amd64_port_plan.md`, `docs/aarch64_guest_plan.md`,
+`docs/historical/riscv64_guest_plan.md`, `jit/guest-arm64/`, `jit/guest-riscv64/`,
 `kernel/calls.c`, `tests/arm64/`, `tests/riscv64/`.
 
 ## Chapter 8. High-level emulation: skipping the instructions entirely
@@ -601,7 +602,7 @@ correct in isolation and wrong at a page boundary.
 - Darwin stdio lock forensics: naming the `FILE` a wedged process is blocked on.
 - When *not* to make something native.
 
-*Anchors:* `docs/TODO.md`, `kernel/native_libc.c`, `docs/native_workspace_design.md`.
+*Anchors:* `docs/TODO.md`, `kernel/native_libc.c`, `docs/historical/native_workspace_design.md`.
 
 ---
 
@@ -775,9 +776,10 @@ correct in isolation and wrong at a page boundary.
 ## Chapter 37. Releasing
 
 - What a release is: bump `CURRENT_PROJECT_VERSION`, write
-  `docs/release-notes-since-iSH-AOK_<N>.md` and a summary, tag
-  `builds/iSH-AOK_<N>`. **The tag name is load-bearing** — the workflow triggers on
-  it, so a differently named tag produces no build.
+  `docs/release-notes/release-notes-since-iSH-AOK_<N>.md` — one file, opening
+  with its own summary paragraph — tag `builds/iSH-AOK_<N>`. **The tag name is
+  load-bearing** — the workflow triggers on it, so a differently named tag
+  produces no build.
 - `tools/release-aok.sh`: preflight, archive, export, upload; and where fastlane's
   Ruby requirements bite.
 - TestFlight, App Store review, and the entitlements story — including the
@@ -790,7 +792,7 @@ correct in isolation and wrong at a page boundary.
   history of the fork.
 
 *Anchors:* `tools/release-aok.sh`, `.github/workflows/build-release-ipa.yml`,
-`fastlane/`, `docs/release-notes-since-iSH-AOK_*.md`.
+`fastlane/`, `docs/release-notes/release-notes-since-iSH-AOK_*.md`.
 
 ---
 
@@ -853,8 +855,9 @@ reader can take to a different project:
 ## Chapter 41. The honest gaps
 
 - No `PROT_EXEC` enforcement — no NX for guest pages.
-- No PID or mount namespaces, so nothing container-shaped works; this is
-  architectural, not a missing feature.
+- No cgroup namespaces, and a network namespace that is only a loopback
+  (mount, user, pid and network namespaces arrived in 559, for sandboxes), so
+  nothing container-shaped works; this is architectural, not a missing feature.
 - The interpreters are legacy and being retired.
 - Known native-program gaps: the applet argv ownership class, unrouted host
   symbols, process substitution where the rootfs lacks `/dev/fd`.
@@ -876,7 +879,7 @@ reader can take to a different project:
 - The Bedrock companion, and the two gaps that mattered (bind mounts, FUSE).
 - What a second maintainer would need to know first.
 
-*Anchors:* `docs/wayland_workspace_plan.md`, `docs/wayland_rotation_resize_plan.md`,
+*Anchors:* `docs/historical/wayland_workspace_plan.md`, `docs/wayland_rotation_resize_plan.md`,
 `docs/external_display_plan.md`, `docs/wasm_browser_architecture.md`,
 `docs/metal_sgemm_milestone1.md`.
 

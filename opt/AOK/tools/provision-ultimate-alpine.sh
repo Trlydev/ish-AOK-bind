@@ -1,11 +1,14 @@
 #!/bin/sh
 # provision-ultimate-alpine.sh
 # ---------------------------------------------------------------------------
+# (It provisions an Alpine machine with a kernel of its own as well -- a virtual
+# machine, any architecture -- leaving out what only the app can do: see IN_AOK
+# below.)
 # Turn a fresh Alpine 3.23 rootfs (i686 OR x86_64) running under iSH-AOK into a
 # full-featured, terminal-only Linux system:
 #   * generous "ultimate terminal" CLI tool set
 #   * services enabled on boot via OpenRC (sshd, syslog-ng, cronie, chronyd, ...)
-#   * US/Pacific timezone (configurable)
+#   * the device's timezone, kept following the device (configurable)
 #   * chrony in iSH-aware monitoring mode (the guest clock is the host clock)
 #   * shell niceties: bash login shells, colour prompt, MOTD, login summary,
 #     fzf/dircolors integration, machine-id, periodic-maintenance cron
@@ -18,10 +21,12 @@
 # When run on a terminal it PROMPTS for the timezone and the primary login
 # (creating that user if it does not exist). Pre-set any tunable via the
 # environment to skip its prompt / run non-interactively:
-#       TZ_NAME=America/Los_Angeles    # timezone (else prompted)
+#       TZ_NAME=America/Los_Angeles    # timezone (else prompted, offering the device's)
 #       TARGET_USER=mke                # primary login to set up (else prompted)
 #       NEW_HOSTNAME=                  # hostname to set (else prompted)
-#       SUDO_NOPASSWD=0                # 1 = passwordless %wheel sudo
+#       NATIVE_LINKS=1                 # 0 = skip linking /AOK/native (native-links.sh)
+#       SUDO_NOPASSWD=1                # 0 = %wheel sudo asks for a password (else prompted)
+#       MIRROR=keep                    # keep dl-cdn rather than pick the fastest mirror
 #
 # Arch note: every package below is arch-independent in Alpine, so the same
 # script provisions an x86_64 3.23.3 rootfs identically.
@@ -37,12 +42,65 @@ fi
 log()  { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 
+# ---- under iSH-AOK, or on a kernel of its own? ----------------------------
+# The same script provisions a virtual machine (the UTM images of
+# the AOK VM project ship it) or any machine running this distribution. What
+# differs there is what the app does for a root under iSH-AOK and nobody does
+# for a machine: the clock is the machine's own, so chrony keeps the
+# distribution's configuration and disciplines it; nothing names the device's
+# timezone; and there are no native programs to link.
+IN_AOK=0
+[ -d /proc/ish ] && IN_AOK=1
+
+# apk add, with every package downloaded whole before any is installed.
+# apk-tools 3 (Alpine 3.23+) streams each package from the mirror straight into
+# extraction, so the connection is read only as fast as files are written. Under
+# emulation that is slow, and if the app is suspended mid-install it stops
+# altogether; a mirror drops a connection left unread for a few minutes
+# (measured: a reader paused for 3 minutes lost the rest of a 68 MB transfer),
+# and apk reports that as "I/O error" on whatever it was extracting.
+# --cache-predownload fetches the whole transaction into the cache first
+# (/var/cache/apk when /etc/apk/cache is not set up) and installs from there; a
+# failed download stops the run before anything is installed, and a retry keeps
+# what already arrived. Up to three tries. The downloaded packages are deleted
+# afterwards unless the system keeps an apk cache of its own. apk-tools 2 has no
+# such option and streams as it always did.
+apk_add() {
+    _apk_opts=""
+    _apk_purge=""
+    case "$(apk --version 2>/dev/null)" in
+        "apk-tools 3."*)
+            _apk_opts="--cache-predownload"
+            [ -e /etc/apk/cache ] || _apk_purge=/var/cache/apk
+            ;;
+    esac
+    _apk_try=1
+    while :; do
+        apk add $_apk_opts "$@"
+        _apk_rc=$?
+        [ "$_apk_rc" -eq 0 ] && break
+        [ "$_apk_try" -ge 3 ] && break
+        _apk_try=$((_apk_try + 1))
+        note "apk add failed; trying again ($_apk_try of 3)"
+    done
+    [ -n "$_apk_purge" ] && rm -f "$_apk_purge"/*.apk
+    return "$_apk_rc"
+}
+
 # ---- config (env overrides; prompts interactively when run on a TTY) ------
 NEW_HOSTNAME="${NEW_HOSTNAME:-}"
-SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"
+SUDO_NOPASSWD="${SUDO_NOPASSWD:-}"
 
-# Defaults offered at the prompts.
-DEF_TZ="${TZ_NAME:-America/Los_Angeles}"
+# Defaults offered at the prompts. The timezone offered is the device's own, as
+# the app reports it; a build too old to report one offers the old default.
+HOST_TZ="$(cat /proc/ish/timezone 2>/dev/null)"
+TZ_PRESET="${TZ_NAME:+1}"
+DEF_TZ="${TZ_NAME:-${HOST_TZ:-America/Los_Angeles}}"
+# (a machine of its own: the zone it already has, else UTC)
+if [ "$IN_AOK" = 0 ] && [ -z "${TZ_NAME:-}" ]; then
+    DEF_TZ="$(cat /etc/timezone 2>/dev/null)"
+    [ -n "$DEF_TZ" ] && [ -f "/usr/share/zoneinfo/$DEF_TZ" ] || DEF_TZ=UTC
+fi
 DEF_USER="${TARGET_USER:-${SUDO_USER:-}}"
 if [ -z "$DEF_USER" ] || [ "$DEF_USER" = root ]; then
     DEF_USER="$(awk -F: '$3>=1000 && $3<2000 {print $1; exit}' /etc/passwd)"
@@ -50,6 +108,11 @@ fi
 [ -n "$DEF_USER" ] || DEF_USER="aok"
 DEF_HOSTNAME="$(cat /etc/hostname 2>/dev/null)"
 [ -n "$DEF_HOSTNAME" ] && [ "$DEF_HOSTNAME" != localhost ] || DEF_HOSTNAME="alpine-ish"
+WHERE="iSH-AOK  (terminal-only userspace)"
+if [ "$IN_AOK" = 0 ]; then
+    [ "$DEF_HOSTNAME" = "alpine-ish" ] && DEF_HOSTNAME="alpine-vm"
+    WHERE="$(uname -m), on a kernel of its own"
+fi
 
 # ask <var> <prompt> <default>: keep an env-provided value; else prompt on a
 # TTY; else use the default (so piped/ssh runs never block).
@@ -68,6 +131,10 @@ ask() {
 ask TZ_NAME     "Timezone (e.g. America/New_York, UTC)" "$DEF_TZ"
 ask TARGET_USER "Primary login username to set up"      "$DEF_USER"
 ask NEW_HOSTNAME "Hostname"                              "$DEF_HOSTNAME"
+# Passwordless unless you say otherwise: the login above is created with no
+# password, so a rule that asks for one would leave it unable to use sudo.
+ask SUDO_NOPASSWD "Passwordless sudo for ${TARGET_USER:-the admin group}? (y/n)" "y"
+case "$SUDO_NOPASSWD" in [Yy]*|1) SUDO_NOPASSWD=1 ;; *) SUDO_NOPASSWD=0 ;; esac
 
 # Create the chosen login if it does not exist yet (fresh rootfs).
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != root ] && ! id "$TARGET_USER" >/dev/null 2>&1; then
@@ -79,6 +146,45 @@ if [ -n "$TARGET_USER" ] && id "$TARGET_USER" >/dev/null 2>&1; then
     TARGET_HOME="$(awk -F: -v u="$TARGET_USER" '$1==u{print $6}' /etc/passwd)"
 fi
 note "timezone=$TZ_NAME  login=${TARGET_USER:-<none>}  hostname=${NEW_HOSTNAME:-<keep>}"
+
+# ===========================================================================
+log "Choosing the fastest package mirror (a couple of minutes)"
+# ===========================================================================
+# The stock repositories are dl-cdn.alpinelinux.org, one CDN for everyone, and a
+# mirror near the device can be several times faster: measured 2026-09-26 from
+# London, 0.8 MB/s from dl-cdn and 2.6 MB/s from the mirror this picked, for the
+# same 68 MB package. setup-apkrepos -f (alpine-conf) times a small request to
+# every mirror on Alpine's list and takes the quickest. It appends that mirror
+# after dl-cdn, where apk may go on using dl-cdn, so the list is emptied first
+# and holds only the mirror afterwards; the stock list is kept as
+# repositories.aok-dl-cdn, and put back if no mirror answers or the run is
+# interrupted. Only a stock list is replaced -- one naming anything else (edge,
+# testing, a mirror of one's own) is left as it is -- and MIRROR=keep skips this.
+MIRROR="${MIRROR:-fastest}"
+REPOS=/etc/apk/repositories
+if [ "$MIRROR" = keep ]; then
+    note "keeping $REPOS (MIRROR=keep)"
+elif grep -Ev '^[[:space:]]*(#|$)' "$REPOS" 2>/dev/null |
+        grep -Evq '^https?://dl-cdn\.alpinelinux\.org/alpine/[^/]+/(main|community)/?$'; then
+    note "keeping $REPOS: it is not the stock dl-cdn list"
+else
+    apk update >/dev/null 2>&1
+    command -v setup-apkrepos >/dev/null 2>&1 || apk_add -q alpine-conf >/dev/null 2>&1
+    if command -v setup-apkrepos >/dev/null 2>&1; then
+        cp "$REPOS" "$REPOS.aok-dl-cdn"
+        trap 'cp "$REPOS.aok-dl-cdn" "$REPOS"; exit 130' INT TERM HUP
+        : > "$REPOS"
+        if setup-apkrepos -c -f >/dev/null 2>&1 && grep -q '^[^#].*/main$' "$REPOS"; then
+            note "mirror: $(sed -n 's#/[^/]*/main$##p' "$REPOS" | head -1)  (was dl-cdn; kept in $REPOS.aok-dl-cdn)"
+        else
+            cp "$REPOS.aok-dl-cdn" "$REPOS"
+            note "no mirror answered; keeping dl-cdn"
+        fi
+        trap - INT TERM HUP
+    else
+        note "could not install alpine-conf (setup-apkrepos); keeping dl-cdn"
+    fi
+fi
 
 # ===========================================================================
 log "Installing packages (this is the slow part under emulation)"
@@ -103,7 +209,7 @@ PKGS="
   fastfetch figlet ncurses lazygit
 "
 apk update >/dev/null 2>&1 || note "apk update failed (continuing with cached index)"
-if apk add --no-progress $PKGS; then
+if apk_add --no-progress $PKGS; then
     note "packages installed"
 else
     note "WARNING: 'apk add' reported errors; review above and re-run if needed"
@@ -115,6 +221,19 @@ log "Timezone -> $TZ_NAME"
 if [ -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
     ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
     echo "$TZ_NAME" > /etc/timezone
+    # Taking the device's own zone leaves the choice with iSH-AOK, which moves
+    # /etc/localtime along with the device at each boot for as long as
+    # /etc/aok-localtime names the zone it holds (see /AOK/docs/roots.md). A
+    # zone set in TZ_NAME, or a different one typed at the prompt, stays put.
+    if [ -z "$TZ_PRESET" ] && [ "$TZ_NAME" = "$HOST_TZ" ]; then
+        printf '%s\n' \
+            "# /etc/localtime names this zone because it is the device's. iSH-AOK" \
+            "# moves it along with the device, at boot, for as long as it still names" \
+            "# this zone; choose any other and it is left alone from then on. Keep this" \
+            "# file: without it a UTC /etc/localtime looks like the distribution's own." \
+            "$TZ_NAME" > /etc/aok-localtime
+        note "following the device's zone from boot to boot (/etc/aok-localtime)"
+    fi
     note "$(date)"
 else
     note "zoneinfo for '$TZ_NAME' not found; leaving clock as-is"
@@ -152,7 +271,7 @@ log "Hostname"
 if [ -n "$NEW_HOSTNAME" ]; then
     echo "$NEW_HOSTNAME" > /etc/hostname
 elif [ ! -s /etc/hostname ] || [ "$(cat /etc/hostname 2>/dev/null)" = localhost ]; then
-    echo "alpine-ish" > /etc/hostname
+    echo "$DEF_HOSTNAME" > /etc/hostname
 fi
 hostname "$(cat /etc/hostname)" 2>/dev/null || true
 note "$(cat /etc/hostname)"
@@ -162,14 +281,23 @@ log "sudo for the wheel group"
 # ===========================================================================
 grep -q '^@includedir /etc/sudoers.d' /etc/sudoers 2>/dev/null || \
     echo '@includedir /etc/sudoers.d' >> /etc/sudoers
+# Named to sort FIRST: sudo reads /etc/sudoers.d in name order and the LAST
+# matching rule wins, so a fragment the user adds (zz-me-nopasswd, 90-me, ...)
+# must come after this one to be able to override it. AOK's earlier name,
+# wheel, sorted after the common ones -- a user's NOPASSWD file was silently
+# beaten by its password rule -- so that file goes, if it is still ours.
+_old=/etc/sudoers.d/wheel
+if [ -f "$_old" ] && { [ "$(cat "$_old")" = '%wheel ALL=(ALL) NOPASSWD: ALL' ] || [ "$(cat "$_old")" = '%wheel ALL=(ALL) ALL' ]; }; then
+    rm -f "$_old"
+fi
 if [ "$SUDO_NOPASSWD" = 1 ]; then
-    echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/wheel
+    echo '%wheel ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-wheel
     note "passwordless sudo for %wheel"
 else
-    echo '%wheel ALL=(ALL) ALL' > /etc/sudoers.d/wheel
-    note "%wheel sudo (password required; set SUDO_NOPASSWD=1 for passwordless)"
+    echo '%wheel ALL=(ALL) ALL' > /etc/sudoers.d/00-wheel
+    note "%wheel sudo (password required -- the login needs one: passwd ${TARGET_USER:-<user>})"
 fi
-chmod 0440 /etc/sudoers.d/wheel
+chmod 0440 /etc/sudoers.d/00-wheel
 if [ -n "$TARGET_USER" ] && id "$TARGET_USER" >/dev/null 2>&1; then
     id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx wheel || adduser "$TARGET_USER" wheel 2>/dev/null
     note "$TARGET_USER is in: $(id -nG "$TARGET_USER")"
@@ -188,9 +316,9 @@ note "root + ${TARGET_USER:-} now use bash"
 # ===========================================================================
 log "MOTD"
 # ===========================================================================
-cat > /etc/motd <<'MOTD'
+cat > /etc/motd <<MOTD
 
-   Alpine Linux 3.23  .  iSH-AOK  (terminal-only userspace)
+   Alpine Linux $(cut -d. -f1,2 /etc/alpine-release 2>/dev/null)  .  $WHERE
    ------------------------------------------------------------
    services :  rc-service <name> {start|stop|status}
    on boot  :  rc-update {add|del} <name> <runlevel>
@@ -266,14 +394,15 @@ chmod 0644 /etc/profile.d/40-aok-tools.sh
 note "wrote /etc/profile.d/30-aok-niceties.sh and 40-aok-tools.sh"
 
 # ===========================================================================
-log "chrony (iSH-aware: monitor only, host owns the clock)"
+[ "$IN_AOK" = 1 ] && log "chrony (iSH-aware: monitor only, host owns the clock)"
+[ "$IN_AOK" = 1 ] || log "chrony (the distribution's configuration: this machine's clock is its own)"
 # ===========================================================================
 # In iSH the guest system clock IS the host (iOS) clock, already NTP-synced by
 # iOS. chronyd therefore runs with -x (no clock control) and we keep the
 # default localhost UDP command port: the unix command socket does NOT work
 # under iSH (chronyc -> "506 Cannot talk to daemon"), so we must NOT set
 # 'cmdport 0'. Dropping 'need net' avoids the unusable ifupdown service.
-if [ -d /etc/chrony ]; then
+if [ "$IN_AOK" = 1 ] && [ -d /etc/chrony ]; then
     cat > /etc/chrony/chrony.conf <<'CHRONYCONF'
 # chrony.conf -- tuned for iSH-AOK (monitoring mode; see /etc/conf.d/chronyd -x)
 pool pool.ntp.org iburst
@@ -529,6 +658,31 @@ TMUXCONF
 }
 write_tmux /root root
 [ -n "$TARGET_HOME" ] && write_tmux "$TARGET_HOME" "$TARGET_USER"
+
+# ===========================================================================
+log "iSH-AOK native programs"
+# ===========================================================================
+# native-links.sh links the app's native programs -- SmallCLUE's applets, zsh,
+# dash as `sh`, motepad and the rest of /AOK/native -- into
+# /usr/local/native-bin, put first on PATH for login shells, and into
+# /usr/local/bin, which every default PATH has ahead of /bin. --no-shell,
+# because this script chose the login shells above. persist-links.sh links your
+# own /AOK/persist/bin into /usr/local/bin, for the sessions that never read
+# /etc/profile.d (`ssh host cmd`, cron, services). NATIVE_LINKS=0 skips both.
+if [ "$IN_AOK" = 0 ]; then
+    note "not under iSH-AOK: there are no native programs to link"
+elif [ "${NATIVE_LINKS:-1}" = 1 ]; then
+    if [ -f /AOK/tools/native-links.sh ] && [ -x /AOK/native/smallclue ]; then
+        sh /AOK/tools/native-links.sh --no-shell 2>&1 | sed 's/^/    /'
+    else
+        note "this iSH-AOK has no /AOK/native; native links skipped"
+    fi
+    if [ -f /AOK/tools/persist-links.sh ] && [ -d /AOK/persist/bin ]; then
+        sh /AOK/tools/persist-links.sh 2>&1 | sed 's/^/    /'
+    fi
+else
+    note "NATIVE_LINKS=0: native links skipped"
+fi
 
 # ===========================================================================
 log "Enable + start services"

@@ -9,6 +9,9 @@
 #define INT_BOUND 5
 #define INT_UNDEFINED 6
 #define INT_FPU 7 // do not try to use the fpu. instead, try to realize the truth: there is no fpu.
+// #MF: an x87 instruction that waits found an unmasked exception pending
+// (the status word's ES), jit/gadgets-aarch64/x87.S. SIGFPE.
+#define INT_MF 16
 #define INT_DOUBLE 8 // interrupt during interrupt, i.e. interruptception
 #define INT_GPF 13
 #define INT_PF 14
@@ -37,6 +40,25 @@
 // (only the host backing shrank), so it must NOT retry through mem_ptr_fault.
 #define INT_BUS 0x103
 // Synthetic interrupt for RISC-V ECALL (syscall) entry. Not wired to a
-// syscall table yet (riscv64_guest_plan.md patch 4) — same staging as
+// syscall table yet (docs/historical/riscv64_guest_plan.md patch 4) — same staging as
 // INT_ARM64_SVC above.
 #define INT_RISCV64_ECALL 0x104
+// Synthetic interrupt for an instruction fetch from a page that is mapped but
+// not executable (tlb_fetch): SIGSEGV with SEGV_ACCERR at segfault_addr, never
+// retried as a read. Chosen when the fault is emitted -- for a JIT, when the
+// block is translated -- because a read of that page would succeed, and the
+// ordinary fault path's retry would only run into the same fetch again.
+#define INT_PF_EXEC 0x105
+// A misaligned access that must be aligned (an arm64 atomic): SIGBUS with
+// BUS_ADRALN at segfault_addr, as Linux sends. Never a page fault: the page is
+// fine, and retrying through mem_ptr_fault re-ran the access forever.
+#define INT_ALIGN 0x106
+// #GP with an error code: the selector a segment load, IRET or sigreturn
+// could not use (bits 15-2: index and TI), or vector * 8 + 2 for `int n`
+// through a gate user mode may not use. Plain INT_GPF is #GP(0). The code
+// travels in the interrupt number rather than in cpu_state, so a later #GP(0)
+// raised by a gadget cannot report an earlier fault's code; handle_interrupt
+// splits it back out.
+#define INT_GPF_CODE_BASE 0x10000
+#define INT_GPF_CODE(code) (INT_GPF_CODE_BASE | ((code) & 0xffff))
+#define INT_IS_GPF_CODE(interrupt) (((interrupt) & ~0xffff) == INT_GPF_CODE_BASE)

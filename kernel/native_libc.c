@@ -6,6 +6,9 @@
 
 #define NATIVE_LIBC_NO_REDIRECT
 
+#ifdef __APPLE__
+#include <net/if_dl.h>
+#endif
 #include <dirent.h>
 #include <errno.h>
 #include <getopt.h>
@@ -15,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <net/if.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -27,10 +31,16 @@
 #include <unistd.h>
 #include <utmpx.h>
 
+#include "fs/net_vif.h"
+#include "kernel/net_ns.h"
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
+#include "kernel/nlibc_shadow.h"
+#include "kernel/sha_crypt.h"
 #include "platform/platform.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
+#include "fs/dev.h"
 #include "kernel/native.h"
 #include "kernel/native_io.h"
 #include "kernel/native_kqueue.h"
@@ -38,6 +48,7 @@
 #include "kernel/native_syscall.h"
 #include "kernel/task.h"
 #include "fs/tty.h"
+#include "fs/tty-real.h"
 #include "kernel/uts.h"
 #include "util/list.h"
 #include "fs/fd.h"
@@ -93,6 +104,7 @@ static int nlibc_host_errno(int guest_err) {
         case 38: return ENOSYS;   // Linux 38 is macOS 78; this is the one that bit
         case 39: return ENOTEMPTY;
         case 40: return ELOOP;
+        case 61: return ENODATA;
 
         // The socket errnos. Every one of these used to land on the default
         // and come out as EINVAL, which is how a perfectly ordinary
@@ -301,12 +313,24 @@ int nlibc_close(int fd_no) {
     return (int) nlibc_ret(native_syscall(NATIVE_SYS_close, fd_no));
 }
 
+// A read or write that came back with less than was asked, or with EAGAIN,
+// has drained the descriptor (or filled it): the program will now wait for
+// the next edge, and a kqueue registration held back as already reported has
+// to be watched again -- kernel/native_kqueue.h's nlibc_kqueue_io_hook, which
+// costs one load when the program has no queue. `res` is the syscall's own
+// result, before translation.
+static void nlibc_note_io(int fd_no, sqword_t res, size_t asked, bool write) {
+    if (res == _EAGAIN || (res > 0 && (size_t) res < asked))
+        nlibc_kqueue_io_hook(fd_no, write);
+}
+
 ssize_t nlibc_read(int fd_no, void *buf, size_t n) {
     NATIVE_FRAME;
     guest_addr_t guest_buf = native_scratch_alloc(n);
     if (guest_buf == 0 && n > 0)
         return nlibc_fail(_ENOMEM);
     sqword_t res = native_syscall(NATIVE_SYS_read, fd_no, guest_buf, n);
+    nlibc_note_io(fd_no, res, n, false);
     if (res > 0 && native_scratch_get(buf, guest_buf, (size_t) res) < 0)
         return nlibc_fail(_EFAULT);
     return nlibc_ret(res);
@@ -317,7 +341,9 @@ ssize_t nlibc_write(int fd_no, const void *buf, size_t n) {
     guest_addr_t guest_buf = native_scratch_put(buf, n);
     if (guest_buf == 0 && n > 0)
         return nlibc_fail(_ENOMEM);
-    return nlibc_ret(native_syscall(NATIVE_SYS_write, fd_no, guest_buf, n));
+    sqword_t res = native_syscall(NATIVE_SYS_write, fd_no, guest_buf, n);
+    nlibc_note_io(fd_no, res, n, true);
+    return nlibc_ret(res);
 }
 
 off_t nlibc_lseek(int fd_no, off_t off, int whence) {
@@ -346,13 +372,27 @@ static void nlibc_guest_stat_to_host(const struct arm64_stat_ *in, struct stat *
     out->st_nlink = (nlink_t) in->nlink;
     out->st_uid = (uid_t) in->uid;
     out->st_gid = (gid_t) in->gid;
-    out->st_rdev = (dev_t) in->rdev;
+    // Linux's packing, repacked for the host: native `ls -l /dev/null` read
+    // the raw number with Darwin's major()/minor() and showed "0, 259".
+    out->st_rdev = dev_real_from_fake((dev_t_) in->rdev);
     out->st_size = (off_t) in->size;
     out->st_blksize = (blksize_t) in->blksize;
     out->st_blocks = (blkcnt_t) in->blocks;
     out->st_atime = (time_t) in->atime;
     out->st_mtime = (time_t) in->mtime;
     out->st_ctime = (time_t) in->ctime;
+    // The nanoseconds too: without them every native program saw whole
+    // seconds, so find -newer called a file made in the same second as its
+    // reference "not newer", and -printf %T@ printed .0000000000.
+#if defined(__APPLE__)
+    out->st_atimespec.tv_nsec = (long) in->atime_nsec;
+    out->st_mtimespec.tv_nsec = (long) in->mtime_nsec;
+    out->st_ctimespec.tv_nsec = (long) in->ctime_nsec;
+#else
+    out->st_atim.tv_nsec = (long) in->atime_nsec;
+    out->st_mtim.tv_nsec = (long) in->mtime_nsec;
+    out->st_ctim.tv_nsec = (long) in->ctime_nsec;
+#endif
 }
 
 static int nlibc_statat(int dirfd, const char *path, struct stat *st, dword_t at_flags) {
@@ -439,8 +479,15 @@ char *nlibc_realpath(const char *path, char *resolved) {
         return NULL;
     }
     char canonical[MAX_PATH];
-    err = generic_getpath(fd, canonical);
+    // The path a reader is shown. In a lazily unmounted mount no path names
+    // the file -- the lookup path is a private staging point (kernel/fs.h) --
+    // so this fails as getcwd there does, which is where a Linux realpath(3)
+    // of a relative name fails too.
+    bool unreachable = false;
+    err = generic_getpath_shown(fd, canonical, &unreachable);
     native_close(fd);
+    if (err >= 0 && unreachable)
+        err = _ENOENT;
     if (err < 0) {
         nlibc_fail(err);
         return NULL;
@@ -644,6 +691,40 @@ int nlibc_unlink(const char *path) {
     NATIVE_FRAME;
     NLIBC_PATH(guest_path, path);
     return (int) nlibc_ret(native_syscall(NATIVE_SYS_unlinkat, AT_FDCWD_, guest_path, 0));
+}
+// mount(2) and umount2(2) as Linux defines them -- arguments, flag values and
+// all -- for SmallCLUE's mount and umount (SMALLCLUE_HOST_LINUX_MOUNT, meson).
+// Darwin's mount() takes different arguments and its MNT_FORCE is another
+// number, so these are not the host names redirected: SmallCLUE calls them
+// through smallclueHostMount/smallclueHostUmount2 (kernel/smallclue_glue.c).
+// The source, type and data of a mount may each be NULL, as on Linux.
+int nlibc_linux_mount(const char *source, const char *target, const char *type,
+                      unsigned long flags, const void *data) {
+    NATIVE_FRAME;
+    guest_addr_t guest_source = 0, guest_type = 0, guest_data = 0;
+    if (source != NULL && (guest_source = native_scratch_str(source)) == 0)
+        return nlibc_fail(_ENOMEM);
+    NLIBC_PATH(guest_target, target);
+    if (type != NULL && (guest_type = native_scratch_str(type)) == 0)
+        return nlibc_fail(_ENOMEM);
+    if (data != NULL && (guest_data = native_scratch_str((const char *) data)) == 0)
+        return nlibc_fail(_ENOMEM);
+    return (int) nlibc_ret(native_syscall(NATIVE_SYS_mount, guest_source, guest_target,
+            guest_type, (dword_t) flags, guest_data));
+}
+int nlibc_linux_umount2(const char *target, int flags) {
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_target, target);
+    return (int) nlibc_ret(native_syscall(NATIVE_SYS_umount2, guest_target, flags));
+}
+
+// remove(3): unlink, or rmdir for a directory -- on the GUEST. Unrouted it was
+// the host's, and libgit2 calls it (repository.c) on a path inside the repo.
+int nlibc_remove(const char *path) {
+    int r = nlibc_unlink(path);
+    if (r < 0 && (errno == EISDIR || errno == EPERM))
+        r = nlibc_rmdir(path);
+    return r;
 }
 int nlibc_rmdir(const char *path) {
     NATIVE_FRAME;
@@ -1142,9 +1223,13 @@ static FILE *nlibc_std_stream(int fd) {
             // A funopen stream is fully buffered by default, and a native
             // program exits by returning rather than through exit(), so
             // nothing would ever flush it -- printf output simply vanished.
-            // Match what a terminal program expects instead: stderr
-            // unbuffered, stdout line-buffered. nlibc_flush_std() below still
-            // catches the tail when stdout is a pipe.
+            // Match what a C program gets instead: stderr unbuffered, stdout
+            // line-buffered on a terminal and fully buffered otherwise, as
+            // glibc and Darwin decide it. nlibc_flush_std() below catches the
+            // tail. Line-buffering a file or pipe too made `seq 1 300000 >f`
+            // one write per line (6.5x slower than the emulated GNU seq) and
+            // put stdout ahead of stderr in a `2>&1` file where Linux has
+            // stderr first (`cmp -l a b >out 2>&1`).
             //
             // stdin stays FULLY buffered, deliberately diverging from a
             // terminal program's usual line-buffered stdin. Darwin's __srefill
@@ -1159,11 +1244,25 @@ static FILE *nlibc_std_stream(int fd) {
             // available either way); the only casualty is the implicit
             // flush-stdout-before-reading-stdin idiom, which cross-program is
             // exactly the coupling this exists to break.
+            // (The tty probe sets ENOTTY; the first printf must not.)
+            int saved = errno;
             setvbuf(nlibc_std[fd], NULL,
-                    fd == 2 ? _IONBF : fd == 0 ? _IOFBF : _IOLBF, BUFSIZ);
+                    fd == 2 ? _IONBF : fd == 0 || !nlibc_isatty(fd) ? _IOFBF : _IOLBF, BUFSIZ);
+            errno = saved;
         }
     }
     return nlibc_std[fd];
+}
+
+// Before another program shares our stdout: a fully buffered stdout (see
+// nlibc_std_stream) would otherwise land after the child's output -- awk's
+// `print "a"; print "x" | "cat"` printed x first, find -ok prompted before
+// the names it had printed. One-true-awk and GNU find flush here themselves
+// only sometimes; when stdout was line-buffered every program got this
+// order for free, so the shim keeps giving it.
+static void nlibc_flush_stdout_for_child(void) {
+    if (nlibc_std[1] != NULL)
+        fflush(nlibc_std[1]);
 }
 
 // Called once a native program returns, before its task exits: a return from
@@ -1290,11 +1389,58 @@ int nlibc_puts(const char *s) {
     return fputc('\n', nlibc_stdout()) == EOF ? EOF : 0;
 }
 int nlibc_putchar(int c) { return fputc(c, nlibc_stdout()); }
+// Only where the two differ; everything else Darwin already words as glibc
+// does (checked errno by errno against glibc 2.36).
+static const char *nlibc_glibc_errtext(int err) {
+    switch (err) {
+        case ENXIO:           return "No such device or address";
+        case ENODEV:          return "No such device";
+        case EBUSY:           return "Device or resource busy";
+        case EXDEV:           return "Invalid cross-device link";
+        case ERANGE:          return "Numerical result out of range";
+        case EOVERFLOW:       return "Value too large for defined data type";
+        case EILSEQ:          return "Invalid or incomplete multibyte or wide character";
+        case ETIMEDOUT:       return "Connection timed out";
+        case ENOTCONN:        return "Transport endpoint is not connected";
+        case EISCONN:         return "Transport endpoint is already connected";
+        case ESHUTDOWN:       return "Cannot send after transport endpoint shutdown";
+        case EADDRNOTAVAIL:   return "Cannot assign requested address";
+        case EAFNOSUPPORT:    return "Address family not supported by protocol";
+        case ETOOMANYREFS:    return "Too many references: cannot splice";
+        case ESTALE:          return "Stale file handle";
+        case EDQUOT:          return "Disk quota exceeded";
+#if defined(__APPLE__)
+        case EOPNOTSUPP:      return "Operation not supported";
+        case ENODATA:         return "No data available";
+        case ENOATTR:         return "No data available";
+        case EOWNERDEAD:      return "Owner died";
+#endif
+        default:              return NULL;
+    }
+}
+
+char *nlibc_strerror(int err) {
+    const char *text = nlibc_glibc_errtext(err);
+    return text != NULL ? (char *) text : strerror(err);
+}
+
+#if defined(__APPLE__)
+int nlibc_strerror_r(int err, char *buf, size_t len) {
+    const char *text = nlibc_glibc_errtext(err);
+    if (text == NULL)
+        return strerror_r(err, buf, len);
+    if (len == 0)
+        return ERANGE;
+    snprintf(buf, len, "%s", text);
+    return strlen(text) < len ? 0 : ERANGE;
+}
+#endif
+
 void nlibc_perror(const char *s) {
     if (s != NULL && s[0] != '\0')
-        fprintf(nlibc_stderr(), "%s: %s\n", s, strerror(errno));
+        fprintf(nlibc_stderr(), "%s: %s\n", s, nlibc_strerror(errno));
     else
-        fprintf(nlibc_stderr(), "%s\n", strerror(errno));
+        fprintf(nlibc_stderr(), "%s\n", nlibc_strerror(errno));
 }
 
 // ----------------------------------------------------------------- process
@@ -1331,10 +1477,19 @@ static void nlibc_exec_reset_handlers(void);
 //
 // And the signal has to reach the program that replaced us, which nothing else
 // will ever signal: the sender aimed at this pid, and after a real exec this
-// pid would BE that program. So forward it, then checkpoint -- which, for a
-// default-fatal signal, does not return, and that is exactly right. The
-// stand-in dies of the same signal the job was killed with, so the parent's
-// wait status says "killed by SIGTERM" instead of "exited 127".
+// pid would BE that program. So forward it -- and then leave it to the
+// program. This used to checkpoint on it too, which for a default-fatal
+// signal killed the stand-in at once (its handlers are reset to SIG_DFL), and
+// that is only right when the program dies of it as well. A program that
+// TRAPS the signal lives on, on Linux, as this pid: `su -c 'exec sh script'`
+// whose script cleans up on SIGHUP. Here its parent saw the pid exit 129 at
+// once while the trap ran on, unseen, for seconds (bip, 2026-10-02 -- the
+// Wayland session reported ended while its cleanup still ran). So what was
+// forwarded is discarded here, and the stand-in ends when the program does,
+// with its status: "killed by SIGTERM" when it was, exit 0 when it trapped it.
+// SIGKILL still kills the stand-in at once, as it kills the pid on Linux, and
+// the job-control signals still stop and continue it, so the parent's wait
+// sees the stop.
 //
 // SIGCHLD is the one signal not forwarded: the only child this task has is the
 // exec'd program itself, so a SIGCHLD here is news ABOUT it, never news FOR it.
@@ -1356,6 +1511,7 @@ static void nlibc_exec_forward_signals(dword_t child) {
     sigset_t_ pending = __atomic_load_n(&current->pending, __ATOMIC_ACQUIRE) |
             __atomic_load_n(&current->sighand->pending, __ATOMIC_ACQUIRE);
     pending &= ~((sigset_t_) 1 << (SIGCHLD_ - 1));
+    sigset_t_ forwarded = pending;
     for (int sig = 1; sig < NUM_SIGS && pending != 0; sig++) {
         sigset_t_ bit = (sigset_t_) 1 << (sig - 1);
         if (!(pending & bit))
@@ -1363,6 +1519,12 @@ static void nlibc_exec_forward_signals(dword_t child) {
         pending &= ~bit;
         sys_kill((pid_t_) child, (dword_t) sig);
     }
+    // Kept for the stand-in itself: SIGKILL, and stop and continue.
+    forwarded &= ~(((sigset_t_) 1 << (SIGKILL_ - 1)) | ((sigset_t_) 1 << (SIGSTOP_ - 1)) |
+            ((sigset_t_) 1 << (SIGTSTP_ - 1)) | ((sigset_t_) 1 << (SIGTTIN_ - 1)) |
+            ((sigset_t_) 1 << (SIGTTOU_ - 1)) | ((sigset_t_) 1 << (SIGCONT_ - 1)));
+    if (forwarded != 0)
+        signal_discard_pending(current, forwarded);
 }
 
 // Exit as the exec'd program did. The guest's wait status word already encodes
@@ -1373,6 +1535,9 @@ static void nlibc_exec_forward_signals(dword_t child) {
 // everything that asks HOW the job ended: `jobs`, the "Terminated" line, and
 // any script testing the status word itself.
 static noreturn void nlibc_exec_standin(dword_t child) {
+    // Recorded for a checkpoint: this task is now nothing but the wait below,
+    // and that is what a restore has to rebuild (nlibc_exec_standin_resume).
+    current->native_standin_child = child;
     nlibc_exec_reset_handlers();
     for (;;) {
         int status = 0;
@@ -1384,8 +1549,28 @@ static noreturn void nlibc_exec_standin(dword_t child) {
         if (res != _EINTR)
             nlibc_exit(127);        // the child really is unreachable
         nlibc_exec_forward_signals(child);
-        native_checkpoint();        // may not return, and that is the point
+        native_checkpoint();        // SIGKILL, a stop, a freeze
     }
+}
+
+// The same wait, for a stand-in a checkpoint is bringing back (kernel/native.c,
+// native_exec_run_pending): the program it stood in for is restored as its
+// child, so resuming means waiting again, not running anything.
+void nlibc_exec_standin_resume(dword_t child) {
+    nlibc_exec_standin(child);
+}
+
+// A traced task's exec, done for real (native_exec_in_place_wanted,
+// kernel/native.h). The program's streams are flushed first, as its exit would
+// have flushed them, and the image is handed the program's own mask without the
+// shim's holds, as the stand-in's child is (nlibc_spawn_default_sigmask).
+// Returns only if the exec failed.
+static int nlibc_exec_in_place(const char *path, char *const argv[], char *const envp[]) {
+    struct native_spawn_opts mask = { .pgid = NATIVE_SPAWN_PGID_INHERIT };
+    nlibc_spawn_default_sigmask(&mask);
+    nlibc_flush_std();
+    nlibc_flush_thread_streams();
+    return native_exec_in_place(path, argv, envp, mask.set_sigmask, mask.sigmask);
 }
 
 // Wait for a child this shim started on the program's behalf, and do not let a
@@ -1425,6 +1610,7 @@ static int nlibc_wait_for_child(dword_t pid, int *status) {
 }
 
 static int nlibc_exec_common(const char *path, char *const argv[], int search_path) {
+    nlibc_flush_stdout_for_child();
     if (path == NULL || argv == NULL)
         return nlibc_fail(_EFAULT);
 
@@ -1434,6 +1620,9 @@ static int nlibc_exec_common(const char *path, char *const argv[], int search_pa
             return nlibc_fail(_ENOENT);
         path = resolved;
     }
+
+    if (native_exec_in_place_wanted())
+        return nlibc_fail(nlibc_exec_in_place(path, argv, native_env_vector()));
 
     // Through native_spawn_opts rather than native_spawn, for the signal mask:
     // this is the program saying "become that program", and the shim's own
@@ -1500,7 +1689,10 @@ int nlibc_execlp(const char *file, const char *arg0, ...) {
 int nlibc_system(const char *command) {
     if (command == NULL)
         return 1;   // a shell is available
-    char *argv[] = { (char *) "/bin/sh", (char *) "-c", (char *) command, NULL };
+    nlibc_flush_stdout_for_child();
+    // argv[0] "sh", as glibc and musl give it: the shell's errors are
+    // "sh: 1: x: not found", not "/bin/sh: ...".
+    char *argv[] = { (char *) "sh", (char *) "-c", (char *) command, NULL };
     dword_t pid = 0;
     int err = native_spawn("/bin/sh", argv, native_env_vector(), &pid);
     if (err < 0)
@@ -1549,6 +1741,15 @@ static int nlibc_wait_status_to_host(int status) {
 
 pid_t nlibc_waitpid(pid_t pid, int *status, int options) {
     int res = native_waitpid((dword_t) pid, status, options);
+    // Interrupted: run the handler BEFORE the caller sees EINTR, which is the
+    // order a real delivery has and what native_syscall does for every call it
+    // routes. This one calls the kernel directly, so the handler used to wait
+    // for the next checkpoint: a program that sets a flag in its handler and
+    // waits in a loop -- SmallCLUE's init, waiting for children until a
+    // shutdown signal -- found the flag still clear, waited again, and never
+    // shut down.
+    if (res == _EINTR)
+        native_checkpoint();
     if (res >= 0 && status != NULL)
         *status = nlibc_wait_status_to_host(*status);
     return res < 0 ? nlibc_fail(res) : res;
@@ -1618,6 +1819,7 @@ FILE *nlibc_popen(const char *command, const char *mode) {
         return NULL;
     }
     bool reading = mode[0] == 'r';
+    nlibc_flush_stdout_for_child();
 
     int fds[2];
     if (nlibc_pipe(fds) < 0)
@@ -1650,7 +1852,9 @@ FILE *nlibc_popen(const char *command, const char *mode) {
     };
 
     struct nlibc_popen *entry = malloc(sizeof(*entry));
-    char *argv[] = { (char *) "/bin/sh", (char *) "-c", (char *) command, NULL };
+    // argv[0] "sh", as glibc and musl give it: the shell's errors are
+    // "sh: 1: x: not found", not "/bin/sh: ...".
+    char *argv[] = { (char *) "sh", (char *) "-c", (char *) command, NULL };
     dword_t pid = 0;
     int err = entry != NULL
         ? native_spawn_opts("/bin/sh", argv, native_env_vector(), &opts, &pid)
@@ -1960,6 +2164,44 @@ int nlibc_futimes(int fd_no, const struct timeval times[2]) {
     return nlibc_utimens(AT_FDCWD, NULL, fd_no, times);
 }
 
+// The nanosecond interface. It was not routed at all: SmallCLUE's cp -p
+// called the HOST's utimensat with a guest path, which failed with ENOENT
+// (or, for a path that also exists on the host, changed a host file's times).
+// The host's UTIME_NOW/UTIME_OMIT are not Linux's numbers on Darwin, so they
+// are translated rather than passed through.
+static guest_addr_t nlibc_put_timespecs(const struct timespec times[2]) {
+    struct nlibc_guest_timespec ts[2];
+    for (int i = 0; i < 2; i++) {
+        ts[i].sec = times[i].tv_sec;
+        if (times[i].tv_nsec == UTIME_NOW)
+            ts[i].nsec = NLIBC_UTIME_NOW;
+        else if (times[i].tv_nsec == UTIME_OMIT)
+            ts[i].nsec = NLIBC_UTIME_OMIT;
+        else
+            ts[i].nsec = times[i].tv_nsec;
+    }
+    return native_scratch_put(ts, sizeof(ts));
+}
+
+int nlibc_utimensat(int dirfd, const char *path, const struct timespec times[2], int flags) {
+    NATIVE_FRAME;
+    guest_addr_t guest_ts = 0;
+    if (times != NULL && (guest_ts = nlibc_put_timespecs(times)) == 0)
+        return nlibc_fail(_ENOMEM);
+    NLIBC_PATH(guest_path, path);
+    dword_t guest_flags = (flags & AT_SYMLINK_NOFOLLOW) ? AT_SYMLINK_NOFOLLOW_ : 0;
+    return (int) nlibc_ret(native_syscall(NATIVE_SYS_utimensat, nlibc_at_fd(dirfd),
+            guest_path, guest_ts, guest_flags));
+}
+
+int nlibc_futimens(int fd_no, const struct timespec times[2]) {
+    NATIVE_FRAME;
+    guest_addr_t guest_ts = 0;
+    if (times != NULL && (guest_ts = nlibc_put_timespecs(times)) == 0)
+        return nlibc_fail(_ENOMEM);
+    return (int) nlibc_ret(native_syscall(NATIVE_SYS_utimensat, fd_no, 0, guest_ts, 0));
+}
+
 int nlibc_chroot(const char *path) {
     NATIVE_FRAME;
     NLIBC_PATH(guest_path, path);
@@ -2005,9 +2247,9 @@ int nlibc_linkat(int oldfd, const char *from, int newfd, const char *to, int fla
 int nlibc_mknod(const char *path, mode_t mode, dev_t dev) {
     NATIVE_FRAME;
     NLIBC_PATH(guest_path, path);
-    // Darwin packs a dev_t as major:minor = 24:8, the guest as 8:8 in the low
-    // 16 bits (fs/dev.h). Repacking rather than passing the raw number through.
-    dword_t guest_dev = (dword_t) (((major(dev) & 0xff) << 8) | (minor(dev) & 0xff));
+    // Darwin packs a dev_t as major:minor = 24:8, the guest as Linux does
+    // (fs/dev.h). Repacking rather than passing the raw number through.
+    dword_t guest_dev = (dword_t) dev_fake_from_real(dev);
     return (int) nlibc_ret(native_syscall(NATIVE_SYS_mknodat, AT_FDCWD_, guest_path,
             mode, guest_dev));
 }
@@ -2015,6 +2257,9 @@ int nlibc_mknod(const char *path, mode_t mode, dev_t dev) {
 // The guest writes the asm-generic statfs64 (fs/stat.h's amd64_statfs_, shared
 // by every 64-bit ABI here); Darwin's struct statfs is a different shape with
 // different field widths, so the fields are copied across by name.
+// The type and fsid matter as much as the counts: `stat -f` prints them,
+// and df and find -fstype ask the type. They were dropped, so every guest
+// filesystem looked like type 0.
 static void nlibc_guest_statfs_to_host(const struct amd64_statfs_ *in, struct statfs *out) {
     memset(out, 0, sizeof(*out));
     out->f_bsize = (uint32_t) (in->bsize > 0 ? in->bsize : 4096);
@@ -2023,6 +2268,54 @@ static void nlibc_guest_statfs_to_host(const struct amd64_statfs_ *in, struct st
     out->f_bavail = in->bavail;
     out->f_files = in->files;
     out->f_ffree = in->ffree;
+    out->f_type = (uint32_t) in->type;
+#if defined(__linux__)
+    out->f_fsid.__val[0] = (int) (uint32_t) in->fsid;
+    out->f_fsid.__val[1] = (int) (uint32_t) (in->fsid >> 32);
+    out->f_namelen = (long) in->namelen;
+    out->f_frsize = (long) in->frsize;
+#else
+    out->f_fsid.val[0] = (int32_t) (uint32_t) in->fsid;
+    out->f_fsid.val[1] = (int32_t) (uint32_t) (in->fsid >> 32);
+#endif
+}
+
+// statvfs from the guest's statfs directly, not through the host statfs:
+// Darwin's struct statfs has nowhere to keep the name length or the
+// fundamental block size, which statvfs does carry.
+static void nlibc_guest_statfs_to_statvfs(const struct amd64_statfs_ *in, struct statvfs *out) {
+    memset(out, 0, sizeof(*out));
+    out->f_bsize = (unsigned long) (in->bsize > 0 ? in->bsize : 4096);
+    out->f_frsize = (unsigned long) (in->frsize > 0 ? in->frsize : out->f_bsize);
+    out->f_blocks = in->blocks;
+    out->f_bfree = in->bfree;
+    out->f_bavail = in->bavail;
+    out->f_files = in->files;
+    out->f_ffree = in->ffree;
+    out->f_favail = in->ffree;
+    out->f_fsid = (unsigned long) in->fsid;
+    out->f_namemax = in->namelen > 0 ? (unsigned long) in->namelen : NAME_MAX;
+    // ST_RDONLY and ST_NOSUID are 1 and 2 on Linux and Darwin alike.
+    out->f_flag = (unsigned long) (in->flags & 3);
+}
+
+// The guest's statfs of a path (fd < 0) or a descriptor.
+static int nlibc_guest_statfs(const char *path, int fd_no, struct amd64_statfs_ *out) {
+    guest_addr_t guest_buf = native_scratch_alloc(sizeof(struct amd64_statfs_));
+    if (guest_buf == 0)
+        return nlibc_fail(_ENOMEM);
+    sqword_t res;
+    if (fd_no < 0) {
+        NLIBC_PATH(guest_path, path);
+        res = native_syscall(NATIVE_SYS_statfs, guest_path, guest_buf);
+    } else {
+        res = native_syscall(NATIVE_SYS_fstatfs, fd_no, guest_buf);
+    }
+    if (res < 0)
+        return nlibc_fail((int) res);
+    if (native_scratch_get(out, guest_buf, sizeof(*out)) < 0)
+        return nlibc_fail(_EFAULT);
+    return 0;
 }
 
 // The descriptor form. Rust reaches for it where a path form would race, and
@@ -2031,54 +2324,38 @@ int nlibc_fstatfs(int fd_no, void *buf) {
     NATIVE_FRAME;
     if (buf == NULL)
         return nlibc_fail(_EFAULT);
-    guest_addr_t guest_buf = native_scratch_alloc(sizeof(struct amd64_statfs_));
-    if (guest_buf == 0)
-        return nlibc_fail(_ENOMEM);
-    sqword_t res = native_syscall(NATIVE_SYS_fstatfs, fd_no, guest_buf);
-    if (res < 0)
-        return nlibc_fail((int) res);
+    if (fd_no < 0)
+        return nlibc_fail(_EBADF);
     struct amd64_statfs_ guest_statfs;
-    if (native_scratch_get(&guest_statfs, guest_buf, sizeof(guest_statfs)) < 0)
-        return nlibc_fail(_EFAULT);
+    if (nlibc_guest_statfs(NULL, fd_no, &guest_statfs) < 0)
+        return -1;
     nlibc_guest_statfs_to_host(&guest_statfs, buf);
     return 0;
 }
 
-// statvfs is POSIX's shape over the same information, and Darwin's struct
-// statvfs is a different layout from its struct statfs -- so this is a
-// translation of a translation rather than an alias. Only the fields a caller
-// can act on are filled; f_flag's ST_* bits have no guest counterpart the
-// guest statfs carries, so it is left zero rather than invented.
-static void nlibc_statfs_to_statvfs(const struct statfs *in, struct statvfs *out) {
-    memset(out, 0, sizeof(*out));
-    out->f_bsize = in->f_bsize;
-    out->f_frsize = in->f_bsize;
-    out->f_blocks = in->f_blocks;
-    out->f_bfree = in->f_bfree;
-    out->f_bavail = in->f_bavail;
-    out->f_files = in->f_files;
-    out->f_ffree = in->f_ffree;
-    out->f_favail = in->f_ffree;
-    out->f_namemax = NAME_MAX;
-}
-
+// statvfs is POSIX's shape over the same information; f_flag carries only
+// ST_RDONLY and ST_NOSUID, the bits both systems number alike.
 int nlibc_fstatvfs(int fd_no, struct statvfs *out) {
-    struct statfs host;
+    NATIVE_FRAME;
     if (out == NULL)
         return nlibc_fail(_EFAULT);
-    if (nlibc_fstatfs(fd_no, &host) < 0)
+    if (fd_no < 0)
+        return nlibc_fail(_EBADF);
+    struct amd64_statfs_ guest_statfs;
+    if (nlibc_guest_statfs(NULL, fd_no, &guest_statfs) < 0)
         return -1;
-    nlibc_statfs_to_statvfs(&host, out);
+    nlibc_guest_statfs_to_statvfs(&guest_statfs, out);
     return 0;
 }
 
 int nlibc_statvfs(const char *path, struct statvfs *out) {
-    struct statfs host;
+    NATIVE_FRAME;
     if (out == NULL)
         return nlibc_fail(_EFAULT);
-    if (nlibc_statfs(path, &host) < 0)
+    struct amd64_statfs_ guest_statfs;
+    if (nlibc_guest_statfs(path, -1, &guest_statfs) < 0)
         return -1;
-    nlibc_statfs_to_statvfs(&host, out);
+    nlibc_guest_statfs_to_statvfs(&guest_statfs, out);
     return 0;
 }
 
@@ -2086,16 +2363,9 @@ int nlibc_statfs(const char *path, void *buf) {
     NATIVE_FRAME;
     if (buf == NULL)
         return nlibc_fail(_EFAULT);
-    NLIBC_PATH(guest_path, path);
-    guest_addr_t guest_buf = native_scratch_alloc(sizeof(struct amd64_statfs_));
-    if (guest_buf == 0)
-        return nlibc_fail(_ENOMEM);
-    sqword_t res = native_syscall(NATIVE_SYS_statfs, guest_path, guest_buf);
-    if (res < 0)
-        return nlibc_fail((int) res);
     struct amd64_statfs_ guest_statfs;
-    if (native_scratch_get(&guest_statfs, guest_buf, sizeof(guest_statfs)) < 0)
-        return nlibc_fail(_EFAULT);
+    if (nlibc_guest_statfs(path, -1, &guest_statfs) < 0)
+        return -1;
     nlibc_guest_statfs_to_host(&guest_statfs, buf);
     return 0;
 }
@@ -2105,6 +2375,21 @@ int nlibc_statfs(const char *path, void *buf) {
 // function with no image to execute. nlibc_execv's spawn-then-exit is the
 // shape that does work (see the process section above).
 int nlibc_fork(void)                        { return nlibc_fail(_ENOSYS); } // init, runit, micro
+// vfork MUST be refused here rather than left to reach the host, and the
+// difference between the two is not academic. An unredirected vfork() forks the
+// EMULATOR: measured with native dash, `dash -c '/bin/echo first; /bin/echo
+// second'` printed only "second" and left three ish processes behind, because
+// dash's vforkexec path called Darwin's vfork and the child was a second copy
+// of the whole app running shell code -- which is what vfork forbids even
+// between ordinary processes.
+//
+// It was invisible because it half-worked: an external command that is the LAST
+// thing a shell does goes through shellexec/execve instead, which the spawn
+// path handles correctly, so simple cases looked fine.
+//
+// Any native program that calls vfork has the same hazard, so this belongs in
+// the shim rather than in a patch to one of them.
+int nlibc_vfork(void)                       { return nlibc_fail(_ENOSYS); } // dash's vforkexec
 int nlibc_glob(const char *p, int f, void *e, void *g) { (void) p; (void) f; (void) e; (void) g; return nlibc_fail(_ENOSYS); } // shell globbing
 
 // Darwin and Linux number their ioctls differently, so the request has to be
@@ -2199,6 +2484,25 @@ int nlibc_ioctl(int fd_no, unsigned long request, ...) {
             *(int *) arg = (int) value;
             return 0;
         }
+        // Linux's own termios requests, passed through untranslated, for a
+        // host program that speaks the guest's termios directly rather than
+        // Darwin's: SmallCLUE's stty, whose `stty -g` has to match GNU's on
+        // Linux bit for bit and whose settings include ones Darwin's struct
+        // has no field for (iuclc, olcuc, xcase, cmspar, swtch). The argument
+        // is the kernel's struct termios (termios_, 36 bytes). These numbers
+        // carry none of Darwin's IOC_IN/OUT/VOID bits, so no Darwin ioctl
+        // can be mistaken for one; on a real Darwin kernel the same call just
+        // fails, and stty falls back to tcgetattr.
+        case TCGETS_:
+            if (arg == NULL)
+                return nlibc_fail(_EFAULT);
+            return nlibc_tty_ioctl(fd_no, TCGETS_, arg, sizeof(struct termios_), true) < 0 ? -1 : 0;
+        case TCSETS_:
+        case TCSETSW_:
+        case TCSETSF_:
+            if (arg == NULL)
+                return nlibc_fail(_EFAULT);
+            return nlibc_tty_ioctl(fd_no, (dword_t) request, arg, sizeof(struct termios_), false) < 0 ? -1 : 0;
         default:
             return nlibc_fail(_ENOSYS);
     }
@@ -2388,9 +2692,8 @@ int nlibc_sysctl(int *name, unsigned namelen, void *old, size_t *oldlen,
 //
 //   available_parallelism() asks hw.ncpu to size a thread pool. AOK
 //   deliberately reports fewer CPUs than the host has, reserving cores so the
-//   emulator does not starve the UI (get_cpu_count_for_affinity,
-//   kernel/resource.c). A program that went around that would size itself for
-//   the whole machine.
+//   emulator does not starve the UI (get_cpu_count, platform/darwin.c). A
+//   program that went around that would size itself for the whole machine.
 //
 //   std_detect asks hw.optional.arm.FEAT_* to decide which instructions it may
 //   emit. A native program IS host arm64 code, so the host's answer is the only
@@ -2440,7 +2743,7 @@ int nlibc_sysctlbyname(const char *name, void *old, size_t *oldlen,
         return -1;
     }
 
-    long value = get_cpu_count_for_affinity();
+    long value = get_cpu_count_allowed();
     if (old == NULL) {
         if (oldlen != NULL)
             *oldlen = sizeof(int);
@@ -2535,7 +2838,7 @@ int nlibc_getmntinfo(struct statfs **mntbufp, int flags) {
 
     // Freed on the next call: getmntinfo's contract is that the caller never
     // owns the buffer.
-    static struct statfs *previous;
+    static __thread struct statfs *previous;
     free(previous);
     previous = out;
     *mntbufp = out;
@@ -2633,18 +2936,108 @@ static int nlibc_tty_ioctl(int fd_no, dword_t cmd, void *arg, size_t size, bool 
 // So anything a caller might reasonably READ and pass on has to survive the
 // round trip, not just the handful the shim itself acts upon. These are the
 // flags OpenSSH's ttymodes.c actually puts on the wire.
+//
+// And then everything else Darwin can say too, for stty: `stty -g` saves a
+// terminal as all four flag words and every control character, `stty saved`
+// puts it back, and a bit this table drops is a setting that silently does
+// not survive the round trip. Linux-only bits (IUCLC, OLCUC, XCASE, CMSPAR,
+// VSWTC) have no Darwin field to travel in and stay as the guest has them.
 static const struct nlibc_flagmap nlibc_lflags[] = {
     { ISIG,   ISIG_ },   { ICANON,  ICANON_ },  { ECHO,   ECHO_ },
     { ECHOE,  ECHOE_ },  { ECHOK,   ECHOK_ },   { NOFLSH, NOFLSH_ },
     { ECHOCTL, ECHOCTL_ }, { ECHOKE, ECHOKE_ }, { IEXTEN, IEXTEN_ },
+    { ECHONL, ECHONL_ }, { TOSTOP,  TOSTOP_ },
+#ifdef ECHOPRT
+    { ECHOPRT, ECHOPRT_ },
+#endif
+#ifdef FLUSHO
+    { FLUSHO, FLUSHO_ },
+#endif
+#ifdef PENDIN
+    { PENDIN, PENDIN_ },
+#endif
+#ifdef EXTPROC
+    { EXTPROC, EXTPROC_ },
+#endif
 };
 static const struct nlibc_flagmap nlibc_iflags[] = {
     { ICRNL,  ICRNL_ },  { IXON,    IXON_ },    { INLCR,  INLCR_ },
-    { IGNCR,  IGNCR_ },
+    { IGNCR,  IGNCR_ },  { IGNBRK,  IGNBRK_ },  { BRKINT, BRKINT_ },
+    { IGNPAR, IGNPAR_ }, { PARMRK,  PARMRK_ },  { INPCK,  INPCK_ },
+    { ISTRIP, ISTRIP_ }, { IXANY,   IXANY_ },   { IXOFF,  IXOFF_ },
+#ifdef IMAXBEL
+    { IMAXBEL, IMAXBEL_ },
+#endif
+#ifdef IUTF8
+    { IUTF8,  IUTF8_ },
+#endif
 };
+// The delay fields' values are single bits on both sides except TABDLY,
+// where Darwin's TAB3 is OXTABS (0x4) rather than TAB1|TAB2: that one is
+// mapped by value below.
 static const struct nlibc_flagmap nlibc_oflags[] = {
     { OPOST,  OPOST_ },  { ONLCR,   ONLCR_ },   { OCRNL,  OCRNL_ },
     { ONOCR,  ONOCR_ },  { ONLRET,  ONLRET_ },
+#ifdef OFILL
+    { OFILL,  OFILL_ },
+#endif
+#ifdef OFDEL
+    { OFDEL,  OFDEL_ },
+#endif
+#ifdef NL1
+    { NL1,    NL1_ },
+#endif
+#if defined(CR1) && defined(CR2)
+    { CR1,    CR1_ },    { CR2,     CR2_ },
+#endif
+#ifdef BS1
+    { BS1,    BS1_ },
+#endif
+#ifdef VT1
+    { VT1,    VT1_ },
+#endif
+#ifdef FF1
+    { FF1,    FF1_ },
+#endif
+};
+// c_cflag's single bits. CSIZE is a field, not a flag, so it is mapped by
+// value below, and so is the speed.
+static const struct nlibc_flagmap nlibc_cflags[] = {
+    { CSTOPB, CSTOPB_ }, { CREAD,   CREAD_ },   { PARENB, PARENB_ },
+    { PARODD, PARODD_ }, { HUPCL,   HUPCL_ },   { CLOCAL, CLOCAL_ },
+#ifdef CRTSCTS
+    { CRTSCTS, CRTSCTS_ },
+#endif
+};
+
+#ifdef TABDLY
+static unsigned long nlibc_tabdly_to_host(dword_t oflags) {
+    switch (oflags & TABDLY_) {
+        case TAB1_: return TAB1;
+        case TAB2_: return TAB2;
+        case TAB3_: return TAB3;
+        default:    return TAB0;
+    }
+}
+static dword_t nlibc_tabdly_to_guest(unsigned long oflag) {
+    switch (oflag & TABDLY) {
+        case TAB1: return TAB1_;
+        case TAB2: return TAB2_;
+        case TAB3: return TAB3_;
+        default:   return 0;
+    }
+}
+#endif
+
+// The control characters, both ways. "No character" is 0 in Linux's c_cc
+// and _POSIX_VDISABLE (0xff) in Darwin's; VMIN and VTIME are counts, not
+// characters, and are copied as they are.
+static const struct { int host; int guest; } nlibc_cc_map[] = {
+    { VINTR, VINTR_ },   { VQUIT, VQUIT_ },     { VERASE, VERASE_ },
+    { VKILL, VKILL_ },   { VEOF, VEOF_ },       { VEOL, VEOL_ },
+    { VEOL2, VEOL2_ },   { VSTART, VSTART_ },   { VSTOP, VSTOP_ },
+    { VSUSP, VSUSP_ },   { VREPRINT, VREPRINT_ }, { VDISCARD, VDISCARD_ },
+    { VWERASE, VWERASE_ }, { VLNEXT, VLNEXT_ },
 };
 
 int nlibc_tcgetattr(int fd_no, struct termios *out) {
@@ -2657,28 +3050,21 @@ int nlibc_tcgetattr(int fd_no, struct termios *out) {
     out->c_lflag = nlibc_flags_to_host(t.lflags, nlibc_lflags, NLIBC_MAP_COUNT(nlibc_lflags));
     out->c_iflag = nlibc_flags_to_host(t.iflags, nlibc_iflags, NLIBC_MAP_COUNT(nlibc_iflags));
     out->c_oflag = nlibc_flags_to_host(t.oflags, nlibc_oflags, NLIBC_MAP_COUNT(nlibc_oflags));
+#ifdef TABDLY
+    out->c_oflag |= nlibc_tabdly_to_host(t.oflags);
+#endif
     out->c_cc[VMIN] = t.cc[VMIN_];
     out->c_cc[VTIME] = t.cc[VTIME_];
-    out->c_cc[VINTR] = t.cc[VINTR_];
-    out->c_cc[VQUIT] = t.cc[VQUIT_];
-    out->c_cc[VSUSP] = t.cc[VSUSP_];
-    out->c_cc[VEOF] = t.cc[VEOF_];
     // The rest of the control characters, for the same reason as the flags
     // above: a caller may be DESCRIBING this terminal to something else rather
     // than driving it. Measured over a real ssh session with only the six
     // above mapped, the remote pty came up reporting
     //     erase = <undef>; kill = <undef>; eol = <undef>
     // which is a terminal where backspace does not erase.
-    out->c_cc[VERASE] = t.cc[VERASE_];
-    out->c_cc[VKILL] = t.cc[VKILL_];
-    out->c_cc[VSTART] = t.cc[VSTART_];
-    out->c_cc[VSTOP] = t.cc[VSTOP_];
-    out->c_cc[VEOL] = t.cc[VEOL_];
-    out->c_cc[VREPRINT] = t.cc[VREPRINT_];
-    out->c_cc[VDISCARD] = t.cc[VDISCARD_];
-    out->c_cc[VWERASE] = t.cc[VWERASE_];
-    out->c_cc[VLNEXT] = t.cc[VLNEXT_];
-    out->c_cc[VEOL2] = t.cc[VEOL2_];
+    for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_cc_map); i++) {
+        byte_t c = t.cc[nlibc_cc_map[i].guest];
+        out->c_cc[nlibc_cc_map[i].host] = c == 0 ? _POSIX_VDISABLE : c;
+    }
     // c_cflag, which was not translated at ALL. Measured on a real session,
     // the remote pty came up "speed 0 baud ... cs5" -- five-bit characters on
     // a hung line.
@@ -2688,12 +3074,16 @@ int nlibc_tcgetattr(int fd_no, struct termios *out) {
     // and a BSD sshd honours an ospeed of 0 by SIGHUPing the session leader.
     // The native path reintroduced exactly that by leaving c_cflag empty. Read
     // the guest's own speed rather than asserting one, so a tty that really
-    // does report B0 still says so.
-    out->c_cflag |= CS8;   // the guest's CS8_ is its CSIZE_, i.e. always 8 here
-    if (t.cflags & CREAD_)  out->c_cflag |= CREAD;
-    if (t.cflags & PARENB_) out->c_cflag |= PARENB;
-    if (t.cflags & HUPCL_)  out->c_cflag |= HUPCL;
-    speed_t baud = ((t.cflags & CBAUD_) == B0_) ? B0 : B38400;
+    // does report B0 still says so -- and so does anything else: the CLI
+    // console carries the host terminal's speed and character size.
+    out->c_cflag = nlibc_flags_to_host(t.cflags, nlibc_cflags, NLIBC_MAP_COUNT(nlibc_cflags));
+    switch (t.cflags & CSIZE_) {
+        case CS5_: out->c_cflag |= CS5; break;
+        case CS6_: out->c_cflag |= CS6; break;
+        case CS7_: out->c_cflag |= CS7; break;
+        case CS8_: out->c_cflag |= CS8; break;
+    }
+    speed_t baud = tty_speed_to_host(t.cflags);
     cfsetispeed(out, baud);
     cfsetospeed(out, baud);
     return 0;
@@ -2712,11 +3102,36 @@ int nlibc_tcsetattr(int fd_no, int action, const struct termios *in) {
     for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_lflags); i++) lmask |= nlibc_lflags[i].guest;
     for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_iflags); i++) imask |= nlibc_iflags[i].guest;
     for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_oflags); i++) omask |= nlibc_oflags[i].guest;
+    dword_t cmask = CSIZE_ | CBAUD_;
+    for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_cflags); i++) cmask |= nlibc_cflags[i].guest;
+#ifdef TABDLY
+    omask |= TABDLY_;
+#endif
     t.lflags = (t.lflags & ~lmask) | nlibc_flags_to_guest(in->c_lflag, nlibc_lflags, NLIBC_MAP_COUNT(nlibc_lflags));
     t.iflags = (t.iflags & ~imask) | nlibc_flags_to_guest(in->c_iflag, nlibc_iflags, NLIBC_MAP_COUNT(nlibc_iflags));
-    t.oflags = (t.oflags & ~omask) | nlibc_flags_to_guest(in->c_oflag, nlibc_oflags, NLIBC_MAP_COUNT(nlibc_oflags));
+    dword_t oflags = nlibc_flags_to_guest(in->c_oflag, nlibc_oflags, NLIBC_MAP_COUNT(nlibc_oflags));
+#ifdef TABDLY
+    oflags |= nlibc_tabdly_to_guest(in->c_oflag);
+#endif
+    t.oflags = (t.oflags & ~omask) | oflags;
+    // c_cflag and the control characters were read back by tcgetattr but
+    // never written: `stty intr ^X`, `stty cs7` and restoring a `stty -g`
+    // string all reported success and changed nothing.
+    dword_t cflags = nlibc_flags_to_guest(in->c_cflag, nlibc_cflags, NLIBC_MAP_COUNT(nlibc_cflags));
+    switch (in->c_cflag & CSIZE) {
+        case CS5: cflags |= CS5_; break;
+        case CS6: cflags |= CS6_; break;
+        case CS7: cflags |= CS7_; break;
+        default:  cflags |= CS8_; break;
+    }
+    cflags |= tty_speed_from_host(cfgetospeed(in));
+    t.cflags = (t.cflags & ~cmask) | cflags;
     t.cc[VMIN_] = in->c_cc[VMIN];
     t.cc[VTIME_] = in->c_cc[VTIME];
+    for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_cc_map); i++) {
+        cc_t c = in->c_cc[nlibc_cc_map[i].host];
+        t.cc[nlibc_cc_map[i].guest] = c == _POSIX_VDISABLE ? 0 : c;
+    }
     return nlibc_tty_ioctl(fd_no, TCSETS_, &t, sizeof(t), false);
 }
 
@@ -2831,8 +3246,10 @@ int nlibc_unlockpt(int fd_no) {
 
 char *nlibc_ptsname(int fd_no) {
     // ptsname's contract is a pointer into storage the caller does not own,
-    // valid until the next call.
-    static char name[32];
+    // valid until the next call -- this thread's next call: native programs
+    // are threads of one process, and one buffer for all of them hands a
+    // program another's answer.
+    static __thread char name[32];
     dword_t number = 0;
     if (nlibc_tty_ioctl(fd_no, TIOCGPTN_, &number, sizeof(number), true) < 0)
         return NULL;
@@ -2882,11 +3299,79 @@ int nlibc_openpty(int *amaster, int *aslave, char *name,
     return 0;
 }
 
+// ---- one process, many programs: libc state that must be per thread --------
+// See native_libc.h. The host's versions of these keep their state, or the
+// buffer their answer is in, in one place for the process; a native program
+// is a thread, so here it is the thread's.
+char *nlibc_strtok(char *str, const char *sep) {
+    static __thread char *save;
+    return strtok_r(str, sep, &save);
+}
+
+struct tm *nlibc_gmtime(const time_t *t) {
+    static __thread struct tm result;
+    return gmtime_r(t, &result);
+}
+
+char *nlibc_asctime(const struct tm *tm) {
+    static __thread char buf[64];
+    return asctime_r(tm, buf);
+}
+
+#ifdef __APPLE__
+// POSIX basename and dirname as Darwin's are: the argument is not written to,
+// and the answer is in the callee's storage until the next call.
+char *nlibc_basename(char *path) {
+    static __thread char out[MAX_PATH];
+    if (path == NULL || *path == '\0')
+        return strcpy(out, ".");
+    const char *end = path + strlen(path);
+    while (end > path + 1 && end[-1] == '/')
+        end--;                              // trailing slashes
+    if (end == path + 1 && *path == '/')
+        return strcpy(out, "/");
+    const char *start = end;
+    while (start > path && start[-1] != '/')
+        start--;
+    size_t len = (size_t) (end - start);
+    if (len >= sizeof(out)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+char *nlibc_dirname(char *path) {
+    static __thread char out[MAX_PATH];
+    if (path == NULL || *path == '\0')
+        return strcpy(out, ".");
+    const char *end = path + strlen(path);
+    while (end > path + 1 && end[-1] == '/')
+        end--;                              // trailing slashes
+    while (end > path && end[-1] != '/')
+        end--;                              // the last component
+    if (end == path)
+        return strcpy(out, ".");            // no slash in it
+    while (end > path + 1 && end[-1] == '/')
+        end--;                              // the slashes before it
+    size_t len = (size_t) (end - path);
+    if (len >= sizeof(out)) {
+        errno = ENAMETOOLONG;
+        return NULL;
+    }
+    memcpy(out, path, len);
+    out[len] = '\0';
+    return out;
+}
+#endif
+
 // The guest's own answer, through /proc/self/fd -- AOK's procfs makes each
 // descriptor a symlink to what it points at (fs/proc/pid.c), which is how
 // ttyname is implemented on Linux too.
 char *nlibc_ttyname(int fd_no) {
-    static char name[MAX_PATH];
+    static __thread char name[MAX_PATH];
     if (!nlibc_isatty(fd_no)) {
         errno = ENOTTY;
         return NULL;
@@ -2982,10 +3467,10 @@ long nlibc_sysconf(int name) {
             // Found because Rust's available_parallelism() reported 1 while
             // nproc in the same guest said 4. nproc goes through
             // sched_getaffinity, which was right all along, so the two ways of
-            // asking disagreed. get_cpu_count_for_affinity is what
-            // sched_getaffinity uses (kernel/resource.c) and is the one source
-            // of truth for how many CPUs AOK is prepared to hand out.
-            return get_cpu_count_for_affinity();
+            // asking disagreed. get_cpu_count is what sched_getaffinity uses
+            // (kernel/resource.c) and is the one source of truth for how many
+            // CPUs AOK is prepared to hand out.
+            return get_cpu_count_allowed();
         case _SC_PHYS_PAGES: {
             unsigned procs = 0;
             uint64_t ram = 0;
@@ -3104,10 +3589,15 @@ static void *nlibc_thread_trampoline(void *opaque) {
     signal_thread_locals_init();
     current = start->task;   // inherit, so the shim has a task to work against
     nlibc_invocation_token_v = start->token;   // same run, same token
+    struct task *task = start->task;
     void *(*fn)(void *) = start->fn;
     void *arg = start->arg;
     free(start);
     void *result = fn(arg);
+    // Counted out only here: a thread that leaves by pthread_exit stays
+    // counted, which only ever keeps an exec from going in place.
+    if (task != NULL)
+        __atomic_sub_fetch(&task->native_helper_threads, 1, __ATOMIC_ACQ_REL);
     // This thread's syscall marshalling arena is a megabyte of the guest
     // address space, and the program that created the thread is still running
     // in that space. Left behind, a program that starts and finishes threads
@@ -3129,9 +3619,17 @@ int nlibc_pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     start->arg = arg;
     start->task = current;
     start->token = nlibc_invocation_token_v;
+    // A program with threads of its own cannot exec in place: they would run
+    // on in native code against a task whose image had been replaced
+    // (native_exec_in_place_wanted).
+    if (current != NULL)
+        __atomic_add_fetch(&current->native_helper_threads, 1, __ATOMIC_ACQ_REL);
     int err = pthread_create(thread, attr, nlibc_thread_trampoline, start);
-    if (err != 0)
+    if (err != 0) {
+        if (current != NULL)
+            __atomic_sub_fetch(&current->native_helper_threads, 1, __ATOMIC_ACQ_REL);
         free(start);
+    }
     return err;
 }
 
@@ -3206,6 +3704,62 @@ noreturn void nlibc_exit(int status) {
     do_exit_group((status & 0xff) << 8);
 }
 
+// abort(), the program's and not the app's.
+//
+// Left to the host it raises SIGABRT in the one process there is, and every
+// session goes with the program: build 558's Organizer crash on an iPad was a
+// Rust panic in native helix (tokio's reactor met an error it does not
+// expect; deps/rust-native is panic=abort), and the abort it ended in was the
+// app's. "A crash either way" was the reason for leaving it alone, and it is
+// not the same crash.
+//
+// Linux's abort raises SIGABRT for a handler to see -- one that returns
+// changes nothing, and one that never returns (longjmp, exit) is the program's
+// business -- and then the process dies of SIGABRT whatever the handler or
+// the mask said. So: the signal to this thread's task, a checkpoint to run a
+// handler there, and the task group ends with SIGABRT as its wait status,
+// which a shell reports as "Aborted" and 134.
+//
+// A program's own threads (nlibc_pthread_create) are host threads sharing its
+// one task, so whichever of them aborts ends the program, there -- as a fatal
+// signal taken at one of their checkpoints always has. The others are not
+// stopped by that: they run on in the program's code against a task that is
+// gone, every call into the shim fails, and a Rust thread that sees its
+// runtime fail panics in its turn. That second abort is the case below with
+// no task: the thread ends, and only the thread. (Rust's own join() does it
+// at once -- it panics when the thread it waited for left without a result.)
+noreturn void nlibc_abort(void) {
+    if (native_have_task()) {
+        native_syscall(NATIVE_SYS_tgkill, native_syscall(NATIVE_SYS_getpid),
+                native_syscall(NATIVE_SYS_gettid), SIGABRT_);
+        native_checkpoint();
+        // No flush of stdio: abort() makes no promise of one, and the stream
+        // another thread is in the middle of writing is locked.
+        do_exit_group(SIGABRT_);
+    }
+    pthread_exit(NULL);
+}
+
+#if defined(__APPLE__)
+// Darwin's assert() calls this, and the host's version prints to the app's
+// stderr and aborts the app. The message goes to the program's stderr, in
+// Darwin's words, and the program aborts.
+noreturn void nlibc_assert_rtn(const char *func, const char *file, int line, const char *expr) {
+    char message[512];
+    int n;
+    if (func != NULL)
+        n = snprintf(message, sizeof(message), "Assertion failed: (%s), function %s, file %s, line %d.\n",
+                     expr, func, file, line);
+    else
+        n = snprintf(message, sizeof(message), "Assertion failed: (%s), file %s, line %d.\n", expr, file, line);
+    if (n > (int) sizeof(message) - 1)
+        n = (int) sizeof(message) - 1;
+    if (n > 0 && native_have_task())
+        nlibc_write(2, message, (size_t) n);
+    nlibc_abort();
+}
+#endif
+
 // ---------------------------------------------------------------- networking
 //
 // AOK's sockets are real host sockets underneath (fs/sock.c), so what routing
@@ -3238,12 +3792,6 @@ static int nlibc_family_to_guest(int host_family) {
     for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_families); i++)
         if (nlibc_families[i].host == host_family)
             return nlibc_families[i].guest;
-    return -1;
-}
-static int nlibc_family_to_host(int guest_family) {
-    for (size_t i = 0; i < NLIBC_MAP_COUNT(nlibc_families); i++)
-        if (nlibc_families[i].guest == guest_family)
-            return nlibc_families[i].host;
     return -1;
 }
 
@@ -3475,6 +4023,9 @@ static int nlibc_accept_common(unsigned num, int fd_no, void *addr, socklen_t *l
             return nlibc_fail(_ENOMEM);
     }
     sqword_t res = native_syscall(num, fd_no, guest_sa, guest_salen);
+    // An accept that found nothing waiting has drained the listener.
+    if (num == NATIVE_SYS_accept)
+        nlibc_note_io(fd_no, res, 0, false);
     if (res < 0)
         return nlibc_fail((int) res);
     if (guest_sa != 0) {
@@ -3527,8 +4078,10 @@ ssize_t nlibc_sendto(int fd_no, const void *buf, size_t len, int flags,
         if (guest_sa == 0)
             return nlibc_fail(_ENOMEM);
     }
-    return nlibc_ret(native_syscall(NATIVE_SYS_sendto, fd_no, guest_buf, len,
-            nlibc_msg_to_guest(flags), guest_sa, guest_salen));
+    sqword_t res = native_syscall(NATIVE_SYS_sendto, fd_no, guest_buf, len,
+            nlibc_msg_to_guest(flags), guest_sa, guest_salen);
+    nlibc_note_io(fd_no, res, len, true);
+    return nlibc_ret(res);
 }
 
 ssize_t nlibc_send(int fd_no, const void *buf, size_t len, int flags) {
@@ -3551,6 +4104,7 @@ ssize_t nlibc_recvfrom(int fd_no, void *buf, size_t len, int flags,
     }
     sqword_t res = native_syscall(NATIVE_SYS_recvfrom, fd_no, guest_buf, len,
             nlibc_msg_to_guest(flags), guest_sa, guest_salen);
+    nlibc_note_io(fd_no, res, len, false);
     if (res < 0)
         return nlibc_fail((int) res);
     if (res > 0 && native_scratch_get(buf, guest_buf, (size_t) res) < 0)
@@ -3671,6 +4225,14 @@ static size_t nlibc_put_guest_msghdr(void *raw, bool w64, guest_addr_t name,
     return sizeof(*h);
 }
 
+// (For nlibc_note_io: how much a sendmsg or recvmsg asked for.)
+static size_t nlibc_msg_iov_total(const struct msghdr *msg) {
+    size_t total = 0;
+    for (int i = 0; msg->msg_iov != NULL && i < (int) msg->msg_iovlen; i++)
+        total += msg->msg_iov[i].iov_len;
+    return total;
+}
+
 ssize_t nlibc_sendmsg(int fd_no, const struct msghdr *msg, int flags) {
     NATIVE_FRAME;
     if (msg == NULL)
@@ -3765,8 +4327,10 @@ ssize_t nlibc_sendmsg(int fd_no, const struct msghdr *msg, int flags) {
     guest_addr_t guest_msg = native_scratch_put(hdr_raw, hdr_size);
     if (guest_msg == 0)
         return nlibc_fail(_ENOMEM);
-    return (ssize_t) nlibc_ret(native_syscall(NATIVE_SYS_sendmsg, fd_no, guest_msg,
-            nlibc_msg_to_guest(flags)));
+    sqword_t sent = native_syscall(NATIVE_SYS_sendmsg, fd_no, guest_msg,
+            nlibc_msg_to_guest(flags));
+    nlibc_note_io(fd_no, sent, nlibc_msg_iov_total(msg), true);
+    return (ssize_t) nlibc_ret(sent);
 }
 
 ssize_t nlibc_recvmsg(int fd_no, struct msghdr *msg, int flags) {
@@ -3829,6 +4393,7 @@ ssize_t nlibc_recvmsg(int fd_no, struct msghdr *msg, int flags) {
 
     sqword_t res = native_syscall(NATIVE_SYS_recvmsg, fd_no, guest_msg,
             nlibc_msg_to_guest(flags));
+    nlibc_note_io(fd_no, res, nlibc_msg_iov_total(msg), false);
     if (res < 0)
         return nlibc_fail((int) res);
 
@@ -4803,6 +5368,119 @@ int nlibc_getifaddrs(struct ifaddrs **ifap) {
         return -1;
     }
     *ifap = NULL;
+    // A program in a private network namespace has that namespace's
+    // interfaces, which is "lo" (kernel/net_ns.h) and its veth and dummy
+    // links (fs/net_vif.h), and not the host's. One block, as the host's own
+    // list is, so that freeifaddrs frees it.
+    struct net_namespace *net_ns = current_net_ns();
+    if (net_ns != NULL) {
+        struct nlibc_ifaddr_entry {
+            struct ifaddrs ifa;
+            struct sockaddr_storage addr, mask, broadcast;
+#ifdef __APPLE__
+            struct sockaddr_dl dl;
+#endif
+            char name[NET_VIF_NAME_MAX];
+        };
+        struct net_vif_info vifs[64];
+        int n_vifs = net_vif_list(net_ns, vifs, 64);
+        if (n_vifs > 64)
+            n_vifs = 64;
+        // A link entry an interface, and one an address.
+        int total = 1 + (atomic_load(&net_ns->lo_addr4) ? 1 : 0) + (atomic_load(&net_ns->lo_addr6) ? 1 : 0);
+        for (int i = 0; i < n_vifs; i++)
+            total += 1 + vifs[i].n_addrs;
+        struct nlibc_ifaddr_entry *entries = calloc((size_t) total, sizeof(*entries));
+        if (entries == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        int used = 0;
+        for (int i = -1; i < n_vifs; i++) {
+            const char *name = i < 0 ? "lo" : vifs[i].name;
+            unsigned flags = i < 0
+                ? IFF_LOOPBACK | (atomic_load(&net_ns->lo_up) ? IFF_UP | IFF_RUNNING : 0)
+                : IFF_BROADCAST | (vifs[i].kind == NET_VIF_DUMMY ? IFF_NOARP : IFF_MULTICAST) |
+                  (vifs[i].up ? IFF_UP : 0) | (vifs[i].lower_up ? IFF_RUNNING : 0);
+            struct nlibc_ifaddr_entry *link = &entries[used++];
+            snprintf(link->name, sizeof(link->name), "%s", name);
+            link->ifa.ifa_name = link->name;
+            link->ifa.ifa_flags = flags;
+#ifdef __APPLE__
+            // The link-level entry every interface has on this host: callers
+            // written against it read ifa_addr without asking whether it is there.
+            size_t nlen = strlen(name);
+            link->dl.sdl_len = sizeof(link->dl);
+            link->dl.sdl_family = AF_LINK;
+            link->dl.sdl_index = (u_short) (i < 0 ? 1 : vifs[i].index);
+            link->dl.sdl_type = i < 0 ? 24 /* IFT_LOOP */ : 6 /* IFT_ETHER */;
+            link->dl.sdl_nlen = (u_char) nlen;
+            memcpy(link->dl.sdl_data, name, nlen);
+            if (i >= 0 && nlen + 6 <= sizeof(link->dl.sdl_data)) {
+                link->dl.sdl_alen = 6;
+                memcpy(link->dl.sdl_data + nlen, vifs[i].mac, 6);
+            }
+            link->ifa.ifa_addr = (struct sockaddr *) &link->dl;
+#endif
+            int n_addrs = i < 0 ? 2 : vifs[i].n_addrs;
+            for (int j = 0; j < n_addrs; j++) {
+                bool v6;
+                uint8_t prefix, bytes[16] = {0};
+                if (i < 0) {
+                    v6 = j == 1;
+                    if (!(v6 ? atomic_load(&net_ns->lo_addr6) : atomic_load(&net_ns->lo_addr4)))
+                        continue;
+                    prefix = v6 ? 128 : 8;
+                    if (v6)
+                        bytes[15] = 1;
+                    else
+                        bytes[0] = 127, bytes[3] = 1;
+                } else {
+                    v6 = vifs[i].addrs[j].v6;
+                    prefix = vifs[i].addrs[j].prefix;
+                    memcpy(bytes, vifs[i].addrs[j].addr, 16);
+                }
+                struct nlibc_ifaddr_entry *e = &entries[used++];
+                snprintf(e->name, sizeof(e->name), "%s", name);
+                e->ifa.ifa_name = e->name;
+                e->ifa.ifa_flags = flags;
+                uint8_t mask[16] = {0};
+                for (int k = 0; k < 16; k++) {
+                    int bits = (int) prefix - k * 8;
+                    mask[k] = bits >= 8 ? 0xff : bits <= 0 ? 0 : (uint8_t) (0xff << (8 - bits));
+                }
+                if (v6) {
+                    struct sockaddr_in6 *addr = (struct sockaddr_in6 *) &e->addr, *m = (struct sockaddr_in6 *) &e->mask;
+                    addr->sin6_family = m->sin6_family = AF_INET6;
+#ifdef __APPLE__
+                    addr->sin6_len = m->sin6_len = sizeof(struct sockaddr_in6);
+#endif
+                    memcpy(&addr->sin6_addr, bytes, 16);
+                    memcpy(&m->sin6_addr, mask, 16);
+                } else {
+                    struct sockaddr_in *addr = (struct sockaddr_in *) &e->addr, *m = (struct sockaddr_in *) &e->mask;
+                    addr->sin_family = m->sin_family = AF_INET;
+#ifdef __APPLE__
+                    addr->sin_len = m->sin_len = sizeof(struct sockaddr_in);
+#endif
+                    memcpy(&addr->sin_addr, bytes, 4);
+                    memcpy(&m->sin_addr, mask, 4);
+                    if (i >= 0 && prefix < 31) {
+                        struct sockaddr_in *b = (struct sockaddr_in *) &e->broadcast;
+                        *b = *addr;
+                        b->sin_addr.s_addr |= ~m->sin_addr.s_addr;
+                        e->ifa.ifa_broadaddr = (struct sockaddr *) b;
+                    }
+                }
+                e->ifa.ifa_addr = (struct sockaddr *) &e->addr;
+                e->ifa.ifa_netmask = (struct sockaddr *) &e->mask;
+            }
+        }
+        for (int i = 0; i + 1 < used; i++)
+            entries[i].ifa.ifa_next = &entries[i + 1].ifa;
+        *ifap = &entries[0].ifa;
+        return 0;
+    }
     // The real one: this file is built with NATIVE_LIBC_NO_REDIRECT, so the
     // name is not the macro that brought us here.
     return getifaddrs(ifap);
@@ -5327,6 +6005,25 @@ static int nlibc_set_disposition(int guest_sig, nlibc_sighandler handler) {
     return err;
 }
 
+// What the kernel has for a signal this program never set. The table starts
+// all SIG_DFL, but SIG_IGN survives exec: a shell that ran `trap "" INT`
+// hands its children an ignored SIGINT, and they must be able to see it --
+// dash and bash refuse to trap a signal ignored on entry, nohup-style code
+// leaves it alone, env --list-signal-handling lists it. Until this, every
+// native program read SIG_DFL back.
+static nlibc_sighandler nlibc_inherited_disposition(int guest_sig) {
+    NATIVE_FRAME;
+    guest_addr_t guest_old = native_scratch_alloc(sizeof(struct sigaction_));
+    if (guest_old == 0)
+        return SIG_DFL;
+    if (native_syscall(NATIVE_SYS_rt_sigaction, guest_sig, 0, guest_old, sizeof(sigset_t_)) < 0)
+        return SIG_DFL;
+    struct sigaction_ old;
+    if (native_scratch_get(&old, guest_old, sizeof(old)) < 0)
+        return SIG_DFL;
+    return old.handler == SIG_IGN_ ? SIG_IGN : SIG_DFL;
+}
+
 int nlibc_sigaction(int host_sig, const struct sigaction *act, struct sigaction *oact) {
     if (host_sig <= 0 || host_sig >= NSIG)
         return nlibc_fail(_EINVAL);
@@ -5346,6 +6043,8 @@ int nlibc_sigaction(int host_sig, const struct sigaction *act, struct sigaction 
             oact->sa_flags |= SA_SIGINFO;
         } else {
             oact->sa_handler = nlibc_handlers[host_sig];
+            if (oact->sa_handler == SIG_DFL)
+                oact->sa_handler = nlibc_inherited_disposition(guest_sig);
         }
     }
     if (act == NULL)
@@ -5395,6 +6094,8 @@ nlibc_sighandler nlibc_signal(int host_sig, nlibc_sighandler handler) {
         return SIG_ERR;
     }
     nlibc_sighandler previous = nlibc_handlers[host_sig];
+    if (previous == SIG_DFL)
+        previous = nlibc_inherited_disposition(guest_sig);
     int err = nlibc_set_disposition(guest_sig, handler);
     if (err < 0) {
         nlibc_fail(err);
@@ -5429,6 +6130,44 @@ static void nlibc_exec_reset_handlers(void) {
         if (h != NULL && h != SIG_DFL && h != SIG_IGN)
             nlibc_signal(host_sig, SIG_DFL);
     }
+}
+
+// pthread_sigmask is the same request for one thread, and a native program's
+// thread is its task, so it is the task's guest mask -- never the host's, which
+// AOK holds as it does on purpose (the wake signal; see native_libc.h on
+// longjmp). Returns the error number rather than setting errno, as pthreads do.
+// libgit2's process spawner blocks SIGPIPE through it.
+int nlibc_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset) {
+    int saved = errno;
+    int r = nlibc_sigprocmask(how, set, oldset);
+    int err = r < 0 ? errno : 0;
+    errno = saved;
+    return err;
+}
+
+// getloadavg(3): the guest's load, from its /proc/loadavg, rather than the
+// host's. libgit2 seeds its random state with it.
+int nlibc_getloadavg(double loadavg[], int nelem) {
+    int fd = nlibc_open("/proc/loadavg", O_RDONLY);
+    if (fd < 0)
+        return -1;
+    char buf[128];
+    ssize_t n = nlibc_read(fd, buf, sizeof(buf) - 1);
+    nlibc_close(fd);
+    if (n <= 0)
+        return -1;
+    buf[n] = '\0';
+    int got = 0;
+    char *p = buf;
+    while (got < nelem && got < 3) {
+        char *end = NULL;
+        double v = strtod(p, &end);
+        if (end == p)
+            break;
+        loadavg[got++] = v;
+        p = end;
+    }
+    return got > 0 ? got : -1;
 }
 
 int nlibc_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
@@ -5487,7 +6226,63 @@ int nlibc_sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
     (void) old;
     if (oldset != NULL)
         nlibc_sigset_from_guest(prev_prog, oldset);
+
+    // A signal this call unblocked is delivered before it returns, which is
+    // when Linux delivers it. The call's own syscall checkpointed BEFORE the
+    // change, while the signal was still blocked, so without this it would
+    // wait for whatever syscall the program happens to make next -- and a
+    // program that unblocks and then tests a flag its handler sets would act
+    // on state the handler had not updated yet.
+    if (current != NULL && (prev_prog & ~current->native_prog_blocked) != 0)
+        native_checkpoint();
     return 0;
+}
+
+// ------------------------------------------------- BSD sigsetmask/sigblock
+//
+// 4.2BSD's signal mask as an int, one bit per signal at (sig - 1). Everything
+// they do goes through nlibc_sigprocmask, so the program's own mask
+// (native_prog_blocked) and the shim's forced blocking stay in step -- which
+// is the entire reason these exist rather than being left to the host. See the
+// note in native_libc.h for what an unrouted sigsetmask did to dash's `wait`.
+//
+// Signals above 31 have no bit and are left alone: that is BSD's own
+// limitation, not a shortcut, and a caller wanting more must use sigprocmask.
+static void nlibc_intmask_to_sigset(int mask, sigset_t *set) {
+    sigemptyset(set);
+    for (int sig = 1; sig < 32; sig++)
+        if (mask & (1 << (sig - 1)))
+            sigaddset(set, sig);
+}
+
+static int nlibc_sigset_to_intmask(const sigset_t *set) {
+    int mask = 0;
+    for (int sig = 1; sig < 32; sig++)
+        if (sigismember(set, sig) == 1)
+            mask |= 1 << (sig - 1);
+    return mask;
+}
+
+static int nlibc_sigmask_change(int how, int mask) {
+    sigset_t set, old;
+    nlibc_intmask_to_sigset(mask, &set);
+    sigemptyset(&old);
+    if (nlibc_sigprocmask(how, &set, &old) < 0)
+        return -1;
+    return nlibc_sigset_to_intmask(&old);
+}
+
+int nlibc_sigsetmask(int mask) {
+    return nlibc_sigmask_change(SIG_SETMASK, mask);
+}
+
+int nlibc_sigblock(int mask) {
+    return nlibc_sigmask_change(SIG_BLOCK, mask);
+}
+
+int nlibc_siggetmask(void) {
+    // SIG_BLOCK of nothing: the mask is unchanged and the old one comes back.
+    return nlibc_sigmask_change(SIG_BLOCK, 0);
 }
 
 int nlibc_sigpending(sigset_t *set) {
@@ -5625,13 +6420,25 @@ void nlibc_deliver_signals(void) {
 // arrived while you were waiting" is exactly the thing sigsuspend reports, and
 // a caller that goes straight back to sleep without being told would never see
 // the state the handler changed.
+// A handler makes syscalls of its own, each of which checkpoints again.
+// __thread because two native programs can be live at once: a process-wide
+// flag meant one shell delivering suppressed the other's delivery entirely.
+// At file scope so that nlibc_program_state_reset can clear it: a handler may
+// exec, and one that execs in place never returns to clear it itself.
+static __thread bool nlibc_delivering;
+
+// Counted when a handler RETURNS, per thread and never reset: see
+// native_syscall_wait for the one reader. A handler that execs or longjmps
+// away is not counted, and has no wait to come back to.
+static __thread unsigned long nlibc_handlers_run_count;
+
+unsigned long nlibc_handlers_run(void) {
+    return nlibc_handlers_run_count;
+}
+
 int nlibc_deliver_signals_count(void) {
-    // A handler makes syscalls of its own, each of which checkpoints again.
-    // __thread because two native programs can be live at once: a process-wide
-    // flag meant one shell delivering suppressed the other's delivery entirely.
-    static __thread bool delivering;
     int ran = 0;
-    if (delivering)
+    if (nlibc_delivering)
         return 0;
 
     // Which of ours are pending. Cheap enough not to matter next to the
@@ -5645,10 +6452,32 @@ int nlibc_deliver_signals_count(void) {
         if (guest_sig != 0)
             ours |= (sigset_t_) 1 << (guest_sig - 1);
     }
+    // ...and not blocked by the PROGRAM. The kernel's mask cannot say this --
+    // every signal with a handler here is blocked there, so that it waits for
+    // a checkpoint -- so the program's own mask is native_prog_blocked, and a
+    // signal in it stays pending until the program unblocks it, as on Linux.
+    //
+    // Taking it anyway ran zsh's SIGCHLD handler inside the very section zsh
+    // had blocked SIGCHLD to protect. zwaitjob blocks it, then walks the job's
+    // descriptor list closing each one; a child that exited during the walk
+    // had its SIGCHLD delivered at that close's checkpoint, the handler found
+    // the job done and deleted it -- list and nodes freed -- and the walk went
+    // on through the freed nodes: a host bad access in pipecleanfilelist, and
+    // the whole app aborted (build 557, iPhone17,5, three times in an hour).
+    if (current != NULL)
+        ours &= ~current->native_prog_blocked;
     if (ours == 0)
         return 0;
 
-    delivering = true;
+    // And one thread of the program at a time (task.h's native_delivering).
+    // A thread that finds another already collecting leaves it to that one:
+    // the handler runs once either way, and which of a program's threads
+    // runs it was never promised.
+    if (current != NULL && __atomic_exchange_n(&current->native_delivering, 1, __ATOMIC_ACQ_REL) != 0)
+        return 0;
+    struct task *delivering_for = current;
+
+    nlibc_delivering = true;
     for (;;) {
         struct nlibc_taken_signal taken;
         int guest_sig = nlibc_sigtake_info(ours, false, &taken);
@@ -5704,7 +6533,7 @@ int nlibc_deliver_signals_count(void) {
                     info.si_errno = taken.sig_errno;
                     info.si_code = taken.code;
                     info.si_pid = (pid_t) taken.pid;
-                    info.si_uid = (uid_t) taken.uid;
+                    info.si_uid = (uid_t) current_uid_shown(taken.uid);
                     info.si_status = taken.status;
                 }
                 nlibc_sigaction_handler h3 = nlibc_info_handlers[host_sig];
@@ -5720,9 +6549,12 @@ int nlibc_deliver_signals_count(void) {
                 nlibc_update_held_signals();
             }
             ran++;
+            nlibc_handlers_run_count++;
         }
     }
-    delivering = false;
+    nlibc_delivering = false;
+    if (delivering_for != NULL && delivering_for == current)
+        __atomic_store_n(&delivering_for->native_delivering, 0, __ATOMIC_RELEASE);
     return ran;
 }
 
@@ -6512,9 +7344,37 @@ int nlibc_setgroups(int size, const gid_t *list) {
     return (int) nlibc_ret(native_syscall(NATIVE_SYS_setgroups, size, guest_list));
 }
 
+// The guest's /etc/group memberships of `user`, plus `group`, as the calling
+// task's supplementary groups. This was a no-op returning success, so native
+// sudo kept the INVOKER's groups: `sudo -u root id` run by uid 1500 printed
+// groups=0(root),1500(tester), where real sudo leaves root's groups only.
 int nlibc_initgroups(const char *user, gid_t group) {
-    (void) user; (void) group;
-    return 0;   // no supplementary groups to set; succeeding is the honest no-op
+    int room = 64;
+    for (;;) {
+        int *list = malloc((size_t) room * sizeof(int));
+        if (list == NULL) {
+            errno = ENOMEM;
+            return -1;
+        }
+        int n = room;
+        if (nlibc_getgrouplist(user, (int) group, list, &n) < 0 && n > room) {
+            free(list);
+            room = n;
+            continue;
+        }
+        gid_t *gids = malloc((size_t) n * sizeof(gid_t));
+        if (gids == NULL) {
+            free(list);
+            errno = ENOMEM;
+            return -1;
+        }
+        for (int i = 0; i < n; i++)
+            gids[i] = (gid_t) list[i];
+        int r = nlibc_setgroups(n, gids);
+        free(gids);
+        free(list);
+        return r;
+    }
 }
 
 // /etc/passwd and /etc/group, read from the GUEST. One entry is cached at a
@@ -6524,7 +7384,42 @@ static __thread char nlibc_pw_line[512];
 static __thread struct passwd nlibc_pw;
 static __thread char nlibc_gr_line[512];
 static __thread struct group nlibc_gr;
-static char *nlibc_gr_members[1];
+// Thread-local like the line it points into: the member pointers are cut out of
+// nlibc_gr_line in place, so they live exactly as long as gr_name does. It was
+// a single shared NULL, which is not a lifetime problem but an ANSWER problem
+// -- see nlibc_gr_set_members.
+#define NLIBC_GR_MAX_MEMBERS 64
+static __thread char *nlibc_gr_members[NLIBC_GR_MAX_MEMBERS + 1];
+
+// Fill gr_mem from /etc/group's fourth field, the comma-separated member list.
+//
+// This used to be hardcoded empty, and an empty member list is not a missing
+// feature here, it is a WRONG ANSWER to a security question: anything asking
+// "is this user in this group?" walks gr_mem, and every such question answered
+// no. sudo's `%wheel ALL=(ALL:ALL) ALL` matched nobody, so a correctly
+// configured sudoers refused a user who was plainly in wheel.
+//
+// Split in place, which is why the array is thread-local: the pointers are into
+// nlibc_gr_line, so they share gr_name's lifetime exactly -- valid until the
+// next lookup on this thread, which is what these interfaces promise.
+static void nlibc_gr_set_members(char **f, size_t n) {
+    size_t count = 0;
+    if (n >= 4 && f[3] != NULL) {
+        char *cursor = f[3];
+        while (count < NLIBC_GR_MAX_MEMBERS && *cursor != '\0') {
+            char *comma = strchr(cursor, ',');
+            if (comma != NULL)
+                *comma = '\0';
+            if (*cursor != '\0')
+                nlibc_gr_members[count++] = cursor;
+            if (comma == NULL)
+                break;
+            cursor = comma + 1;
+        }
+    }
+    nlibc_gr_members[count] = NULL;
+    nlibc_gr.gr_mem = nlibc_gr_members;
+}
 
 static char *nlibc_next_field(char **cursor) {
     char *start = *cursor;
@@ -6632,6 +7527,70 @@ struct passwd *nlibc_getpwnam(const char *name) {
     return &nlibc_pw;
 }
 
+// /etc/shadow, on the same terms as /etc/passwd above: read from the GUEST,
+// one entry cached at a time, valid until the next call.
+//
+// Darwin has no shadow file and no getspnam, which is why SmallCLUE's su,
+// sudo and passwd were compiled only under __linux__ -- the dependency was
+// never really the OS, it was this lookup and a crypt(3) that speaks $6$
+// (kernel/sha_crypt.c, now). deps/smallclue-shim/shadow.h declares the struct
+// so those callers compile; this is what they end up calling.
+//
+// A locked account's field is "*" or "!..." -- not a hash, and no password can
+// produce it, which is exactly the property an authentication check relies on.
+// Nothing here special-cases that: the caller compares crypt() output against
+// the stored field and a locked field simply never matches.
+static __thread char nlibc_sp_line[512];
+static __thread struct spwd nlibc_sp;
+
+static bool nlibc_sp_match(char **f, size_t n, const void *keyv) {
+    const char *name = keyv;
+    if (n < 2 || strcmp(f[0], name) != 0)
+        return false;
+    memset(&nlibc_sp, 0, sizeof(nlibc_sp));
+    nlibc_sp.sp_namp = f[0];
+    nlibc_sp.sp_pwdp = f[1];
+    // The ageing fields are -1 ("unset"), which is what a shadow line with
+    // empty fields means and what every caller here treats as "no policy".
+    nlibc_sp.sp_lstchg = nlibc_sp.sp_min = nlibc_sp.sp_max = -1;
+    nlibc_sp.sp_warn = nlibc_sp.sp_inact = nlibc_sp.sp_expire = -1;
+    return true;
+}
+
+struct spwd *nlibc_getspnam(const char *name) {
+    if (name == NULL)
+        return NULL;
+    memset(&nlibc_sp, 0, sizeof(nlibc_sp));
+    if (!nlibc_scan_db("/etc/shadow", nlibc_sp_line, sizeof(nlibc_sp_line),
+                       nlibc_sp_match, name))
+        return NULL;
+    return &nlibc_sp;
+}
+
+// /etc/.pwd.lock, the advisory lock passwd takes before rewriting the shadow
+// file. A real lckpwdf holds a write lock on that file for at most 15 seconds;
+// this holds the descriptor for the life of the process, which is the same
+// guarantee for a program that locks, rewrites and exits.
+static __thread int nlibc_pwd_lock_fd = -1;
+
+int nlibc_lckpwdf(void) {
+    if (nlibc_pwd_lock_fd >= 0)
+        return -1;                 // already held: a real one returns -1 too
+    int fd = nlibc_open("/etc/.pwd.lock", O_WRONLY | O_CREAT, 0600);
+    if (fd < 0)
+        return -1;
+    nlibc_pwd_lock_fd = fd;
+    return 0;
+}
+
+int nlibc_ulckpwdf(void) {
+    if (nlibc_pwd_lock_fd < 0)
+        return -1;
+    nlibc_close(nlibc_pwd_lock_fd);
+    nlibc_pwd_lock_fd = -1;
+    return 0;
+}
+
 // The _r forms, which is what a thread-aware runtime calls -- Rust's std uses
 // getpwuid_r for home_dir(), and unrouted it read the Mac's /etc/passwd and
 // handed a native program the developer's home directory.
@@ -6702,11 +7661,10 @@ static bool nlibc_gr_match(char **f, size_t n, const void *keyv) {
     if (key->by_name ? strcmp(f[0], key->name) != 0
                      : (gid_t) strtoul(f[2], NULL, 10) != key->gid)
         return false;
-    nlibc_gr_members[0] = NULL;
     nlibc_gr.gr_name = f[0];
     nlibc_gr.gr_passwd = f[1];
     nlibc_gr.gr_gid = (gid_t) strtoul(f[2], NULL, 10);
-    nlibc_gr.gr_mem = nlibc_gr_members;
+    nlibc_gr_set_members(f, n);
     return true;
 }
 
@@ -6772,9 +7730,9 @@ const char *nlibc_group_from_gid(gid_t gid, int nogroup) {
 
 // Which groups a user belongs to, from the GUEST's /etc/group.
 //
-// nlibc_getgrent cannot answer this: its parser fills gr_mem with an empty
-// list, so a walk over it would report the base gid and nothing else. So this
-// reads the fourth field itself -- the comma-separated member list -- through
+// Written when nlibc_getgrent's parser filled gr_mem with an empty list, so a
+// walk over it would have reported the base gid and nothing else. That is fixed
+// now (nlibc_gr_set_members), but this stays: it reads the fourth field through
 // the same index-keyed scan the getgrent walker uses, which re-reads the file
 // once per group. That is O(n^2) over /etc/group and entirely fine at its size;
 // it is also what makes the answer reflect the file as it is now.
@@ -6868,13 +7826,22 @@ int nlibc_getgrouplist(const char *name, int basegid, int *groups, int *ngroups)
 // so NULL it is -- what glibc returns for an unsupported salt, and what
 // xcrypt's callers must already tolerate.
 //
-// Making this real means implementing the crypt algorithms over CommonCrypto's
-// SHA-2, against the guest's /etc/shadow. That belongs with the sshd work, not
-// ahead of it.
+// Implemented for $5$ and $6$ since, over CommonCrypto's SHA-2
+// (kernel/sha_crypt.c), because a native sudo and passwd cannot authenticate
+// without it. Everything else -- $1$, $2b$, and the $y$ yescrypt that Debian
+// 12 now defaults to -- is still the refusal described above, for the reason
+// described above: a confident wrong answer here is an authentication bypass.
+//
+// The buffer is thread-local rather than static. crypt(3)'s interface hands
+// back storage the caller does not own, and a native program is a function
+// call on a guest task's own thread -- one shared buffer would let two tasks
+// authenticating at once read each other's result.
 char *nlibc_crypt(const char *key, const char *salt) {
-    (void) key; (void) salt;
-    errno = ENOSYS;
-    return NULL;
+    static _Thread_local char buf[256];
+    char *out = aok_sha_crypt(key, salt, buf, sizeof(buf));
+    if (out == NULL)
+        errno = EINVAL;
+    return out;
 }
 
 // =========================================================== the rest of it
@@ -6934,111 +7901,193 @@ int nlibc_syncfs(int fd_no) {
 void nlibc_sync(void) {
 }
 
-// The extended-attribute family, all eight of Darwin's spellings.
+// The extended-attribute family. These reach the guest's calls (kernel/xattr.c)
+// like every other path call here, through native_syscall with the strings and
+// buffers marshalled into guest memory -- so zsh's zsh/attr module and any
+// native tool see exactly what a guest program sees, on the guest's files.
 //
-// The guest's answer is again a constant, and again read out of the table
-// rather than guessed: kernel/calls.c's arm64 entry is
-// `[5 ... 16] = (syscall_t) sys_xattr_stub` -- twelve numbers, the whole
-// get/set/list/remove x plain/l/f matrix -- and kernel/fs.c:2763 makes
-// sys_xattr_stub `return _ENOTSUP;` unconditionally, for any path. AOK's fakefs
-// stores no xattrs, so "this filesystem does not support them" is the true
-// answer and not a refusal to answer.
+// Before AOK had extended attributes they answered ENOTSUP outright, and before
+// THAT they were unrouted: `zmodload zsh/attr; zlistattr /Users` reached the
+// Mac's own filesystem from a guest prompt. The routing is the point; the
+// answers are whatever the kernel's are.
 //
-// These are absent from the generated header for a different reason than sync
-// above: the numbers arrive as a RANGE initialiser and the generator's regex
-// only matches single-index entries. Worth knowing before assuming a missing
-// NATIVE_SYS_* means a missing syscall.
-//
-// What this replaces is the sharpest result the triage turned up, and it is
-// worth keeping: `zmodload zsh/attr` (one line in a .zshrc) plus
-// `zlistattr /Users` returned SUCCESS in a guest where /Users does not exist,
-// while `zlistattr /etc/debian_version` failed on a file the guest could list.
-// The module was resolving guest paths against the Mac's root -- a read and
-// write primitive aimed at the device, two words from any prompt.
-//
-// If AOK ever implements xattrs, these move to native_syscall together with the
-// kernel change; the l-forms are Darwin's XATTR_NOFOLLOW option rather than
-// separate entry points, which is why there are eight names here and twelve in
-// the table.
+// Darwin's calls take a position (resource forks only; anything else must pass
+// 0) and an options word where Linux has separate l-forms and different flag
+// values, and report "no such attribute" as ENOATTR rather than ENODATA.
+
+#if !defined(__linux__)
+#ifndef XATTR_NOFOLLOW
+#define XATTR_NOFOLLOW 0x0001
+#define XATTR_CREATE 0x0002
+#define XATTR_REPLACE 0x0004
+#endif
+#ifndef ENOATTR
+#define ENOATTR 93
+#endif
+#endif
+
+static long nlibc_xattr_ret(sqword_t res) {
+#if !defined(__linux__)
+    if (res == _ENODATA) {
+        errno = ENOATTR;
+        return -1;
+    }
+#endif
+    return nlibc_ret(res);
+}
+
+static ssize_t nlibc_xattr_get(int nr, sqword_t target, const char *name, void *value, size_t size) {
+    NLIBC_PATH(guest_name, name);
+    guest_addr_t guest_value = 0;
+    if (size != 0) {
+        if (size > 65536)
+            size = 65536;
+        guest_value = native_scratch_alloc(size);
+        if (guest_value == 0)
+            return nlibc_fail(_ENOMEM);
+    }
+    sqword_t res = native_syscall(nr, target, guest_name, guest_value, size);
+    if (res > 0 && size != 0 && native_scratch_get(value, guest_value, (size_t) res) < 0)
+        return nlibc_fail(_EFAULT);
+    return nlibc_xattr_ret(res);
+}
+
+static int nlibc_xattr_set(int nr, sqword_t target, const char *name, const void *value,
+        size_t size, int guest_flags) {
+    NLIBC_PATH(guest_name, name);
+    guest_addr_t guest_value = 0;
+    if (size != 0 && size <= 65536) {
+        if (value == NULL)
+            return nlibc_fail(_EFAULT);
+        guest_value = native_scratch_put(value, size);
+        if (guest_value == 0)
+            return nlibc_fail(_ENOMEM);
+    }
+    return (int) nlibc_xattr_ret(native_syscall(nr, target, guest_name, guest_value, size,
+            guest_flags));
+}
+
+static ssize_t nlibc_xattr_list(int nr, sqword_t target, char *names, size_t size) {
+    guest_addr_t guest_list = 0;
+    if (size != 0) {
+        if (size > 65536)
+            size = 65536;
+        guest_list = native_scratch_alloc(size);
+        if (guest_list == 0)
+            return nlibc_fail(_ENOMEM);
+    }
+    sqword_t res = native_syscall(nr, target, guest_list, size);
+    if (res > 0 && size != 0 && native_scratch_get(names, guest_list, (size_t) res) < 0)
+        return nlibc_fail(_EFAULT);
+    return nlibc_xattr_ret(res);
+}
+
+static int nlibc_xattr_remove(int nr, sqword_t target, const char *name) {
+    NLIBC_PATH(guest_name, name);
+    return (int) nlibc_xattr_ret(native_syscall(nr, target, guest_name));
+}
+
 #if defined(__linux__)
-// Linux's xattr calls take neither a position nor an options word, and split
-// "do not follow symlinks" into separate l-prefixed entry points. Every one of
-// these fails with ENOTSUP exactly as the Darwin set does -- see the note in
-// native_libc.h -- so this is the same answer in the platform's own shape.
 ssize_t nlibc_getxattr(const char *path, const char *name, void *value, size_t size) {
-    (void) path; (void) name; (void) value; (void) size;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_get(NATIVE_SYS_getxattr, guest_path, name, value, size);
 }
 ssize_t nlibc_fgetxattr(int fd_no, const char *name, void *value, size_t size) {
-    (void) fd_no; (void) name; (void) value; (void) size;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    return nlibc_xattr_get(NATIVE_SYS_fgetxattr, fd_no, name, value, size);
 }
 int nlibc_setxattr(const char *path, const char *name, const void *value,
         size_t size, int flags) {
-    (void) path; (void) name; (void) value; (void) size; (void) flags;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_set(NATIVE_SYS_setxattr, guest_path, name, value, size, flags);
 }
 int nlibc_fsetxattr(int fd_no, const char *name, const void *value,
         size_t size, int flags) {
-    (void) fd_no; (void) name; (void) value; (void) size; (void) flags;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    return nlibc_xattr_set(NATIVE_SYS_fsetxattr, fd_no, name, value, size, flags);
 }
 ssize_t nlibc_listxattr(const char *path, char *names, size_t size) {
-    (void) path; (void) names; (void) size;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_list(NATIVE_SYS_listxattr, guest_path, names, size);
 }
 ssize_t nlibc_flistxattr(int fd_no, char *names, size_t size) {
-    (void) fd_no; (void) names; (void) size;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    return nlibc_xattr_list(NATIVE_SYS_flistxattr, fd_no, names, size);
 }
 int nlibc_removexattr(const char *path, const char *name) {
-    (void) path; (void) name;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_remove(NATIVE_SYS_removexattr, guest_path, name);
 }
 int nlibc_fremovexattr(int fd_no, const char *name) {
-    (void) fd_no; (void) name;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    return nlibc_xattr_remove(NATIVE_SYS_fremovexattr, fd_no, name);
 }
 #else
+// Darwin's options: XATTR_NOFOLLOW 1, XATTR_CREATE 2, XATTR_REPLACE 4. The
+// others (NOSECURITY, NODEFAULT, SHOWCOMPRESSION) ask about things a Linux
+// filesystem does not have, and are ignored.
+static int nlibc_xattr_flags(int options) {
+    return ((options & XATTR_CREATE) ? 1 : 0) | ((options & XATTR_REPLACE) ? 2 : 0);
+}
 ssize_t nlibc_getxattr(const char *path, const char *name, void *value,
         size_t size, uint32_t position, int options) {
-    (void) path; (void) name; (void) value; (void) size;
-    (void) position; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    if (position != 0)
+        return nlibc_fail(_EINVAL);
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_get((options & XATTR_NOFOLLOW) ? NATIVE_SYS_lgetxattr : NATIVE_SYS_getxattr,
+            guest_path, name, value, size);
 }
 ssize_t nlibc_fgetxattr(int fd_no, const char *name, void *value,
         size_t size, uint32_t position, int options) {
-    (void) fd_no; (void) name; (void) value; (void) size;
-    (void) position; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    (void) options;
+    if (position != 0)
+        return nlibc_fail(_EINVAL);
+    return nlibc_xattr_get(NATIVE_SYS_fgetxattr, fd_no, name, value, size);
 }
 int nlibc_setxattr(const char *path, const char *name, const void *value,
         size_t size, uint32_t position, int options) {
-    (void) path; (void) name; (void) value; (void) size;
-    (void) position; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    if (position != 0)
+        return nlibc_fail(_EINVAL);
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_set((options & XATTR_NOFOLLOW) ? NATIVE_SYS_lsetxattr : NATIVE_SYS_setxattr,
+            guest_path, name, value, size, nlibc_xattr_flags(options));
 }
 int nlibc_fsetxattr(int fd_no, const char *name, const void *value,
         size_t size, uint32_t position, int options) {
-    (void) fd_no; (void) name; (void) value; (void) size;
-    (void) position; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    if (position != 0)
+        return nlibc_fail(_EINVAL);
+    return nlibc_xattr_set(NATIVE_SYS_fsetxattr, fd_no, name, value, size,
+            nlibc_xattr_flags(options));
 }
 ssize_t nlibc_listxattr(const char *path, char *names, size_t size, int options) {
-    (void) path; (void) names; (void) size; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_list((options & XATTR_NOFOLLOW) ? NATIVE_SYS_llistxattr : NATIVE_SYS_listxattr,
+            guest_path, names, size);
 }
 ssize_t nlibc_flistxattr(int fd_no, char *names, size_t size, int options) {
-    (void) fd_no; (void) names; (void) size; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    (void) options;
+    return nlibc_xattr_list(NATIVE_SYS_flistxattr, fd_no, names, size);
 }
 int nlibc_removexattr(const char *path, const char *name, int options) {
-    (void) path; (void) name; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    NLIBC_PATH(guest_path, path);
+    return nlibc_xattr_remove((options & XATTR_NOFOLLOW) ? NATIVE_SYS_lremovexattr : NATIVE_SYS_removexattr,
+            guest_path, name);
 }
 int nlibc_fremovexattr(int fd_no, const char *name, int options) {
-    (void) fd_no; (void) name; (void) options;
-    return nlibc_fail(_ENOTSUP);
+    NATIVE_FRAME;
+    (void) options;
+    return nlibc_xattr_remove(NATIVE_SYS_fremovexattr, fd_no, name);
 }
 #endif
 
@@ -7681,11 +8730,10 @@ static bool nlibc_gr_ent_match(char **f, size_t n, const void *keyv) {
         return false;
     if (key->seen++ != key->want)
         return false;
-    nlibc_gr_members[0] = NULL;
     nlibc_gr.gr_name = f[0];
     nlibc_gr.gr_passwd = f[1];
     nlibc_gr.gr_gid = (gid_t) strtoul(f[2], NULL, 10);
-    nlibc_gr.gr_mem = nlibc_gr_members;
+    nlibc_gr_set_members(f, n);
     return true;
 }
 
@@ -7720,8 +8768,16 @@ struct group *nlibc_getgrent(void) {
 //          40  char    ut_id[4]
 //          44  char    ut_user[32]
 //          76  char    ut_host[256]
-//         340  int32   ut_tv.tv_sec, then int32 tv_usec
-//                                      384 bytes per record
+//         340  int32   ut_tv.tv_sec, then int32 tv_usec   (i386, amd64)
+//         344  int64   ut_tv.tv_sec, then int64 tv_usec   (arm64, riscv64)
+//                                      384 bytes per record on x86, 400 on
+//                                      arm64 and riscv64
+//
+// Two sizes because glibc keeps 32-bit time fields in struct utmp only where
+// a 32-bit compat ABI shares the file (x86); arm64 and riscv64 have a long
+// ut_session and a struct timeval. Measured: four records from pututline on
+// Devuan arm64 made a 1600-byte file. This read 384 everywhere, so an arm64
+// root's utmp read as garbage from the second record on.
 //
 // Darwin's struct utmpx is a different shape entirely -- ut_user first and 256
 // bytes wide, ut_type after ut_pid -- so pointing the host's header at the
@@ -7730,23 +8786,22 @@ struct group *nlibc_getgrent(void) {
 // file straight into WATCH_STRUCT_UTMP. So the file is parsed here, by offset,
 // and a Darwin struct utmpx is BUILT from it.
 //
-// The offsets are not derived again: they are the ones deps/smallclue/src/
-// core.c's smallclueUtmpUserCount() already established and ships against, and
-// the two readers agree field for field so a guest cannot see `uptime` and
-// `log` disagree about who is logged in.
+// The offsets are the ones deps/smallclue/src/utmp_rec.c reads and writes
+// (uptime's user count, login's records, init's), and the two agree field for
+// field so a guest cannot see `uptime` and `log` disagree about who is logged
+// in. SmallCLUE picks the size from uname; here the task's ABI says it.
 //
 // Byte order is the guest's, and the guest's is the host's: every AOK guest ABI
 // (i386, amd64, arm64, riscv64) is little-endian, as is every device this runs
 // on, so the int32 fields are memcpy'd rather than assembled.
 
-#define NLIBC_UTMP_RECORD    384
+#define NLIBC_UTMP_RECORD_MAX 400
 #define NLIBC_UTMP_OFF_TYPE    0
 #define NLIBC_UTMP_OFF_PID     4
 #define NLIBC_UTMP_OFF_LINE    8
 #define NLIBC_UTMP_OFF_ID     40
 #define NLIBC_UTMP_OFF_USER   44
 #define NLIBC_UTMP_OFF_HOST   76
-#define NLIBC_UTMP_OFF_TV    340
 #define NLIBC_UTMP_LEN_LINE   32
 #define NLIBC_UTMP_LEN_ID      4
 #define NLIBC_UTMP_LEN_USER   32
@@ -7797,19 +8852,33 @@ static FILE *nlibc_utmp_open(void) {
 }
 
 static bool nlibc_utmp_next(FILE *f, struct utmpx *out) {
-    uint8_t rec[NLIBC_UTMP_RECORD];
-    if (f == NULL || fread(rec, sizeof(rec), 1, f) != 1)
+    bool wide = guest_abi_is_64bit(current->abi) && current->abi != GUEST_ABI_AMD64;
+    size_t size = wide ? 400 : 384;
+    uint8_t rec[NLIBC_UTMP_RECORD_MAX];
+    if (f == NULL || fread(rec, size, 1, f) != 1)
         return false;
-    int32_t type = 0, pid = 0, sec = 0, usec = 0;
+    // ut_type is a short followed by two bytes of padding a writer need not
+    // have zeroed.
+    int16_t type = 0;
+    int32_t pid = 0;
+    int64_t sec = 0, usec = 0;
     memcpy(&type, rec + NLIBC_UTMP_OFF_TYPE, sizeof(type));
     memcpy(&pid, rec + NLIBC_UTMP_OFF_PID, sizeof(pid));
-    memcpy(&sec, rec + NLIBC_UTMP_OFF_TV, sizeof(sec));
-    memcpy(&usec, rec + NLIBC_UTMP_OFF_TV + 4, sizeof(usec));
+    if (wide) {
+        memcpy(&sec, rec + 344, sizeof(sec));
+        memcpy(&usec, rec + 352, sizeof(usec));
+    } else {
+        int32_t sec32 = 0, usec32 = 0;
+        memcpy(&sec32, rec + 340, sizeof(sec32));
+        memcpy(&usec32, rec + 344, sizeof(usec32));
+        sec = sec32;
+        usec = usec32;
+    }
     memset(out, 0, sizeof(*out));
     out->ut_type = nlibc_utmp_type(type);
     out->ut_pid = (pid_t) pid;
-    out->ut_tv.tv_sec = sec;
-    out->ut_tv.tv_usec = usec;
+    out->ut_tv.tv_sec = (time_t) sec;
+    out->ut_tv.tv_usec = (suseconds_t) usec;
     nlibc_utmp_field(out->ut_user, sizeof(out->ut_user), rec,
             NLIBC_UTMP_OFF_USER, NLIBC_UTMP_LEN_USER);
     nlibc_utmp_field(out->ut_line, sizeof(out->ut_line), rec,
@@ -7950,6 +9019,10 @@ int nlibc_getlogin_r(char *buf, size_t len) {
 int nlibc_execve(const char *path, char *const argv[], char *const envp[]) {
     if (path == NULL || argv == NULL)
         return nlibc_fail(_EFAULT);
+    nlibc_flush_stdout_for_child();
+    if (native_exec_in_place_wanted())
+        return nlibc_fail(nlibc_exec_in_place(path, argv,
+                envp != NULL ? envp : native_env_vector()));
     // native_spawn_opts, not native_spawn, and ONLY for the signal mask -- the
     // same reason nlibc_exec_common does it, and this function was the one
     // place that did not. Measured in the guest before the fix:
@@ -7986,51 +9059,30 @@ int nlibc_execve(const char *path, char *const argv[], char *const envp[]) {
 // exited rather than collecting its status.
 int nlibc_sigsuspend(const sigset_t *mask) {
     struct timespec *forever = NULL;
-    // MASK is the program's blocked set FOR THE DURATION, and saying so to the
-    // shim is the whole point rather than bookkeeping.
-    //
-    // struct task's native_held is `shim_held & ~native_prog_blocked` -- the
-    // signals the shim is holding behind the program's back, which
-    // task_wake_blocked() subtracts so that a wait still ends for them. A
-    // signal the PROGRAM blocked is deliberately not in there: it asked not to
-    // be interrupted.
+    // MASK is the program's blocked set FOR THE DURATION, and nlibc_pselect
+    // says so to the shim as well as to the kernel. Both halves of that were
+    // found here first, as hangs:
     //
     // zsh waits for a child inside child_block(), which blocks SIGCHLD, and
     // then calls sigsuspend with an (almost) empty mask -- "unblock SIGCHLD
-    // while I sleep". Without this, native_prog_blocked still said SIGCHLD was
-    // the program's own choice, native_held did not include it, and the
-    // pselect6 the wait rides on was never interrupted by the child's exit.
-    // The shell hung after its first external command, forever, with a zombie
-    // sitting there.
-    // Deliver first, and do not block if anything was waiting.
+    // while I sleep". With native_prog_blocked still saying SIGCHLD was the
+    // program's own choice, native_held did not include it, and the pselect6
+    // the wait rides on was never interrupted by the child's exit. The shell
+    // hung after its first external command, forever, with a zombie sitting
+    // there.
     //
-    // This is the other half of the hang, and it is a sequencing problem rather
-    // than a masking one. Handlers run at a syscall CHECKPOINT, so a SIGCHLD
-    // that interrupts this wait is not delivered until the NEXT syscall the
-    // program makes -- and for zsh that next syscall is the following
-    // sigsuspend, which checkpoints (running the handler, which reaps the
-    // child and marks the job done) and then blocks anyway, on a condition
-    // that has just stopped being true and will never be signalled again.
-    //
-    // Delivering before the wait and reporting it as EINTR gives the caller its
-    // chance to re-test.
-    if (nlibc_deliver_signals_count() > 0) {
-        errno = EINTR;
-        return -1;
-    }
-    sigset_t_ saved = 0;
-    bool tracked = current != NULL;
-    if (tracked) {
-        saved = current->native_prog_blocked;
-        current->native_prog_blocked = mask != NULL ? nlibc_sigset_to_guest(mask) : 0;
-        nlibc_update_held_signals();
-    }
-    nlibc_pselect(0, NULL, NULL, NULL, forever, mask);
-    if (tracked) {
-        current->native_prog_blocked = saved;
-        nlibc_update_held_signals();
-    }
-    nlibc_deliver_signals_count();
+    // And a SIGCHLD already pending has to run BEFORE the wait, which then
+    // does not start: handlers run at a syscall checkpoint, and one taken by
+    // the checkpoint in front of the wait (reaping the child, marking the job
+    // done) was followed by a wait on a condition that had just stopped being
+    // true and would never be signalled again. nlibc_pselect reports that as
+    // EINTR, which gives the caller its chance to re-test.
+    sigset_t none;
+    sigemptyset(&none);
+    nlibc_pselect(0, NULL, NULL, NULL, forever, mask != NULL ? mask : &none);
+    // What the restored mask lets through, and the wait's own did not.
+    if (!nlibc_delivery_deferred())
+        nlibc_deliver_signals_count();
     // sigsuspend has no success return: it comes back only when a handler has
     // run, and always as -1/EINTR.
     errno = EINTR;
@@ -8042,8 +9094,43 @@ int nlibc_sigsuspend(const sigset_t *mask) {
 // select with a timespec and a signal mask. nlibc_select already goes through
 // pselect6 because that is the only one the guest has; this is the same call
 // with the two arguments select cannot express.
+static int nlibc_pselect_wait(int nfds, void *readfds, void *writefds,
+        void *errorfds, const struct timespec *timeout, const sigset_t *sigmask);
+
+// SIGMASK is the program's blocked set FOR THE DURATION, and the shim has to
+// be told so, not just the kernel: a handled signal is delivered only when the
+// program's own mask (native_prog_blocked) lets it through, and struct task's
+// native_held -- what ends the wait -- is computed from the same mask. The
+// pattern this is for is "block X; loop { pselect(..., mask without X) }":
+// zsh's sigsuspend and OpenSSH's ppoll both have it, and X has to interrupt the
+// wait and run its handler there, not wait for the program to unblock it.
+//
+// A signal the mask lets through that is ALREADY pending runs first, and the
+// wait does not start: that is what the kernel would do with it, and handlers
+// run only at checkpoints, so one taken by the checkpoint in front of the wait
+// would otherwise be followed by a wait for a condition the handler had just
+// ended.
 int nlibc_pselect(int nfds, void *readfds, void *writefds, void *errorfds,
         const struct timespec *timeout, const sigset_t *sigmask) {
+    if (sigmask == NULL || current == NULL)
+        return nlibc_pselect_wait(nfds, readfds, writefds, errorfds, timeout, sigmask);
+    sigset_t_ saved = current->native_prog_blocked;
+    current->native_prog_blocked = nlibc_sigset_to_guest(sigmask);
+    nlibc_update_held_signals();
+    int res;
+    if (!nlibc_delivery_deferred() && nlibc_deliver_signals_count() > 0)
+        res = nlibc_fail(_EINTR);
+    else
+        res = nlibc_pselect_wait(nfds, readfds, writefds, errorfds, timeout, sigmask);
+    int saved_errno = errno;
+    current->native_prog_blocked = saved;
+    nlibc_update_held_signals();
+    errno = saved_errno;
+    return res;
+}
+
+static int nlibc_pselect_wait(int nfds, void *readfds, void *writefds,
+        void *errorfds, const struct timespec *timeout, const sigset_t *sigmask) {
     NATIVE_FRAME;
     if (nfds < 0)
         return nlibc_fail(_EINVAL);
@@ -8094,7 +9181,14 @@ int nlibc_pselect(int nfds, void *readfds, void *writefds, void *errorfds,
             return nlibc_fail(_ENOMEM);
     }
 
-    sqword_t res = native_syscall(NATIVE_SYS_pselect6, nfds, guest_sets[0],
+    // With a mask, armed: a handler the mask let through, run by the
+    // checkpoint in front of the call, ends the wait before it starts. Without
+    // one the program has no way to have closed that window either, on Linux
+    // or here, and the call is issued whatever ran before it.
+    sqword_t res = sigmask != NULL
+        ? native_syscall_wait(NATIVE_SYS_pselect6, nfds, guest_sets[0],
+            guest_sets[1], guest_sets[2], guest_ts, guest_sig)
+        : native_syscall(NATIVE_SYS_pselect6, nfds, guest_sets[0],
             guest_sets[1], guest_sets[2], guest_ts, guest_sig);
     if (res < 0)
         return nlibc_fail((int) res);
@@ -8392,6 +9486,7 @@ static int nlibc_posix_spawn_common(pid_t *pid_out, const char *file,
         char *const argv[], char *const envp[], bool search_path) {
     if (file == NULL || argv == NULL)
         return EINVAL;
+    nlibc_flush_stdout_for_child();
 
     struct native_spawn_opts opts = { .pgid = NATIVE_SPAWN_PGID_INHERIT };
     nlibc_spawn_default_sigmask(&opts);
@@ -8605,11 +9700,11 @@ char *nlibc_setlocale(int category, const char *name) {
 // /etc/services is whitespace-separated rather than colon-separated
 // ("ssh 22/tcp SSH"), so it cannot reuse nlibc_scan_db, which splits on colons
 // for passwd and group.
-static char nlibc_se_line[512];
-static struct servent nlibc_se;
-static char *nlibc_se_aliases[1];
-static char nlibc_se_proto[16];
-static size_t nlibc_se_pos;
+static __thread char nlibc_se_line[512];
+static __thread struct servent nlibc_se;
+static __thread char *nlibc_se_aliases[1];
+static __thread char nlibc_se_proto[16];
+static __thread size_t nlibc_se_pos;
 
 void nlibc_setservent(int stayopen) { (void) stayopen; nlibc_se_pos = 0; }
 void nlibc_endservent(void) { nlibc_se_pos = 0; }
@@ -8730,10 +9825,10 @@ struct servent *nlibc_getservbyport(int port, const char *proto) {
 //
 // Same walker shape as getservent above, over "tcp 6 TCP" instead of
 // "ssh 22/tcp SSH".
-static char nlibc_pe_line[512];
-static struct protoent nlibc_pe;
-static char *nlibc_pe_aliases[1];
-static size_t nlibc_pe_pos;
+static __thread char nlibc_pe_line[512];
+static __thread struct protoent nlibc_pe;
+static __thread char *nlibc_pe_aliases[1];
+static __thread size_t nlibc_pe_pos;
 
 void nlibc_setprotoent(int stayopen) { (void) stayopen; nlibc_pe_pos = 0; }
 void nlibc_endprotoent(void) { nlibc_pe_pos = 0; }
@@ -9204,4 +10299,67 @@ int nlibc_fsetattrlist(int fd_no, void *attrs, void *buf, size_t size, unsigned 
     (void) fd_no; (void) attrs; (void) buf; (void) size; (void) options;
     errno = ENOTSUP;
     return -1;
+}
+
+// --------------------------------------------------------- in-place exec
+//
+// See native_exec_in_place_wanted in kernel/native.h. The shim keeps some state
+// per THREAD rather than per program, on the ground that a native program is
+// the one thing its thread ever runs: its thread ended with it. An exec in
+// place ends the program and keeps the thread, so what follows is everything a
+// program leaves on its thread that the next one must not start with.
+
+bool nlibc_in_stdio(void) {
+    return nlibc_stdio_depth > 0;
+}
+
+// Take this thread's streams out of the registry. They were flushed before the
+// exec (nlibc_exec_in_place); left registered, the next program on this thread
+// would find them in its own fflush(NULL) walk and in fileno(), still naming
+// descriptor numbers that the exec gave new meanings to. The FILEs themselves
+// are abandoned with the program that made them, as its heap is.
+static void nlibc_streams_forget_mine(void) {
+    if (pthread_mutex_trylock(&nlibc_stream_lock) != 0)
+        return;
+    pthread_t self = pthread_self();
+    struct nlibc_stream **link = &nlibc_streams;
+    while (*link != NULL) {
+        struct nlibc_stream *s = *link;
+        if (pthread_equal(s->owner, self)) {
+            *link = s->next;
+            free(s);
+        } else {
+            link = &s->next;
+        }
+    }
+    pthread_mutex_unlock(&nlibc_stream_lock);
+}
+
+void nlibc_program_state_reset(void) {
+    nlibc_streams_forget_mine();
+    for (int i = 0; i < 3; i++)
+        nlibc_std[i] = NULL;
+    nlibc_stdio_depth = 0;
+    nlibc_stdio_deferred = 0;
+    nlibc_delivering = false;
+    if (current != NULL)
+        __atomic_store_n(&current->native_delivering, 0, __ATOMIC_RELEASE);
+    // getopt as a new thread has it. BSD getopt keeps its scanning pointer in
+    // a static only optreset can reach, and optreset set is how a caller asks
+    // for exactly this.
+    nlibc_optarg_v = NULL;
+    nlibc_optind_v = 1;
+    nlibc_opterr_v = 1;
+    nlibc_optopt_v = '?';
+    nlibc_optreset_v = 1;
+    nl_place = NL_EMSG;
+    nl_nonopt_start = -1;
+    nl_nonopt_end = -1;
+    nl_dash_prefix = NL_NO_PREFIX;
+    // openlog's connection is a guest descriptor, and the exec has decided
+    // what that number is now.
+    nlibc_log_ident[0] = '\0';
+    nlibc_log_facility = LOG_USER;
+    nlibc_log_option = 0;
+    nlibc_log_fd = -1;
 }

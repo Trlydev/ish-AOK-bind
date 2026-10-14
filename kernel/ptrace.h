@@ -13,6 +13,7 @@ struct task;
 #define PTRACE_PEEKUSER_ 3
 #define PTRACE_POKETEXT_ 4
 #define PTRACE_POKEDATA_ 5
+#define PTRACE_POKEUSER_ 6
 #define PTRACE_CONT_ 7
 #define PTRACE_KILL_ 8
 #define PTRACE_SINGLESTEP_ 9
@@ -22,7 +23,11 @@ struct task;
 #define PTRACE_DETACH_ 17
 #define PTRACE_GETFPREGS_ 14
 #define PTRACE_SETFPREGS_ 15
+#define PTRACE_GETFPXREGS_ 18
+#define PTRACE_SETFPXREGS_ 19
 #define PTRACE_SYSCALL_ 24
+#define PTRACE_GET_THREAD_AREA_ 25
+#define PTRACE_SET_THREAD_AREA_ 26
 #define PTRACE_SETOPTIONS_ 0x4200
 #define PTRACE_GETEVENTMSG_ 0x4201
 #define PTRACE_GETSIGINFO_ 0x4202
@@ -30,25 +35,74 @@ struct task;
 #define PTRACE_SETREGSET_ 0x4205
 #define PTRACE_SEIZE_ 0x4206
 #define PTRACE_INTERRUPT_ 0x4207
+#define PTRACE_LISTEN_ 0x4208
+#define PTRACE_GET_SYSCALL_INFO_ 0x420e
 
 #define NT_PRSTATUS_ 1
 #define NT_PRFPREG_ 2
 #define NT_X86_XSTATE_ 0x202
+#define NT_PRXFPREG_ 0x46e62b7f
+#define NT_ARM_TLS_ 0x401
+#define NT_ARM_HW_BREAK_ 0x402
+#define NT_ARM_HW_WATCH_ 0x403
 #define NT_ARM_SYSTEM_CALL_ 0x404
+#define NT_RISCV_VECTOR_ 0x901
 
 #define PTRACE_EVENT_FORK_ 1
 #define PTRACE_EVENT_VFORK_ 2
 #define PTRACE_EVENT_CLONE_ 3
 #define PTRACE_EVENT_EXEC_ 4
+#define PTRACE_EVENT_VFORK_DONE_ 5
 #define PTRACE_EVENT_EXIT_ 6
+#define PTRACE_EVENT_SECCOMP_ 7
 #define PTRACE_EVENT_STOP_ 128
+
+// PTRACE_GETEVENTMSG at a syscall stop: which of the pair it is (Linux 5.3+).
+#define PTRACE_EVENTMSG_SYSCALL_ENTRY_ 1
+#define PTRACE_EVENTMSG_SYSCALL_EXIT_ 2
+
+// PTRACE_GET_SYSCALL_INFO's op: what kind of stop the tracee is in.
+#define PTRACE_SYSCALL_INFO_NONE_ 0
+#define PTRACE_SYSCALL_INFO_ENTRY_ 1
+#define PTRACE_SYSCALL_INFO_EXIT_ 2
+#define PTRACE_SYSCALL_INFO_SECCOMP_ 3
+
+// struct ptrace_syscall_info (linux/ptrace.h). The same layout for every
+// tracer, 32-bit ones included: every field is fixed-width.
+struct ptrace_syscall_info_ {
+    byte_t op;
+    byte_t reserved;
+    word_t flags;
+    dword_t arch;
+    qword_t instruction_pointer;
+    qword_t stack_pointer;
+    union {
+        struct {
+            qword_t nr;
+            qword_t args[6];
+        } entry;
+        struct {
+            sqword_t rval;
+            byte_t is_error;
+        } exit;
+        struct {
+            qword_t nr;
+            qword_t args[6];
+            dword_t ret_data;
+        } seccomp;
+    };
+};
+
+static_assert(sizeof(struct ptrace_syscall_info_) == 88, "ptrace_syscall_info layout mismatch");
 
 #define PTRACE_O_TRACESYSGOOD_ 1
 #define PTRACE_O_TRACEFORK_ 2
 #define PTRACE_O_TRACEVFORK_ 4
 #define PTRACE_O_TRACECLONE_ 8
 #define PTRACE_O_TRACEEXEC_ 0x10
+#define PTRACE_O_TRACEVFORKDONE_ 0x20
 #define PTRACE_O_TRACEEXIT_ 0x40
+#define PTRACE_O_TRACESECCOMP_ 0x80
 
 struct user_regs_struct_ {
     dword_t ebx;
@@ -184,17 +238,52 @@ struct user_fpregs_struct_riscv64_ {
 
 static_assert(sizeof(struct user_fpregs_struct_riscv64_) == 264, "riscv64 ptrace fpregs layout mismatch");
 
+// arm64 NT_ARM_HW_BREAK / NT_ARM_HW_WATCH payload (struct user_hwdebug_state):
+// dbg_info is (debug architecture << 8) | number of slots, then one entry per
+// slot the architecture allows -- sixteen, whatever the hardware has.
+struct user_hwdebug_state_arm64_ {
+    dword_t dbg_info;
+    dword_t pad;
+    struct {
+        qword_t addr;
+        dword_t ctrl;
+        dword_t pad;
+    } dbg_regs[16];
+};
+
+static_assert(sizeof(struct user_hwdebug_state_arm64_) == 264, "arm64 hwdebug layout mismatch");
+
 struct user_ {
     struct user_regs_struct_ user_regs;
     char padding[286 - sizeof(struct user_regs_struct_)];
 };
 
+// Where the debug registers sit in each ABI's struct user, and how big that
+// is: x86_64 928 bytes, u_debugreg at 848; i386 284, u_debugreg at 252
+// (measured, <sys/user.h> on Linux 6.12, gcc and gcc -m32).
+#define USER_DEBUGREG_AMD64_ 848
+#define USER_SIZE_AMD64_ 928
+#define USER_DEBUGREG_I386_ 252
+#define USER_SIZE_I386_ 284
+
 dword_t sys_ptrace(dword_t request, dword_t pid, addr_t addr, dword_t data);
 dword_t sys_ptrace_guest(dword_t request, dword_t pid, guest_addr_t addr, guest_addr_t data);
 void ptrace_signal_stop(int sig, struct siginfo_ *info);
 void ptrace_group_stop(void);
+// End a PTRACE_LISTEN without reporting anything (ptrace.listening).
+void ptrace_listen_end(void);
+// Report that a SIGCONT has lifted the group-stop a listening tracee was
+// waiting out: a PTRACE_EVENT_STOP carrying SIGTRAP, status 0x80057f.
+void ptrace_listen_cont_stop(void);
 void ptrace_syscall_stop(struct cpu_state *cpu);
 void ptrace_event_stop(int sig, struct siginfo_ *info, int event, qword_t eventmsg);
-void ptrace_attach_fork_child(struct task *child, struct task *tracee);
+// Take the PTRACE_EVENT_STOP the current task owes its tracer (ptrace.trap_stop),
+// if it owes one. Call where the task looks for signals, before taking any, with
+// no lock held.
+void ptrace_trap_stop_if_pending(void);
+// Attach a new child to the tracer of `tracee`, its creator. Returns false,
+// having done nothing, when `tracee` is no longer traced by the time pids_lock
+// is held.
+bool ptrace_attach_fork_child(struct task *child, struct task *tracee);
 
 #endif /* KERNEL_PTRACE_H */

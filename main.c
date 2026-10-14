@@ -4,6 +4,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <termios.h>
+#include <time.h>
+#include <sys/ioctl.h>
+#include <pthread.h>
+#include <poll.h>
 
 #include "fs/dev.h"
 #include "fs/devices.h"
@@ -11,11 +16,16 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "fs/stat.h"
+#include "fs/virtgpu.h"
 #include "jit/jit.h"
 #include "kernel/calls.h"
+#include "fs/sockrestart.h"
 #include "kernel/fs.h"
 #include "kernel/task.h"
+#include "kernel/native_root.h"
+#include "kernel/foreign_exec.h"
 #include "kernel/swap.h"
+#include "kernel/checkpoint.h"
 #include "xX_main_Xx.h"
 #include "platform/platform.h"
 
@@ -124,7 +134,7 @@ static char *build_initial_envp(void) {
     p += sizeof(path_var);
     memcpy(p, home_var, sizeof(home_var));
     p += sizeof(home_var);
-    p += sprintf(p, "TERM=%s", term) + 1;
+    p += snprintf(p, term_size, "TERM=%s", term) + 1;
     *p = '\0';
     return envp;
 }
@@ -136,6 +146,65 @@ static char *build_initial_envp(void) {
 // are still held — _exit avoids atexit handlers that might re-enter those locks,
 // and lets the OS reclaim every lingering guest pthread cleanly instead of the
 // pthread_kill(SIGKILL) sweep that would otherwise kill us with signal 9.
+// See ISH_CHECKPOINT_AFTER below. A host thread, deliberately: the point is to
+// exercise the path the app uses, which is not a guest task either.
+double cli_checkpoint_delay;
+const char *cli_checkpoint_path;
+// Set instead of a delay by the "@<file>" form: checkpoint once this host file
+// exists. NULL for a plain delay.
+const char *cli_checkpoint_when;
+
+// See ISH_SOCKRESTART_AFTER below. Same idea, same reason: fs/sockrestart.c's
+// save and rebuild are reached ONLY from the app's background and foreground
+// transitions, so until now the one path that decides whether a guest's
+// listening sockets survive a suspension could not be run from here at all.
+double cli_sockrestart_delay;
+static void *cli_sockrestart_after(void *unused) {
+    (void) unused;
+    usleep((useconds_t) (cli_sockrestart_delay * 1000000));
+    unsigned saved = sockrestart_on_suspend();
+    fprintf(stderr, "sockrestart: saved %u listener(s)\n", saved);
+    // A real suspension sits between the two. Long enough that anything
+    // blocked in accept or poll is certainly blocked before the rebuild.
+    usleep(500000);
+    unsigned rebuilt = sockrestart_on_resume();
+    fprintf(stderr, "sockrestart: rebuilt %u listener(s)\n", rebuilt);
+    return NULL;
+}
+static void *cli_checkpoint_after(void *unused) {
+    (void) unused;
+    while (cli_checkpoint_path == NULL)
+        usleep(1000);
+    if (cli_checkpoint_when != NULL) {
+        // Up to two minutes for the guest to say it is ready; after that the
+        // save goes ahead and is refused or written as it stands, and the log
+        // beside the image says which.
+        for (int i = 0; i < 12000 && access(cli_checkpoint_when, F_OK) != 0; i++)
+            usleep(10000);
+    } else {
+        usleep((useconds_t) (cli_checkpoint_delay * 1000000));
+    }
+    // ISH_CHECKPOINT_LEAVE_OUT=1: the app's save-what-can-be-saved, which
+    // leaves out the processes that cannot be saved instead of refusing.
+    const char *leave_out = getenv("ISH_CHECKPOINT_LEAVE_OUT");
+    int err = checkpoint_save_external_flags(cli_checkpoint_path,
+            leave_out != NULL && strcmp(leave_out, "1") == 0 ? CKPT_SAVE_LEAVE_OUT : 0);
+    // To a file beside the image, not to stderr: by the time this runs the
+    // guest may have closed the host's standard streams on its way out, and a
+    // diagnostic that vanishes is worse than none.
+    char log[PATH_MAX];
+    snprintf(log, sizeof(log), "%s.log", cli_checkpoint_path);
+    FILE *lf = fopen(log, "w");
+    if (lf != NULL) {
+        struct checkpoint_status ck;
+        checkpoint_get_status(&ck);
+        fprintf(lf, "%s (%d) %s\n", err == 0 ? "written" : "refused", err,
+                ck.last_refusal);
+        fclose(lf);
+    }
+    return NULL;
+}
+
 static noreturn void cli_halt(int status) {
     if (getenv("ISH_QUIESCE_STATS") != NULL) {
         extern void quiesce_stats_dump(const char *tag);
@@ -153,6 +222,14 @@ static noreturn void cli_halt(int status) {
         extern void lockstats_dump(void); // no-op unless a lockstats knob is set
         lockstats_dump();
     }
+    {
+        // no-op unless ISH_GUEST_PROFILE is set
+        guestprof_dump();
+    }
+    {
+        extern void jitprof_dump(void); // no-op unless ISH_JIT_PROFILE is set
+        jitprof_dump();
+    }
     // Deliberately NOT fflush(NULL). That walks every host stream and takes
     // each one's lock, and the shim gives a native program host FILEs for its
     // stdout and stderr -- so a guest task killed inside stdio leaves a stream
@@ -168,6 +245,9 @@ static noreturn void cli_halt(int status) {
         nlibc_flush_stream_if_lockable(stderr);
         nlibc_flush_all_streams();
     }
+    // _exit skips atexit, and this process's host socket directory has to go
+    // with it (fs/sock.c). Nothing it touches is a guest lock.
+    sock_host_dir_cleanup();
     if ((status & 0x7f) == 0)          // WIFEXITED
         _exit((status >> 8) & 0xff);
     _exit(128 + (status & 0x7f));      // WIFSIGNALED: shell convention 128+signo
@@ -220,6 +300,12 @@ static void setup_host_mounts(void) {
     ensure_dev_node("/dev/tty", TTY_ALTERNATE_MAJOR, DEV_TTY_MINOR);
     ensure_dev_node("/dev/ptmx", TTY_ALTERNATE_MAJOR, DEV_PTMX_MINOR);
     ensure_dev_node("/dev/fuse", MISC_MAJOR, DEV_FUSE_MINOR);
+    // The GPU render node (fs/virtgpu.c), when the renderer is built in:
+    // crw-rw-rw- as a Linux render node, which any user may open.
+    if (virtgpu_available()) {
+        ignore_eexist(generic_mkdirat(AT_PWD, "/dev/dri", 0755));
+        ensure_dev_node("/dev/dri/renderD128", DRM_MAJOR, DEV_VIRTGPU_RENDER_MINOR);
+    }
     // The swap area as a block device, so /proc/swaps has a real path to name.
     // brw-rw---- like a Linux swap device, and present whether or not swap is
     // enabled -- an unbound block node is an ordinary Linux state, and creating
@@ -301,12 +387,49 @@ static void setup_host_mounts(void) {
     ignore_eexist(do_mount(&sysfs, "sysfs", "/sys", "", 0));
     ignore_eexist(do_mount(&devptsfs, "devpts", "/dev/pts", "", 0));
 
+    // Native mode (docs/native_mode_plan.md): ISH_NATIVE_ROOT=1 treats the root
+    // as a native-mode root and provisions it exactly as the app does at every
+    // boot of one -- links into /AOK/native, /etc, the rc scripts -- and makes
+    // init an arm64 task. ISH_NATIVE_USER=<name> (with ISH_NATIVE_PASSWORD, if
+    // wanted) answers the first-start prompt for the everyday account, on a
+    // root that does not have one yet.
+    // ISH_FOREIGN_EXEC=root|libs|off: /proc/ish/foreign_exec, from the start.
+    const char *foreign = getenv("ISH_FOREIGN_EXEC");
+    if (foreign != NULL) {
+        int mode = foreign_exec_parse_mode(foreign, strlen(foreign));
+        if (mode >= 0)
+            foreign_exec_set_mode((enum foreign_exec_mode) mode);
+        else
+            fprintf(stderr, "ISH_FOREIGN_EXEC: want root, libs or off, not %s\n", foreign);
+    }
+    // Any root: login shells naming a native program this build lacks get one
+    // that exists (kernel/native_root.c).
+    native_root_repair_login_shells();
+    const char *native_root = getenv("ISH_NATIVE_ROOT");
+    if (native_root != NULL && strcmp(native_root, "1") == 0) {
+        int nerr = native_root_provision();
+        if (nerr < 0)
+            fprintf(stderr, "ISH_NATIVE_ROOT: cannot provision this root (%d)\n", nerr);
+        native_root_adopt_abi(current);
+        native_root_mount_zoneinfo();
+        const char *user = getenv("ISH_NATIVE_USER");
+        if (nerr == 0 && user != NULL && user[0] != '\0' && !native_root_has_default_user()) {
+            nerr = native_root_add_user(user, getenv("ISH_NATIVE_PASSWORD"));
+            if (nerr < 0)
+                fprintf(stderr, "ISH_NATIVE_USER: cannot add %s (%d)\n", user, nerr);
+        }
+    }
+
     // Dev-only: mount a host directory as realfs at /realmnt to reproduce
     // real-fs-backed behavior (e.g. /AOK/persist) against a local fakefs root.
+    // ISH_REAL_MNT_SHARED=1 mounts it the way the app mounts /AOK/persist and
+    // /AOK/roots (MOUNT_ISH_SHARED_), which a guest's own mount cannot ask for.
     const char *real_mnt = getenv("ISH_REAL_MNT");
     if (real_mnt != NULL && real_mnt[0] != '\0') {
+        const char *shared = getenv("ISH_REAL_MNT_SHARED");
+        int real_flags = shared != NULL && strcmp(shared, "1") == 0 ? MOUNT_ISH_SHARED_ : 0;
         ignore_eexist(generic_mkdirat(AT_PWD, "/realmnt", 0755));
-        ignore_eexist(do_mount(&realfs, real_mnt, "/realmnt", "", 0));
+        ignore_eexist(do_mount(&realfs, real_mnt, "/realmnt", "", real_flags));
     }
 
     // Dev-only: mount a second fakefs (SQLite-backed) root at /fakemnt2, to
@@ -319,6 +442,24 @@ static void setup_host_mounts(void) {
         ignore_eexist(generic_mkdirat(AT_PWD, "/fakemnt2", 0755));
         ignore_eexist(do_mount(&fakefs, fake_mnt2_data, "/fakemnt2", "", 0));
     }
+}
+
+// Dev harness for mount_detach_tree, which only the app calls (renaming or
+// deleting an installed root): ISH_TEST_DETACH_TREE="<point>:<ms>" detaches
+// the tree at <point> that long after boot, as the app would, and says what
+// came of it. With ISH_FAKE_MNT2, <point> is /fakemnt2.
+static void *test_detach_tree_thread(void *arg) {
+    char *spec = arg;
+    char *colon = strrchr(spec, ':');
+    long ms = colon != NULL ? atol(colon + 1) : 0;
+    if (colon != NULL)
+        *colon = '\0';
+    struct timespec delay = {ms / 1000, (ms % 1000) * 1000000};
+    nanosleep(&delay, NULL);
+    int err = mount_detach_tree(spec);
+    fprintf(stderr, "ISH_TEST_DETACH_TREE %s -> %d\n", spec, err);
+    free(spec);
+    return NULL;
 }
 
 // Dev harness for the fakefs suspension quiesce gate (ISH_TEST_QUIESCE), run
@@ -356,7 +497,209 @@ static void *quiesce_test_thread(void *arg) {
     return NULL;
 }
 
+
+// ---- ISH_CLI_PTY: a session on a PSEUDO-terminal, from the command line ----
+//
+// The iOS app's shape -- a Terminal object owns the master side -- made
+// reachable from the CLI. Without it the CLI runs its command as init on the
+// console, and kernel/checkpoint.c's CKPT_TTY_PTS restore path (sessions,
+// controlling terminals, foreground process groups -- everything job control
+// touches) cannot be exercised outside the app. That made every restore bug a
+// four-minute round trip through the simulator UI.
+//
+// The master side is THIS process: guest output goes to stdout, and a reader
+// thread feeds stdin into the terminal a byte at a time, so a full-screen
+// program (ktop, an editor) can be driven by typing. For that the invoking
+// terminal is put into raw mode -- and put BACK on exit, because leaving
+// someone's shell raw is not a debugging aid. Only .write is mandatory to
+// fs/tty.c; .init is where the reader starts.
+static struct termios cli_pty_saved_termios;
+static bool cli_pty_termios_saved;
+
+static void cli_pty_restore_host_terminal(void) {
+    if (cli_pty_termios_saved)
+        tcsetattr(STDIN_FILENO, TCSANOW, &cli_pty_saved_termios);
+}
+
+// Which terminal a reader feeds. Not a reference: the reader must not keep the
+// terminal alive after its session is over. See cli_pty_read_thread.
+struct cli_pty_reader {
+    struct tty *tty; // identity only -- compared, never dereferenced
+    int type;
+    int num;
+};
+
+static void *cli_pty_read_thread(void *opaque) {
+    struct cli_pty_reader reader = *(struct cli_pty_reader *) opaque;
+    free(opaque);
+    int in = dup(STDIN_FILENO);
+    if (in < 0)
+        in = STDIN_FILENO;
+    char ch;
+    for (;;) {
+        ssize_t n = read(in, &ch, 1);
+        if (n == 1) {
+            // The terminal belongs to the session, not to this thread. When the
+            // last descriptor on it closes -- the shell exits, as a restored zsh
+            // that read EIO did -- tty_release frees the struct, and a byte
+            // arriving after that walked the freed tty->fds into poll_wakeup.
+            // Hold a reference across the call instead, re-found by device
+            // number exactly as the app's -sendInput does, and stop once the
+            // terminal is gone: nothing will ever read it again.
+            struct tty *tty = tty_lookup_ref(reader.type, reader.num, reader.tty);
+            if (tty == NULL)
+                return NULL;
+            tty_input(tty, &ch, 1, 0);
+            tty_put(tty);
+            continue;
+        }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+            usleep(10000);
+            continue;
+        }
+        // EOF (stdin is /dev/null, or a pipe that closed): nothing more will
+        // ever arrive, so stop reading rather than spinning on it.
+        return NULL;
+    }
+}
+
+static int cli_pty_init(struct tty *tty) {
+    struct winsize winsz;
+    if (ioctl(STDIN_FILENO, TIOCGWINSZ, &winsz) == 0) {
+        tty->winsize.col = winsz.ws_col;
+        tty->winsize.row = winsz.ws_row;
+    }
+    if (isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &cli_pty_saved_termios) == 0) {
+        cli_pty_termios_saved = true;
+        atexit(cli_pty_restore_host_terminal);
+        struct termios raw = cli_pty_saved_termios;
+        cfmakeraw(&raw);
+        tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+    }
+    // Called from tty_get under ttys_lock, before the tty is in its slot, so
+    // the reader's first tty_lookup_ref waits for that lock and finds it.
+    struct cli_pty_reader *reader = malloc(sizeof(*reader));
+    if (reader == NULL)
+        return _ENOMEM;
+    *reader = (struct cli_pty_reader) {.tty = tty, .type = tty->type, .num = tty->num};
+    pthread_t th;
+    if (pthread_create(&th, NULL, cli_pty_read_thread, reader) != 0) {
+        free(reader);
+        return _EIO;
+    }
+    pthread_detach(th);
+    return 0;
+}
+
+static int cli_pty_write(struct tty *UNUSED(tty), const void *buf, size_t len,
+                         bool UNUSED(blocking)) {
+    return (int) write(STDOUT_FILENO, buf, len);
+}
+
+static struct tty_driver_ops cli_pty_ops = { .init = cli_pty_init, .write = cli_pty_write };
+static struct tty_driver cli_pty_driver = { .ops = &cli_pty_ops };
+
+static struct tty *cli_pty_open_session(void) {
+    struct tty *tty = pty_open_fake(&cli_pty_driver);
+    return IS_ERR(tty) ? NULL : tty;
+}
+
+// ISH_PRESENT_DUMP=<file>: a stand-in for the app's viewer of wl-present's
+// frames (fs/virtgpu.h), for testing that path from the command line. Counts
+// frames and damaged pixels on stderr every 100 frames, and writes the frame
+// it has as a PPM at the first frame, when the size changes, and otherwise at
+// most once a second.
+static int cli_present_frame(const struct virtgpu_frame *f, void *ctx) {
+    static unsigned long frames;
+    static unsigned long long damaged;
+    static uint32_t last_width, last_height;
+    static time_t last_dump;
+    const char *path = ctx;
+    if (f == NULL) {
+        fprintf(stderr, "present: presenter gone after %lu frames\n", frames);
+        return 0;
+    }
+    frames++;
+    damaged += (unsigned long long) f->damage_width * (unsigned long long) f->damage_height;
+    time_t now = time(NULL);
+    if (frames == 1 || f->width != last_width || f->height != last_height || now != last_dump) {
+        last_width = f->width;
+        last_height = f->height;
+        last_dump = now;
+        FILE *out = fopen(path, "wb");
+        if (out != NULL) {
+            fprintf(out, "P6\n%u %u\n255\n", f->width, f->height);
+            for (uint32_t y = 0; y < f->height; y++) {
+                const uint8_t *row = (const uint8_t *) f->pixels + (size_t) y * f->stride;
+                for (uint32_t x = 0; x < f->width; x++) {
+                    uint8_t rgb[3] = {row[x * 4 + 2], row[x * 4 + 1], row[x * 4]};
+                    fwrite(rgb, 1, 3, out);
+                }
+            }
+            fclose(out);
+        }
+    }
+    if (frames % 100 == 0)
+        fprintf(stderr, "present: %lu frames, %llu damaged pixels, last %dx%d at %d,%d\n", frames,
+                damaged, f->damage_width, f->damage_height, f->damage_x, f->damage_y);
+    return 0;
+}
+
+static void cli_present_clipboard(const char *text, size_t len, void *ctx) {
+    (void) ctx;
+    fprintf(stderr, "present: clipboard, %zu bytes: %.*s\n", len, (int) (len > 200 ? 200 : len), text);
+}
+
+static const struct virtgpu_present_ops cli_present_ops = {
+    .frame = cli_present_frame,
+    .clipboard = cli_present_clipboard,
+};
+
+// ISH_PRESENT_INPUT=<fifo>, with ISH_PRESENT_DISPLAY=<the desktop's VNC
+// port>: the app's input to wl-present, from the command line. One event a
+// line: `ptr X Y MASK`, `key KEYSYM 1|0`, `type TEXT` (each character down and
+// up), `clip TEXT`, `resize W H`.
+static void *cli_present_input(void *arg) {
+    const char *path = arg;
+    const char *d = getenv("ISH_PRESENT_DISPLAY");
+    uint32_t display = d != NULL ? (uint32_t) strtoul(d, NULL, 10) : 5901;
+    char line[4096];
+    for (;;) {
+        FILE *in = fopen(path, "r");
+        if (in == NULL)
+            return NULL;
+        while (fgets(line, sizeof(line), in) != NULL) {
+            line[strcspn(line, "\n")] = '\0';
+            unsigned long a = 0, b = 0, c = 0;
+            int err = 0;
+            if (sscanf(line, "ptr %lu %lu %lu", &a, &b, &c) == 3)
+                err = virtgpu_present_input(display, VIRTGPU_INPUT_POINTER, (uint32_t) (a | b << 16), (uint32_t) c, NULL, 0);
+            else if (sscanf(line, "key %li %lu", (long *) &a, &b) == 2)
+                err = virtgpu_present_input(display, VIRTGPU_INPUT_KEY, (uint32_t) a, (uint32_t) b, NULL, 0);
+            else if (sscanf(line, "resize %lu %lu", &a, &b) == 2)
+                err = virtgpu_present_input(display, VIRTGPU_INPUT_RESIZE, (uint32_t) a, (uint32_t) b, NULL, 0);
+            else if (strncmp(line, "clip ", 5) == 0)
+                err = virtgpu_present_input(display, VIRTGPU_INPUT_CLIPBOARD, 0, 0, line + 5, (uint32_t) strlen(line + 5));
+            else if (strncmp(line, "type ", 5) == 0)
+                for (const char *p = line + 5; *p != '\0' && err == 0; p++) {
+                    err = virtgpu_present_input(display, VIRTGPU_INPUT_KEY, (uint8_t) *p, 1, NULL, 0);
+                    if (err == 0)
+                        err = virtgpu_present_input(display, VIRTGPU_INPUT_KEY, (uint8_t) *p, 0, NULL, 0);
+                }
+            fprintf(stderr, "present: input '%s': %d\n", line, err);
+        }
+        fclose(in);
+    }
+}
+
 int main(int argc, char *const argv[]) {
+    if (getenv("ISH_PRESENT_DUMP") != NULL)
+        virtgpu_set_present_hook(0, &cli_present_ops, getenv("ISH_PRESENT_DUMP"));
+    if (getenv("ISH_PRESENT_INPUT") != NULL) {
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, cli_present_input, getenv("ISH_PRESENT_INPUT")) == 0)
+            pthread_detach(thread);
+    }
     // The system's memory-pressure source, which outranks our own per-process
     // headroom arithmetic; see host_mem_pressure_start() in platform/darwin.c.
     host_mem_pressure_start();
@@ -364,6 +707,7 @@ int main(int argc, char *const argv[]) {
     // every acquire, and a lock held from before it was armed would be dropped
     // as an unmatched release.
     lockstats_init();
+    guestprof_init();
     run_at_boot();
     configure_standalone_i386_safety(argc, argv);
     configure_standalone_amd64_jit();
@@ -381,14 +725,15 @@ int main(int argc, char *const argv[]) {
                            strcasecmp(mc, "no") == 0 || strcasecmp(mc, "off") == 0))
             doEnableMulticore = false;
     }
-    // HLE of fingerprinted guest libc functions (jit/hle.c). Default OFF;
-    // ISH_HLE=1 enables it (arm64/riscv64 guests only).
+    // HLE of fingerprinted guest libc functions (jit/hle.c). Default ON
+    // since its calls return through the ret cache (arm64/riscv64 guests
+    // only); ISH_HLE=0 turns it off.
     {
         extern bool doEnableHLE;
         const char *hle = getenv("ISH_HLE");
-        if (hle != NULL && strcmp(hle, "0") != 0 && strcasecmp(hle, "false") != 0 &&
-                strcasecmp(hle, "no") != 0 && strcasecmp(hle, "off") != 0)
-            doEnableHLE = true;
+        if (hle != NULL && (strcmp(hle, "0") == 0 || strcasecmp(hle, "false") == 0 ||
+                strcasecmp(hle, "no") == 0 || strcasecmp(hle, "off") == 0))
+            doEnableHLE = false;
     }
     // Crypto accelerator (kernel/ish_accel.c): host-native ChaCha20-Poly1305
     // via ISH_SYS_AEAD. Default OFF; ISH_CRYPTO_ACCEL=1 enables it (only takes
@@ -412,6 +757,75 @@ int main(int argc, char *const argv[]) {
         if (pa != NULL && strcmp(pa, "0") != 0 && strcasecmp(pa, "false") != 0 &&
                 strcasecmp(pa, "no") != 0 && strcasecmp(pa, "off") != 0)
             doEnablePixAccel = true;
+    }
+    // ISH_CLI_PTY=1 -- run the command as a child of init on a PSEUDO-terminal
+    // instead of as init on the console, which is the app's shape and the only
+    // way to reach the checkpoint's CKPT_TTY_PTS restore path from here. See
+    // cli_pty_open_session above and the block in xX_main_Xx.h.
+    if (getenv("ISH_CLI_PTY") != NULL) {
+        cli_session_tty_open = cli_pty_open_session;
+        checkpoint_open_session_tty = cli_pty_open_session;
+    }
+    // ISH_CHECKPOINT_AFTER=<seconds>:<path> -- take a checkpoint from a thread
+    // that is NOT a guest task, after the guest has been running a while.
+    // ISH_CHECKPOINT_AFTER=@<file>:<path> -- the same, as soon as the host file
+    // <file> exists, which a guest can create through ISH_REAL_MNT when it has
+    // set up what the checkpoint is meant to catch. A fixed delay counts from
+    // the CLI's start, so on a slow boot it lands before the guest has run at
+    // all ("refused: there is no guest running") -- checkpoint_anonfd.sh did.
+    //
+    // This is the APP's path, exercised where it can be tested: the app
+    // backgrounds on its UI thread and has to know the image is on disk before
+    // iOS freezes it, which is a different entry point from the guest writing
+    // to /proc/ish/checkpoint. Without this the only way to reach
+    // checkpoint_save_external would be to run the app.
+    {
+        const char *spec = getenv("ISH_CHECKPOINT_AFTER");
+        if (spec != NULL && *spec != '\0') {
+            static char at[PATH_MAX];
+            static char when[PATH_MAX];
+            static double delay;
+            const char *colon = strchr(spec, ':');
+            if (colon != NULL) {
+                if (spec[0] == '@') {
+                    snprintf(when, sizeof(when), "%.*s", (int) (colon - spec - 1), spec + 1);
+                    extern const char *cli_checkpoint_when;
+                    cli_checkpoint_when = when;
+                } else {
+                    delay = atof(spec);
+                }
+                snprintf(at, sizeof(at), "%s", colon + 1);
+                pthread_t th;
+                pthread_create(&th, NULL, cli_checkpoint_after, NULL);
+                pthread_detach(th);
+                extern double cli_checkpoint_delay;
+                extern const char *cli_checkpoint_path;
+                cli_checkpoint_delay = delay;
+                cli_checkpoint_path = at;
+            }
+        }
+    }
+    // ISH_SOCKRESTART_AFTER=<seconds> -- run the app's suspend/resume socket
+    // cycle from a host thread, without the app. iOS destroys a listening
+    // socket while the process is frozen, so fs/sockrestart.c records every
+    // listener on the way down and rebuilds it on the way up; this is the only
+    // way to exercise that from the command line.
+    {
+        const char *spec = getenv("ISH_SOCKRESTART_AFTER");
+        if (spec != NULL && *spec != '\0') {
+            cli_sockrestart_delay = atof(spec);
+            pthread_t th;
+            pthread_create(&th, NULL, cli_sockrestart_after, NULL);
+            pthread_detach(th);
+        }
+    }
+    // See test_detach_tree_thread.
+    const char *detach_tree = getenv("ISH_TEST_DETACH_TREE");
+    if (detach_tree != NULL && detach_tree[0] != '\0') {
+        pthread_t th;
+        char *spec = strdup(detach_tree);
+        if (spec != NULL && pthread_create(&th, NULL, test_detach_tree_thread, spec) == 0)
+            pthread_detach(th);
     }
     halt_hook = cli_halt;
     // hle_stats_dump runs from cli_halt, after guest teardown has closed the
@@ -444,14 +858,17 @@ int main(int argc, char *const argv[]) {
         return 1;
     }
 
+    // Runs inside xX_main_Xx, between mounting the root and exec'ing the
+    // command, rather than after both. See kernel/init.h: doing it afterwards
+    // made every /AOK path (and every /dev node this creates) unreachable to
+    // the one command the CLI was asked to run.
+    ish_boot_setup_hook = setup_host_mounts;
     int err = xX_main_Xx(argc, argv, envp);
     free(envp);
     if (err < 0) {
         fprintf(stderr, "xX_main_Xx: %s\n", strerror(-err));
         return 1;
     }
-
-    setup_host_mounts();
 
     // Dev harness for the LLM-Chat guest-shell tool primitive. With
     // ISH_TEST_GUEST_CMD set, run that command in the guest via
@@ -496,6 +913,61 @@ int main(int argc, char *const argv[]) {
         const char *linger_str = getenv("ISH_TEST_GUEST_LINGER_MS");
         if (linger_str != NULL)
             usleep((useconds_t) atoi(linger_str) * 1000);
+        sock_host_dir_cleanup();
+        _exit(0);
+    }
+
+    // Dev harness for guest_process_spawn_user, the persistent guest process
+    // behind the LLM Chat's in-guest MCP servers. With ISH_TEST_GUEST_PROCESS
+    // set, start that command, then for each line of ISH_TEST_GUEST_LINES
+    // (default "one" and "two") write it to the process's stdin and read one
+    // line back from its stdout -- two round trips through one process prove
+    // it stays alive between them -- print what came back and anything on
+    // stderr, stop it, and report whether it was reaped. ISH_TEST_GUEST_USER
+    // selects the su path as for ISH_TEST_GUEST_CMD.
+    // e.g. ISH_TEST_GUEST_PROCESS='while read l; do echo "got $l"; echo "err $l" >&2; done' ./build/ish -f root /bin/sh
+    const char *proc_cmd = getenv("ISH_TEST_GUEST_PROCESS");
+    if (proc_cmd != NULL) {
+        struct guest_process process;
+        int rc = guest_process_spawn_user(getenv("ISH_TEST_GUEST_USER"), proc_cmd, NULL, &process);
+        int pid = process.pid;
+        fprintf(stderr, "[guest-proc] spawn rc=%d pid=%d\n", rc, pid);
+        const char *lines = getenv("ISH_TEST_GUEST_LINES");
+        char *copy = strdup(lines != NULL ? lines : "one\ntwo");
+        for (char *save = NULL, *line = strtok_r(copy, "\n", &save); rc == 0 && line != NULL; line = strtok_r(NULL, "\n", &save)) {
+            char request[512];
+            int length = snprintf(request, sizeof(request), "%s\n", line);
+            ssize_t wrote = write(process.stdin_fd, request, (size_t) length);
+            char reply[512];
+            size_t got = 0;
+            while (got + 1 < sizeof(reply)) {
+                struct pollfd pfd = {.fd = process.stdout_fd, .events = POLLIN};
+                if (poll(&pfd, 1, 10000) <= 0)
+                    break;
+                ssize_t n = read(process.stdout_fd, reply + got, 1);
+                if (n <= 0)
+                    break;
+                got += (size_t) n;
+                if (reply[got - 1] == '\n')
+                    break;
+            }
+            reply[got] = '\0';
+            fprintf(stderr, "[guest-proc] wrote %zd, read: %s%s", wrote, reply, got > 0 && reply[got - 1] == '\n' ? "" : "(no newline)\n");
+        }
+        free(copy);
+        if (rc == 0) {
+            char err[1024];
+            struct pollfd pfd = {.fd = process.stderr_fd, .events = POLLIN};
+            ssize_t n = poll(&pfd, 1, 500) > 0 ? read(process.stderr_fd, err, sizeof(err) - 1) : 0;
+            err[n > 0 ? n : 0] = '\0';
+            fprintf(stderr, "[guest-proc] stderr: %s\n", err);
+            guest_process_stop(&process);
+            struct task *left = pid_get_task_zombie_global_ref((dword_t) pid);
+            fprintf(stderr, "[guest-proc] after stop: %s\n", left == NULL ? "reaped" : (left->zombie ? "zombie" : "still running"));
+            if (left != NULL)
+                task_ref_cnt_mod(left, -1);
+        }
+        sock_host_dir_cleanup();
         _exit(0);
     }
 

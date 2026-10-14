@@ -14,7 +14,12 @@ and therefore fail differently.
 The release process is short:
 
 1. Bump `CURRENT_PROJECT_VERSION`.
-2. Add `docs/release-notes-since-iSH-AOK_<N>.md` and a summary.
+2. Add `docs/release-notes/release-notes-since-iSH-AOK_<N>.md` — one file, named exactly that
+   way for every release, opening with its own summary paragraph. That is the
+   whole artifact: a separate `release-summary-iSH-AOK_<N>.md` was tried for
+   three builds (547, 548, 553) as a condensed duplicate and abandoned; those
+   three are in `docs/historical/` and nothing should reintroduce the second
+   file.
 3. Tag that commit `builds/iSH-AOK_<N>` and push it.
 
 Pushing that tag triggers `.github/workflows/build-release-ipa.yml`, which
@@ -151,9 +156,20 @@ not own, which makes it the highest-value item on a list nobody enjoys.
 
 **The release gate is wider than the pre-push one.** Chapter 35's pre-push rule
 asks for both suites plus the JVM on a single guest. Before a tag, the full
-guest regression suite runs on **all four guests** — i386, amd64, arm64 and
-riscv64 — on the Mac and again on real hardware, with the end-to-end suite and
-the JVM smoke test.
+guest regression suite runs on **all five roots** — the four musl guests
+(i386, amd64, arm64 and riscv64) plus a fifth leg on glibc, aarch64 — on the
+Mac and again on real hardware, with the end-to-end suite and the JVM smoke
+test. The device leg boots each root in turn, relaunching the app with
+`ISH_BOOT_ROOT` (Chapter 30). Until 557 it booted only the glibc root and
+reached the four musl roots through `mount-root.sh`'s chroot, which proved
+chroot behaviour at least as much as each root booted on its own — a
+distinction sharp enough that three of 556's device failures turned out to be
+chroot-only. And the build on the device is
+one the release itself compiled, installed and launched, never one started from
+Xcode's Run button: under the debugger every host-thread wake-up signal goes
+through debugserver, and on the M4 iPad in 556's leg a 17-thread process took
+4.3 s to die of `SIGKILL` where the same build, launched normally, took 11 ms.
+The timing tests failed as if the timer work had regressed.
 
 Each axis earns its place by having caught something nothing else could. The
 four wrong tests fixed in 552 were visible only on **i386**: a `PTRACE_POKEDATA`
@@ -171,7 +187,7 @@ here.
 
 ## 37.5 The release notes are a design record
 
-`docs/release-notes-since-iSH-AOK_521.md` through `_551.md` are in the tree, and
+`docs/release-notes/release-notes-since-iSH-AOK_521.md` through `_551.md` are in the tree, and
 they are worth reading as a genre.
 
 They are not marketing copy and they are not changelogs. A typical entry names
@@ -222,7 +238,7 @@ it shipped.
 [fastlane/](../../fastlane), [AppStoreExportOptions.plist](../../AppStoreExportOptions.plist),
 [iSHRelease.entitlements](../../iSHRelease.entitlements),
 [app/iSH.xcconfig](../../app/iSH.xcconfig),
-[docs/release-notes-since-iSH-AOK_549.md](../../docs/release-notes-since-iSH-AOK_549.md),
+[docs/release-notes/release-notes-since-iSH-AOK_549.md](../../docs/release-notes/release-notes-since-iSH-AOK_549.md),
 [opt/AOK/docs/](../../opt/AOK/docs), [fs/aok-docs.manifest](../../fs/aok-docs.manifest).
 
 *Story:* an unsigned IPA installing with no App Group — because sideloaders read

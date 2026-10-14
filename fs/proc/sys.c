@@ -8,6 +8,7 @@
 #include "kernel/inotify.h"
 #include "kernel/random.h"
 #include "kernel/task.h"
+#include "kernel/personality.h"
 #include "kernel/hostinfo.h"
 #include "fs/proc.h"
 #include "platform/platform.h"
@@ -371,9 +372,66 @@ static bool proc_sys_fs_inotify_readdir(struct proc_entry *UNUSED(entry), unsign
     return false;
 }
 
+// fs.mqueue.*: the POSIX message queue limits kernel/mqueue.c enforces, each
+// IPC namespace's own, so a reader sees its namespace's values. The bounds are
+// Linux's (ipc/mq_sysctl.c, measured on 6.12): the message counts 1..65536
+// (HARD_MSGMAX), the message sizes 128..16 MiB (HARD_MSGSIZEMAX), and
+// queues_max any int at all -- a negative one, stored unsigned, is no limit.
+static const struct {
+    const char *name;
+    long min, max;
+} proc_sys_fs_mqueue_bounds[] = {
+    {"msg_default", 1, 65536},
+    {"msg_max", 1, 65536},
+    {"msgsize_default", 128, 16 * 1024 * 1024},
+    {"msgsize_max", 128, 16 * 1024 * 1024},
+    {"queues_max", INT32_MIN, INT32_MAX},
+};
+#define PROC_SYS_FS_MQUEUE_LEN \
+    (sizeof(proc_sys_fs_mqueue_bounds) / sizeof(proc_sys_fs_mqueue_bounds[0]))
+
+static struct proc_dir_entry proc_sys_fs_mqueue_entry;
+
+static void proc_sys_fs_mqueue_getname(struct proc_entry *entry, char *buf) {
+    snprintf(buf, 256, "%s", proc_sys_fs_mqueue_bounds[entry->fd].name);
+}
+static int proc_sys_fs_mqueue_show(struct proc_entry *entry, struct proc_data *buf) {
+    unsigned *value = mqueue_sysctl(proc_sys_fs_mqueue_bounds[entry->fd].name);
+    if (value == NULL)
+        return _ENOENT;
+    proc_printf(buf, "%d\n", (int) *value);
+    return 0;
+}
+static int proc_sys_fs_mqueue_update(struct proc_entry *entry, struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    long value;
+    int err = proc_sys_scalar_parse(data, proc_sys_fs_mqueue_bounds[entry->fd].min,
+            proc_sys_fs_mqueue_bounds[entry->fd].max, &value);
+    if (err < 0)
+        return err;
+    unsigned *slot = mqueue_sysctl(proc_sys_fs_mqueue_bounds[entry->fd].name);
+    if (slot == NULL)
+        return _ENOENT;
+    *slot = (unsigned) (int) value;
+    return 0;
+}
+static bool proc_sys_fs_mqueue_readdir(struct proc_entry *UNUSED(entry), unsigned long *index,
+        struct proc_entry *next_entry) {
+    if (*index >= PROC_SYS_FS_MQUEUE_LEN)
+        return false;
+    *next_entry = (struct proc_entry) {&proc_sys_fs_mqueue_entry, .fd = (sdword_t) *index};
+    (*index)++;
+    return true;
+}
+static struct proc_dir_entry proc_sys_fs_mqueue_entry = {NULL, S_IFREG | 0644,
+    .getname = proc_sys_fs_mqueue_getname, .show = proc_sys_fs_mqueue_show,
+    .update = proc_sys_fs_mqueue_update};
+
 static struct proc_dir_entry proc_sys_fs_entries[] = {
     {"binfmt_misc", S_IFDIR, .readdir = proc_binfmt_misc_readdir},
     {"inotify", S_IFDIR, .readdir = proc_sys_fs_inotify_readdir},
+    {"mqueue", S_IFDIR, .readdir = proc_sys_fs_mqueue_readdir},
     {"file-max", S_IFREG | 0644, .show = sys_show_fs_file_max, .update = sys_update_fs_file_max},
     {"nr_open", S_IFREG | 0644, .show = sys_show_fs_nr_open, .update = sys_update_fs_nr_open},
 };
@@ -514,6 +572,40 @@ static int sys_update_kernel_hostname(struct proc_entry *UNUSED(entry), struct p
     return 0;
 }
 
+// /proc/sys/kernel/domainname, the same for the NIS domain: what
+// setdomainname(2) sets and uname(2) reports, per UTS namespace, "(none)"
+// until something names it. The file was missing, and systemd makes it
+// read-only (with hostname beside it) for every ProtectHostname=yes service
+// that keeps the host's UTS namespace -- logind, udevd, userdbd -- and fails
+// the service at step NAMESPACE when there is nothing there to bind.
+static int sys_show_kernel_domainname(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct uts_namespace *ns = uts_ns_current();
+    char domainname[sizeof(ns->domainname)];
+    lock(&ns->lock, 0);
+    memcpy(domainname, ns->domainname, sizeof(domainname));
+    unlock(&ns->lock);
+    domainname[sizeof(domainname) - 1] = '\0';
+    // Unset reads "(none)", as uname(2) reports it.
+    proc_printf(buf, "%s\n", domainname[0] != '\0' ? domainname : "(none)");
+    return 0;
+}
+
+static int sys_update_kernel_domainname(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    struct uts_namespace *ns = uts_ns_current();
+    size_t len = data->size;
+    while (len > 0 && (data->data[len - 1] == '\n' || data->data[len - 1] == '\r'))
+        len--;
+    if (len >= sizeof(ns->domainname))
+        return _EINVAL;
+    lock(&ns->lock, 0);
+    memcpy(ns->domainname, data->data, len);
+    ns->domainname[len] = '\0';
+    unlock(&ns->lock);
+    return 0;
+}
+
 static int sys_show_net_version(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "%s\n", proc_ish_version);
     return 0;
@@ -527,8 +619,9 @@ static int sys_show_kernel_osrelease(struct proc_entry *UNUSED(entry), struct pr
 }
 
 static int sys_show_kernel_cap_last_cap(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    // Keep this aligned with the advertised 4.20 kernel release.
-    proc_printf(buf, "%d\n", 37);
+    // CAP_LAST_CAP_ is the same number the full capability masks in
+    // /proc/PID/status are built from, so the two cannot drift apart.
+    proc_printf(buf, "%d\n", CAP_LAST_CAP_);
     return 0;
 }
 
@@ -630,10 +723,9 @@ static int sys_update_kernel_pid_max(struct proc_entry *UNUSED(entry), struct pr
     if (!superuser())
         return _EPERM;
     long value;
-    // The table is sized at compile time, so MAX_PID is a hard ceiling; Linux's
-    // own floor is 301. Out of range is EINVAL, which is what Linux answers too
-    // -- it is not silently clamped.
-    int err = proc_sys_scalar_parse(data, 301, MAX_PID, &value);
+    // Linux's range, 301..PID_MAX_LIMIT; out of it is EINVAL, as on Linux.
+    // Allocation still wraps at MAX_PID, the table size (task_set_pid_max).
+    int err = proc_sys_scalar_parse(data, 301, PID_MAX_LIMIT, &value);
     if (err < 0)
         return err;
     return task_set_pid_max((dword_t) value);
@@ -671,13 +763,49 @@ static int sys_show_kernel_ngroups_max(struct proc_entry *UNUSED(entry), struct 
     return 0;
 }
 
+// The id a uid or gid reads as where it cannot be represented: across a user
+// namespace boundary, or through a 16-bit uid call. AOK has neither, so this
+// is Linux's default; bubblewrap reads both before anything else and refuses
+// to start without them.
+static int sys_show_kernel_overflowid(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "%d\n", 65534);
+    return 0;
+}
+
+static int sys_show_kernel_randomize_va_space(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "%d\n", aslr_randomize_va_space());
+    return 0;
+}
+
+// Root only, 0 to 2, as on Linux; it applies from the next exec. Read-only
+// in effect while the cache of translated code is on (kernel/personality.h):
+// a write of the value already in force succeeds, any other is EPERM, which
+// sysctl(8) reports and systemd-sysctl passes over.
+static int sys_update_kernel_randomize_va_space(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    long value;
+    int err = proc_sys_scalar_parse(data, 0, 2, &value);
+    if (err < 0)
+        return err;
+    if (aslr_randomize_va_space_locked())
+        return (int) value == aslr_randomize_va_space() ? 0 : _EPERM;
+    aslr_set_randomize_va_space((int) value);
+    return 0;
+}
+
 struct proc_dir_entry proc_sys_kernel[] = {
     {"cap_last_cap", .show = sys_show_kernel_cap_last_cap},
+    {"domainname", S_IFREG | 0644, .show = sys_show_kernel_domainname, .update = sys_update_kernel_domainname},
     {"hostname", S_IFREG | 0644, .show = sys_show_net_unix_hostname, .update = sys_update_kernel_hostname},
     {"ngroups_max", .show = sys_show_kernel_ngroups_max},
     {"osrelease", .show = sys_show_kernel_osrelease},
+    {"overflowgid", .show = sys_show_kernel_overflowid},
+    {"overflowuid", .show = sys_show_kernel_overflowid},
     {"pid_max", S_IFREG | 0644, .show = sys_show_kernel_pid_max, .update = sys_update_kernel_pid_max},
     {"random", S_IFDIR, .readdir = proc_sys_kernel_random_readdir},
+    {"randomize_va_space", S_IFREG | 0644, .show = sys_show_kernel_randomize_va_space,
+        .update = sys_update_kernel_randomize_va_space},
     {"threads-max", S_IFREG | 0644, .show = sys_show_kernel_threads_max, .update = sys_update_kernel_threads_max},
     {"version", .show = sys_show_net_version},
 };
@@ -747,8 +875,11 @@ void proc_sys_init(struct proc_dir_entry *root_entry) {
         proc_set_entries_parent(proc_sys_debug, PROC_SYS_DEBUG_LEN, debug_dir);
 
     fs_dir = proc_children_find(&proc_sys_children, "fs");
-    if (fs_dir != NULL)
+    if (fs_dir != NULL) {
         proc_set_entries_parent(proc_sys_fs_entries, PROC_SYS_FS_LEN, fs_dir);
+        proc_sys_fs_mqueue_entry.parent =
+                proc_find_entry(proc_sys_fs_entries, PROC_SYS_FS_LEN, "mqueue");
+    }
 
     kernel_dir = proc_children_find(&proc_sys_children, "kernel");
     if (kernel_dir != NULL) {

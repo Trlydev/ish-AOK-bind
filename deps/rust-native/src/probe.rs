@@ -36,6 +36,23 @@ pub extern "C" fn rust_native_probe_main(
         args.push(unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned());
     }
 
+    // Ending badly, on request (tests/manual/native_abort.c). This crate is
+    // panic=abort, so each of these is an abort() -- which has to be the
+    // PROGRAM's: before it was routed (kernel/native_libc.c's nlibc_abort)
+    // every one of them took the app, and all its sessions, with it.
+    match args.get(1).map(String::as_str) {
+        Some("--panic") => panic!("rust-probe: panicking on request"),
+        Some("--panic-thread") => {
+            // On a thread that is not the program's first: where tokio's
+            // workers run, and where the panic that was reported happened.
+            let _ = std::thread::spawn(|| panic!("rust-probe: panicking on a second thread")).join();
+            println!("rust-probe: the panic did not end the program");
+            return 0;
+        }
+        Some("--abort") => std::process::abort(),
+        _ => {}
+    }
+
     println!("rust-native-probe: Rust {} running as a native program", env!("CARGO_PKG_VERSION"));
     println!("argv: {:?}", args);
 

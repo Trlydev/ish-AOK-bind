@@ -4,6 +4,18 @@ cc = meson.get_compiler('c')
 
 if cc.get_id() == 'clang'
     add_project_arguments('-Wimplicit-fallthrough', '-Wtautological-constant-in-range-compare', language: 'c')
+    # Errors, not warnings. Both of these fired on kernel/native.c's registry
+    # for weeks and were printed by every single build -- a positional
+    # initializer had put a function pointer into a bool and a string literal
+    # into a function pointer, so native zsh ran setuid-root and a checkpoint
+    # CALLED the string. Nothing about that is a style question, and a warning
+    # in a log nobody greps for is the same as no warning at all.
+    #
+    # clang only, deliberately: the vendored trees carry '-w' in their own
+    # c_args, which comes after these and wins, and GCC on the Linux CI is a
+    # different compiler with a different idea of what these catch.
+    add_project_arguments('-Werror=incompatible-pointer-types',
+                          '-Werror=pointer-bool-conversion', language: 'c')
 endif
 
 # A missing declaration must fail the DEVELOPMENT build, because it already
@@ -126,6 +138,60 @@ summary({'native zsh': have_zsh ? 'yes -- permissive (zsh LICENCE), no GPL compi
                                 : 'no'},
         section: 'Licensing')
 
+# dash, and the one thing about it that has to be checked rather than trusted.
+#
+# dash is BSD-3-Clause except src/mksignames.c, which is GPL-2+ and whose
+# OUTPUT is linked -- Debian's own copyright file says so in as many words. The
+# vendored tree (deps/dash, emkey1/dash) has that file REMOVED and replaced by
+# src/aok_mksignames.c under dash's own licence.
+#
+# THE GUARD BELOW IS THE POINT. Removing a file from a fork is not durable on
+# its own: a merge from Debian restores it silently, the build picks it up
+# through the same HELPERS rule, and the binary quietly carries GPL-derived
+# content again with nothing in the log to say so. Configure fails instead.
+dash_dir = 'deps/dash'
+# Like deps/zsh, this must be a PREPARED tree rather than a pristine checkout:
+# dash generates five of the objects it links (builtins, init, nodes, signames,
+# syntax) from its own helpers, and meson does not reimplement that. The marker
+# is a generated file, so a checkout that has never been built fails the test.
+#   cd deps/dash && ../../tools/configure-dash.sh
+# Configure only: the generated sources are committed, and dash's own `make`
+# fails from a clean checkout (see tools/configure-dash.sh).
+dash_opt = get_option('native_dash')
+dash_prepared = fs_early.exists(dash_dir / 'src/signames.c') and fs_early.exists(dash_dir / 'config.h')
+dash_present = fs_early.exists(dash_dir / 'src/aok_mksignames.c')
+if fs_early.exists(dash_dir / 'src/mksignames.c')
+    error('deps/dash/src/mksignames.c is present.\n' +
+          '  That file is GPL-2+ (it is bash\'s) and its generated output is\n' +
+          '  LINKED into the binary, which is exactly what iSH-AOK removed it to\n' +
+          '  avoid -- see README.md, "Native bash and licensing".\n' +
+          '  It has almost certainly come back through a merge from Debian.\n' +
+          '  Remove it again; src/aok_mksignames.c replaces it.')
+endif
+if dash_opt.disabled()
+    have_dash = false
+elif dash_opt.enabled() and not dash_prepared
+    error('-Dnative_dash=enabled but deps/dash is not a prepared dash tree.\n' +
+          '  Its generated sources are committed but config.h is not; configure it once:\n' +
+          '    git submodule update --init deps/dash\n' +
+          '    cd deps/dash && ../../tools/configure-dash.sh\n' +
+          '  Or build without dash: -Dnative_dash=disabled')
+else
+    have_dash = dash_prepared
+endif
+if have_dash
+    add_project_arguments('-DISH_NATIVE_DASH=1', language: 'c')
+endif
+# Spelled out rather than nested, because meson forbids a nested ternary.
+if have_dash
+    dash_summary = 'yes -- permissive (BSD-3-Clause), GPL generator removed'
+elif dash_present
+    dash_summary = 'no -- tree present but not prepared (see tools/configure-dash.sh)'
+else
+    dash_summary = 'no'
+endif
+summary({'native dash': dash_summary}, section: 'Licensing')
+
 # Resolved here (rather than next to the gadget source lists below) because
 # it also drives a project-wide define, and add_project_arguments must run
 # before any target is declared. The arm64-GUEST gadgets
@@ -197,6 +263,17 @@ sqlite3 = cc.find_library('sqlite3')
 # link. required: false so a host without it still builds, with tar and gzip
 # excluded exactly as they were before.
 zlib = cc.find_library('z', required: false, has_headers: ['zlib.h'])
+
+# libcompression: Apple's in-OS compressor (LZ4, LZFSE, ZLIB). Public on macOS
+# 10.11+ and iOS 9+, so like zlib above this costs nothing but the link -- no
+# vendored code, nothing to keep up to date. Used by kernel/memcomp.c, the
+# phase-0 measurement for guest-memory compression. required: false so a host
+# without it still builds; memcomp_available() then reports no compressor and
+# the /proc surface says so rather than lying.
+libcompression = cc.find_library('compression', required: false, has_headers: ['compression.h'])
+if libcompression.found()
+    add_project_arguments('-DISH_HAVE_LIBCOMPRESSION=1', language: 'c')
+endif
 if zlib.found()
     # kernel/smallclue_glue.c defines tar/gzip/gunzip/zcat stubs when this is
     # absent. add_project_arguments has to run before any target is declared,
@@ -278,7 +355,7 @@ endif
 if not have_curl_shim and host_machine.system() in ['darwin', 'ios']
     warning('no Objective-C compiler -- curl and wget will be stubs')
 endif
-dependencies = [librt, libm, libdl, libatomic, threads, sqlite3]
+dependencies = [librt, libm, libdl, libatomic, threads, sqlite3, libcompression]
 if zlib.found()
     dependencies += zlib
 endif
@@ -402,9 +479,9 @@ aok_generated_book = custom_target('aok_generated_book',
 # in fs/aok.c, which is what lets it serve a tree with a directory per
 # language.
 #
-# Only built when helix is; without it the manifest's files would be a
-# megabyte of queries and themes for an editor that is not in the binary. The
-# empty manifest keeps fs/aok.c compiling either way, with the counts at zero.
+# Helix's runtime is only built when helix is; without it the manifest's files
+# would be a megabyte of queries and themes for an editor that is not in the
+# binary, and the empty manifest stands in for it.
 aok_libs_manifest = have_helix ? 'fs/aok-libs.manifest' : 'fs/aok-libs-empty.manifest'
 aok_lib_srcs = []
 foreach line : fs_mod.read(aok_libs_manifest).strip().split('\n')
@@ -413,12 +490,39 @@ foreach line : fs_mod.read(aok_libs_manifest).strip().split('\n')
         aok_lib_srcs += files('deps/helix/runtime' / entry.split()[0])
     endif
 endforeach
+# The same table also serves what a shell with no distro under it would
+# otherwise find in /usr/share: the terminfo database (always -- native zsh,
+# hx and the applets all want a terminal description) and zsh's function tree
+# (with zsh). A native-mode root links /usr/share/terminfo here
+# (kernel/native_root.c), and kernel/zsh_glue.c puts the zsh tree on FPATH.
+# tools/gen-native-share-manifests.sh regenerates both manifests.
+aok_libs_groups = [['fs/aok-terminfo.manifest', 'opt/AOK/share/terminfo', '/native/libs/terminfo'],
+                   # /AOK/bundled: built ahead of time for guest roots, by
+                   # tools/build-bundled.sh, so setup scripts link instead of
+                   # compiling on the device.
+                   ['fs/aok-bundled.manifest', 'opt/AOK/bundled', '/bundled']]
+if have_zsh
+    aok_libs_groups += [['fs/aok-zsh-functions.manifest', 'deps/zsh', '/native/libs/zsh']]
+endif
+aok_libs_also = []
+aok_libs_manifests = []
+foreach g : aok_libs_groups
+    aok_libs_manifests += files(g[0])
+    aok_libs_also += ['--also', meson.current_source_dir() / g[0],
+                      meson.current_source_dir() / g[1], g[2]]
+    foreach line : fs_mod.read(g[0]).strip().split('\n')
+        entry = line.strip()
+        if entry != '' and not entry.startswith('#')
+            aok_lib_srcs += files(g[1] / entry.split()[0])
+        endif
+    endforeach
+endforeach
 aok_generated_libs = custom_target('aok_generated_libs',
     output: 'aok_generated_libs.inc',
-    input: [files('tools/gen-aokfs.py', aok_libs_manifest)] + aok_lib_srcs,
+    input: [files('tools/gen-aokfs.py', aok_libs_manifest)] + aok_libs_manifests + aok_lib_srcs,
     command: [python, '@INPUT0@', '@INPUT1@',
               meson.current_source_dir() / 'deps' / 'helix' / 'runtime', '@OUTPUT@',
-              '/native/libs/helix', '_libs'])
+              '/native/libs/helix', '_libs'] + aok_libs_also)
 
 # The syscall numbers a native program may issue, generated from calls.c's own
 # table so the two cannot drift. The hand-written list this replaces named 77
@@ -434,6 +538,8 @@ native_syscall_nums = custom_target('native_syscall_nums',
 emu_src = [
     'emu/tlb.c',
     'emu/fpu.c',
+    'emu/fpenv.c',
+    'emu/i386_sreg.c', # i386 segment registers and TLS descriptors: the JIT's i386_jit_sreg and the kernel's side
     'emu/vec.c',
     'emu/avx.c', # arch-independent AVX/VEX semantics, shared by the amd64 and i386 front-ends
     'emu/mmx.c',
@@ -441,7 +547,9 @@ emu_src = [
     'emu/amd64_interp.c', # always built: host gadgets + jit/gen.c link its amd64_jit_* helpers
     'jit/jit.c',
     'jit/gen.c',
+    'jit/jitprof.c',
     'jit/hle.c',
+    'jit/arm64_mops.c',
     'jit/helpers.c',
     'jit/riscv64_vendor_ext.c', # portable C, inert unless gen_step_riscv64 ever runs
 ]
@@ -456,6 +564,9 @@ emu_src += [
     gadgets+'/misc.S',
     offsets,
 ]
+if jit_cpu_family == 'aarch64'
+    emu_src += [gadgets+'/x87.S']  # the x87; an x86_64 host keeps emu/fpu.c
+endif
 # AArch64 GUEST gadgets (native ARM64 guest code) -- only meaningful/
 # buildable on an aarch64 host, since they're literal AArch64 assembly.
 # Distinct from gadgets-aarch64/ above (the ARM64 HOST gadget set used by
@@ -473,6 +584,9 @@ if jit_cpu_family == 'aarch64' and guest_archs.contains('arm64')
         'jit/guest-arm64/atomics.S',
         'jit/guest-arm64/dpextra.S',
         'jit/guest-arm64/simd.S',
+        'jit/guest-arm64/simd_spec.S',
+        'jit/guest-arm64/simd_spec3.S',
+        'jit/guest-arm64/alu_spec.S',
         'jit/guest-arm64/simd_arith.S',
         'jit/guest-arm64/simd_misc.S',
         'jit/guest-arm64/simd_shift.S',
@@ -489,13 +603,15 @@ if jit_cpu_family == 'aarch64' and guest_archs.contains('riscv64')
         'jit/guest-riscv64/memory.S',
         'jit/guest-riscv64/atomics.S',
         'jit/guest-riscv64/fp.S',
+        'jit/guest-riscv64/rcache.S',
+        'jit/guest-riscv64/vector.S',
     ]
 endif
 
 libish_emu = library('ish_emu', emu_src, include_directories: includes)
 
 libfakefs = library('fakefs',
-    ['fs/fake-db.c', 'fs/fake-migrate.c', 'fs/fake-rebuild.c', 'fs/fake-conn.c',
+    ['fs/fake-db.c', 'fs/fake-migrate.c', 'fs/fake-rebuild.c', 'fs/fake-conn.c', 'fs/fake-snapshot.c',
      'util/lockstats.c'],
     include_directories: includes,
     dependencies: sqlite3)
@@ -505,14 +621,16 @@ src = [
     'kernel/errno.c',
 
     'kernel/calls.c',
+    'kernel/checkpoint.c',
     'kernel/ish_accel_crypto.c',
     'kernel/ish_accel_aes.c',
     'kernel/ish_accel.c',
     'kernel/ish_accel_pix.c',
     'kernel/ish_accel_pix_kernels.c',
     'kernel/user.c',
-    'kernel/vdso.c', vdso,
+    'kernel/vdso.c', vdso, vdso_amd64, vdso_arm64, vdso_riscv64,
     'kernel/task.c',
+    'kernel/guestprof.c',
     'kernel/group.c',
     'kernel/log.c',
 
@@ -521,18 +639,24 @@ src = [
     'kernel/native.c',
     'kernel/native_bench.c',
     'kernel/native_io.c',
+    'kernel/native_root.c',
+    'kernel/foreign_exec.c',
     'kernel/native_libc.c',
+    'kernel/native_fnmatch.c',
+    'kernel/native_tz.c',
+    'kernel/sha_crypt.c',
     'kernel/native_kqueue.c',
     'kernel/native_termcap.c',
     'kernel/native_syscall.c', native_syscall_nums,
     'kernel/smallclue_glue.c',
     'kernel/openssh_glue.c',
     'kernel/ktop_glue.c',
+    'kernel/acct.c',
     'kernel/exit.c',
     'kernel/time.c',
     'kernel/binfmt_misc.c',
     'kernel/mmap.c',
-    'kernel/swap.c',
+    'kernel/memcomp.c', 'kernel/zpool.c', 'kernel/zswap.c', 'kernel/swap.c',
     'kernel/uname.c',
     'kernel/tls.c',
     'kernel/futex.c',
@@ -541,6 +665,7 @@ src = [
     'kernel/resource.c',
     'kernel/random.c',
     'kernel/misc.c',
+    'kernel/seccomp.c',
     'kernel/aio.c',
     'kernel/eventfd.c',
     'kernel/pidfd.c',
@@ -558,6 +683,10 @@ src = [
 
     'kernel/fs.c',
     'kernel/fs_info.c',
+    'kernel/xattr.c',
+    'kernel/rseq.c',
+    'kernel/ipc_ns.c',
+    'kernel/mqueue.c',
     'fs/aok.c', aok_generated_libs, aok_generated_tests, aok_generated_tools, aok_generated_docs,
     aok_generated_book,
     'fs/mount.c',
@@ -586,8 +715,10 @@ src = [
 
     'fs/adhoc.c',
     'fs/sock.c',
+    'fs/net_vif.c',
     'fs/pipe.c',
     'fs/fifo.c',
+    'fs/host_fifo.c',
     'fs/sockrestart.c',
     'fs/lock.c',
 
@@ -598,6 +729,7 @@ src = [
     'fs/pty.c',
     'fs/tmp.c',
     'fs/fuse.c',
+    'fs/virtgpu.c',
 
     'fs/poll.c',
     'kernel/poll.c',
@@ -610,6 +742,7 @@ src = [
     'util/fifo.c',
 
     'emu/memory.c',
+    'emu/host_fault.c',
     'platform/standalone.c',
 
     'platform/' + host_machine.system() + '.c',
@@ -788,6 +921,13 @@ else
             'silently. Populate it with: git -C deps/smallclue submodule ' +
             'update --init third-party/nextvi')
 endif
+# The glob runs at configure time only, so a source file added to SmallCLUE
+# was invisible to an existing build directory -- ninja and Xcode's meson.sh
+# both went straight to a link that lacked it (sed_app.c, 2026-09-30).
+# SmallCLUE's CMakeLists.txt lists every source, so it changes whenever one
+# is added; reading it makes it a regeneration dependency, and the next build
+# re-runs this glob.
+fs_mod.read('deps/smallclue/CMakeLists.txt')
 # Space-separated, not newline: meson interprets \n inside its own string
 # literals, which would break the one-liner before python ever sees it.
 foreach f : run_command(python, '-c',
@@ -834,12 +974,36 @@ smallclue_c_args = [
     # syslog(2), so say so rather than letting the #else claim dmesg is
     # unsupported on a system whose /usr/bin/dmesg works.
     '-DSMALLCLUE_HAVE_KLOGCTL',
+    # su, sudo and passwd need to read the guest's /etc/shadow and a crypt(3)
+    # that speaks $6$. Both exist for native code now (kernel/native_libc.c's
+    # getspnam, kernel/sha_crypt.c), so the gates in core.c can stop asking
+    # whether the HOST is Linux -- which it never is on an app build -- and
+    # ask whether the capability is present, which is what they meant.
+    '-DSMALLCLUE_HAVE_SHADOW_AUTH',
+    # mount and umount, for the guest kernel, which is Linux whatever the host
+    # is (src/mount_app.c; kernel/smallclue_glue.c supplies the two calls).
+    # This is what lets a native-mode root reach a distro root beside it:
+    # mount-root.sh needs mount --bind and umount.
+    '-DSMALLCLUE_HOST_LINUX_MOUNT',
+    # login's last resort when an account's shell does not exist, ahead of
+    # /bin/sh -- which a native-mode root has only as a link into /AOK/native,
+    # and which a user can break. The terminal's root prompt must survive a
+    # broken /etc/passwd (docs/native_mode_plan.md 4b), so it ends in a shell
+    # that is part of the app.
+    have_zsh ? '-DSMALLCLUE_FALLBACK_SHELL="/AOK/native/zsh"'
+             : '-DSMALLCLUE_FALLBACK_SHELL="/AOK/native/sh"',
     # `md` with no arguments lists the documents in this directory, and
     # `md native-programs` resolves a bare name against it. The default is
     # $HOME/Docs, which an AOK guest has no reason to have -- so md looked
     # broken rather than empty. /AOK/docs is compiled into the app
     # (fs/aok-docs.manifest) and is always there.
     '-DSMALLCLUE_MARKDOWN_DOCS_DIR="/AOK/docs"',
+    # uname() here is the guest kernel's (kernel/native_libc.c's nlibc_uname),
+    # so SmallCLUE must not swap in the host's hw.machine -- `uname -m` said
+    # "iPad17,3" where scripts expect "aarch64" (#622).
+    '-DSMALLCLUE_UNAME_FROM_KERNEL',
+    # A guest shell has already expanded every pattern: rm must not glob again.
+    '-DSMALLCLUE_ARGS_EXPANDED',
     '-w',  # vendored code, not ours to police
 ]
 
@@ -856,12 +1020,82 @@ endif
 # directory is a configure error.
 openssh_includes = []
 if have_openssh
+    # OpenSSH 10.5 includes <sys/tree.h>, <endian.h> and friends directly,
+    # which Darwin does not have. Upstream's configure generates forwarding or
+    # empty shims into openbsd-compat/include and puts that on CPPFLAGS; the
+    # AOK tree commits them instead, because it is built from a
+    # hand-maintained config.h rather than configured.
     openssh_includes = [include_directories(
         openssh_dir, openssh_dir / 'openbsd-compat')]
+    # ... and an OpenSSH old enough not to need them does not have the
+    # directory at all, which include_directories() treats as an error.
+    if fs_mod.is_dir(openssh_dir / 'openbsd-compat' / 'include')
+        openssh_includes += include_directories(
+            openssh_dir / 'openbsd-compat' / 'include')
+    endif
 endif
 
+# libgit2, for SmallCLUE's git applet (src/git_app.c, ~13k lines of porcelain
+# over it). It used to be a stub in every AOK build -- "libgit2 support is not
+# enabled in this build" -- because SmallCLUE's own builds configure libgit2
+# with OpenSSL and AOK links none. On Apple platforms it needs none: HTTPS
+# through SecureTransport, SHA-1 through libgit2's bundled collision-detecting
+# implementation, SHA-256 through CommonCrypto, regcomp, and the zlib already
+# linked. deps/libgit2-shim holds the two headers libgit2's CMake generates
+# for exactly that configuration (git2_features.h, git2/experimental.h);
+# regenerate them with its cmake and these -D options if libgit2 is bumped:
+#   USE_HTTPS=SecureTransport USE_SHA1=CollisionDetection
+#   USE_SHA256=CommonCrypto USE_HTTP_PARSER=builtin USE_REGEX=regcomp
+#   USE_COMPRESSION=zlib USE_SSH=OFF USE_AUTH_NTLM=OFF USE_AUTH_NEGOTIATE=OFF
+#   USE_I18N=OFF USE_NSEC=ON
+#
+# Compiled as a native program's code: the native_libc.h force-include routes
+# its files, sockets and DNS to the guest, exactly as SmallCLUE's are, and
+# NO_MMAP keeps it from mapping a guest descriptor through the host. The
+# sources are the same globs libgit2's CMake compiles for that configuration
+# (checked equal, 177 files). A missing submodule, or a non-Apple host, keeps
+# the stub: `git -C deps/smallclue submodule update --init third-party/libgit2`.
+libgit2_dir = 'deps/smallclue/third-party/libgit2'
+have_libgit2 = host_machine.system() in ['darwin', 'ios'] and \
+    fs_mod.is_file(libgit2_dir / 'include' / 'git2.h')
+liblibgit2 = []
+libgit2_includes = []
+if have_libgit2
+    libgit2_src = []
+    foreach f : run_command(python, '-c',
+            'import glob, sys; r = sys.argv[1]; print(" ".join(sorted(p[len(r) + 1:] for d in ("src/libgit2", "src/libgit2/streams", "src/libgit2/transports", "src/util", "src/util/allocators", "src/util/unix", "deps/xdiff", "deps/llhttp", "src/util/hash/sha1dc") for p in glob.glob(r + "/" + d + "/*.c"))))',
+            meson.current_source_dir() / libgit2_dir, check: true).stdout().strip().split(' ')
+        if f != ''
+            libgit2_src += files(libgit2_dir / f)
+        endif
+    endforeach
+    libgit2_src += files(libgit2_dir / 'src/util/hash/collisiondetect.c',
+                         libgit2_dir / 'src/util/hash/common_crypto.c')
+    libgit2_includes = include_directories(libgit2_dir / 'include')
+    liblibgit2 = [static_library('git2', libgit2_src,
+        include_directories: [include_directories(
+            'deps/libgit2-shim',
+            libgit2_dir / 'include',
+            libgit2_dir / 'src/util',
+            libgit2_dir / 'src/libgit2',
+            libgit2_dir / 'deps/xdiff',
+            libgit2_dir / 'deps/llhttp'), includes],
+        c_args: [
+            '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+            '-D_GNU_SOURCE', '-DNDEBUG', '-DNO_MMAP',
+            '-DSHA1DC_NO_STANDARD_INCLUDES=1',
+            '-DSHA1DC_CUSTOM_INCLUDE_SHA1_C="git2_util.h"',
+            '-DSHA1DC_CUSTOM_INCLUDE_UBC_CHECK_C="git2_util.h"',
+            '-w',  # vendored code, not ours to police
+        ])]
+    smallclue_c_args += '-DPSCAL_HAS_LIBGIT2'
+endif
+summary({'git (libgit2)': have_libgit2 ? 'yes -- SecureTransport, no SSH transport'
+                                       : 'stub (deps/smallclue/third-party/libgit2 missing, or not Apple)'},
+        section: 'Native programs')
+
 libsmallclue = static_library('smallclue', smallclue_src + smallclue_extra_src,
-    include_directories: [includes, smallclue_includes] + openssh_includes,
+    include_directories: [includes, smallclue_includes, libgit2_includes] + openssh_includes,
     c_args: smallclue_c_args)
 
 # NOT compiled with the native_libc.h force-include the rest of SmallCLUE
@@ -1560,6 +1794,113 @@ if have_zsh
         c_args: zsh_defs)
 endif
 
+libdash = []
+if have_dash
+    # dash_CFILES from deps/dash/src/Makefile.am, plus the five sources its own
+    # helpers generate. Listed rather than globbed, so a file appearing upstream
+    # is a compile error to look at rather than something silently absorbed.
+    dash_cfiles = [
+        'alias.c', 'arith_yacc.c', 'arith_yylex.c', 'cd.c', 'error.c',
+        'eval.c', 'exec.c', 'expand.c', 'histedit.c', 'input.c', 'jobs.c',
+        'mail.c', 'main.c', 'memalloc.c', 'miscbltin.c', 'mystring.c',
+        'options.c', 'parser.c', 'redir.c', 'show.c', 'trap.c', 'output.c',
+        'system.c', 'var.c',
+        'bltin/printf.c', 'bltin/test.c', 'bltin/times.c',
+        # AOK's own: fork by re-launch, which is what makes a pipeline, a
+        # command substitution or a background job work at all when fork()
+        # cannot exist. Not from Makefile.am, and deliberately listed next to
+        # the files it replaces the behaviour of.
+        'aok_fork.c',
+        # Generated by dash's helpers -- see tools/configure-dash.sh. signames.c
+        # is the one this project cares about: it comes from aok_mksignames.c,
+        # not from the GPL generator that used to produce it.
+        'builtins.c', 'init.c', 'nodes.c', 'signames.c', 'syntax.c',
+    ]
+    dash_src = []
+    foreach f : dash_cfiles
+        dash_src += files(dash_dir / 'src' / f)
+    endforeach
+
+    # config.h is at the tree root; the sources are in src/ and include each
+    # other unqualified. implicit_include_directories is off for the same
+    # reason it is off for zsh and OpenSSH: AOK's own root has files whose
+    # names dash also uses (error.h, output.h, var.h).
+    dash_includes = include_directories(dash_dir, dash_dir / 'src')
+    dash_defs = [
+        # dash FORCE-INCLUDES its config.h rather than having each source
+        # include it (src/Makefile.am: AM_CPPFLAGS = -include config.h), so
+        # -DHAVE_CONFIG_H alone buys nothing and every HAVE_* test silently
+        # reads as "absent". That is not a quiet degradation: system.h then
+        # declares its own stpcpy/strtod/killpg against the real ones, and
+        # cd.c uses stat64, which config.h is what maps to stat here.
+        '-include', meson.current_source_dir() / dash_dir / 'config.h',
+        # ...and what of it is overridden: dash's own pattern matcher, not
+        # Darwin's fnmatch (the reasons are in the file).
+        '-include', meson.current_source_dir() / 'kernel/dash_config_aok.h',
+        # THE SHIM, and dash is useless without it. A native program compiled
+        # against the HOST's libc calls the host's everything: its open() writes
+        # to the Mac rather than the guest, and its fork() forks the entire
+        # emulator. That is not a subtle failure but it LOOKS like success --
+        # before this line, `(x=inner)` isolated correctly and an external
+        # command ran, because a real host fork does both. See
+        # kernel/native_libc.h and the note on smallclue_c_args.
+        #
+        # AFTER config.h deliberately: config.h is only #defines and sets the
+        # HAVE_* that dash's own headers test, while native_libc.h is a header
+        # and has to precede the first libc one to redirect anything.
+        '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+        # From the same file's COMMON_CPPFLAGS.
+        '-DBSD=1', '-DSHELL',
+        # A native program is a function call, not a process, so dash's main()
+        # becomes an ordinary function and kernel/dash_glue.c calls it. Same
+        # mechanism as bash (-Dmain=bash_main_entry) and ktop.
+        '-Dmain=dash_main',
+        # THREE SHELLS AND AN SSH IN ONE ARCHIVE SHARE ONE SYMBOL NAMESPACE.
+        # link_whole folds every object into libish.a, so a name dash exports
+        # that bash, zsh or OpenSSH also exports is a duplicate-symbol link
+        # error -- not a subtle one, but it names only the collisions it found,
+        # so this list grows a line at a time as dash is updated. Exactly five
+        # collide today, and each is renamed rather than patched, so deps/dash
+        # stays a clean merge from Debian:
+        '-Devalstring=dash_evalstring',      # bash: builtins/evalstring.c
+        '-Ddecode_signal=dash_decode_signal',# bash: trap.c
+        '-Dhashcmd=dash_hashcmd',            # zsh:  Src/exec.c
+        '-Ddotrap=dash_dotrap',              # zsh:  Src/signals.c
+        '-Dxasprintf=dash_xasprintf',        # OpenSSH: xmalloc.c
+        # AND THREE THE LINKER ONLY REPORTED ONCE dash's GLOBALS WENT
+        # __thread. Before that conversion these were TENTATIVE definitions
+        # (`int shlvl;` with no initialiser, which clang emits as a common
+        # symbol), and a common symbol does not collide -- it MERGES with a
+        # real definition of the same name. So dash's $SHLVL and zsh's were one
+        # variable, dash's parser line counter and zsh's were one variable, and
+        # dash's arithmetic yylval and bash's were one variable, in a build
+        # that linked without a word. A __thread definition is a real
+        # definition, so all three became hard errors the moment the conversion
+        # landed. Renamed rather than reasoned about:
+        '-Dshlvl=dash_shlvl',                # zsh:  Src/params.c
+        '-Dlineno=dash_lineno',              # zsh:  Src/params.c
+        '-Dyylval=dash_yylval',              # bash: y.tab.c
+        # AND ONE THE LINKER DID NOT REPORT, which is the dangerous kind.
+        # bash also defines signal_names (deps/bash/trap.c). Both are DATA
+        # symbols, and duplicate data merges silently where duplicate text is a
+        # hard error -- so the link succeeded and dash indexed BASH's table.
+        # decode_signal walks `signo < NSIG` calling strcasecmp on every entry
+        # with no NULL check (deps/dash/src/trap.c), so `trap 'echo x' INT`
+        # segfaulted while `trap 'echo x' 2` worked, the numeric path never
+        # touching the array. Found with nm, not with the linker.
+        '-Dsignal_names=dash_signal_names',
+    ]
+
+    # Behind have_dash exactly like zsh_glue.c is behind have_zsh, so the
+    # registry entry and the archive can never disagree.
+    src += files('kernel/dash_glue.c')
+
+    libdash = static_library('dash', dash_src,
+        include_directories: dash_includes,
+        implicit_include_directories: false,
+        c_args: dash_defs)
+endif
+
 # link_whole, not link_with: this folds SmallCLUE's objects into libish.a
 # itself. The Xcode project links the meson archives by name (libish.a,
 # libish_emu.a, libfakefs.a), so a fourth archive would silently fail to
@@ -1592,6 +1933,48 @@ endif
 if have_helix
     ish_c_args += '-DISH_NATIVE_HELIX'
 endif
+# /dev/dri/renderD128 (fs/virtgpu.c, #484): virglrenderer's Venus renderer
+# over MoltenVK, both built here as subprojects (subprojects/virglrenderer
+# and subprojects/MoltenVK link to the submodules in deps/) and merged into
+# libish -- so the Xcode build carries them inside libish.a, and the app links
+# only the frameworks they use (app/App.xcconfig). auto: on Darwin, when both
+# submodules are checked out.
+virgl_libs = []
+virgl_deps = []
+gpu_opt = get_option('gpu')
+have_gpu = false
+if not gpu_opt.disabled() and host_machine.system() == 'darwin'
+    have_gpu = (fs_mod.exists('deps/virglrenderer/src/venus/vkr_renderer.c') and
+                fs_mod.exists('deps/MoltenVK/meson.build'))
+    if gpu_opt.enabled() and not have_gpu
+        error('-Dgpu=enabled but deps/virglrenderer or deps/MoltenVK is not checked out')
+    endif
+endif
+if have_gpu
+    moltenvk = subproject('MoltenVK')
+    # virglrenderer's Venus renderer links vkGetInstanceProcAddr directly
+    # (vulkan-dload=false): MoltenVK is its Vulkan. Headers only -- MoltenVK
+    # itself is merged into libish below, and a second copy on the link line
+    # duplicates its Objective-C classes once -ObjC loads them.
+    meson.override_dependency('vulkan', declare_dependency(
+        include_directories: moltenvk.get_variable('vulkan_inc')))
+    virgl = subproject('virglrenderer', default_options: [
+        'default_library=static', 'vrend=false', 'venus=true', 'vulkan-dload=false',
+        'render-server-worker=thread', 'tests=false', 'werror=false', 'warning_level=0',
+    ])
+    virgl_libs = [virgl.get_variable('libvirgl'), virgl.get_variable('libmesa'),
+                  moltenvk.get_variable('libmoltenvk')]
+    ish_c_args += '-DISH_VIRTGPU'
+    if not meson.is_cross_build()
+        # -ObjC: MoltenVK adds methods to Metal classes in categories, which a
+        # static archive's members only bring in when asked (the app's link
+        # has it already); without it the first sampler with a border colour
+        # is an unrecognized selector, and an uncaught exception.
+        virgl_deps = [moltenvk.get_variable('framework_deps'),
+                      dependency('appleframeworks', modules: ['CoreFoundation']),
+                      declare_dependency(link_args: ['-ObjC'])]
+    endif
+endif
 
 # motepad is a native PROGRAM, so its libc calls have to reach the guest --
 # its own archive purely so it can be compiled with the native_libc.h
@@ -1604,6 +1987,14 @@ endif
 # Mac, and its reads raced the emulator's own reader on the same host
 # descriptor -- which showed up as every other keystroke going missing.
 libmotepad = static_library('motepad', 'kernel/native_motepad.c',
+    include_directories: includes,
+    c_args: ish_c_args + [
+        '-include', meson.current_source_dir() / 'kernel/native_libc.h',
+    ])
+
+# wl-present (#484), on the same terms: host code reaching the guest's
+# compositor through the shim, and the app through fs/virtgpu.h.
+libwlpresent = static_library('wlpresent', 'kernel/native_wlpresent.c',
     include_directories: includes,
     c_args: ish_c_args + [
         '-include', meson.current_source_dir() / 'kernel/native_libc.h',
@@ -1632,11 +2023,14 @@ libktop = static_library('ktop', 'opt/AOK/tools/ktop/ktop.c',
 
 libish = library('ish', src,
     objects: librustnative,
-    link_whole: [libsmallclue, libnextvi, libbash, libzsh, libopenssh, libmotepad, libktop] + libopenssh_special + libcurlshim,
+    link_whole: [libsmallclue, libnextvi, libbash, libzsh, libdash, libopenssh, libmotepad, libktop, libwlpresent] + libopenssh_special + libcurlshim + liblibgit2 + virgl_libs,
     include_directories: includes, c_args: ish_c_args)
+# SecureTransport, for libgit2's HTTPS (the app links it in app/App.xcconfig).
+libgit2_deps = have_libgit2 and not meson.is_cross_build() ? \
+    [dependency('appleframeworks', modules: ['Security', 'CoreFoundation'])] : []
 ish = declare_dependency(
     link_with: [libish, libish_emu, libfakefs],
-    dependencies: dependencies,
+    dependencies: dependencies + virgl_deps + libgit2_deps,
     include_directories: includes)
 
 # The CLI executable is skipped for the iOS cross build because Xcode links the
@@ -1665,13 +2059,88 @@ if not meson.is_cross_build()
     # test for floating point library
     float80_test = executable('float80_test', ['emu/float80.c', 'emu/float80-test.c'], dependencies: [libm])
     test('float80', float80_test)
+    # The round-to-nearest fast paths against the general code, bit for bit.
+    float80_fast_test = executable('float80_fast_test', ['emu/float80.c', 'emu/float80-fast-test.c'],
+        include_directories: includes, dependencies: [libm])
+    test('float80_fast', float80_fast_test, args: ['400000'])
+
+    # The compressed-page pool holds guest memory the guest can no longer see,
+    # so a bug in it is silent corruption. Host unit test rather than a guest
+    # one because the pool has no guest-visible surface of its own.
+    zpool_test = executable('zpool_test', ['kernel/zpool.c', 'kernel/zpool-test.c'],
+        include_directories: includes)
+    test('zpool', zpool_test)
 
     # riscv64 decode.h check: RVC expansion + immediate reassembly against
     # llvm-mc-derived vectors (tests/riscv64/decode_vectors.h, checked in).
+    # SHA-crypt ($5$/$6$) against the published vectors. An implementation that
+    # is subtly wrong is indistinguishable from a correct one by inspection --
+    # see the header of the test.
+    sha_crypt_test = executable('sha_crypt_test',
+        ['kernel/sha_crypt.c', 'kernel/sha_crypt-test.c'],
+        include_directories: includes)
+    test('sha_crypt', sha_crypt_test)
+
     riscv64_decode_check = executable('riscv64_decode_check',
         ['tests/riscv64/decode_check.c'],
         include_directories: [includes, include_directories('tests/riscv64')])
     test('riscv64_decode', riscv64_decode_check)
+
+    # No gadget may read a vector register across a call that can reach C:
+    # save_c keeps general registers only, and on an A10X the TLB slow path
+    # came back with v0 changed (a4e9b84fc). The checker reads the assembled
+    # objects, Mach-O ones, so this is for an Apple silicon host.
+    if host_machine.cpu_family() == 'aarch64' and host_machine.system() == 'darwin'
+        gadget_vreg_audit = files('tools/gadget-vreg-audit.py')
+        test('gadget_vreg_selftest', python, args: [gadget_vreg_audit, '--self-test'])
+        test('gadget_vreg_audit', python,
+            args: [gadget_vreg_audit, meson.current_build_dir() / 'libish_emu.a.p'],
+            depends: [libish_emu], timeout: 300)
+    endif
+
+    # The LLM Chat's tool permission rules decide what runs in the guest
+    # without the user seeing it. Foundation only, so it needs a Mac.
+    if host_machine.system() == 'darwin' and have_curl_shim
+        llm_permissions_test = executable('llm_permissions_test',
+            ['app/LLMChatPermissions.m', 'tests/unit/llm_permissions_test.m'],
+            include_directories: include_directories('app'),
+            objc_args: ['-fobjc-arc'],
+            link_args: ['-framework', 'Foundation'])
+        test('llm_permissions', llm_permissions_test)
+
+        # The diff the chat shows for the model's file changes; patch(1) is
+        # the oracle.
+        llm_diff_test = executable('llm_diff_test',
+            ['app/LLMChatDiff.m', 'tests/unit/llm_diff_test.m'],
+            include_directories: include_directories('app'),
+            objc_args: ['-fobjc-arc'],
+            link_args: ['-framework', 'Foundation'])
+        test('llm_diff', llm_diff_test, timeout: 180)
+
+        # The Anthropic Messages API translation: tool turns, caching, replay.
+        llm_anthropic_test = executable('llm_anthropic_test',
+            ['app/LLMChatAnthropic.m', 'tests/unit/llm_anthropic_test.m'],
+            include_directories: include_directories('app'),
+            objc_args: ['-fobjc-arc'],
+            link_args: ['-framework', 'Foundation'])
+        test('llm_anthropic', llm_anthropic_test)
+
+        # Streamed replies reassembled into the non-streaming message.
+        llm_stream_test = executable('llm_stream_test',
+            ['app/LLMChatStream.m', 'app/LLMChatAnthropic.m', 'tests/unit/llm_stream_test.m'],
+            include_directories: include_directories('app'),
+            objc_args: ['-fobjc-arc'],
+            link_args: ['-framework', 'Foundation'])
+        test('llm_stream', llm_stream_test)
+
+        # MCP JSON-RPC framing and tool translation.
+        llm_mcp_test = executable('llm_mcp_test',
+            ['app/LLMChatMCPCore.m', 'tests/unit/llm_mcp_test.m'],
+            include_directories: include_directories('app'),
+            objc_args: ['-fobjc-arc'],
+            link_args: ['-framework', 'Foundation'])
+        test('llm_mcp', llm_mcp_test)
+    endif
 endif
 
 e2e_test = find_program('tests/e2e/e2e.bash')

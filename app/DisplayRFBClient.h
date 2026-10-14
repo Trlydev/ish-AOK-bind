@@ -46,7 +46,7 @@ NS_ASSUME_NONNULL_BEGIN
 //
 // Replaces DisplayNetworkBridge + the WS/noVNC/WKWebView stack entirely:
 // this connects straight to wayvnc's loopback TCP port (see
-// wayland_workspace_plan.md and the harmonic-giggling-aho plan for why).
+// docs/historical/wayland_workspace_plan.md and the harmonic-giggling-aho plan for why).
 @interface DisplayRFBClient : NSObject
 
 @property (nonatomic, weak, nullable) id<DisplayRFBClientDelegate> delegate;
@@ -75,8 +75,17 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)acknowledgeFramebufferRead;
 
+// While YES, no further FramebufferUpdateRequest is sent (the read loop and
+// input carry on): the desktop's pixels are arriving another way
+// (wl-present, fs/virtgpu.h) and wayvnc need not capture them. Setting it
+// back to NO asks for updates again.
+@property (nonatomic) BOOL framebufferUpdatesPaused;
+
 #pragma mark - Input
 
+// Input, the clipboard and desktop resizes go to wl-present instead of VNC
+// whenever it takes them for this desktop (virtgpu_present_input,
+// fs/virtgpu.h): it drives the compositor itself, so wayvnc can let go of it.
 - (void)sendPointerEventAtX:(uint16_t)x y:(uint16_t)y buttonMask:(uint8_t)buttonMask;
 - (void)sendKeyEvent:(uint32_t)keysym down:(BOOL)down;
 - (void)sendCtrlAltDel;
@@ -90,10 +99,18 @@ NS_ASSUME_NONNULL_BEGIN
 // (see docs/wayland_rotation_resize_plan.md): the labwc output really
 // changes mode, maximized windows reflow, and the new size arrives back as
 // a DesktopSize/ExtendedDesktopSize rect, which this client applies to its
-// framebuffer. Purely advisory: a server that doesn't support it (or
-// refuses) simply never sends a size rect and nothing changes. No-op when
-// the requested size already matches, or before the connection is up.
+// framebuffer. Purely advisory: when a server doesn't support it, or
+// refuses, the framebuffer keeps its size. Not always
+// sent at once: the client holds it until the first frame has arrived, any
+// earlier request has been answered and no frame is on its way. Sooner crashes
+// the wayvnc that Debian 13 and Devuan 6 ship, or garbles the stream (seen
+// with wayvnc 0.10.0). Only the latest size asked for is kept, and after a
+// "prohibited" answer none are sent.
 - (void)requestDesktopSizeWidth:(uint16_t)width height:(uint16_t)height;
+
+// The desktop's clipboard, arriving some other way than VNC (wl-present):
+// told to the delegate as if the server had sent it. Any thread.
+- (void)deliverServerCutText:(NSString *)text;
 
 @end
 

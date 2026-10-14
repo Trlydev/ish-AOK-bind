@@ -8,6 +8,8 @@
 // all the listening sockets. On resume, open new sockets, reconfigure them,
 // use dup2 to replace the original sockets, and get any thread waiting on them
 // to restart the wait.
+// (AF_UNIX listeners are spared: XNU creates them exempt from this. A resume
+// replaces only the listeners it finds dead -- see sockrestart.c.)
 // This file contains hooks into various other places to do all that.
 // https://developer.apple.com/library/archive/technotes/tn2277/_index.html
 #ifndef FS_SOCKRESTART_H
@@ -18,11 +20,24 @@ struct fd;
 
 void sockrestart_begin_listen(struct fd *sock);
 void sockrestart_end_listen(struct fd *sock);
+// A successful bind: a bound UDP socket is rebuilt after a suspension too.
+void sockrestart_note_bound(struct fd *sock);
 void sockrestart_begin_listen_wait(struct fd *sock);
 void sockrestart_end_listen_wait(struct fd *sock);
+// The same pair for a wait on more than one fd: begin once if the set holds
+// a socket (sockrestart_watches), end once if begun.
+bool sockrestart_watches(struct fd *fd);
+void sockrestart_begin_wait(void);
+void sockrestart_end_wait(void);
+struct task;
+void sockrestart_task_gone(struct task *task);
 bool sockrestart_should_restart_listen_wait(int);
-void sockrestart_on_suspend(void);
-void sockrestart_on_resume(void);
+// Both return how many sockets they handled -- listeners, and bound UDP
+// sockets (sockrestart_note_bound) -- so the caller can log
+// it. A save of 0 and a restore of 0 are the two states that look identical
+// from outside and mean completely different things.
+unsigned sockrestart_on_suspend(void);
+unsigned sockrestart_on_resume(void);
 
 struct fd_sockrestart {
     struct list listen;

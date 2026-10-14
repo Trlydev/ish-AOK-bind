@@ -6,13 +6,16 @@
 //
 
 #import "AboutAppearanceViewController.h"
+#import "AppDelegate.h"
 #import "FontPickerViewController.h"
 #import "TerminalView.h"
 #import "ThemesViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "UIViewController+Extras.h"
+#import "WorkspaceViewController.h"
 
-@interface AboutAppearanceViewController ()
+@interface AboutAppearanceViewController () <WorkspaceTextScaledPage>
 @property (strong, nonatomic) IBOutlet UISwitch *blinkCursor;
 @property (strong, nonatomic) IBOutlet UISegmentedControl *cursorStyle;
 @property (strong, nonatomic) IBOutlet UISwitch *hideStatusBar;
@@ -61,7 +64,8 @@ char *previewString = "# cat /proc/ish/colors\r\n"
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    [UserPreferences.shared observe:@[@"theme", @"fontSize", @"lineHeight", @"fontFamily", @"colorScheme", @"workspaceStyle"]
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
+    [UserPreferences.shared observe:@[@"theme", @"fontSize", @"lineHeight", @"terminalBottomPadding", @"fontFamily", @"colorScheme", @"workspaceStyle"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.tableView reloadData];
@@ -77,7 +81,16 @@ char *previewString = "# cat /proc/ish/colors\r\n"
     [self updateOtherControls];
 
     if (![NSUserDefaults.standardUserDefaults boolForKey:@"recovery"]) {
-        _terminal = [Terminal createPseudoTerminal:&_tty];
+        // Borrow init for the duration, as UpgradeRootViewController does for
+        // its own preview terminal. Making a pty reaches kernel code that
+        // expects to be running as SOME process -- the slave node takes its
+        // ownership from the caller -- and this is the UI thread, which is not
+        // one.
+        struct task *previousCurrent = NULL;
+        if ([AppDelegate pushUsableInitTaskAsCurrent:&previousCurrent]) {
+            _terminal = [Terminal createPseudoTerminal:&_tty];
+            [AppDelegate popCurrentTask:previousCurrent];
+        }
         [_terminal sendOutput:previewString length:(int)strlen(previewString)];
     }
 }
@@ -98,6 +111,7 @@ enum {
     WorkspaceStyleSection,
     CursorSection,
     StatusBarSection,
+    BottomPaddingSection,
     TerminalButtonsSection,
     WorkspaceLaunchSection,
     NumberOfSections,
@@ -120,6 +134,7 @@ enum {
         case WorkspaceStyleSection: return 2;
         case CursorSection: return 2;
         case StatusBarSection: return 1;
+        case BottomPaddingSection: return 1;
         case TerminalButtonsSection: return 1;
         case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? 4 : 0;
         default: NSAssert(NO, @"unhandled section"); return 0;
@@ -128,23 +143,24 @@ enum {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     switch (section) {
-        case PreviewSection: return @"Preview";
-        case ColorSchemeSection: return @"Color Scheme";
-        case WorkspaceStyleSection: return @"Workspace Style";
-        case CursorSection: return @"Cursor";
-        case StatusBarSection: return @"Status Bar";
-        case TerminalButtonsSection: return @"Terminal Buttons";
-        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? @"Desktops at Launch" : nil;
+        case PreviewSection: return NSLocalizedString(@"Preview", @"Appearance settings section header");
+        case ColorSchemeSection: return NSLocalizedString(@"Color Scheme", @"Appearance settings section header");
+        case WorkspaceStyleSection: return NSLocalizedString(@"Workspace Style", @"Appearance settings section header");
+        case CursorSection: return NSLocalizedString(@"Cursor", @"Appearance settings section header");
+        case StatusBarSection: return NSLocalizedString(@"Status Bar", @"Appearance settings section header");
+        case TerminalButtonsSection: return NSLocalizedString(@"Terminal Buttons", @"Appearance settings section header");
+        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? NSLocalizedString(@"Desktops at Launch", @"Appearance settings section header") : nil;
         default: return nil;
     }
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     switch (section) {
-        case PreviewSection: return @"Change the color scheme used for the preview.";
-        case WorkspaceStyleSection: return @"Modern is a flat, redesigned desktop; Classic keeps the original look. Both stay available and only restyle the Workspace.";
-        case TerminalButtonsSection: return @"Show the settings (gear) and terminal-switcher buttons on the terminal. Turn this off for a cleaner terminal.";
-        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? @"How many in-app Desktops to open automatically at launch." : nil;
+        case PreviewSection: return NSLocalizedString(@"Change the color scheme used for the preview.", @"Appearance settings section footer");
+        case WorkspaceStyleSection: return NSLocalizedString(@"Modern is a flat, redesigned desktop; Classic keeps the original look. Both stay available and only restyle the Workspace.", @"Appearance settings section footer");
+        case BottomPaddingSection: return NSLocalizedString(@"Leaves this much space below the terminal while no on-screen keyboard is showing, so its last rows stay clear of the Home indicator and the swipe area around it.", @"Appearance settings section footer");
+        case TerminalButtonsSection: return NSLocalizedString(@"Show the settings (gear) and terminal-switcher buttons on the terminal. Turn this off for a cleaner terminal.", @"Appearance settings section footer");
+        case WorkspaceLaunchSection: return [self supportsWorkspaceLaunchCount] ? NSLocalizedString(@"How many in-app Desktops to open automatically at launch.", @"Appearance settings section footer") : nil;
         default: return nil;
     }
 }
@@ -161,6 +177,7 @@ enum {
         case WorkspaceStyleSection: return @"Color Scheme";
         case CursorSection: return @[@"Cursor Style", @"Blink Cursor"][indexPath.row];
         case StatusBarSection: return @"Status Bar";
+        case BottomPaddingSection: return @"Font Size";
         case TerminalButtonsSection: return @"Color Scheme";
         case WorkspaceLaunchSection: return @"Color Scheme";
         default: return nil;
@@ -171,12 +188,32 @@ enum {
     if (indexPath.section == PreviewSection && indexPath.row == 0) {
         // Try a best-effort guess as to how big the preview should be.
         return [@"\n\n\n\n\n\n" sizeWithAttributes:@{NSFontAttributeName: UserPreferences.shared.approximateFont}].height + 10;
-    } else {
+    } else if (indexPath.section == PreviewSection) {
         return UITableViewAutomaticDimension;
+    } else {
+        // The Font Size and Line Height rows centre a label and a stepper with
+        // nothing above or below, so they would stay 44 points tall whatever
+        // the text size.
+        return ISHWorkspaceTextScaledRowHeight(UITableViewAutomaticDimension, ISHWorkspaceTextScaleForViewController(self));
     }
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are. Not the
+// preview section: a terminal drawn at the terminal's own font size, and the
+// control that switches its colours.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    if (indexPath.section != PreviewSection)
+        ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:[self reuseIdentifierForIndexPath:indexPath] forIndexPath:indexPath];
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
     
@@ -205,7 +242,10 @@ enum {
                     break;
                 case 1:
                     cell.detailTextLabel.text = UserPreferences.shared.fontFamilyUserFacingName;
-                    cell.detailTextLabel.font = [UIFont fontWithName:UserPreferences.shared.fontFamily size:cell.detailTextLabel.font.pointSize];
+                    // The size before any Workspace text scale. This label may
+                    // carry one, and the new face would otherwise be scaled twice.
+                    cell.detailTextLabel.font = [UIFont fontWithName:UserPreferences.shared.fontFamily
+                                                                size:ISHWorkspaceUnscaledFont(cell.detailTextLabel).pointSize];
                     break;
                 case 2:
                 case 3: {
@@ -217,7 +257,7 @@ enum {
                     // including the action it wired, which belongs to Font Size.
                     [stepper removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
                     if (indexPath.row == 2) {
-                        title.text = @"Font Size";
+                        title.text = NSLocalizedString(@"Font Size", @"Appearance settings row label");
                         stepper.minimumValue = 1;
                         stepper.maximumValue = 72;
                         stepper.stepValue = 1;
@@ -226,7 +266,7 @@ enum {
                         [stepper addTarget:self action:@selector(fontSizeChanged:)
                           forControlEvents:UIControlEventValueChanged];
                     } else {
-                        title.text = @"Line Height";
+                        title.text = NSLocalizedString(@"Line Height", @"Appearance settings row label");
                         // Inside the bounds UserPreferences and hterm both enforce, and
                         // narrower: this closes a one-or-two-pixel band, so the useful
                         // range is just below 1. 0.05 is a visible step at every font
@@ -248,13 +288,13 @@ enum {
         case ColorSchemeSection:
             switch (indexPath.row) {
                 case 0:
-                    cell.textLabel.text = @"Match System";
+                    cell.textLabel.text = NSLocalizedString(@"Match System", @"Color scheme option");
                     break;
                 case 1:
-                    cell.textLabel.text = @"Light";
+                    cell.textLabel.text = NSLocalizedString(@"Light", @"Color scheme option");
                     break;
                 case 2:
-                    cell.textLabel.text = @"Dark";
+                    cell.textLabel.text = NSLocalizedString(@"Dark", @"Color scheme option");
                     break;
             }
             if (indexPath.row == UserPreferences.shared.colorScheme) {
@@ -269,10 +309,10 @@ enum {
         case WorkspaceStyleSection:
             switch (indexPath.row) {
                 case 0:
-                    cell.textLabel.text = @"Classic";
+                    cell.textLabel.text = NSLocalizedString(@"Classic", @"Workspace style option");
                     break;
                 case 1:
-                    cell.textLabel.text = @"Modern";
+                    cell.textLabel.text = NSLocalizedString(@"Modern", @"Workspace style option");
                     break;
             }
             if (indexPath.row == UserPreferences.shared.workspaceStyle) {
@@ -284,8 +324,27 @@ enum {
             }
             break;
 
+        case BottomPaddingSection: {
+            // The stepper row Font Size and Line Height use (see there).
+            UILabel *title = [cell viewWithTag:3];
+            UILabel *label = [cell viewWithTag:1];
+            UIStepper *stepper = [cell viewWithTag:2];
+            [stepper removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
+            NSInteger points = UserPreferences.shared.terminalBottomPadding.integerValue;
+            title.text = NSLocalizedString(@"Bottom Padding", @"Appearance settings row label");
+            stepper.minimumValue = 0;
+            stepper.maximumValue = 120;
+            stepper.stepValue = 4;
+            stepper.value = points;
+            label.text = points == 0 ? NSLocalizedString(@"Off", @"Appearance settings value: no bottom padding") : [NSString stringWithFormat:NSLocalizedString(@"%ld pt", @"Appearance settings value; %ld is a number of points"), (long) points];
+            [stepper addTarget:self action:@selector(bottomPaddingChanged:)
+              forControlEvents:UIControlEventValueChanged];
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            break;
+        }
+
         case TerminalButtonsSection:
-            cell.textLabel.text = @"Show Settings & Switcher";
+            cell.textLabel.text = NSLocalizedString(@"Show Settings & Switcher", @"Appearance settings toggle for the terminal quick buttons");
             if (UserPreferences.shared.showTerminalQuickButtons) {
                 cell.accessoryType = UITableViewCellAccessoryCheckmark;
                 cell.accessibilityTraits |= UIAccessibilityTraitSelected;
@@ -297,7 +356,7 @@ enum {
 
         case WorkspaceLaunchSection: {
             NSInteger count = indexPath.row + 1;
-            cell.textLabel.text = count == 1 ? @"1 desktop" : [NSString stringWithFormat:@"%ld desktops", (long)count];
+            cell.textLabel.text = count == 1 ? NSLocalizedString(@"1 desktop", @"Desktops at Launch option") : [NSString stringWithFormat:NSLocalizedString(@"%ld desktops", @"Desktops at Launch option; %ld is 2 or more"), (long)count];
             if (count == UserPreferences.shared.workspaceLaunchCount) {
                 cell.accessoryType = UITableViewCellAccessoryCheckmark;
                 cell.accessibilityTraits |= UIAccessibilityTraitSelected;
@@ -370,6 +429,10 @@ enum {
     // Rounded because a stepper accumulates its step in binary: 0.05 twenty
     // times is not 1, and the value label would show 0.95000000000000007.
     UserPreferences.shared.lineHeight = @(round(sender.value * 100) / 100);
+}
+
+- (IBAction)bottomPaddingChanged:(UIStepper *)sender {
+    UserPreferences.shared.terminalBottomPadding = @((int) sender.value);
 }
 
 - (IBAction)fontSizeChanged:(UIStepper *)sender {

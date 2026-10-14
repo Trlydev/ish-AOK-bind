@@ -45,6 +45,16 @@ jobs:
           submodules: true
           fetch-depth: 0
 
+      # `submodules: true` stops one level down, and two of smallclue's own
+      # submodules ship in the app: third-party/openssh (ssh, scp, sftp,
+      # ssh-keygen) and third-party/nextvi (vi). Without them meson swaps in
+      # stubs and says so only as a setup WARNING, so every IPA built here had
+      # an ssh that says "not built into this iSH-AOK" and a stub vi. Just
+      # those two: meson uses none of smallclue's other submodules (dvtm,
+      # libgit2, openrsync).
+      - name: Check out smallclue's openssh, nextvi and libgit2
+        run: git -C deps/smallclue submodule update --init third-party/openssh third-party/nextvi third-party/libgit2
+
       - name: Select newest available Xcode
         run: |
           LATEST_XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
@@ -70,6 +80,12 @@ jobs:
         run: |
           cd deps/libapps/hterm
           python3 bin/mkdist
+      # deps/dash needs its config.h, which the fork does not commit (the
+      # generated sources are committed; see tools/configure-dash.sh). Configure
+      # ONLY: `make` fails from a clean checkout and can regenerate nodes.c
+      # without the __thread conversion.
+      - name: Configure deps/dash
+        run: cd deps/dash && ../../tools/configure-dash.sh --quiet
 
       - name: Build unsigned .app
         run: |

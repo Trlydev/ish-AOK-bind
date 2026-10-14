@@ -1,8 +1,10 @@
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "fs/poll.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel/anonfd_ckpt.h"
 
 static struct fd_ops epoll_ops;
 
@@ -306,11 +308,20 @@ static int epoll_wait_common(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
     bool guest_infinite = (timeout_ts_ptr == NULL);
     struct timespec bounded = { .tv_sec = 2 };
     int res;
-    do {
-        context.n = 0;
-        res = poll_wait(epoll->epollfd.poll, epoll_callback, &context,
-                        guest_infinite ? &bounded : timeout_ts_ptr);
-    } while (guest_infinite && res == 0);
+    // io_block, as poll and select set it around the same poll_wait. Without
+    // it a process sitting in its event loop read 'R' in /proc/<pid>/stat for
+    // the whole wait (Linux: 'S') and added 1 to the guest load average, which
+    // counts every task that is not io_block -- one for each node, python
+    // asyncio, dbus or systemd process idling in epoll_wait. It also keeps the
+    // address-space barrier from poking the waiter, which poll_wait would only
+    // have ignored.
+    TASK_MAY_BLOCK {
+        do {
+            context.n = 0;
+            res = poll_wait(epoll->epollfd.poll, epoll_callback, &context,
+                            guest_infinite ? &bounded : timeout_ts_ptr);
+        } while (guest_infinite && res == 0);
+    }
     // epoll_wait is EINTR on a pending signal, full stop -- it does not
     // restart. Linux's ep_poll() breaks out with -EINTR the moment
     // signal_pending() is true and never reaches the restart machinery, while
@@ -319,8 +330,21 @@ static int epoll_wait_common(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
     // Devuan 6 / Linux 6.12, ^Z-ing a process waiting in poll() and resuming
     // leaves the poll completing, and the same treatment of epoll_wait()
     // returns EINTR. AOK shared poll_wait() for both and so restarted both.
-    if (res == _ERESTART || res == _ERESTART_NOHAND)
-        res = _EINTR;
+    //
+    // Except for a checkpoint freeze, which the guest must never see: AOK
+    // restarts every call one interrupts. It stays the restart poll_wait
+    // reported, so the deadline poll_wait recorded for it is the one the
+    // re-executed call waits out. Every other restart becomes EINTR, and the
+    // deadline goes with it: nothing re-executes this call to consume it, so
+    // the next poll, select or epoll_wait to run would have -- the stale
+    // deadline of an epoll_wait a SIGSTOP had interrupted, or the 2 s cap
+    // above for an untimed one.
+    if (res == _ERESTART || res == _ERESTART_NOHAND) {
+        if (res != _ERESTART_NOHAND || !checkpoint_freeze_pending()) {
+            current->poll_restart_valid = false;
+            res = _EINTR;
+        }
+    }
     STRACE("%d end epoll_wait", current->pid);
     if (res >= 0) {
         for (int i = 0; i < res; i++) {
@@ -416,7 +440,7 @@ int_t sys_epoll_pwait2_guest(fd_t epoll_f, guest_addr_t events_addr, int_t max_e
         if (user_get(timeout_addr, timeout_ts64))
             return _EFAULT;
         timeout_ts.tv_sec = timeout_ts64.sec;
-        timeout_ts.tv_nsec = timeout_ts64.nsec;
+        timeout_ts.tv_nsec = timespec64_nsec_from_guest(timeout_ts64.nsec);
         if (timeout_ts.tv_sec < 0 || timeout_ts.tv_nsec < 0 || timeout_ts.tv_nsec >= 1000000000)
             return _EINVAL;
         timeout_ts_ptr = &timeout_ts;
@@ -449,23 +473,29 @@ static int epoll_close(struct fd *fd) {
 // and systemd's mount units "protocol"-failed on most boots (tmp.mount)
 // because the rescan a mountinfo event triggers never ran.
 //
-// Evaluate members the same way poll_scan_ready_locked would: virtual fds
-// via ops->poll masked by the registration's interest + ET suppression.
-// Host-backed members (real sockets/files) have no ops->poll; their events
-// arrive through the host backend of whichever poll holds the watch and do
-// not cascade here -- a nested epoll of purely host fds still needs a
-// waiter on the inner epoll (none of the known nested-epoll users do this;
-// revisit if one appears).
+// Evaluate members the same way poll_scan_ready_locked would: ops->poll masked
+// by the registration's interest + ET suppression, and an edge-triggered host
+// socket, pipe or FIFO only with an event collected from the host -- which is
+// why the inner poll's host queue is collected here first. A host event does
+// not WAKE an outer waiter, though: it lands in the inner poll's own host
+// queue, which only a waiter on the inner epoll, or a scan like this one,
+// looks at. None of the known nested-epoll users nest host fds; revisit if
+// one appears.
 static int epoll_poll(struct fd *fd) {
     struct poll *poll = fd->epollfd.poll;
     int res = 0;
     lock(&poll->lock, 0);
+    // A member whose host events are all there is to know (poll_fd.host_edges)
+    // is ready only with one collected; see fs/poll.c poll_scan_ready_locked.
+    poll_drain_host_locked(poll);
     struct poll_fd *poll_fd;
     list_for_each_entry(&poll->poll_fds, poll_fd, fds) {
         struct fd *member = poll_fd->fd;
-        if (member == NULL || member->ops->poll == NULL)
+        if (member == NULL || member->ops->poll == NULL || poll_fd->disarmed)
             continue;
-        int types = member->ops->poll(member);
+        if (poll_fd->host_edges && poll_fd->host_events == 0)
+            continue;
+        int types = member->ops->poll(member) | poll_fd->host_events;
         types &= poll_fd->types | POLL_HUP | POLL_ERR | POLL_NVAL;
         if (poll_fd->types & POLL_EDGETRIGGERED)
             types &= ~poll_fd->triggered_types;
@@ -479,7 +509,43 @@ static int epoll_poll(struct fd *fd) {
 }
 
 static struct fd_ops epoll_ops = {
-    .anon_inode_class = "eventpoll",
+    .name = "epoll",
+    .anon_inode_class = "[eventpoll]",
     .poll = epoll_poll,
     .close = epoll_close,
 };
+
+// ---- checkpoint (kernel/anonfd_ckpt.h) ------------------------------------
+
+bool epoll_fd_is(struct fd *fd) {
+    return fd != NULL && fd->ops == &epoll_ops;
+}
+
+struct fd *epoll_ckpt_new(void) {
+    struct poll *poll = poll_create();
+    if (IS_ERR(poll))
+        return ERR_PTR(PTR_ERR(poll));
+    struct fd *fd = adhoc_fd_create(&epoll_ops);
+    if (fd == NULL) {
+        poll_destroy(poll);
+        return ERR_PTR(_ENOMEM);
+    }
+    poll->owner_fd = fd;
+    fd->epollfd.poll = poll;
+    return fd;
+}
+
+void epoll_ckpt_each(struct fd *ep, epoll_ckpt_each_fn each, void *ctx) {
+    struct poll *poll = ep->epollfd.poll;
+    lock(&poll->lock, 0);
+    struct poll_fd *pf;
+    list_for_each_entry(&poll->poll_fds, pf, fds)
+        each(ctx, pf->fd, pf->guest_fd, pf->types, pf->info.num);
+    unlock(&poll->lock);
+}
+
+int epoll_ckpt_add(struct fd *ep, struct fd *target, int32_t guest_fd,
+                   int types, uint64_t data) {
+    return poll_add_fd(ep->epollfd.poll, target, (fd_t) guest_fd, types,
+                       (union poll_fd_info) data);
+}

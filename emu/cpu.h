@@ -20,83 +20,16 @@ int cpu_run_to_interrupt_amd64(struct cpu_state *cpu, struct tlb *tlb);
 // aarch64_guest_plan.md patch 5 — interpreter-only, no native gadget
 // engine yet (that's patch 8, jit/guest-arm64/).
 int cpu_run_to_interrupt_arm64(struct cpu_state *cpu, struct tlb *tlb);
-int amd64_step_to_interrupt_jit(struct cpu_state *cpu, struct tlb *tlb);
-int amd64_step_to_interrupt_jit_bridge(struct cpu_state *cpu);
-int amd64_jit_ret(struct cpu_state *cpu, struct tlb *tlb);
-int amd64_jit_ret_imm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long imm16);
-int amd64_jit_leave(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long pop_size, unsigned long next_ip);
-int amd64_jit_push_reg(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg, unsigned long next_ip);
-int amd64_jit_pop_reg(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg, unsigned long next_ip);
-int amd64_jit_pop_rm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long next_ip);
-int amd64_jit_bswap(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg_size, unsigned long next_ip);
-int amd64_jit_push_flags(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long push_size, unsigned long next_ip);
-int amd64_jit_pop_flags(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long pop_size, unsigned long next_ip);
-int amd64_jit_push_imm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long value, unsigned long next_ip);
-int amd64_jit_xchg_rax_reg(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg_size, unsigned long next_ip);
-int amd64_jit_xchg_rm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_jmp_abs(struct cpu_state *cpu, struct tlb *tlb, unsigned long target);
-int amd64_jit_call_abs(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long target, unsigned long next_ip);
-int amd64_jit_jcc_abs(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long cc, unsigned long target, unsigned long next_ip);
 int amd64_jit_syscall(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
 int amd64_jit_rdtsc(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
-int amd64_jit_cpuid(struct cpu_state *cpu, struct tlb *tlb,
+int amd64_jit_vmcall(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long next_ip);
-int amd64_jit_xgetbv(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long next_ip);
-int amd64_jit_port_io(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long insn_ip);
-int amd64_jit_moffs_accum(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_sign_extend(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_string_op(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_mov_imm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long reg_size, unsigned long value, unsigned long next_ip);
-int amd64_jit_reg_reg_op(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long op_regs_size, unsigned long next_ip);
-int amd64_jit_reg_imm_op(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long op_group_rm_size, unsigned long value, unsigned long next_ip);
-int amd64_jit_imul_imm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_accum_imm_op(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_mem_op(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long meta, unsigned long disp, unsigned long next_ip);
-int amd64_jit_movx(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long op2, unsigned long next_ip);
-int amd64_jit_0f_rm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long op2, unsigned long next_ip);
 int amd64_jit_0f_vec_rm(struct cpu_state *cpu, struct tlb *tlb,
         unsigned long op2, unsigned long next_ip);
-int amd64_jit_grp3_test(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_grp3_op(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_modrm_imm(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_shift(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long opcode, unsigned long next_ip);
-int amd64_jit_fe_group(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long next_ip);
-int amd64_jit_ff_group(struct cpu_state *cpu, struct tlb *tlb,
-        unsigned long next_ip);
-void amd64_jit_bridge_set_tlb(struct tlb *tlb);
+int amd64_jit_sse3_haddsub(struct cpu_state *cpu, struct tlb *tlb,
+        unsigned long op2, unsigned long next_ip);
 void cpu_poke(struct cpu_state *cpu);
 void dump_amd64_cc1_trace(const struct cpu_state *cpu);
 void dump_amd64_as_trace_task(const struct task *task);
@@ -202,6 +135,15 @@ union xmm_reg {
 };
 static_assert(sizeof(union xmm_reg) == 16, "xmm_reg size");
 static_assert(sizeof(union mm_reg) == 8, "mm_reg size");
+
+// A TLS entry as set_thread_area filled it: struct user_desc's base, its
+// limit (20 bits) and its flags word (bits 0-6). flags is 0 for an empty
+// entry, since a filled one is always 32-bit. See emu/i386_sreg.c.
+struct i386_tls_desc {
+    dword_t base;
+    dword_t limit;
+    dword_t flags;
+};
 
 struct cpu_state {
     struct mmu *mmu;
@@ -317,6 +259,14 @@ struct cpu_state {
     // NaN-boxed into the low 32 bits per the ISA spec.
     qword_t riscv64_f[32];
     dword_t riscv64_fcsr;
+    // V (RVV 1.0, VLEN 128: jit/guest-riscv64/vector.S). v0-v31 as bytes, and
+    // the vector CSRs; vcsr is vxrm << 1 | vxsat. vtype's bit 63 is vill.
+    union xmm_reg riscv64_v[32];
+    qword_t riscv64_vl;
+    qword_t riscv64_vtype;
+    qword_t riscv64_vstart;
+    dword_t riscv64_vxrm;
+    dword_t riscv64_vxsat;
 
     // flags
     union {
@@ -366,29 +316,37 @@ struct cpu_state {
         byte_t flags_res;
     };
 
-    union mm_reg mm[8];
+    // (No MMX array: MMn is fp[n].signif -- see CPU_MMX below.)
     union xmm_reg xmm[16];
     // fpu
     float80 fp[8];
+    // The status word's bitfields are 16-bit units, so the union is exactly the
+    // word and x87_valid sits in what was its padding: no later field moves.
     union {
         word_t fsw;
         struct {
-            bitfield ie:1; // invalid operation
-            bitfield de:1; // denormalized operand
-            bitfield ze:1; // divide by zero
-            bitfield oe:1; // overflow
-            bitfield ue:1; // underflow
-            bitfield pe:1; // precision
-            bitfield stf:1; // stack fault
-            bitfield es:1; // exception status
-            bitfield c0:1;
-            bitfield c1:1;
-            bitfield c2:1;
-            unsigned top:3;
-            bitfield c3:1;
-            bitfield b:1; // fpu busy (?)
+            uint16_t ie:1; // invalid operation
+            uint16_t de:1; // denormalized operand
+            uint16_t ze:1; // divide by zero
+            uint16_t oe:1; // overflow
+            uint16_t ue:1; // underflow
+            uint16_t pe:1; // precision
+            uint16_t stf:1; // stack fault
+            uint16_t es:1; // exception status
+            uint16_t c0:1;
+            uint16_t c1:1;
+            uint16_t c2:1;
+            uint16_t top:3;
+            uint16_t c3:1;
+            uint16_t b:1; // busy: mirrors es
         };
     };
+    // The x87 tag word, abridged as FXSAVE stores it: bit i set when PHYSICAL
+    // register fp[i] holds a value, clear when it is empty. Zero (all empty)
+    // is FNINIT's state, and the one a fresh task starts in. FNSTENV's full
+    // two-bit tags are derived from it and the register contents.
+    byte_t x87_valid;
+    byte_t x87_pad_;
     union {
         word_t fcw;
         struct {
@@ -411,13 +369,29 @@ struct cpu_state {
     // read-modify-write round-trips (Free Pascal's FPU init does this).
     dword_t mxcsr;
 
-    // TLS bullshit
-    word_t gs;
+    // The base an FS override adds on i386: that of the descriptor FS
+    // selected when it was loaded, 0 unless that is a TLS entry. It sits in
+    // what was padding before tls_ptr, where the JIT's seg_fs gadget reaches
+    // it with an immediate. See emu/i386_sreg.c.
+    dword_t i386_fs_base;
+    // The TLS base: FS's on amd64 (ARCH_SET_FS, CLONE_SETTLS), and on i386
+    // GS's, the base of the descriptor GS selected when it was loaded (see
+    // emu/i386_sreg.c). The JIT's seg_gs gadget adds it to every GS-relative
+    // address.
     guest_addr_t tls_ptr;
 
     // for the page fault handler
     guest_addr_t segfault_addr;
     bool segfault_was_write;
+    // The i386 JIT's memory-fault exits (segfault_read/segfault_write) set
+    // this and its interrupt gadget clears it: segfault_addr then came from
+    // a failed access, and is an address even when it is 0. The GPF handler
+    // used to read 0 as "no address reported", so a NULL dereference fell
+    // through to its opcode decoder, and anything the decoder does not know
+    // (`cmp eax, [ecx]`, HotSpot's implicit null check) became SIGSEGV
+    // SI_KERNEL at the PC instead of SEGV_MAPERR at 0. It sits in what was
+    // padding before trapno, so no offset moves.
+    bool segfault_reported;
 
     dword_t trapno;
     // access atomically
@@ -438,11 +412,9 @@ struct cpu_state {
     // Splitting it this way rather than widening xmm[] keeps every existing
     // SSE gadget's cpu->xmm[i] offset exactly where it was.
     //
-    // Not threaded through ptrace GETFPREGS / signal-frame construction /
-    // clone: those only need state observable across a syscall, signal, or
-    // debugger boundary, which no current guest workload exercises for
-    // vector state. A debugger inspecting %ymm mid-signal won't see it --
-    // a known, narrow gap, not a straight-line-execution bug.
+    // Across the boundaries, as XSAVE state (emu/xsave.h): a signal frame's
+    // math frame and sigreturn, ptrace's NT_X86_XSTATE, exec's reset to the
+    // initial configuration; clone and checkpoints copy cpu_state whole.
     union xmm_reg xmm_ext[16];
     union xmm_reg ymm_hi[32];
     struct {
@@ -451,7 +423,94 @@ struct cpu_state {
     // EVEX opmask registers k0-k7. k0 architecturally means "no masking" and
     // is never written by a masked instruction, but is stored like any other.
     uint64_t avx512_k[8];
+
+    // amd64 segment selectors, indexed by the ModRM Sreg encoding
+    // (AMD64_SREG_*): what `mov Sreg, r/m` and `pop fs/gs` last loaded into
+    // ES, DS, FS and GS. Zero from exec, as Linux's start_thread leaves them,
+    // and carried across fork and signal delivery, as Linux carries them. The
+    // CS and SS slots are unused: a 64-bit user task's CS is always 0x33, and
+    // 0x2b is the only selector its SS can be loaded with. See
+    // amd64_sreg_op in emu/amd64_interp.c.
+    word_t amd64_sreg[6];
+
+    // i386 segment state; see emu/i386_sreg.c. i386_sreg holds what ES, SS,
+    // DS, FS and GS were last loaded with -- by 8E, POP, sigreturn, ptrace or
+    // exec -- indexed by the Sreg encoding, as amd64_sreg is. The CS slot is
+    // unused: a 32-bit task's CS is always 0x23. i386_tls holds GDT entries
+    // 12-14, the ones set_thread_area fills. Both are inherited by fork and
+    // reset by exec, as Linux's are. FS's and GS's bases are i386_fs_base and
+    // tls_ptr above.
+    word_t i386_sreg[6];
+    struct i386_tls_desc i386_tls[3];
+
+    // The error code of the last #GP delivered, for REG_ERR in its signal
+    // frame (signal_trap_error in kernel/signal.c). Written only by the
+    // kernel as it delivers the SIGSEGV; the engines hand the code over in
+    // the interrupt number (INT_GPF_CODE in emu/interrupt.h).
+    word_t gp_error_code;
+
+    // The amd64 GS base, which a 65-prefixed memory operand adds the way a
+    // 64-prefixed one adds tls_ptr, the FS base. Linux keeps it per thread:
+    // ARCH_SET_GS and PTRACE_SETREGS set it, loading a selector into GS
+    // clears it (amd64_sreg_load), exec zeroes it, fork and clone copy it,
+    // and signal delivery leaves it alone. Appended for the gadget offset
+    // range; see the AVX note above.
+    guest_addr_t amd64_gs_base;
+
+    // x86 CR2 as a signal frame reports it: the address of the last page
+    // fault that raised a signal. Linux keeps it per thread (thread.cr2) and
+    // writes it into EVERY later frame, a #GP's included; fork copies it.
+    guest_addr_t pf_cr2;
+
+    // x86 IA32_TSC_AUX as RDTSCP and RDPID read it: Linux's (node << 12) |
+    // cpu, the CPU number getcpu reports (kernel/rseq.c task_current_cpu).
+    // The kernel keeps it current: after every interrupt it handles (a
+    // syscall can register rseq, exec, change the CPU count) and for a task
+    // clone or exec starts (rseq_fork, rseq_exec).
+    dword_t tsc_aux;
+    // A UMIP-spoofed SGDT/SIDT/SMSW/SLDT/STR whose store faulted (math.S
+    // x86_umip_put): Linux reports it as SIGSEGV/SEGV_MAPERR at the operand's
+    // first byte whatever failed (fixup_umip_exception). segfault_addr holds
+    // the byte that did, so a page that can be brought in is, and the
+    // instruction runs again; the page-fault handler consumes the flag.
+    bool umip_report;
+    guest_addr_t umip_report_addr;
 };
+
+// MMX register n is the significand of PHYSICAL x87 register n: one storage,
+// as on the hardware, so FXSAVE/XSAVE, FNSAVE/FRSTOR, the signal frame and
+// ptrace carry MMX state, and x87 code after MMX code sees it. An MMX write
+// also sets fp[n]'s sign and exponent to all ones, and every MMX instruction
+// but EMMS makes TOP 0 and all eight valid (the JIT's mmx_wait and mmx_touch
+// gadgets, around the instruction).
+#define CPU_MMX(cpu, n) (*(union mm_reg *) &(cpu)->fp[(n)].signif)
+
+#define AMD64_SREG_ES 0
+#define AMD64_SREG_CS 1
+#define AMD64_SREG_SS 2
+#define AMD64_SREG_DS 3
+#define AMD64_SREG_FS 4
+#define AMD64_SREG_GS 5
+#define AMD64_SEL_USER_CS 0x33
+#define AMD64_SEL_USER_DS 0x2b
+
+// A segment override on an amd64 memory operand, prefix 64 or 65. In long
+// mode only FS and GS have a base; the ES, CS, SS and DS overrides are
+// accepted and ignored. NONE is 0, so the value still tests true exactly
+// when an operand has a base to add.
+enum amd64_seg {
+    AMD64_SEG_NONE = 0,
+    AMD64_SEG_FS,
+    AMD64_SEG_GS,
+};
+
+static inline guest_addr_t amd64_seg_base(const struct cpu_state *cpu, enum amd64_seg seg) {
+    if (seg == AMD64_SEG_FS)
+        return cpu->tls_ptr;
+    if (seg == AMD64_SEG_GS)
+        return cpu->amd64_gs_base;
+    return 0;
+}
 
 #define CPU_OFFSET(field) offsetof(struct cpu_state, field)
 
@@ -511,5 +570,17 @@ static inline const char *reg32_name(enum reg32 reg) {
         default: return "?";
     }
 }
+
+// The arm64 guest's MIDR_EL1, as `mrs` reads it (jit/gen.c) and as
+// /proc/cpuinfo spells it out (fs/proc/root.c): implementer 0x00 (reserved
+// by Arm for software), variant 0, architecture 0xf (see the ID registers),
+// part 0xa0c, revision 0. Deliberately no CPU that exists.
+#define ARM64_GUEST_MIDR_IMPLEMENTER 0x00
+#define ARM64_GUEST_MIDR_VARIANT 0x0
+#define ARM64_GUEST_MIDR_PART 0xa0c
+#define ARM64_GUEST_MIDR_REVISION 0
+#define ARM64_GUEST_MIDR ((uint64_t) ARM64_GUEST_MIDR_IMPLEMENTER << 24 | ARM64_GUEST_MIDR_VARIANT << 20 | \
+                          0xf << 16 | ARM64_GUEST_MIDR_PART << 4 | ARM64_GUEST_MIDR_REVISION)
+
 
 #endif

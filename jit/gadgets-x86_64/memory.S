@@ -1,6 +1,22 @@
 #include "gadgets.h"
 #include "emu/interrupt.h"
 
+# [vec_align16][orig_ip]: a legacy-SSE 128-bit memory operand must be 16-byte
+# aligned; misaligned is #GP(0) at the instruction. The aarch64 twin is in
+# jit/gadgets-aarch64/memory.S, and jit/gen.c emits it for both hosts.
+.gadget vec_align16
+    testl $15, %_addr
+    jnz 1f
+    gret 1
+1:
+    movq $0, CPU_segfault_addr(%_cpu)
+    movb $0, CPU_segfault_was_write(%_cpu)
+    movb $0, CPU_segfault_reported(%_cpu)
+    movl (%_ip), %_eip
+    movl $INT_GPF, %_tmp
+    jmp jit_exit
+
+
 .gadget push
     leal -4(%_esp), %_addr
     write_prep 32, push
@@ -13,6 +29,13 @@
     read_prep 32, pop
     movl (%_addrq), %_tmp
     add $4, %_esp
+    gret 1
+
+# [esp_add][delta]: ESP += delta. See the aarch64 twin in
+# jit/gadgets-aarch64/memory.S. The host flags hold no guest state between
+# gadgets here (pop's `add` clobbers them too).
+.gadget esp_add
+    addl (%_ip), %_esp
     gret 1
 
 .macro x name, reg
@@ -56,6 +79,11 @@
     addl CPU_tls_ptr(%_cpu), %_addr
     gret
 
+# An FS override on i386: FS's base (emu/i386_sreg.c).
+.gadget seg_fs
+    addl CPU_i386_fs_base(%_cpu), %_addr
+    gret
+
 .irp type, read,write
 
 .global handle_\type\()_miss
@@ -92,6 +120,7 @@ segfault_\type:
     .else
         movb $1, CPU_segfault_was_write(%_cpu)
     .endif
+    movb $1, CPU_segfault_reported(%_cpu)
     movq (%_ip), %_ip
     leal -4(%_esp), %r14d
     btq $62, %_ip

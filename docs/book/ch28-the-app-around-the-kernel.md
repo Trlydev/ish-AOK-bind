@@ -120,6 +120,18 @@ The rule that came out of it: **exit 137 may be the host, not the guest.** Check
 a guest-side story, and read the `asi` field, which names the assertion that
 failed.
 
+Its companion for a footprint that is growing rather than already dead is
+`/proc/ish/host_vm` (557): the app's own memory by the host's region tags,
+footprint first. It exists because Extreme Tux Racer's race took the app on an
+M4 from 1 GB to 3.9 GB and on past its 6 GB limit while everything the guest
+could see — its Vulkan device memory, MoltenVK's textures — stayed small. Only
+the host could say where the rest was. `/proc/ish/host_fds` (559) is the same
+kind of answer for descriptors: every file, socket and pipe any guest process
+has open is a descriptor of the one host process, so it counts them by kind
+against the host's limit — which the kernel now raises at boot as far as the
+host allows, after a guest well inside its own 1024 got `EMFILE` from a host
+started at 256.
+
 ## 28.5 Diagnostics as a subsystem
 
 `AppDelegate.m` is about 3,700 lines, and a striking fraction of it is not the
@@ -142,6 +154,18 @@ That last one matters more than it sounds. The alternative to an export bundle
 is asking a user to reproduce a crash while a developer watches, on a device the
 developer does not have, running a rootfs the developer did not build.
 
+The guest's side of that is the kernel log, and what a pasted `dmesg` is triaged
+from: a guest fault gets a full report there — the line, the registers, an
+opcode window, page-table state, the stack. Until 559 every fault got one,
+including the ones a program takes on purpose and catches; a JVM's null checks
+do that all day, and with a distribution's `rsyslogd` writing the log to disk
+three suite runs filled a phone. Now, as on Linux, only a fault that kills its
+program is reported — not one with a handler that can run or a tracer to go
+to — at most ten in five seconds, with a line counting the rest; the one that
+kills keeps the full report rather than Linux's single line.
+`/proc/ish/fault_reports` sets the mode (`unhandled`, `all` as it was, or
+`none`), and `ISH_FAULT_REPORTS` sets it for a command-line run.
+
 ## 28.6 Preferences have two front doors
 
 `UserPreferences` is the app's settings store, observed with KVO so that a
@@ -151,7 +175,10 @@ accelerators (Chapter 33).
 
 The second front door is `/proc/ish/defaults` (Chapter 18): the same store,
 one file per preference, readable by anyone and writable by root, with the same
-validation the Settings screen uses.
+validation the Settings screen uses. "Readable by anyone" is also why a secret
+cannot be a preference: until 557 the LLM chat's API keys were, and any guest
+process could `cat` them. They live in the Keychain now, and the file reads back
+empty.
 
 Two surfaces onto one store is a small thing that changes what the product is.
 A setting reachable only by tapping cannot be scripted, cannot be set from an

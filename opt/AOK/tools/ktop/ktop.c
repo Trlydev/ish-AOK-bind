@@ -147,6 +147,17 @@ static const char *arch_from_machine(const char *machine) {
     return arch_intern("?");
 }
 
+// The label for a program running as native host code: its architecture with
+// "(n)", so the ARCH column shows at a glance which processes are native.
+static const char *native_label(const char *arch) {
+    if (strcmp(arch, "arm64") == 0)   return arch_intern("arm64(n)");
+    if (strcmp(arch, "x86_64") == 0)  return arch_intern("x86_64(n)");
+    if (strcmp(arch, "riscv64") == 0) return arch_intern("riscv64(n)");
+    if (strcmp(arch, "x86") == 0)     return arch_intern("x86(n)");
+    if (strcmp(arch, "arm") == 0)     return arch_intern("arm(n)");
+    return arch_intern("?(n)");
+}
+
 // A kernel thread has no /proc/<pid>/exe -- on real Linux either -- so there is
 // no ELF header to read an architecture out of. Reporting "?" for AOK's
 // kthreadd is accurate but useless; a kernel thread belongs to the running
@@ -233,10 +244,88 @@ static bool exe_is_native(pid_t pid) {
     return strncmp(target, prefix, sizeof(prefix) - 1) == 0;
 }
 
+// iSH-AOK's own answer, /proc/ish/arch: "PID ARCH" and then one "<pid>
+// <machine>" line per process, where machine is what uname(2) says inside it,
+// the host's machine marked "(n)" ("aarch64(n)") for a program running as host
+// code -- "native" before 556 -- or "-" for one with no address space. Read
+// once per refresh, before the /proc walk.
+//
+// It comes FIRST because the ELF header below cannot answer for another user's
+// process: /proc/<pid>/exe is gated by ptrace_may_access, on Linux and on
+// iSH-AOK since the 2026-09-24 hardening, so a normal user saw "?" beside every
+// root process -- init, login, sshd, udevd. The table is readable by anyone,
+// and one file per refresh is also cheaper than an open per process. The exe
+// read stays as the fallback for an iSH-AOK without the table, a process that
+// started after it was read, and a real Linux kernel.
+struct arch_entry {
+    pid_t pid;
+    const char *arch;   // NULL: listed with no address space
+};
+static struct arch_entry *arch_table = NULL;
+static int arch_table_len = 0;
+static int arch_table_cap = 0;
+
+static void load_arch_table(void) {
+    arch_table_len = 0;
+    FILE *f = fopen("/proc/ish/arch", "r");
+    if (f == NULL)
+        return;
+    char line[128];
+    if (fgets(line, sizeof(line), f) == NULL || strncmp(line, "PID ARCH", 8) != 0) {
+        fclose(f);   // not a format this ktop knows; the exe read still works
+        return;
+    }
+    while (fgets(line, sizeof(line), f) != NULL) {
+        long pid;
+        char machine[32];
+        if (sscanf(line, "%ld %31s", &pid, machine) != 2)
+            continue;
+        if (arch_table_len == arch_table_cap) {
+            int cap = arch_table_cap != 0 ? arch_table_cap * 2 : 256;
+            struct arch_entry *grown = realloc(arch_table, (size_t) cap * sizeof(*grown));
+            if (grown == NULL)
+                break;
+            arch_table = grown;
+            arch_table_cap = cap;
+        }
+        const char *arch;
+        size_t mlen = strlen(machine);
+        if (mlen > 3 && strcmp(machine + mlen - 3, "(n)") == 0) {
+            machine[mlen - 3] = '\0';
+            arch = native_label(arch_from_machine(machine));
+        } else if (strcmp(machine, "native") == 0)
+            arch = native_label(host_arch());
+        else if (strcmp(machine, "-") == 0)
+            arch = NULL;
+        else
+            arch = arch_from_machine(machine);
+        arch_table[arch_table_len++] = (struct arch_entry) {(pid_t) pid, arch};
+    }
+    fclose(f);
+}
+
+// Whether the table lists `pid`, and if so what it says.
+static bool arch_table_lookup(pid_t pid, const char **arch) {
+    for (int i = 0; i < arch_table_len; i++) {
+        if (arch_table[i].pid == pid) {
+            *arch = arch_table[i].arch;
+            return true;
+        }
+    }
+    return false;
+}
+
 // `kernel_thread` comes from the caller, which has already read the state and
 // the command line: an empty /proc/<pid>/cmdline is how ps decides to bracket a
 // name, and excluding zombies keeps a reaped process from borrowing the label.
 static const char *detect_arch(pid_t pid, bool kernel_thread) {
+    const char *listed;
+    if (arch_table_lookup(pid, &listed)) {
+        if (listed != NULL)
+            return listed;
+        return kernel_thread ? native_label(host_arch()) : arch_intern("?");
+    }
+
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/exe", (int) pid);
     unsigned char hdr[20];
@@ -264,13 +353,16 @@ static const char *detect_arch(pid_t pid, bool kernel_thread) {
     }
 
     // Nothing ELF-shaped behind the exe link. A native program is the one case
-    // with a real answer; a kernel thread has no exe at all and borrows the
-    // kernel's; anything else -- an exe outside this chroot, a process that
+    // with a real answer; a kernel thread has no exe at all, and is iSH-AOK's
+    // own kernel code -- host code, running natively, whichever root is
+    // booted, so it is labelled the way a native program is (it used to take
+    // the guest's architecture, and kthreadd alone had no "(n)" in a native
+    // root); anything else -- an exe outside this chroot, a process that
     // exited mid-scan -- is genuinely unknown.
     if (exe_is_native(pid))
-        return host_arch();
+        return native_label(host_arch());
     if (fd < 0 && kernel_thread)
-        return guest_arch();
+        return native_label(host_arch());
     return arch_intern("?");
 }
 
@@ -441,9 +533,11 @@ static uid_t read_proc_uid(pid_t pid) {
 
 // Width of everything to the left of the Command column. Kept in one place so
 // the header and the rows agree on where Command starts and how wide it is.
+// ARCH is 9 wide (%-9s): counted as 7 here, the header ran 2 columns past
+// the terminal, wrapped, and every frame scrolled the top line away.
 static int command_column_start(void) {
     return 6 + 1 + 8 + 1 + 3 + 1 + 3 + 1 + 7 + 1 + 7 + 1 + 1 + 1
-         + 7 + 1 + 5 + 1 + 5 + 1 + 8 + 1;
+         + 9 + 1 + 5 + 1 + 5 + 1 + 8 + 1;
 }
 
 static void read_proc_cmdline(pid_t pid, char *buf, size_t bufsize) {
@@ -479,6 +573,78 @@ struct meminfo {
     unsigned long buffers_kb, cached_kb;
     unsigned long swap_total_kb, swap_free_kb;
 };
+
+// ---- AOK's compressed memory, and whether swap has a file behind it --------
+//
+// /proc/meminfo cannot answer either question. In RAM-only mode AOK still
+// reports a SwapTotal -- slots are allocated per evicted frame whether or not
+// the bytes reach storage -- so a swap meter drawn from meminfo alone announces
+// "Swp 2.0M/512M" on a device where nothing is on storage at all and no file
+// exists. That is the opposite of what the feature does, and it was reported
+// from an iPad as exactly that confusion.
+//
+// Both files are AOK's own and absent everywhere else; a kernel without them
+// simply gets no compression line and the old swap behaviour.
+struct zswapinfo {
+    int enabled;
+    int swap_has_file;          // a real file backs the area
+    unsigned long cap_mb;
+    unsigned long objects;
+    unsigned long pool_kb;      // what the pool occupies, retained slabs included
+    unsigned long stored_kb;    // compressed bytes currently live
+    unsigned long original_kb;  // what those frames occupied before
+};
+
+// A TUI has no natural way to be fed controlled input, which is why the meters
+// went untested until a device reported one showing the wrong thing. KTOP_PROC
+// points the AOK-specific reads at a directory of fixture files instead, so the
+// four display states can be rendered on demand. Unset in every normal run, and
+// it only redirects AOK's own files -- /proc/meminfo and the process table are
+// untouched.
+static FILE *ktop_open_proc(const char *leaf) {
+    const char *root = getenv("KTOP_PROC");
+    if (root == NULL)
+        return fopen(leaf, "r");
+    char path[512];
+    const char *base = strrchr(leaf, '/');
+    snprintf(path, sizeof(path), "%s/%s", root, base ? base + 1 : leaf);
+    return fopen(path, "r");
+}
+
+static void read_zswapinfo(struct zswapinfo *z) {
+    memset(z, 0, sizeof(*z));
+    char line[256];
+
+    FILE *f = ktop_open_proc("/proc/ish/zswap");
+    if (f != NULL) {
+        if (fgets(line, sizeof(line), f) != NULL && strncmp(line, "on", 2) == 0) {
+            z->enabled = 1;
+            sscanf(line, "on cap %lu MB", &z->cap_mb);
+        }
+        while (fgets(line, sizeof(line), f) != NULL) {
+            sscanf(line, "objects %lu", &z->objects);
+            sscanf(line, "pool %lu KB", &z->pool_kb);
+            sscanf(line, "stored %lu KB", &z->stored_kb);
+            sscanf(line, "original %lu KB", &z->original_kb);
+        }
+        fclose(f);
+    }
+
+    // Absent the file (an older kernel, or a non-AOK one), assume a real swap
+    // file so the meter behaves exactly as it always did.
+    z->swap_has_file = 1;
+    f = ktop_open_proc("/proc/ish/swap");
+    if (f != NULL) {
+        while (fgets(line, sizeof(line), f) != NULL) {
+            if (strncmp(line, "backing", 7) != 0)
+                continue;
+            // "a swap file" is the only backing that is actually on storage.
+            z->swap_has_file = strstr(line, "swap file") != NULL;
+            break;
+        }
+        fclose(f);
+    }
+}
 
 static void read_meminfo(struct meminfo *mi) {
     memset(mi, 0, sizeof(*mi));
@@ -551,6 +717,7 @@ static int collect(struct proc_sample *procs, int max) {
         perror("ktop: opendir /proc");
         return 0;
     }
+    load_arch_table();
     int count = 0;
     struct dirent *de;
     while (count < max && (de = readdir(d)) != NULL) {
@@ -955,10 +1122,18 @@ static void draw_header(int cols, int ncpu,
     read_loadavg(&l1, &l5, &l15);
 
     int rows = 0;
-    printf("\033[K%sktop%s - %s up %s   Tasks: %s%d%s, %s%d%s running   Load: %.2f %.2f %.2f\n",
-           C_LABEL, C_RESET, timebuf, uptime,
-           C_LABEL, task_total, C_RESET, C_LABEL, task_running, C_RESET,
-           l1, l5, l15);
+    // A line wider than the terminal wraps into a row the frame did not count
+    // and scrolls it: on a narrow terminal the summary goes out plain and cut.
+    char plain[256];
+    int plain_len = snprintf(plain, sizeof(plain), "ktop - %s up %s   Tasks: %d, %d running   Load: %.2f %.2f %.2f",
+                             timebuf, uptime, task_total, task_running, l1, l5, l15);
+    if (plain_len > cols)
+        printf("\033[K%.*s\n", cols, plain);
+    else
+        printf("\033[K%sktop%s - %s up %s   Tasks: %s%d%s, %s%d%s running   Load: %.2f %.2f %.2f\n",
+               C_LABEL, C_RESET, timebuf, uptime,
+               C_LABEL, task_total, C_RESET, C_LABEL, task_running, C_RESET,
+               l1, l5, l15);
     rows++;
 
     // CPU meters, two per row. Meter inner width sized so two meters + labels
@@ -1050,7 +1225,13 @@ static void draw_header(int cols, int ncpu,
         putchar('\n');
         rows++;
     }
-    if (mi->swap_total_kb > 0) {
+    struct zswapinfo z;
+    read_zswapinfo(&z);
+
+    // Swap, only when something is actually on storage. In RAM-only mode AOK
+    // still reports a SwapTotal, so the old `swap_total_kb > 0` test drew a
+    // swap meter for an area with no file -- see read_zswapinfo.
+    if (mi->swap_total_kb > 0 && z.swap_has_file) {
         unsigned long sw_used = mi->swap_total_kb - mi->swap_free_kb;
         char su[16], st[16];
         format_kb_unit(sw_used, su, sizeof(su));
@@ -1064,6 +1245,37 @@ static void draw_header(int cols, int ncpu,
         rows++;
     }
 
+    // Compressed memory, only when it is on. The bar is how full the pool is
+    // against its cap, because that is the resource the user chose and the one
+    // that runs out; the text is what it is buying them.
+    //
+    // The saving is computed from STORED against ORIGINAL -- live compressed
+    // bytes against the memory those frames occupied -- and not from the pool's
+    // size. The pool retains empty slabs after a free so they can be reused, so
+    // pool-against-original reads as a loss on a guest that has faulted most of
+    // its memory back, which is the opposite of the truth.
+    if (z.enabled) {
+        unsigned long cap_kb = z.cap_mb * 1024;
+        char pu[16], pc[16];
+        format_kb_unit(z.pool_kb, pu, sizeof(pu));
+        format_kb_unit(cap_kb, pc, sizeof(pc));
+        if (z.original_kb > 0 && z.stored_kb <= z.original_kb) {
+            int saved = (int) (((z.original_kb - z.stored_kb) * 100) / z.original_kb);
+            double ratio = (double) z.original_kb / (double) (z.stored_kb ? z.stored_kb : 1);
+            snprintf(text, sizeof(text), "%s/%s  %d%% saved, %.1fx", pu, pc, saved, ratio);
+        } else {
+            // On, but holding nothing yet. Say so rather than print 0% saved,
+            // which reads as "this is not working".
+            snprintf(text, sizeof(text), "%s/%s  idle", pu, pc);
+        }
+        const double fracs[1] = {cap_kb > 0 ? (double) z.pool_kb / (double) cap_kb : 0.0};
+        const char *colors[1] = {C_BAR_BLUE};
+        fputs("\033[K", stdout);
+        draw_meter("Cmp", mem_inner, fracs, colors, 1, text);
+        putchar('\n');
+        rows++;
+    }
+
     header_rows_drawn = rows;
 }
 
@@ -1072,8 +1284,16 @@ static void draw_column_header(int cols) {
     // highlight color.
     char line[64];
     fputs("\033[K", stdout);
+    // Too narrow for the whole header: the same text, cut to the width.
+    if (cols < command_column_start() + 7) {
+        char full[160];
+        snprintf(full, sizeof(full), "%6s %-8.8s %3s %3s %7s %7s %1s %-9s %5s %5s %8s Command",
+                 "PID", "USER", "PR", "NI", "VIRT", "RES", "S", "ARCH", "%CPU", "%MEM", "TIME+");
+        printf("%s%-*.*s%s\n", C_HDR, cols, cols, full, C_RESET);
+        return;
+    }
     fputs(C_HDR, stdout);
-    snprintf(line, sizeof(line), "%6s %-8.8s %3s %3s %7s %7s %1s %-7s ",
+    snprintf(line, sizeof(line), "%6s %-8.8s %3s %3s %7s %7s %1s %-9s ",
              "PID", "USER", "PR", "NI", "VIRT", "RES", "S", "ARCH");
     fputs(line, stdout);
     printf("%s%5s%s%s %s%5s%s%s %s%8s%s%s ",
@@ -1186,7 +1406,7 @@ static void draw_interactive(struct proc_sample *procs, int n,
 
         char line[512];
         int len = snprintf(line, sizeof(line),
-                           "%6d %-8.8s %3ld %3ld %7s %7s %1s %-7s %5.1f %5.1f %8s %s",
+                           "%6d %-8.8s %3ld %3ld %7s %7s %1s %-9s %5.1f %5.1f %8s %s",
                            (int) procs[i].pid, userbuf,
                            procs[i].priority, procs[i].nice,
                            virt, res, state, procs[i].arch,
@@ -1285,7 +1505,7 @@ static void print_batch(struct proc_sample *cur, int cur_n,
     printf("Mem: %lukB total, %lukB used, %lukB free\n",
            mi->total_kb, used_kb, mi->free_kb);
 
-    printf("\n%6s %-8s %3s %3s %8s %8s %-7s %5s %5s  %s\n",
+    printf("\n%6s %-8s %3s %3s %8s %8s %-9s %5s %5s  %s\n",
            "PID", "USER", "PR", "NI", "VIRT(K)", "RES(K)", "ARCH", "%CPU", "%MEM", "COMMAND");
 
     for (int i = 0; i < cur_n; i++) {
@@ -1310,7 +1530,7 @@ static void print_batch(struct proc_sample *cur, int cur_n,
         } else {
             snprintf(cmdbuf, sizeof(cmdbuf), "%s", cur[i].comm);
         }
-        printf("%6d %-8s %3ld %3ld %8lu %8ld %-7s %5.1f %5.1f  %s\n",
+        printf("%6d %-8s %3ld %3ld %8lu %8ld %-9s %5.1f %5.1f  %s\n",
                (int) cur[i].pid, userbuf, cur[i].priority, cur[i].nice,
                cur[i].vsize / 1024, cur[i].rss_pages * page_kb,
                cur[i].arch, cpu_pct, mem_pct, cmdbuf);

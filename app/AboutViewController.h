@@ -12,9 +12,15 @@ NS_ASSUME_NONNULL_BEGIN
 extern NSString *const kPreferenceOpenDiagnosticsOnLaunchKey;
 extern UINavigationController *ISHCreateAboutNavigationController(BOOL recoveryMode, BOOL startInDiagnostics);
 extern UIViewController *ISHCreateDiagnosticsViewController(void);
+// Diagnostics for a workspace tool window: same screen, wrapped so its Share
+// and Refresh buttons have a bar to live in. See the definition.
+extern UIViewController *ISHCreateDiagnosticsNavigationController(void);
 extern UIViewController *ISHCreateLLMClientViewController(void);
 extern UIViewController *ISHCreateLLMClientViewControllerWithInitialPrompt(NSString *_Nullable initialPrompt);
 extern UIViewController *ISHCreateLLMSettingsViewController(void);
+// The page that installs a desktop for the Wayland display and chooses which
+// one it starts (GH #639). Push it, or present it in a navigation controller.
+extern UIViewController *ISHCreateDesktopSetupViewController(void);
 extern BOOL ISHLLMClientEnabled(void);
 
 typedef NS_ENUM(NSInteger, AOKLLMBackend) {

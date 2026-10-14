@@ -115,8 +115,14 @@ static inline void _read_unlock(wrlock_t *lock, const char *file, int line) {
     (void) file;
     (void) line;
 #endif
-    if (old_val - 1 == 0)
-        pthread_cond_broadcast(&lock->c);  // last reader out: wake any writer
+    // Last reader out: wake any writer. And last but one, when a writer is
+    // waiting: it may be a reader upgrading (read_to_write_lock_timed), which
+    // holds a read of its own and waits for the count to reach one, not
+    // zero. Nothing told it, so it slept out its whole timeout -- 20ms for
+    // every split LOCK operation whose sibling was still in guest code when
+    // it began (emu/tlb.c).
+    if (old_val - 1 == 0 || (old_val - 1 == 1 && lock->writers_waiting > 0))
+        pthread_cond_broadcast(&lock->c);
     pthread_mutex_unlock(&lock->m);
 }
 
@@ -245,6 +251,40 @@ static inline void read_to_write_lock(wrlock_t *lock) {  // Atomically swap a re
     lock->writers_waiting--;
     atomic_store_explicit(&lock->val, -1, memory_order_relaxed);
     pthread_mutex_unlock(&lock->m);
+}
+
+// read_to_write_lock without ever letting go of the read side: wait until this
+// thread is the only reader left, and give up after `timeout_ns` still holding
+// it. Returns whether the write lock was taken.
+//
+// For a caller that must not drop its read lock while it waits -- one running
+// guest code, which also holds the JIT's jetsam_lock for reading. Dropping mem
+// read lets a structural writer (mprotect) in, which then waits for jetsam
+// write, which waits for this thread: a cycle only jetsam_write_lock_timed's 5s
+// timeout breaks. Holding on, no writer can get in, so no cycle forms, and a
+// timeout hands the decision back instead of waiting on a thread that may be
+// waiting on us.
+static inline bool read_to_write_lock_timed(wrlock_t *lock, long timeout_ns) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += timeout_ns;
+    deadline.tv_sec += deadline.tv_nsec / 1000000000;
+    deadline.tv_nsec %= 1000000000;
+    pthread_mutex_lock(&lock->m);
+    lock->writers_waiting++;    // new readers yield while this waits
+    while (atomic_load_explicit(&lock->val, memory_order_relaxed) != 1) {
+        if (pthread_cond_timedwait(&lock->c, &lock->m, &deadline) != 0 &&
+                atomic_load_explicit(&lock->val, memory_order_relaxed) != 1)
+            break;
+    }
+    lock->writers_waiting--;
+    bool ok = atomic_load_explicit(&lock->val, memory_order_relaxed) == 1;
+    if (ok)
+        atomic_store_explicit(&lock->val, -1, memory_order_relaxed);
+    else
+        pthread_cond_broadcast(&lock->c);   // readers held off above may proceed
+    pthread_mutex_unlock(&lock->m);
+    return ok;
 }
 
 static inline void write_to_read_lock(wrlock_t *lock) { // Atomically swap a write lock to a read lock.

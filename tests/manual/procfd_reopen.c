@@ -18,16 +18,27 @@
 // this; older test images had a committed machine-id and hid it.
 //
 // Also covered: fresh file position on procfd reopen (script-loader
-// behavior), O_NOFOLLOW -> ELOOP on the magic link, O_TRUNC honored, and
-// the deleted-file fallback (same accmode) still works. Deviation not
+// behavior), O_NOFOLLOW -> ELOOP on the magic link, O_TRUNC honored, the
+// deleted-file fallback (same accmode) still works, and a deleted file whose
+// name has been taken since reopens as itself -- AOK reopened by that name,
+// which read the new file and let O_TRUNC empty it. Deviation not
 // asserted: reopening a DELETED file with a WIDER accmode than the original
 // fd succeeds on Linux (inode reopen) but fails EACCES under AOK (no stable
 // path to reopen; a loud error beats a silently read-only fd).
 //
-// Also passes on real Linux (mint oracle, verified).
+// Directories: an O_PATH handle on one, reopened through the link to read
+// it, is a description of its own that getdents reads -- AOK handed back the
+// handle itself, which reads nothing (EBADF) -- and opening one for writing
+// is EISDIR, where AOK said EACCES. O_PATH through the link of a directory is
+// that directory, usable as a dirfd, with O_PATH|O_DIRECTORY as its F_GETFL.
+//
+// Also passes on real Linux (mint oracle, verified; the directory cases on
+// camd, Linux 6.12, gcc and gcc -m32).
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,6 +138,94 @@ int main(int argc, char **argv) {
     }
     close(fd);
 
+    // 6. a deleted file whose name has been taken since: the reopen is the
+    // deleted file, and an O_TRUNC reopen leaves the new one alone. AOK
+    // reopened by the name the deleted file had, so it read the new file --
+    // and emptied it.
+    fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    check(fd >= 0 && write(fd, "old", 3) == 3, "create the file to delete (%s)", strerror(errno));
     unlink(path);
+    int newer = open(path, O_RDWR | O_CREAT | O_EXCL, 0644);
+    check(newer >= 0 && write(newer, "newer", 5) == 5, "create a new file at its name (%s)",
+          strerror(errno));
+    del = procfd_open(fd, O_RDONLY);
+    check(del >= 0, "reopen of the deleted file (%s)", strerror(errno));
+    if (del >= 0) {
+        n = pread(del, buf, sizeof(buf), 0);
+        check(n == 3 && memcmp(buf, "old", 3) == 0,
+              "the reopen is the deleted file, not the new one (read \"%.*s\")",
+              n > 0 ? (int) n : 0, buf);
+        close(del);
+    }
+    tr = procfd_open(fd, O_RDWR | O_TRUNC);
+    check(tr >= 0, "O_TRUNC reopen of the deleted file (%s)", strerror(errno));
+    if (tr >= 0)
+        close(tr);
+    check(fstat(newer, &st) == 0 && st.st_size == 5,
+          "the new file keeps its contents (size %lld)", (long long) st.st_size);
+    if (newer >= 0)
+        close(newer);
+    close(fd);
+
+    unlink(path);
+
+    // 7. a directory held as an O_PATH handle, reopened through the link.
+    const char *dir = "/tmp/procfd_reopen_dir", *entry = "/tmp/procfd_reopen_dir/entry";
+    unlink(entry);
+    rmdir(dir);
+    check(mkdir(dir, 0755) == 0, "mkdir %s (%s)", dir, strerror(errno));
+    fd = open(entry, O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    check(fd >= 0, "create %s (%s)", entry, strerror(errno));
+    if (fd >= 0)
+        close(fd);
+    int dh = open(dir, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    check(dh >= 0, "O_PATH open of %s (%s)", dir, strerror(errno));
+    int dr = procfd_open(dh, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(dr >= 0, "procfd reopen of the directory O_RDONLY (%s)", strerror(errno));
+    if (dr >= 0) {
+        fl = fcntl(dr, F_GETFL);
+        check(!(fl & O_PATH), "the reopened directory is not O_PATH (%#x)", fl);
+        DIR *dp = fdopendir(dr);
+        check(dp != NULL, "fdopendir(the reopened directory) (%s)", strerror(errno));
+        bool found = false;
+        errno = 0;
+        struct dirent *de;
+        while (dp != NULL && (de = readdir(dp)) != NULL)
+            found |= strcmp(de->d_name, "entry") == 0;
+        check(found, "readdir of the reopened directory finds entry (%s)",
+              errno != 0 ? strerror(errno) : "not listed");
+        if (dp != NULL)
+            closedir(dp);
+    }
+    errno = 0;
+    int dw = procfd_open(dh, O_RDWR | O_CLOEXEC);
+    check(dw < 0 && errno == EISDIR, "procfd reopen of the directory O_RDWR is EISDIR (%s)",
+          dw >= 0 ? "opened" : strerror(errno));
+    if (dw >= 0)
+        close(dw);
+
+    // 8. O_PATH through the link of an open directory: that directory.
+    int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    check(dfd >= 0, "open %s (%s)", dir, strerror(errno));
+    int dp2 = procfd_open(dfd, O_PATH | O_DIRECTORY | O_CLOEXEC);
+    check(dp2 >= 0, "O_PATH|O_DIRECTORY through the directory's link (%s)", strerror(errno));
+    if (dp2 >= 0) {
+        struct stat a, b;
+        check(fstat(dfd, &a) == 0 && fstat(dp2, &b) == 0 && a.st_dev == b.st_dev &&
+                  a.st_ino == b.st_ino, "  is the same directory");
+        fl = fcntl(dp2, F_GETFL);
+        check(fl == (O_PATH | O_DIRECTORY), "  F_GETFL is O_PATH|O_DIRECTORY (%#x)", fl);
+        int e = openat(dp2, "entry", O_RDONLY | O_CLOEXEC);
+        check(e >= 0, "  and a dirfd: openat(it, \"entry\") (%s)", strerror(errno));
+        if (e >= 0)
+            close(e);
+        close(dp2);
+    }
+    if (dfd >= 0)
+        close(dfd);
+    if (dh >= 0)
+        close(dh);
+    unlink(entry);
+    rmdir(dir);
     return finish_suite("procfd_reopen");
 }

@@ -10,8 +10,9 @@
 #if ENGINE_JIT
 
 #define JIT_INITIAL_HASH_SIZE (1 << 10)
+#define JIT_LOOKUP_STRIPES 64
 #define JIT_CACHE_SIZE (1 << 10)
-#define JIT_PAGE_HASH_SIZE (1 << 10)
+#define JIT_INITIAL_PAGE_HASH_SIZE (1 << 10)
 
 struct jit {
     // there is one jit per address space
@@ -26,7 +27,9 @@ struct jit {
     // period, if we had such a thing)
     struct list jetsam;
 
-    // A way to look up blocks in a page
+    // A way to look up blocks in a page: page_hash_size buckets (a power of
+    // two, grown with num_blocks -- see jit_insert), each listing the blocks
+    // that start (blocks[0]) or end (blocks[1]) in a page congruent to it.
     struct {
         struct list blocks[2];
     } *page_hash;
@@ -38,6 +41,15 @@ struct jit {
     } reference;
 
     lock_t lock;
+    // The block hash's buckets, in JIT_LOOKUP_STRIPES groups, each with a lock
+    // of its own, so that a thread whose own cache missed can look a block up
+    // without the lock above. Every thread of a process shares one jit, and a
+    // miss used to take that one mutex just to read: under sysbench with eight
+    // clients, 77% of MariaDB's lock waiting was there. Whoever changes a
+    // bucket's chain holds `lock` AND the bucket's stripe; a resize holds them
+    // all. Bucket b is in stripe b % JIT_LOOKUP_STRIPES, which the hash sizes
+    // (1024 doubled) keep the same across a resize.
+    pthread_mutex_t lookup_lock[JIT_LOOKUP_STRIPES];
     wrlock_t jetsam_lock;
     // Set once jit_teardown_lock has acquired jetsam_lock for write, ahead
     // of mem_destroy's own pt_unmap_always call -- see jit_invalidate_lock's
@@ -67,6 +79,29 @@ struct jit {
     // whole timeout, several times per run. Every raise in jit.c is paired
     // with exactly one matching lower on every path out.
     atomic_uint write_wanted;
+    size_t page_hash_size;
+
+    // x86 self-modifying code. See jit_note_code_write in jit.c. Set by the
+    // first x86 compile; stores to executable pages are noted from then on.
+    atomic_bool track_code_writes;
+    // Bumped under lock by each noted store; a compile that finds it moved
+    // for one of its pages ran against bytes that were being rewritten.
+    uint64_t code_write_seq;
+    // JIT_CODE_WRITE_SLOTS entries, allocated by the first noted store.
+    struct jit_code_write *code_writes;
+    // Code reached through more than one mapping. See jit_shared_code in
+    // jit.c. Set by the first compile from a MAP_SHARED page; stores to shared
+    // pages are noted from then on, by what they map.
+    atomic_bool track_shared_code;
+    // The guest pages holding blocks compiled from shared memory, findable by
+    // what they map. NULL until the first.
+    struct jit_shared_code *shared_code;
+
+    // Fork inheritance (jit_fork in jit.c). `lineage` is shared with the
+    // children forked from this address space, NULL until the first fork;
+    // `origin` is the parent's, which this jit's misses consult first.
+    struct jit_lineage *lineage;
+    struct jit_lineage *origin;
 };
 
 // this is roughly the average number of instructions in a basic block according to anonymous sources
@@ -94,6 +129,13 @@ struct jit_block {
     // links for free list
     struct list jetsam;
     bool is_jetsam;
+    // Not a function of the code bytes alone, so not for the exec cache
+    // (jit.c): an hle_call gadget, chosen by which library the mapping is, or
+    // a block carrying ISH_JIT_PROFILE's counters.
+    bool no_share;
+    // The code[] slot holding this block's own address (i386 call gadgets),
+    // or 0; a copy of the block must point it at itself.
+    unsigned patch_ip;
 
     unsigned long code[];
 };
@@ -128,7 +170,26 @@ void jit_invalidate_unlock(struct jit *jit);
 // mem_changed.
 void jit_invalidate_range(struct jit *jit, page_t start, page_t end);
 void jit_invalidate_page(struct jit *jit, page_t page);
+void jit_invalidate_rect(struct jit *jit, guest_addr_t start, uint64_t stride,
+        uint64_t row_bytes, uint32_t rows);
 void jit_invalidate_all(struct jit *jit);
+
+// A guest store has just made `page` writable in `tlb`. Called by
+// tlb_handle_miss, after the entry is installed, while jit->track_code_writes
+// is set (an x86 guest). For an executable page, or a MAP_SHARED one once code
+// has been compiled from shared memory, drops the blocks compiled from the
+// page -- through every mapping of it -- and records the store, so the next
+// compile from the page takes the writable entry away again. Returns false if
+// the store could not be recorded, and then the caller must not leave the
+// entry writable.
+struct tlb;
+bool jit_note_code_write(struct jit *jit, page_t page, const struct tlb *tlb);
+
+// A write through mem_ptr (a syscall, a ptrace poke) to a MAP_SHARED page:
+// drop the blocks compiled from any mapping of it. A no-op until code has been
+// compiled from shared memory. Call with mem locked.
+struct pt_entry;
+void jit_note_shared_write(struct jit *jit, const struct pt_entry *entry);
 
 // i386 gadget-fusion switches, readable and writable at RUNTIME via
 // /proc/ish/i386_jit_fuse. Each bit enables one fused gadget family in
@@ -156,8 +217,20 @@ void jit_invalidate_all(struct jit *jit);
 #define JIT_FUSE_LEA     (1u << 2)  // lea reg,[base+disp] in one gadget
 #define JIT_FUSE_ALU     (1u << 3)  // ALU reg,imm (32-bit) in one gadget
 #define JIT_FUSE_PUSHPOP (1u << 4)  // push/pop of a register in one gadget
+#define JIT_FUSE_JCC8    (1u << 5)  // 8-bit cmp/test + jcc in one gadget
+#define JIT_FUSE_ALURR   (1u << 6)  // ALU reg,reg (32-bit) in one gadget
+#define JIT_FUSE_SHIFT   (1u << 7)  // shl/shr/sar reg,imm (32-bit) in one gadget
+#define JIT_FUSE_INCDEC  (1u << 8)  // inc/dec reg (32-bit) in one gadget
+#define JIT_FUSE_MOVI    (1u << 9)  // mov reg, imm32 in one gadget
+#define JIT_FUSE_MOVX    (1u << 10) // movzx reg32, [base+disp] and mov word [base+disp], reg
+#define JIT_FUSE_IMUL    (1u << 11) // imul reg32, reg32 in one gadget
+#define JIT_FUSE_ADDRSI  (1u << 12) // [base+index*scale+disp] address in one gadget
+#define JIT_FUSE_CMPRR   (1u << 13) // cmp/test reg,reg + jcc in one gadget
 #define JIT_FUSE_ALL (JIT_FUSE_ADDR | JIT_FUSE_MOVMR | JIT_FUSE_LEA | \
-                      JIT_FUSE_ALU | JIT_FUSE_PUSHPOP)
+                      JIT_FUSE_ALU | JIT_FUSE_PUSHPOP | JIT_FUSE_JCC8 | \
+                      JIT_FUSE_ALURR | JIT_FUSE_SHIFT | JIT_FUSE_INCDEC | \
+                      JIT_FUSE_MOVI | JIT_FUSE_MOVX | JIT_FUSE_IMUL | \
+                      JIT_FUSE_ADDRSI | JIT_FUSE_CMPRR)
 
 // The arm64 and riscv64 guests get the same treatment, with their own bit
 // namespaces (the values overlap; the arch selects which table applies).
@@ -174,8 +247,30 @@ void jit_invalidate_all(struct jit *jit);
 // that matters. Same design as riscv64's (JIT_FUSE_RV_RETCACHE); both engines
 // return through a link register and share LINKREG_RET_CACHE_HASH.
 #define JIT_FUSE_A64_RETCACHE (1u << 3)
+// SIMD element moves through gadgets specialised by element size, fed
+// precomputed cpu_state offsets (jit/guest-arm64/simd_spec.S) instead of the
+// generic gadgets that decode registers, size and lane at run time.
+#define JIT_FUSE_A64_VSPEC (1u << 4)
+// Scalar ALU gadgets fed precomputed cpu_state offsets (SP included), the
+// same idea for the integer side (jit/guest-arm64/alu_spec.S).
+#define JIT_FUSE_A64_OSPEC (1u << 5)
+// Loads/stores with writeback (post/pre-index) and register offsets through
+// fast gadgets fed slot offsets (jit/guest-arm64/memory.S's _post/_pre/_rx*).
+#define JIT_FUSE_A64_LSPEC (1u << 6)
+// Not a fusion: backward conditional branches use the gadget layout whose taken
+// path is straight-line (loops); see JIT_FUSE_RV_BTFN.
+#define JIT_FUSE_A64_BTFN (1u << 7)
+// Two gadgets that follow each other in a block become one that does both and
+// dispatches once (jit/guest-arm64/frag.h, pairs.h; gen.c's arm64_pair_fuse).
+#define JIT_FUSE_A64_PAIR (1u << 8)
+// In such a pair, an operand of the second gadget that is the first one's
+// result comes over in a host register, not through its cpu_state slot.
+#define JIT_FUSE_A64_FWD (1u << 9)
 #define JIT_FUSE_A64_ALL (JIT_FUSE_A64_BCOND | JIT_FUSE_A64_LDST | \
-                          JIT_FUSE_A64_LDCMP | JIT_FUSE_A64_RETCACHE)
+                          JIT_FUSE_A64_LDCMP | JIT_FUSE_A64_RETCACHE | \
+                          JIT_FUSE_A64_VSPEC | JIT_FUSE_A64_OSPEC | \
+                          JIT_FUSE_A64_LSPEC | JIT_FUSE_A64_BTFN | \
+                          JIT_FUSE_A64_PAIR | JIT_FUSE_A64_FWD)
 
 // riscv64 had NO switch at all for either of its fusions, so neither could be
 // A/B'd without rebuilding. ISH_RISCV64_NO_FUSE now clears both.
@@ -189,7 +284,34 @@ void jit_invalidate_all(struct jit *jit);
 // newly compiled blocks: an interleaved A/B must start a fresh guest process
 // per rep (fresh jit, fresh translations) after flipping the knob.
 #define JIT_FUSE_RV_RETCACHE (1u << 2)
-#define JIT_FUSE_RV_ALL (JIT_FUSE_RV_FOLD | JIT_FUSE_RV_JAL | JIT_FUSE_RV_RETCACHE)
+// gen_riscv64_try_pair: two 64-bit loads (or stores) off one base in one gadget,
+// the ldp/stp RV64 lacks -- register saves and restores in every prologue.
+#define JIT_FUSE_RV_PAIR (1u << 3)
+// gen_riscv64_try_after_slli/_after_add: slli+srli/srai, slli+add and
+// add+load pairs in one gadget each (the shifts RV64GC uses for zext.w/sext
+// and shNadd, and indexed loads).
+#define JIT_FUSE_RV_ALU (1u << 4)
+// gen_riscv64_try_li_branch/_andi_branch: li t,K or andi t,rs,K followed by a
+// conditional branch on t, as one compare-and-branch gadget.
+#define JIT_FUSE_RV_BRANCH (1u << 5)
+// Not a fusion: backward conditional branches use the gadget layout whose taken
+// path is straight-line (loops), forward ones the fallthrough-straight layout.
+#define JIT_FUSE_RV_BTFN (1u << 6)
+// gen_riscv64_try_rcache_run: straight register-only runs keep up to four guest
+// registers in host x23-x26 (jit/guest-riscv64/rcache.S).
+#define JIT_FUSE_RV_RCACHE (1u << 7)
+// Two gadgets that follow each other in a block become one that does both and
+// dispatches once: the arm64 guest's JIT_FUSE_A64_PAIR for this one
+// (jit/guest-riscv64/frag.h, pairs.h). "fuse2", since "pair" was taken by the
+// hand-written ld+ld and sd+sd.
+#define JIT_FUSE_RV_FUSE2 (1u << 8)
+// ...and hands the first one's result to the second in a host register when
+// the second uses it (JIT_FUSE_A64_FWD).
+#define JIT_FUSE_RV_FWD (1u << 9)
+#define JIT_FUSE_RV_ALL (JIT_FUSE_RV_FOLD | JIT_FUSE_RV_JAL | JIT_FUSE_RV_RETCACHE | \
+                         JIT_FUSE_RV_PAIR | JIT_FUSE_RV_ALU | JIT_FUSE_RV_BRANCH | \
+                         JIT_FUSE_RV_BTFN | JIT_FUSE_RV_RCACHE | JIT_FUSE_RV_FUSE2 | \
+                         JIT_FUSE_RV_FWD)
 
 // The amd64 guest's bits are not fusions in the i386 sense (two gadgets folded
 // into one) but NATIVE-vs-BRIDGE switches, which is the same A/B in the shape
@@ -203,7 +325,18 @@ void jit_invalidate_all(struct jit *jit);
 // that re-derives operands the translator already knew. A native gadget
 // removes all three, which is why these are worth measuring separately.
 #define JIT_FUSE_AMD64_INCDEC_REG (1u << 0)  // FF /0,/1 mod==3: inc/dec of a register
-#define JIT_FUSE_AMD64_ALL (JIT_FUSE_AMD64_INCDEC_REG)
+#define JIT_FUSE_AMD64_DEADFLAGS  (1u << 1)  // skip flags the next writer overwrites unread
+#define JIT_FUSE_AMD64_MOVR       (1u << 2)  // mov r32/r64,r32/r64 specialised per register pair
+#define JIT_FUSE_AMD64_ARITHR     (1u << 3)  // add/sub/or/and/xor reg,reg|imm specialised per register
+#define JIT_FUSE_AMD64_MEMR       (1u << 4)  // mov r,[base+disp] / mov [base+disp],r on the register cache
+#define JIT_FUSE_AMD64_SHIFTR     (1u << 5)  // shl/shr/sar reg,imm (and by 1), rol/ror reg,imm, specialised per register
+#define JIT_FUSE_AMD64_INCDECR    (1u << 6)  // inc/dec reg specialised per register
+#define JIT_FUSE_AMD64_RESIDENT   (1u << 7)  // the register cache stays unwritten across chained branches
+#define JIT_FUSE_AMD64_RETCACHE   (1u << 8)  // ret enters the target block through jit_frame.ret_cache
+#define JIT_FUSE_AMD64_ALL (JIT_FUSE_AMD64_INCDEC_REG | JIT_FUSE_AMD64_DEADFLAGS | \
+                            JIT_FUSE_AMD64_MOVR | JIT_FUSE_AMD64_ARITHR | JIT_FUSE_AMD64_MEMR | \
+                            JIT_FUSE_AMD64_SHIFTR | JIT_FUSE_AMD64_INCDECR | JIT_FUSE_AMD64_RESIDENT | \
+                            JIT_FUSE_AMD64_RETCACHE)
 
 // Live masks. Seeded on first use from the ISH_NO_*_FUSE / ISH_*_NO_FUSE
 // environment variables, whose existing semantics are unchanged (set to ANY value
@@ -226,8 +359,54 @@ const char *jit_fuse_name(enum jit_fuse_arch arch, unsigned index, unsigned *bit
 // Returns false for a name this arch does not have ("all" is accepted).
 bool jit_fuse_set_by_name(enum jit_fuse_arch arch, const char *name, bool on);
 
+// A forked child starts with no blocks; jit_fork lets its misses copy the
+// parent's block at the same address when the code under it is still the
+// same memory in both. Call jit_lineage_detach before the parent's page tables
+// go away, and jit_inherit_set to switch it (/proc/ish/jit_inherit).
+void jit_fork(struct jit *parent, struct jit *child);
+void jit_lineage_detach(struct jit *jit);
+void jit_inherit_set(bool on);
+bool jit_inherit_enabled(void);
+// The exec cache (jit.c, "The exec cache"), off unless it is turned on.
+// Counters for /proc/ish/jit_timing and jit_cache.
+struct jit_xcache_stats {
+    bool enabled;
+    unsigned long hits, misses, stored, refused;
+    unsigned long long bytes;
+};
+void jit_xcache_get(struct jit_xcache_stats *stats);
+// Turn the cache on or off. On also sets randomize_va_space to 0 and holds it
+// there; off puts it back and frees the cache. See jit.c.
+void jit_xcache_set_enabled(bool on);
+
+// Block translation time, per guest architecture (i386, amd64, arm64, riscv64):
+// ISH_JIT_TIMING at start-up, or /proc/ish/jit_timing at run time.
+struct jit_timing_stats {
+    bool enabled;
+    unsigned long long bytes;
+    const char *arch[4];
+    unsigned long long ns[4];
+    unsigned long blocks[4];
+    // Of those, how many were copied from the parent (jit_fork).
+    unsigned long inherited[4];
+};
+void jit_timing_set(bool on);
+void jit_timing_get(struct jit_timing_stats *stats);
+
 bool amd64_jit_is_enabled(void);
 void amd64_jit_set_enabled(bool enabled);
+// Block-compile accounting for the amd64 frontend, published through
+// /proc/ish/amd64_jit. Every compile attempt ends in exactly one of these
+// three, so `attempts - successes - fallbacks` is the OOM count -- which is
+// what makes a reported zero trustworthy rather than merely quiet.
+//
+// It exists because the interpreter is being retired and "does the JIT ever
+// fail to compile a block?" is the question that decides what a failure has to
+// become. ISH_TRACE_AMD64_JIT_STATS only prints its histogram at eight or more
+// fallbacks and only to stderr, so it cannot tell a genuine zero from a small
+// number, which is the distinction that matters here.
+void amd64_jit_compile_stats(unsigned long *attempts, unsigned long *successes,
+        unsigned long *fallbacks);
 bool i386_single_step_comm_matches(const char *comm);
 void i386_single_step_comm_set(const char *comm);
 void i386_single_step_comm_get(char *buf, size_t bufsize);

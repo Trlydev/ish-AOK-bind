@@ -14,6 +14,9 @@ struct proc_entry {
     pid_t_ pid;
     sdword_t fd; // typedef might not have been read yet
     struct proc_dir_entry *parent;
+    // Set for a .readlink that readlink(2) itself asked for, clear for one the
+    // path walk follows: see proc_readlink_shown.
+    bool shown;
 };
 
 struct proc_data {
@@ -74,7 +77,20 @@ struct proc_dir_entry {
 
     struct proc_dir_entry *parent;
     int inode;
+
+    // Only a caller that may inspect the entry's task -- Linux's
+    // ptrace_may_access(PTRACE_MODE_READ_FSCREDS), task_ptrace_may_access --
+    // may open it, read it as a link, or look anything up inside it; anyone
+    // else gets EACCES. For what describes a process's address space, open
+    // files, working directory and executable: Linux gates each of these the
+    // same way (mm_access, proc_fd_access_allowed), so another user's process
+    // shows its status and cmdline but not its memory map or its files.
+    bool ptrace_read;
 };
+
+// The gate described at ptrace_read, for the task an entry names. True when
+// the task is gone: the entry's own handler reports that.
+bool proc_entry_may_read(struct proc_entry *entry);
 
 struct proc_children {
     size_t count;
@@ -86,6 +102,19 @@ struct proc_children {
 // open(2) on a /proc/pid/ns/* magic link: returns a namespace fd (NULL if
 // name is not a namespace entry -- caller falls back to path resolution).
 struct fd *proc_ns_open(int pid, const char *name);
+// For setns(2): false if `fd` is not a namespace fd; otherwise its CLONE_NEW*
+// type, and the UTS or IPC namespace it holds (NULL for the other kinds, of
+// which there is only the initial one). `ns` is borrowed from the fd.
+bool proc_ns_fd_info(struct fd *fd, unsigned *nstype, void **ns);
+// Whether a namespace fd refers to the system's own namespace of its kind --
+// every kind but UTS and IPC has only that one. What a checkpoint can carry.
+bool proc_ns_fd_is_initial(struct fd *fd);
+// A namespace fd's /proc/<pid>/fd link text, as Linux prints it: "pid:[ino]".
+// False if `fd` is not a namespace fd.
+bool proc_ns_fd_link(struct fd *fd, char *buf, size_t size);
+// A namespace fd for the system's namespace of kind `nstype` (CLONE_NEW*_),
+// as kernel/checkpoint.c rebuilds one. ERR_PTR on an unknown kind.
+struct fd *proc_ns_fd_initial(unsigned nstype);
 
 extern struct proc_dir_entry proc_root;
 extern struct proc_dir_entry proc_pid;
@@ -100,6 +129,10 @@ int proc_show_mountinfo(struct proc_entry *entry, struct proc_data *buf);
 // mounts_lock NOT held. libmount's kernel mount monitor (systemd) depends
 // on an edge per change; see the comment at the definition.
 void proc_mountinfo_notify_changed(void);
+// procfs's readlink for readlink(2), as against for the path walk (the fs
+// op). The /proc/<pid>/{fd/N,cwd,root,exe} links answer these differently in
+// one case, a lazily unmounted bind: see generic_getpath_shown.
+ssize_t proc_readlink_shown(const char *path, char *buf, size_t bufsize);
 int proc_show_mounts(struct proc_entry *entry, struct proc_data *buf);
 
 mode_t_ proc_entry_mode(struct proc_entry *entry);

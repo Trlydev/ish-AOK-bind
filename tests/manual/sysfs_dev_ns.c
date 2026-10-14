@@ -262,6 +262,14 @@ static void test_nsfs_ioctls(void) {
         char path[64], label[128];
         snprintf(path, sizeof(path), "/proc/self/ns/%s", expect[i].name);
         int fd = open(path, O_RDONLY);
+        // A kernel built without a kind has no file for it: AOK has no cgroup
+        // or time namespaces, and had no ns/net before network namespaces.
+        // namespace_errno.c holds each file to whether its kind can be made;
+        // uts_namespace.c holds the other five to being there.
+        if (fd < 0 && errno == ENOENT &&
+            (expect[i].nstype == CLONE_NEWNET_ || expect[i].nstype == CLONE_NEWCGROUP_ ||
+             expect[i].nstype == CLONE_NEWTIME_))
+            continue;
         snprintf(label, sizeof(label), "ns.%s_opens", expect[i].name);
         if (!check(label, fd >= 0))
             continue;
@@ -306,7 +314,13 @@ static void test_nsfs_ioctls(void) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (check("ns.socket_opens", sock >= 0)) {
         int ns = ioctl(sock, SIOCGSKNS_);
-        if (geteuid() == 0) {
+        int ns_errno = errno;
+        if (access("/proc/self/ns/net", F_OK) != 0) {
+            // No network namespaces at all (AOK; a kernel without
+            // CONFIG_NET_NS): there is no namespace file to hand back.
+            errno = ns_errno; // eq_errno reads errno; access() just set it
+            eq_errno("ns.siocgskns_without_netns", ns, geteuid() == 0 ? EINVAL : EPERM);
+        } else if (geteuid() == 0) {
             if (check("ns.siocgskns_as_root", ns >= 0)) {
                 check("ns.siocgskns_gives_a_net_ns",
                       ioctl(ns, NS_GET_NSTYPE_) == CLONE_NEWNET_);
@@ -369,6 +383,68 @@ static void test_sysfs_poll(void) {
     }
 }
 
+// And the other half of sysfs's mask: POLLPRI|POLLERR mean "this attribute
+// may have changed since you last read it", so they are there from the open
+// until the first read, and gone after it -- lseek does not bring them back,
+// pread counts as a read. A directory never has them. Measured on Linux 6.12
+// (camd) with /sys/class/tty/tty0/active, the file elogind watches: fresh,
+// events 0 gives POLLERR and IN|PRI gives IN|PRI|ERR; after a read, events 0
+// gives nothing and IN|PRI gives IN. AOK reported POLLERR for ever, and
+// elogind -- which registers that file with no events, so POLLERR alone wakes
+// it -- reread it and was woken again, at a full core, on every boot.
+static int poll_mask(int fd, short events) {
+    struct pollfd pf = {.fd = fd, .events = events};
+    return poll(&pf, 1, 0) == 1 ? pf.revents : 0;
+}
+static void test_sysfs_poll_event(void) {
+    const char *path = "/sys/class/tty/tty0/active";
+    int fd = open(path, O_RDONLY);
+    if (!check("sysfs.event_opens(tty0/active)", fd >= 0))
+        return;
+    int fresh0 = poll_mask(fd, 0);
+    int fresh_in = poll_mask(fd, POLLIN | POLLPRI);
+    int efd = epoll_create1(0);
+    struct epoll_event ev = {.events = 0}, out;
+    epoll_ctl(efd, EPOLL_CTL_ADD, fd, &ev);
+    int ep_fresh = epoll_wait(efd, &out, 1, 0);
+    uint32_t ep_fresh_ev = ep_fresh == 1 ? out.events : 0;
+    char b[64];
+    read(fd, b, sizeof(b));
+    int read0 = poll_mask(fd, 0);
+    int read_in = poll_mask(fd, POLLIN | POLLPRI);
+    int ep_read = epoll_wait(efd, &out, 1, 0);
+    lseek(fd, 0, SEEK_SET);
+    int seek0 = poll_mask(fd, 0);
+    test_logf("     fresh ev0=%#x evIN|PRI=%#x epoll=%d/%#x; read ev0=%#x evIN|PRI=%#x "
+              "epoll=%d; lseek ev0=%#x\n", fresh0, fresh_in, ep_fresh, ep_fresh_ev,
+              read0, read_in, ep_read, seek0);
+    check("sysfs.event_fresh_is_pollerr", fresh0 == POLLERR);
+    check("sysfs.event_fresh_in_pri_err", fresh_in == (POLLIN | POLLPRI | POLLERR));
+    check("sysfs.event_fresh_epoll_err", ep_fresh == 1 && ep_fresh_ev == EPOLLERR);
+    check("sysfs.event_read_quiet", read0 == 0);
+    check("sysfs.event_read_in_only", read_in == POLLIN);
+    check("sysfs.event_read_epoll_quiet", ep_read == 0);
+    check("sysfs.event_lseek_stays_quiet", seek0 == 0);
+    close(efd);
+    close(fd);
+
+    // pread counts as a read.
+    fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        pread(fd, b, sizeof(b), 0);
+        check("sysfs.event_pread_quiet", poll_mask(fd, 0) == 0);
+        close(fd);
+    }
+    // A directory is POLLIN|POLLOUT and nothing else.
+    fd = open("/sys/class/tty", O_RDONLY | O_DIRECTORY);
+    if (check("sysfs.event_dir_opens", fd >= 0)) {
+        int dm = poll_mask(fd, POLLIN | POLLOUT | POLLPRI);
+        test_logf("     dir revents=%#x\n", dm);
+        check("sysfs.event_dir_in_out", dm == (POLLIN | POLLOUT));
+        close(fd);
+    }
+}
+
 // ---- one anonymous filesystem per kind, as Linux has it -----------------
 //
 // A program cannot ask a descriptor what KIND of thing it is. What it can do
@@ -377,8 +453,8 @@ static void test_sysfs_poll(void) {
 // eventfd/epoll family each their own internal filesystem with its own
 // anonymous device number.
 //
-// lsns is built on exactly that: it reads the device number off
-// /proc/self/ns/net and then examines every descriptor that matches it. With
+// lsns is built on exactly that: it reads the device number off a namespace
+// file (/proc/self/ns/net where there is one; mnt is used here) and then examines every descriptor that matches it. With
 // one device shared by everything anonymous, that filter selects everything,
 // and lsns interrogates every pipe and socket on the machine -- seventy lines
 // of "Unsupported ioctl NS_GET_NSTYPE" before its first row of output, on a
@@ -393,7 +469,7 @@ static dev_t dev_of_fd(int fd) {
 }
 
 static void test_anon_devices(void) {
-    int nsfd = open("/proc/self/ns/net", O_RDONLY);
+    int nsfd = open("/proc/self/ns/mnt", O_RDONLY);
     dev_t ns_dev = dev_of_fd(nsfd);
     if (nsfd >= 0)
         close(nsfd);
@@ -449,6 +525,7 @@ int main(int argc, char **argv) {
     alarm(test_watchdog_secs(60));
 
     test_sysfs_poll();
+    test_sysfs_poll_event();
     test_anon_devices();
     test_sys_dev_block();
     test_sys_block_attrs();

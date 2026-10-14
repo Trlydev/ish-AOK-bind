@@ -18,6 +18,10 @@ float80 f80_from_int(int64_t i);
 int64_t f80_to_int(float80 f);
 float80 f80_from_double(double d);
 double f80_to_double(float80 f);
+// The single-precision pair, bit for bit. Going through a host double instead
+// rounds twice, and runs the host FPU under the guest's SSE mode.
+float80 f80_from_float(float f);
+float f80_to_float(float80 f);
 float80 f80_round(float80 f);
 
 bool f80_isnan(float80 f);
@@ -26,6 +30,13 @@ bool f80_iszero(float80 f);
 bool f80_isdenormal(float80 f);
 bool f80_is_supported(float80 f);
 
+// Round-to-nearest fast paths for normal operands and results at p bits of
+// precision (64, 53 or 24); false means "use f80_add/f80_mul instead" and
+// leaves nothing changed. Report PE (inexact) and C1 (rounded up) through the
+// out-parameters instead of the thread-local flags. See emu/float80.c.
+bool f80_add_fast(float80 a, float80 b, int p, float80 *out, bool *inexact, bool *up);
+bool f80_mul_fast(float80 a, float80 b, int p, float80 *out, bool *inexact, bool *up);
+bool f80_div_fast(float80 a, float80 b, int p, float80 *out, bool *inexact, bool *up);
 float80 f80_add(float80 a, float80 b);
 float80 f80_sub(float80 a, float80 b);
 float80 f80_mul(float80 a, float80 b);
@@ -41,12 +52,14 @@ float80 f80_neg(float80 f);
 float80 f80_abs(float80 f);
 
 float80 f80_log2(float80 x);
+float80 f80_log2p1(float80 x);
 float80 f80_sqrt(float80 x);
 
 float80 f80_scale(float80 x, int scale);
+float80 f80_fscale(float80 x, float80 y);
 
-// Used to implement fxtract
-void f80_xtract(float80 f, int *exp, float80 *signif);
+// FXTRACT: the exponent and the significand, both as values
+void f80_xtract(float80 x, float80 *exp, float80 *signif);
 
 enum f80_rounding_mode {
     round_to_nearest = 0,
@@ -71,7 +84,27 @@ extern __thread int f80_precision;
 extern __thread int f80_inexact;
 extern __thread int f80_rounded_up;
 
+// The other exceptions an operation raised, in the x87 status word's own bit
+// order, so the x87 layer can OR them straight in. Cleared by the caller
+// before an operation, like f80_inexact, which stays the record of PE.
+#define F80_EXC_INVALID   (1 << 0)
+#define F80_EXC_DENORMAL  (1 << 1)
+#define F80_EXC_DIVZERO   (1 << 2)
+#define F80_EXC_OVERFLOW  (1 << 3)
+#define F80_EXC_UNDERFLOW (1 << 4)
+extern __thread int f80_exceptions;
+
+// A NaN whose quiet bit (bit 62 of the significand) is clear. Using one as an
+// operand is an invalid operation, and the NaN that comes out is quieted.
+bool f80_issnan(float80 f);
+
 #define F80_NAN ((float80) {.signif = 0xc000000000000000, .exp = 0x7fff, .sign = 0})
+// The x87 "real indefinite": the QNaN an invalid operation produces, and its
+// SIGN BIT IS SET. F80_NAN above is the positive quiet NaN, which is what a
+// widened host NaN looks like -- not what FPREM of a zero divisor, or any other
+// invalid x87 operation, returns. Measured against real x86_64 hardware: the
+// two differ by exactly that bit.
+#define F80_INDEFINITE ((float80) {.signif = 0xc000000000000000, .exp = 0x7fff, .sign = 1})
 #define F80_INF ((float80) {.signif = 0x8000000000000000, .exp = 0x7fff, .sign = 0})
 
 #endif

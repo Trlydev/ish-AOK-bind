@@ -4,6 +4,11 @@
 why it is fast. This page is the practical half: getting them onto your `PATH`,
 making one your login shell, and backing out again.
 
+**On a [native-mode](native-mode.md) root there is nothing to set up**: its
+`/bin` and `/usr/bin` already are these programs, linked by iSH-AOK at every
+boot, and `native-links.sh` says so and does nothing. This page is for
+distribution roots.
+
 There is a near neighbour with a different job. `/AOK/tools/persist-links.sh`
 has the same shape — same `--list`, `--remove`, `--force`, same per-root
 caveat — but it links **your own** programs out of `/AOK/persist/bin`, so it can
@@ -14,7 +19,7 @@ Nothing here is required. `/AOK/native` is always present, and you can always
 run a native program by its full path without setting anything up at all:
 
 ```sh
-/AOK/native/bash --version
+/AOK/native/zsh --version
 /AOK/native/smallclue wc -l /etc/passwd
 ```
 
@@ -30,14 +35,44 @@ No `sudo` — a stock Alpine or Devuan root does not have it installed, and the
 app logs you in as root anyway. If you have added `sudo` and are running as
 someone else, prefix it.
 
-That creates a symlink per applet in `/usr/local/native-bin`, puts that
-directory first on your `PATH`, and switches the UID 1000 user's login shell to
-a native one. On a current build it links about 110 applets and skips a couple
+That creates a symlink per applet in `/usr/local/native-bin` **and in
+`/usr/local/bin`**, puts `/usr/local/native-bin` first on your `PATH`, and
+switches the UID 1000 user's login shell to a native one. On a current build it links about 110 applets and skips a couple
 of dozen it knows do not work.
 
 It links the **standalone** native programs too, not only SmallCLUE's applets —
-`bash`, `zsh`, [`motepad`](motepad.md), `hx` and the `bmm`/`bmt` benchmarks each
-get a link pointing at their own file. It enumerates `/AOK/native` rather than
+`zsh`, `dash`, `sh`, [`motepad`](motepad.md), [`ktop`](ktop.md), `wl-present`,
+`su`, `sudo`, `passwd` and the `bmm`/`bmt` benchmarks each get a link pointing
+at their own file. `hx` joins
+them in the shipped app build, which enables it by default, but not in a plain
+CLI/meson build unless you pass `-Dnative_helix=enabled`. `bash` is **not** in
+the default build either way, as of 556 (`-Dnative_bash=enabled` builds it in),
+so a stock install has neither `/AOK/native/bash` nor a `bash` link. `su`,
+`sudo` and `passwd` are the **setuid-root** ones — see
+[native-programs.md](native-programs.md#su-sudo-and-passwd-the-only-setuid-root-native-programs)
+— and linking them means a bare `sudo` reaches AOK's rather than your distro's.
+
+**`sh` is worth singling out.** Because this directory goes first on your
+`PATH`, that link is what makes a bare `sh`, and any script you run as
+`sh script`, mean native dash rather than your distro's shell. Scripts with
+`#!/bin/sh` in them are unaffected — a shebang names an absolute path, and
+`/bin/sh` is left alone. If you would rather keep `sh` as it was, pass
+`--no-sh`, which also takes back an `sh` link an earlier run made; the rest keep
+working.
+
+**Why `/usr/local/bin` as well.** `/etc/profile.d` only reaches login shells.
+`ssh host cmd`, cron and init scripts take the distro's compiled-in `PATH`,
+which has `/usr/local/bin` ahead of `/bin`, so the second set of links is what
+makes `sh` and every other native command the default there too. It reaches
+further than the first set for the same reason: a package's install scripts
+then run SmallCLUE's `sed`, `grep` and `awk` rather than the distro's. Those are
+checked against GNU sed and grep and against mawk (see
+[native-programs.md](native-programs.md#what-runs-natively)), but if one still
+trips a package up, `--target-only` keeps everything in
+`/usr/local/native-bin`. Nothing already in `/usr/local/bin` that is not a link
+of ours is replaced without `--force`.
+
+It enumerates `/AOK/native` rather than
 naming them, so a program this build does not have is simply absent. Three names
 are deliberately left out: `smallclue` itself (its applets are linked by name,
 so a bare `smallclue` link would only print the banner), `zsh-multio` (an
@@ -54,11 +89,15 @@ sh /AOK/tools/native-links.sh --list
 The last lines are the summary worth reading:
 
 ```
-would link 110 applet(s) and 6 program(s), leave 0 in place, skip 20 excluded, 0 already linked, unlink 0 now-excluded
+would link 124 applet(s) and 17 program(s) into /usr/local/native-bin and /usr/local/bin, leave 0 in place, skip 40 excluded, 119 already linked, unlink 1 now-excluded
   would put /usr/local/native-bin first on PATH via /etc/profile.d/05-aok-native-bin.sh
   would make zsh read it too, via /etc/zprofile
-  nu already uses /AOK/native/bash
+  would set nu's shell: /bin/sh -> /AOK/native/zsh
 ```
+
+(captured on a CLI build's Alpine test root that had been linked before; each
+count covers both directories, and the numbers depend on the build and on the
+root, so read yours rather than these.)
 
 **Do this once per root.** The links live in the root's own `/usr/local`, and
 the PATH snippet in its `/etc/profile.d`, so a second root — or one you install
@@ -73,31 +112,53 @@ default, so on a stock setup this step changes a user you may never log in as,
 and you will not notice it. On the bundled roots that user is `nu`; check with
 `getent passwd 1000`.
 
-By default it picks `/AOK/native/bash` when that exists and `/AOK/native/zsh`
-otherwise. Say so explicitly with `--shell`:
+By default it picks `/AOK/native/zsh` when that exists and `/AOK/native/bash`
+otherwise. It used to prefer bash, and it was changed deliberately: bash was
+**removed from the shipped build in 556**, so preferring it would have kept
+handing new installs a shell that was going away. Say so explicitly with `--shell`:
 
 ```sh
-sh /AOK/tools/native-links.sh --shell zsh        # native zsh
-sh /AOK/tools/native-links.sh --shell bash       # native bash
+sh /AOK/tools/native-links.sh --shell zsh        # native zsh (the default)
+sh /AOK/tools/native-links.sh --shell bash       # native bash, on a build that has it
 sh /AOK/tools/native-links.sh --shell /bin/ash   # an absolute path is taken as given
 sh /AOK/tools/native-links.sh --no-shell         # link the applets, leave the shell alone
 ```
 
+`--shell` takes `bash`, `zsh` or a path — there is no `--shell dash`, so ask for
+native dash by its path: `--shell /AOK/native/dash`. It is a scripting shell
+with no line editing or history, which is why it is not one of the shorthands.
+
 The previous shell is recorded in `/etc/aok-native-shell.prev`, so `--remove`
 can put it back.
+
+**A login shell the build no longer has is repaired at boot.** An account set
+up before 556 may still name `/AOK/native/bash`, and `sshd`, `login` and `su`
+all refuse a user whose shell does not exist — which looks like a bad password
+or a bad key, not a missing shell. So at every boot of every root, each
+`/etc/passwd` shell under `/AOK/native` that this build lacks is changed to the
+root's own program of that name (a distro's `/bin/bash`), else native zsh, else
+`/bin/sh`. Nothing else in the file changes, its mode and owner are kept, and
+the kernel log says what it did:
+
+```sh
+dmesg | grep 'login shell'   # native: login shell of nu was /AOK/native/bash, ...
+```
+
+`native-links.sh` does the same for a native bash whenever it runs, pointing
+the entry at the guest's own bash, else `/bin/sh`.
 
 To check what you are actually running right now, ask the shell where it came
 from:
 
 ```sh
-echo $BASH          # bash:  /AOK/native/bash
+echo $BASH          # bash:  /bin/bash, or /AOK/native/bash on a build with it
 echo $ZSH_ARGZERO   # zsh:   /AOK/native/zsh
 ```
 
 `echo $0` works for a shell you invoked by name, but a *login* shell
 conventionally reports `-bash`, which tells you nothing about which bash it is.
-`/proc/self/exe` will not tell you either — a native program has no guest image
-of its own, so that link still points at the last guest binary the task loaded.
+`readlink /proc/$$/exe` does: a native program has no guest image of its own,
+so that link names the `/AOK/native` entry that was exec'd.
 
 ## Options
 
@@ -107,6 +168,8 @@ of its own, so that link still points at the last guest binary the task loaded.
 | `--remove` | remove the links, restore the login shell, delete the PATH file |
 | `--no-path` | create the links but leave `PATH` alone |
 | `--no-shell` | leave the login shell alone |
+| `--no-sh` | link `dash`, but do not make `sh` mean it |
+| `--target-only` | link into the target directory only, not `/usr/local/bin` too |
 | `--shell S` | `bash`, `zsh`, or an absolute path |
 | `--all` | include applets that are known not to work in this build |
 | `--force` | replace files that are not our own symlinks |
@@ -161,7 +224,8 @@ sh /AOK/tools/native-links.sh --remove
 ```
 
 That removes every link it owns, restores the login shell it saved, and deletes
-`/etc/profile.d/05-aok-native-bin.sh`. It removes any symlink in that directory
+`/etc/profile.d/05-aok-native-bin.sh`. It removes any symlink in that directory,
+and in `/usr/local/bin`,
 pointing **anywhere into `/AOK/native`** — not just SmallCLUE's applets, but the
 standalone programs too, and that includes a link you made to `/AOK/native/bash`
 or `/AOK/native/hx` by hand: the script now creates those itself, so it treats
@@ -178,10 +242,12 @@ usable by full path, and nothing is shadowed.
 
 ## When something behaves oddly
 
-The applets are *smaller* implementations, not drop-in replacements, and the
-places they diverge tend to be individual flags rather than whole commands. A
-script that has always worked can fail on one option while the command itself is
-plainly present and working — that is the shape this problem takes.
+The applets that stand in for distro tools are checked against GNU's (and
+`awk` against mawk's) as of 557, but SmallCLUE is still its own implementation,
+and where one diverges it tends to be an individual flag rather than a whole
+command. A script that has always worked can fail on one option while the
+command itself is plainly present and working — that is the shape this problem
+takes.
 
 The excluded list is **measured** — each applet was run and its behaviour
 recorded — rather than predicted from the sources; `tools/native-applet-audit.py`

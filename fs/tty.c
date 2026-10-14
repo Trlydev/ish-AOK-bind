@@ -1,4 +1,5 @@
 #define DEFAULT_CHANNEL debug
+#include "kernel/pid_ns.h"
 #include "debug.h"
 #include <string.h>
 #include "kernel/calls.h"
@@ -20,6 +21,33 @@ struct tty_driver *tty_drivers[256] = {
 
 // lock this before locking a tty
 lock_t ttys_lock = LOCK_INITIALIZER;
+
+// The line discipline a terminal starts life with.
+//
+// Factored out of tty_alloc because a RE-LAUNCHED native program has to be
+// handed exactly this and nothing else. Such a program starts from scratch
+// and captures whatever mode it finds as the one to restore when it exits --
+// so if it is handed back the raw mode its previous incarnation left behind,
+// it saves raw, sets raw, and on exit restores RAW, leaving the shell on a
+// terminal with no echo and no line discipline. That is not a lockup but it
+// is indistinguishable from one. See kernel/checkpoint.c's dispatch.
+static void tty_init_termios(struct tty *tty, int type) {
+    tty->termios.iflags = ICRNL_ | IXON_;
+    tty->termios.oflags = OPOST_ | ONLCR_;
+    // Linux keeps this per driver rather than using one value everywhere:
+    // drivers/tty/vt/vt.c takes tty_std_termios as-is for the console, which
+    // includes HUPCL, while drivers/tty/pty.c overrides c_cflag to
+    // B38400|CS8|CREAD for both the master and the slave. Key off the device
+    // type rather than the driver identity: the app drives its terminals
+    // through a tty_driver of its own, but pty_open_fake registers them under
+    // TTY_PSEUDO_SLAVE_MAJOR, so to the guest they are pty slaves.
+    tty->termios.cflags = B38400_ | CS8_ | CREAD_;
+    if (type != TTY_PSEUDO_MASTER_MAJOR && type != TTY_PSEUDO_SLAVE_MAJOR)
+        tty->termios.cflags |= HUPCL_;
+    tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOK_ | ECHOCTL_ | ECHOKE_ | IEXTEN_;
+    // from include/asm-generic/termios.h
+    memcpy(tty->termios.cc, "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\0\0", 19);
+}
 
 struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     // Zero everything: the driver-specific union at the end (real tty thread,
@@ -45,21 +73,7 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     tty->fg_group = 0;
     list_init(&tty->fds);
 
-    tty->termios.iflags = ICRNL_ | IXON_;
-    tty->termios.oflags = OPOST_ | ONLCR_;
-    // Linux keeps this per driver rather than using one value everywhere:
-    // drivers/tty/vt/vt.c takes tty_std_termios as-is for the console, which
-    // includes HUPCL, while drivers/tty/pty.c overrides c_cflag to
-    // B38400|CS8|CREAD for both the master and the slave. Key off the device
-    // type rather than the driver identity: the app drives its terminals
-    // through a tty_driver of its own, but pty_open_fake registers them under
-    // TTY_PSEUDO_SLAVE_MAJOR, so to the guest they are pty slaves.
-    tty->termios.cflags = B38400_ | CS8_ | CREAD_;
-    if (type != TTY_PSEUDO_MASTER_MAJOR && type != TTY_PSEUDO_SLAVE_MAJOR)
-        tty->termios.cflags |= HUPCL_;
-    tty->termios.lflags = ISIG_ | ICANON_ | ECHO_ | ECHOE_ | ECHOK_ | ECHOCTL_ | ECHOKE_ | IEXTEN_;
-    // from include/asm-generic/termios.h
-    memcpy(tty->termios.cc, "\003\034\177\025\004\0\1\0\021\023\032\0\022\017\027\026\0\0\0", 19);
+    tty_init_termios(tty, type);
     tty->winsize = (struct winsize_) {.row = 24, .col = 80};
 
     lock_init(&tty->lock, "tty_alloc\0");
@@ -370,7 +384,7 @@ static int tty_push_char(struct tty *tty, char ch, bool flag, int blocking) {
     while (tty->bufsize >= sizeof(tty->buf)) {
         if (!blocking)
             return _EAGAIN;
-        if (wait_for(&tty->consumed, &tty->lock, NULL))
+        if (wait_for_blocked(&tty->consumed, &tty->lock, NULL))
             return _EINTR;
     }
     tty->buf[tty->bufsize] = ch;
@@ -671,7 +685,7 @@ no_special:
                 err = _EAGAIN;
                 if (!blocking)
                     break;
-                err = wait_for(&tty->consumed, &tty->lock, NULL);
+                err = wait_for_blocked(&tty->consumed, &tty->lock, NULL);
                 if (err < 0)
                     break;
             }
@@ -871,7 +885,7 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
             err = _EAGAIN;
             if (fd->flags & O_NONBLOCK_)
                 goto error;
-            err = wait_for(&tty->produced, &tty->lock, NULL);
+            err = wait_for_blocked(&tty->produced, &tty->lock, NULL);
             if (err < 0)
                 goto error;
         }
@@ -919,7 +933,7 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
                 err = _EAGAIN;
                 if (fd->flags & O_NONBLOCK_)
                     goto error;
-                err = wait_for(&tty->produced, &tty->lock, timeout_ptr);
+                err = wait_for_blocked(&tty->produced, &tty->lock, timeout_ptr);
                 if (err == _ETIMEDOUT)
                     break;
                 if (err < 0)
@@ -936,7 +950,7 @@ static ssize_t tty_read(struct fd *fd, void *buf, size_t bufsize) {
             if (fd->flags & O_NONBLOCK_)
                 goto error;
             // there should be no timeout for the first character read
-            err = wait_for(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
+            err = wait_for_blocked(&tty->produced, &tty->lock, tty->bufsize == 0 ? NULL : timeout_ptr);
             if (tty_trace_timed_raw_enabled(tty)) {
                 printk("INFO: top tty_read wait pid=%d tty=%d:%d bufsize=%zu min=%u time=%u err=%d first=%d\n",
                        current->pid,
@@ -1011,7 +1025,7 @@ static ssize_t tty_write(struct fd *fd, const void *buf, size_t bufsize) {
             unlock(&tty->lock);
             return _EAGAIN;
         }
-        int ferr = wait_for(&tty->flow_resumed, &tty->lock, NULL);
+        int ferr = wait_for_blocked(&tty->flow_resumed, &tty->lock, NULL);
         if (ferr < 0) {
             unlock(&tty->lock);
             return ferr;
@@ -1201,7 +1215,9 @@ static int tiocspgrp(struct tty *tty, pid_t_ pgid) {
     if (err < 0)
         goto out;
 
-    tty->fg_group = pgid;
+    // The machine's number (kernel/pid_ns.h): the terminal signals this
+    // group from threads that are in no pid namespace at all.
+    tty->fg_group = current_pid_global(pgid);
     STRACE("tty group set to = %d\n", tty->fg_group);
 
 out:
@@ -1230,7 +1246,7 @@ static int tiocsctty(struct tty *tty, int force) {
     if (tty->session) {
         if (force == 1 && superuser()) {
             // steal it
-            struct pid *pid = pid_get(tty->session);
+            struct pid *pid = pid_get_global(tty->session);
             struct tgroup *tgroup;
             list_for_each_entry(&pid->session, tgroup, session) {
                 lock(&tgroup->lock, 0);
@@ -1291,7 +1307,7 @@ static int tiocnotty(struct tty *tty, struct tty_hangup_targets *hup) {
         hup->fg_group = tty->fg_group;
         hup->session = 0;
 
-        struct pid *pid = pid_get(tty->session);
+        struct pid *pid = pid_get_global(tty->session);
         if (pid != NULL) {
             struct tgroup *tgroup;
             list_for_each_entry(&pid->session, tgroup, session) {
@@ -1344,7 +1360,7 @@ static int tiocgsid(struct tty *tty, pid_t_ *out) {
         err = _ENOTTY;
         goto out_unlock;
     }
-    *out = slave->session;
+    *out = current_pid_shown(slave->session);
     STRACE("tty session = %d\n", slave->session);
 
 out_unlock:
@@ -1364,13 +1380,29 @@ static int tiocgpgrp(struct tty *tty, pid_t_ *fg_group) {
         err = _ENOTTY;
         goto error_no_ctrl_tty;
     }
-    *fg_group = slave->fg_group;
+    *fg_group = current_pid_shown(slave->fg_group);
     STRACE("tty group = %d\n", slave->fg_group);
 
 error_no_ctrl_tty:
     if (slave != tty)
         unlock(&slave->lock);
     return err;
+}
+
+// The rate each CBAUD code stands for: the kernel's baud_table, indexed by
+// tty_baud_index().
+static const dword_t tty_baud_table[] = {
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600,
+    19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600,
+    1000000, 1152000, 1500000, 2000000, 2500000, 3000000, 3500000, 4000000,
+};
+
+static dword_t tty_baud_rate(dword_t cflags) {
+    // BOTHER (CBAUDEX alone) means "the rate is in c_ospeed", which AOK does
+    // not keep. It indexes B38400's slot, the nominal rate TCGETS2 used to
+    // report for everything.
+    dword_t i = tty_baud_index(cflags);
+    return i < array_size(tty_baud_table) ? tty_baud_table[i] : 38400;
 }
 
 // These ioctls are separated out because they have to operate on the slave
@@ -1404,11 +1436,12 @@ static int tty_mode_ioctl(struct tty *in_tty, int cmd, void *arg) {
             break;
 
         // termios2 variants: same fields as termios_ above, plus explicit
-        // ispeed/ospeed. iSH's virtual ttys have no real baud rate, so
-        // TCGETS2 just reports the nominal speed the CBAUD bits of cflags are
-        // initialized to and the SETS2 variants ignore the incoming speed
-        // fields entirely -- musl and glibc both read cfget*speed() out of
-        // cflags anyway, so that is the field that has to stay sane.
+        // ispeed/ospeed. AOK's virtual ttys have no real baud rate, so
+        // TCGETS2 reports whatever rate the CBAUD bits of cflags encode (the
+        // CLI console copies the host terminal's) and the SETS2 variants
+        // ignore the incoming speed fields entirely -- musl and glibc both
+        // read cfget*speed() out of cflags anyway, so that is the field that
+        // has to stay sane.
         case TCGETS2_: {
             struct termios2_ *termios2 = arg;
             termios2->iflags = tty->termios.iflags;
@@ -1417,8 +1450,8 @@ static int tty_mode_ioctl(struct tty *in_tty, int cmd, void *arg) {
             termios2->lflags = tty->termios.lflags;
             termios2->line = tty->termios.line;
             memcpy(termios2->cc, tty->termios.cc, sizeof(termios2->cc));
-            termios2->ispeed = 38400;
-            termios2->ospeed = 38400;
+            termios2->ispeed = tty_baud_rate(tty->termios.cflags);
+            termios2->ospeed = termios2->ispeed;
             break;
         }
         case TCSETSF2_:
@@ -1435,6 +1468,11 @@ static int tty_mode_ioctl(struct tty *in_tty, int cmd, void *arg) {
             tty->termios.lflags = termios2->lflags;
             tty->termios.line = termios2->line;
             memcpy(tty->termios.cc, termios2->cc, sizeof(tty->termios.cc));
+            // Same IXON release as TCSETS_ above: this is the same call, and
+            // on a glibc root it is the ONLY one tcsetattr() actually makes,
+            // so leaving it out here left a ^S stop that nothing could lift.
+            if (!(tty->termios.iflags & IXON_) && tty->stopped && !tty->tco_stopped)
+                tty_start_output_locked(tty);
             break;
         }
 
@@ -1463,6 +1501,14 @@ static int tty_mode_ioctl(struct tty *in_tty, int cmd, void *arg) {
 static bool tty_ioctl_modifies_terminal(int cmd) {
     switch (cmd) {
         case TCSETS_: case TCSETSW_: case TCSETSF_:
+        // The termios2 spellings are the same operation and Linux checks them
+        // in the same handler. Leaving them out meant a BACKGROUND process
+        // could change the terminal unchecked -- and it is not a corner case:
+        // a modern glibc issues TCSETS2 for a plain tcsetattr(), so on a glibc
+        // root every background tcsetattr silently succeeded where it should
+        // have taken SIGTTOU (or EIO, when the group is orphaned). musl still
+        // sends TCSETS, which is why the musl roots never showed it.
+        case TCSETS2_: case TCSETSW2_: case TCSETSF2_:
         case TCFLSH_: case TCSBRK_: case TCXONC_:
         case TIOCSPGRP_:
             return true;
@@ -1643,11 +1689,15 @@ void tty_set_winsize(struct tty *tty, struct winsize_ winsize) {
         return;
     if (trylock(&pids_lock) != 0)
         return;
-    struct pid *pid = pid_get(tty->fg_group);
+    struct pid *pid = pid_get_global(tty->fg_group);
     if (pid != NULL) {
         struct tgroup *tgroup;
         list_for_each_entry(&pid->pgroup, tgroup, pgroup) {
-            send_signal(tgroup->leader, SIGWINCH_, SIGINFO_NIL);
+            // To the process, as Linux's kill_pgrp sends it: a thread that
+            // can take it is told, whether or not the leader has exited or
+            // blocks SIGWINCH.
+            if (tgroup->leader != NULL)
+                send_signal_to_process_pids_locked(tgroup->leader, SIGWINCH_, SIGINFO_NIL);
         }
     }
     unlock(&pids_lock);
@@ -1657,8 +1707,14 @@ struct tty_hangup_targets tty_hangup(struct tty *tty) {
     // Captured before anything else: the caller may clear these itself (the
     // session leader's own exit does), and the signal has to reflect who was
     // attached when the terminal went away.
+    // The session leader only, as Linux's tty_signal_session_leader does: not
+    // the foreground group, which hears of it when the leader exits (its
+    // tty_old_pgrp; here the tty keeps its fg_group, and exit_hangup_session_tty
+    // signals that). Measured on 6.12: su under a pty whose master closes gets
+    // SIGHUP; its child in su's own group, no job control, gets nothing and
+    // runs on. AOK signalled the foreground group too, and the child died.
     struct tty_hangup_targets targets = {
-        .fg_group = tty->fg_group,
+        .fg_group = 0,
         .session = tty->session,
     };
     tty->hung_up = true;
@@ -1685,19 +1741,21 @@ struct tty_hangup_targets tty_hangup(struct tty *tty) {
 
 // A terminal going away is how a shell learns its session is over -- an ssh
 // disconnect, a closed terminal window, the last master of a pty closing.
-// Linux signals the foreground group and the session leader with SIGHUP and
-// then SIGCONT (the SIGCONT so a stopped job runs far enough to notice the
-// SIGHUP). AOK woke every reader and poller but signalled nobody, so a shell
-// sat in its read loop on a terminal that no longer existed.
+// Linux signals the session leader with SIGHUP and then SIGCONT (the SIGCONT
+// so a stopped leader runs far enough to notice the SIGHUP); the rest of the
+// session hears when the leader goes. AOK woke every reader and poller but
+// signalled nobody, so a shell sat in its read loop on a terminal that no
+// longer existed. TIOCNOTTY by a leader names the foreground group instead.
 void tty_hangup_notify(struct tty_hangup_targets targets) {
     if (targets.fg_group != 0) {
         send_group_signal(targets.fg_group, SIGHUP_, SIGINFO_NIL);
         send_group_signal(targets.fg_group, SIGCONT_, SIGINFO_NIL);
     }
-    // The session leader too, unless the foreground group already covered it.
-    if (targets.session != 0 && targets.session != targets.fg_group) {
-        send_group_signal(targets.session, SIGHUP_, SIGINFO_NIL);
-        send_group_signal(targets.session, SIGCONT_, SIGINFO_NIL);
+    // The leader's process, not its process group (send_signal_locked to
+    // PIDTYPE_TGID): a member of the leader's group is not a leader.
+    if (targets.session != 0) {
+        send_tgid_signal(targets.session, SIGHUP_, SIGINFO_NIL);
+        send_tgid_signal(targets.session, SIGCONT_, SIGINFO_NIL);
     }
 }
 
@@ -1754,3 +1812,16 @@ struct dev_ops tty_dev = {
     .fd.ioctl_size = tty_ioctl_size,
     .fd.ioctl = tty_ioctl,
 };
+
+// Put a terminal back to the state a freshly created one is in.
+//
+// Used by a checkpoint restore before it re-launches a native program: see
+// tty_init_termios above for why a re-launched program must not inherit the
+// mode its previous incarnation left behind.
+void tty_reset_termios_to_default(struct tty *tty) {
+    if (tty == NULL)
+        return;
+    lock(&tty->lock, 0);
+    tty_init_termios(tty, tty->type);
+    unlock(&tty->lock);
+}

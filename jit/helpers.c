@@ -12,6 +12,43 @@ void helper_cpuid(dword_t *a, dword_t *b, dword_t *c, dword_t *d) {
     do_cpuid(a, b, c, d);
 }
 
+int cpuid_long_mode_override = -1;
+struct cpuid_table cpuid_tables[2];
+
+static void cpuid_fill(struct cpuid_answer *ans, dword_t leaf, dword_t subleaf) {
+    dword_t a = leaf, b = 0, c = subleaf, d = 0;
+    do_cpuid(&a, &b, &c, &d);
+    *ans = (struct cpuid_answer) {a, b, c, d};
+}
+
+// jit/gadgets-aarch64/misc.S cpuid_lookup picks slots by number.
+_Static_assert(CPUID_SLOT_LEAF7_0 == 2 && CPUID_SLOT_LEAFD_0 == 3 && CPUID_SLOT_EXT0 == 9 &&
+        CPUID_SLOT_ABOVE_BASIC == 11 && CPUID_SLOT_ZERO == 12 && CPUID_SLOT_ABOVE_EXT == 13 &&
+        CPUID_SLOT_LEAF7_1 == 14, "cpuid_lookup's slot numbers");
+
+__attribute__((constructor)) void cpuid_tables_init(void) {
+    for (int lm = 0; lm < 2; lm++) {
+        cpuid_long_mode_override = lm;
+        struct cpuid_answer *s = cpuid_tables[lm].slot;
+        cpuid_fill(&s[CPUID_SLOT_LEAF0], 0, 0);
+        cpuid_fill(&s[CPUID_SLOT_LEAF1], 1, 0);
+        cpuid_fill(&s[CPUID_SLOT_LEAF7_0], 7, 0);
+        cpuid_fill(&s[CPUID_SLOT_LEAF7_1], 7, 1);
+        cpuid_fill(&s[CPUID_SLOT_LEAFD_0], 0xd, 0);
+        cpuid_fill(&s[CPUID_SLOT_LEAFD_1], 0xd, 1);
+        cpuid_fill(&s[CPUID_SLOT_LEAFD_2], 0xd, 2);
+        cpuid_fill(&s[CPUID_SLOT_LEAFD_5], 0xd, 5);
+        cpuid_fill(&s[CPUID_SLOT_LEAFD_6], 0xd, 6);
+        cpuid_fill(&s[CPUID_SLOT_LEAFD_7], 0xd, 7);
+        cpuid_fill(&s[CPUID_SLOT_EXT0], 0x80000000u, 0);
+        cpuid_fill(&s[CPUID_SLOT_EXT1], 0x80000001u, 0);
+        cpuid_fill(&s[CPUID_SLOT_ABOVE_BASIC], cpuid_basic_max_leaf() + 1, 0);
+        cpuid_fill(&s[CPUID_SLOT_ZERO], 2, 0);
+        cpuid_fill(&s[CPUID_SLOT_ABOVE_EXT], 0x80000002u, 0);
+    }
+    cpuid_long_mode_override = -1;
+}
+
 // XGETBV for the i386 guest. Takes the same four-register frame as
 // helper_cpuid so it can reuse that gadget's shape exactly: ecx selects the
 // register on the way in, eax/edx take the value on the way out, ebx is
@@ -46,180 +83,6 @@ void helper_expand_flags(struct cpu_state *cpu) {
 
 void helper_collapse_flags(struct cpu_state *cpu) {
     collapse_flags(cpu);
-}
-
-void helper_trace_unaligned_atomic(struct cpu_state *cpu, dword_t addr, dword_t tag) {
-    (void) cpu;
-    (void) addr;
-    (void) tag;
-}
-
-// Unaligned i386 `lock cmpxchg8b [addr]`. The aarch64 fast path uses an ARM
-// exclusive load (ldaxr), which requires 8-byte alignment; but x86 permits
-// unaligned LOCK operands, and the i386 ABI aligns 64-bit fields to only 4
-// bytes -- so glibc/Python 64-bit atomics routinely land on a 4-aligned (not
-// 8-aligned) address and the gadget previously bailed to segfault_write.
-//
-// Perform a software-atomic compare-exchange under the global atomic lock,
-// which serializes against the other emulated CPUs' atomics. tlb_read/tlb_write
-// handle cross-page access and faults (returning false with tlb->segfault_addr
-// already set), so the gadget jumps to its existing segfault_write exit on a
-// nonzero return. The caller has spilled EAX/EBX/ECX/EDX to cpu->* and reloads
-// EAX/EDX afterward; flags live in memory (cpu->eflags/flags_res), so setting
-// ZF here is visible to the next gadget. Only ZF is affected (x86: CF/PF/AF/
-// SF/OF unchanged by CMPXCHG8B), matching the aligned gadget exactly.
-// Returns 0 on success, 1 on fault.
-int helper_atomic_cmpxchg8b(struct cpu_state *cpu, struct tlb *tlb, dword_t addr) {
-    qword_t expected = ((qword_t) cpu->edx << 32) | (dword_t) cpu->eax;
-    qword_t desired  = ((qword_t) cpu->ecx << 32) | (dword_t) cpu->ebx;
-    qword_t dst = 0;
-    int faulted = 0;
-    lock(&atomic_l_lock, 0);
-    if (!tlb_read(tlb, addr, &dst, 8)) {
-        faulted = 1;
-    } else {
-        cpu->zf = (expected == dst);   // only ZF is affected (CF/PF/AF/SF/OF kept)
-        cpu->zf_res = 0;
-        if (expected == dst) {
-            if (!tlb_write(tlb, addr, &desired, 8))
-                faulted = 1;
-        } else {
-            cpu->eax = (dword_t) dst;
-            cpu->edx = (dword_t) (dst >> 32);
-        }
-    }
-    unlock(&atomic_l_lock);
-    return faulted;
-}
-
-// ---------------------------------------------------------------------------
-// Page-batched rep movs / rep stos fast path.
-//
-// The per-element string gadgets in jit/gadgets-aarch64/string.S re-run the
-// full inline TLB hash (read_prep/write_prep) on EVERY element of a rep loop,
-// so a `rep movsb` of N bytes pays ~2N translation sequences even though the
-// host page base is invariant until the address crosses a 4 KB boundary.
-//
-// This helper resolves the host page once per page-run (via the same
-// __tlb_read_ptr/__tlb_write_ptr the C TLB path uses, so it inherits all the
-// miss / COW / cross-page / write-revalidate / staleness-flush handling) and
-// bulk-copies the run with memmove/memset. It is invoked only for the forward
-// (DF=0) direction with ecx >= a small threshold; the gadget keeps the existing
-// per-element loop for backward, tiny, and data-dependent (cmps/scas) reps.
-//
-// Operates directly on cpu->{esi,edi,ecx,eax}; the gadget spills the
-// host-register-cached copies before the call and reloads them after. On a
-// fault it returns 1 (source/read) or 2 (dest/write) with cpu->{esi,edi,ecx}
-// left pointing at the element about to be processed (x86 #PF restartability),
-// and tlb->segfault_addr already set by the miss handler, so the gadget jumps
-// to the existing segfault_read/segfault_write exit.
-//
-// It returns 3 when a poke arrived mid-rep, with that same restart state, and
-// the gadget exits to jit_ret with eip set back to this instruction so the rep
-// resumes after the interrupt has been handled.
-//
-// Overlapping forward movs (edi>esi within the run) is the x86 "smear" case
-// that memmove would NOT reproduce, so it falls back to single-element copies
-// through guest memory, which smears identically to the hardware.
-// ---------------------------------------------------------------------------
-int rep_string_fast(struct cpu_state *cpu, struct tlb *tlb, unsigned elem_size, int is_movs) {
-    uint32_t ecx = cpu->ecx;
-    uint32_t edi = cpu->edi;
-    uint32_t esi = cpu->esi;
-    uint32_t eax = cpu->eax;
-
-    while (ecx != 0) {
-        uint32_t run = (PAGE_SIZE - PGOFFSET(edi)) / elem_size; // whole elems left in dst page
-        if (run > ecx)
-            run = ecx;
-        if (is_movs) {
-            uint32_t src_room = (PAGE_SIZE - PGOFFSET(esi)) / elem_size;
-            if (run > src_room)
-                run = src_room;
-        }
-
-        // memmove only matches x86 ascending semantics when the run does not
-        // forward-overlap (edi <= esi, or no overlap within the run).
-        int overlap_smear = is_movs && edi > esi &&
-            (uint64_t) (edi - esi) < (uint64_t) run * elem_size;
-
-        if (run >= 1 && !overlap_smear) {
-            char *dst = (char *) __tlb_write_ptr(tlb, edi);
-            if (dst == NULL)
-                return 2;
-            if (is_movs) {
-                char *src = (char *) __tlb_read_ptr(tlb, esi);
-                if (src == NULL)
-                    return 1;
-                memmove(dst, src, (size_t) run * elem_size);
-                esi += run * elem_size;
-            } else if (elem_size == 1) {
-                memset(dst, eax & 0xff, run);
-            } else if (elem_size == 2) {
-                uint16_t v = eax & 0xffff;
-                for (uint32_t i = 0; i < run; i++)
-                    ((uint16_t *) dst)[i] = v;
-            } else {
-                for (uint32_t i = 0; i < run; i++)
-                    ((uint32_t *) dst)[i] = eax;
-            }
-            edi += run * elem_size;
-            ecx -= run;
-        } else {
-            // One element via the cross-page-safe path: handles an element
-            // straddling a page boundary (run == 0) and the overlap-smear case.
-            if (is_movs) {
-                char tmp[8];
-                if (!tlb_read(tlb, esi, tmp, elem_size))
-                    return 1;
-                if (!tlb_write(tlb, edi, tmp, elem_size))
-                    return 2;
-                esi += elem_size;
-            } else {
-                if (!tlb_write(tlb, edi, &eax, elem_size))
-                    return 2;
-            }
-            edi += elem_size;
-            ecx -= 1;
-        }
-
-        cpu->ecx = ecx;
-        cpu->edi = edi;
-        cpu->esi = esi;
-
-        // x86 makes REP interruptible BETWEEN iterations, and until now AOK
-        // did not: this helper ran to ecx == 0 no matter how long that took,
-        // and the JIT only tests the poke flag at block boundaries. A guest
-        // memcpy compiled to `rep movsb` over a large buffer therefore held
-        // the thread inside one gadget for the whole copy -- a signal could
-        // not be delivered, and the swap pager's throttle poke (emu/tlb.c
-        // sets mem_throttle_wanted and calls cpu_poke) could not reach the
-        // thread it was aimed at, so reclaim waited on a copy that had
-        // already faulted in everything it touched.
-        //
-        // Once per loop iteration, which is once per page-run on the bulk arm
-        // above and once per ELEMENT on the single-element arm (an overlapping
-        // forward movs, or an element straddling a page). That is the right
-        // way round: the single-element arm is the slow one, so it is the one
-        // that most needs to be interruptible, and it is rare enough that a
-        // load per element does not matter.
-        //
-        // Only AFTER the registers above have been written back and progress
-        // has been made. ecx, edi and esi are exactly the restart state x86
-        // defines for #PF, so re-executing the instruction resumes where this
-        // left off; returning before doing any work would livelock on a flag
-        // nobody clears.
-        //
-        // Relaxed, and a load rather than an exchange. No ordering is needed
-        // -- nothing here reads data published alongside the flag -- and the
-        // authoritative read is cpu_take_poke's seq_cst exchange, which is
-        // what actually consumes it. Clearing it here would swallow the poke
-        // and yield for nothing. This matches jit_ret_chain, which reads the
-        // same byte with a plain ldrb.
-        if (ecx != 0 && __atomic_load_n(cpu->poked_ptr, __ATOMIC_RELAXED))
-            return 3;
-    }
-    return 0;
 }
 
 // LOOP decrements ECX and, unlike DEC, leaves the flags alone. The branch
@@ -344,45 +207,3 @@ void helper_aad(struct cpu_state *cpu, uint32_t base) {
     bcd_set_result_flags(cpu, al);
 }
 
-// ---------------------------------------------------------------------------
-// 66 0F 3A 63 pcmpistri, register form. Called from the JIT gadget rather than
-// having it call vec_pcmpistri128 directly, because two things must happen
-// afterwards and both are easy to miss in assembly:
-//
-//   - the index lands in cpu->ecx. vec.c's pcmp helpers are shared with the
-//     i386 emulator and write the LEGACY register; for an amd64 guest it has
-//     to be moved into amd64_regs[rcx], zero-extended to 64 bits.
-//   - the flags it sets are the lazy kind, so they have to be collapsed before
-//     anything reads them.
-//
-// emu/amd64_interp.c's bridge does exactly this pair after its own call. A
-// gadget that skipped either would not fail loudly -- it would return a stale
-// rcx or stale flags to glibc's strlen, which is the worst possible shape for
-// a bug.
-// ---------------------------------------------------------------------------
-void amd64_jit_pcmpistri(struct cpu_state *cpu, const union xmm_reg *src,
-        union xmm_reg *dst, uint8_t imm) {
-    vec_pcmpistri128(cpu, src, dst, imm);
-    cpu->amd64_regs[amd64_rcx] = (uint32_t) cpu->ecx;
-    collapse_flags(cpu);
-}
-
-// 66 0F 3A 61 pcmpestri. The EXPLICIT-length form, and the one that actually
-// dominates: measured over a gcc workload in the amd64 guest, op3=0x61 was
-// 12956 of 20250 three-byte decodes (64%), against 6 for the register form of
-// pcmpistri. It does not show up in a mnemonic grep of libc because glibc
-// reaches it through strcmp/strncmp rather than by name.
-//
-// Unlike pcmpistri it reads the string lengths from EAX and EDX, and those are
-// the LEGACY registers -- vec.c is shared with the i386 emulator -- so for an
-// amd64 guest they have to be staged down from RAX/RDX first. The interpreter
-// does exactly this before its own call; a gadget that skipped it would hand
-// vec.c whatever the last i386-shaped write happened to leave behind.
-void amd64_jit_pcmpestri(struct cpu_state *cpu, const union xmm_reg *src,
-        union xmm_reg *dst, uint8_t imm) {
-    cpu->eax = (dword_t) cpu->amd64_regs[amd64_rax];
-    cpu->edx = (dword_t) cpu->amd64_regs[amd64_rdx];
-    vec_pcmpestri128(cpu, src, dst, imm);
-    cpu->amd64_regs[amd64_rcx] = (uint32_t) cpu->ecx;
-    collapse_flags(cpu);
-}

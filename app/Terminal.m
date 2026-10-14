@@ -32,6 +32,14 @@ NSNotificationName const TerminalRegistryDidChangeNotification = @"TerminalRegis
 
 @property BOOL loaded;
 @property BOOL didReportLoadFailure;
+// Web content process terminations are counted inside a sliding window so a
+// single reclaim can be recovered from in silence while a genuine kill loop
+// still gets reported. webViewRecoveryGeneration invalidates the watchdog armed
+// by an earlier recovery.
+@property NSUInteger webContentTerminationCount;
+@property CFTimeInterval webContentTerminationWindowStart;
+@property CFTimeInterval lastWebContentTerminationAt;
+@property NSUInteger webViewRecoveryGeneration;
 @property (nonatomic) tty_t tty;
 // lock with dataLock for !linux and @synchronized(self) for linux
 @property (nonatomic) NSMutableData *pendingData;
@@ -179,6 +187,13 @@ static CFTimeInterval ISHTerminalNowMonotonic(void) {
 
 static const CFTimeInterval ISHTerminalOutputWatchdogSeconds = 1.5;
 
+// How long a rebuilt web view gets to finish loading before the failure is
+// reported to the user, and how many terminations inside one window are treated
+// as recoverable before we stop waiting and say so.
+static const CFTimeInterval ISHTerminalRecoveryReportDelay = 8.0;
+static const CFTimeInterval ISHTerminalTerminationWindowSeconds = 60.0;
+static const NSUInteger ISHTerminalTerminationWindowLimit = 3;
+
 static NSString *ISHStringFromBOOL(BOOL value) {
     return value ? @"yes" : @"no";
 }
@@ -270,7 +285,15 @@ int Terminal_debugSendInputUTF8Sync(int type, int number, const char *input) {
                                              @"firstByte": [NSString stringWithFormat:@"%#x", first]}];
         }
 
-        tty_input(terminal.tty, copy, length, 0);
+        // A reference across the call, as -sendInput takes: terminal.tty is an
+        // unowned back-pointer that tty_release can free under us.
+        struct tty *tty = tty_lookup_ref(terminal.type, terminal.number, terminal.tty);
+        if (tty == NULL) {
+            free(copy);
+            return -3;
+        }
+        tty_input(tty, copy, length, 0);
+        tty_put(tty);
         free(copy);
         return 0;
     }
@@ -355,6 +378,25 @@ static void NotifyTerminalRegistryChanged(void) {
         [oldWebView removeFromSuperview];
         _webView = nil;
         [self webView];
+
+        // The rebuilt view is off-screen until it loads: TerminalView puts it
+        // back from its KVO on `loaded`. If that never arrives the terminal is
+        // really gone, and that is the point at which the user should hear about
+        // it. A later recovery invalidates this watchdog by bumping the
+        // generation, so a second termination does not produce a second report
+        // for a terminal that is being rebuilt again.
+        NSUInteger generation = ++self.webViewRecoveryGeneration;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(ISHTerminalRecoveryReportDelay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self.webViewRecoveryGeneration != generation || self.loaded)
+                return;
+            [self recordLifecycleEvent:@"terminal.webview.recoverFailed"
+                               details:@{@"reason": reason ?: @"unknown"}];
+            [self reportTerminalLoadFailure:error ?:
+                [NSError errorWithDomain:WKErrorDomain
+                                    code:WKErrorWebContentProcessTerminated
+                                userInfo:@{NSLocalizedDescriptionKey: NSLocalizedString(@"the terminal's web view did not come back", @"Terminal UI failure alert message")}]];
+        });
     });
 }
 
@@ -389,9 +431,9 @@ static void NotifyTerminalRegistryChanged(void) {
         if (xtermHtmlFile == nil) {
             NSError *error = [NSError errorWithDomain:NSCocoaErrorDomain
                                                  code:NSFileNoSuchFileError
-                                             userInfo:@{NSLocalizedDescriptionKey: @"missing bundled terminal UI"}];
+                                             userInfo:@{NSLocalizedDescriptionKey: NSLocalizedString(@"missing bundled terminal UI", @"Terminal UI failure alert message")}];
             [self reportTerminalLoadFailure:error];
-            [_webView loadHTMLString:@"<html><body style='background:black;color:white;font-family:-apple-system;padding:1rem'>Terminal UI failed to load.</body></html>"
+            [_webView loadHTMLString:[NSString stringWithFormat:@"<html><body style='background:black;color:white;font-family:-apple-system;padding:1rem'>%@</body></html>", NSLocalizedString(@"Terminal UI failed to load.", @"Shown in place of the terminal when its UI cannot load")]
                              baseURL:nil];
             return _webView;
         }
@@ -406,6 +448,16 @@ static void NotifyTerminalRegistryChanged(void) {
     if (IS_ERR(*tty))
         return nil;
     return (__bridge Terminal *) (*tty)->data;
+}
+
+struct tty *ISHOpenTerminalForRestoredSession(void) {
+    struct tty *tty = NULL;
+    // The Terminal is retained by the tty itself (ios_tty_init's
+    // CFBridgingRetain), so it outlives this call and is waiting in the
+    // registry for the view controller that adopts the session.
+    if ([Terminal createPseudoTerminal:&tty] == nil)
+        return NULL;
+    return tty;
 }
 
 - (void)setTty:(tty_t)tty {
@@ -457,12 +509,47 @@ static void NotifyTerminalRegistryChanged(void) {
 
 - (void)webViewWebContentProcessDidTerminate:(WKWebView *)webView {
     self.loaded = NO;
+
+    CFTimeInterval now = ISHTerminalNowMonotonic();
+    if (self.webContentTerminationWindowStart == 0 ||
+        now - self.webContentTerminationWindowStart > ISHTerminalTerminationWindowSeconds) {
+        self.webContentTerminationWindowStart = now;
+        self.webContentTerminationCount = 0;
+    }
+    // "Repeating" has to mean the terminal is not staying up, not merely that it
+    // has been killed a few times: a view that is reclaimed every twenty seconds
+    // and recovers each time is a working terminal, and saying otherwise puts an
+    // alert on screen that the recovery immediately withdraws again. So also
+    // require that this kill landed before the last recovery had even settled.
+    CFTimeInterval sinceLast = now - self.lastWebContentTerminationAt;
+    BOOL repeating = self.webContentTerminationCount >= ISHTerminalTerminationWindowLimit - 1 &&
+                     sinceLast < ISHTerminalRecoveryReportDelay;
+    self.lastWebContentTerminationAt = now;
+    self.webContentTerminationCount++;
+
     [self recordLifecycleEvent:@"terminal.webContentProcessTerminated"
-                       details:@{@"webViewHidden": ISHStringFromBOOL(webView.isHidden)}];
+                       details:@{@"webViewHidden": ISHStringFromBOOL(webView.isHidden),
+                                 @"terminationsInWindow": @(self.webContentTerminationCount)}];
+
+    NSString *description = repeating ?
+        NSLocalizedString(@"the system keeps stopping the terminal's web view, most likely to reclaim memory", @"Terminal UI failure alert message") :
+        NSLocalizedString(@"terminal web content process terminated", @"Terminal UI failure alert message");
     NSError *error = [NSError errorWithDomain:WKErrorDomain
                                          code:WKErrorWebContentProcessTerminated
-                                     userInfo:@{NSLocalizedDescriptionKey: @"terminal web content process terminated"}];
-    [self reportTerminalLoadFailure:error];
+                                     userInfo:@{NSLocalizedDescriptionKey: description}];
+
+    // Nothing has failed yet, so say nothing yet. The system killing a web
+    // content process is routine on a Mac, where an iOS app's WKWebViews get no
+    // RunningBoard assertion of their own and are the first thing reclaimed
+    // under memory pressure; rebuilding the view puts the terminal back within a
+    // second. reportTerminalLoadFailure: raises a modal alert that has to be
+    // dismissed by hand, so reporting here leaves the user staring at a
+    // complaint about a terminal that already recovered. Recovery arms a
+    // watchdog that reports if the rebuilt view does not load -- unless the
+    // kills are coming faster than recovery can keep up, in which case waiting
+    // longer tells the user nothing they don't already see.
+    if (repeating)
+        [self reportTerminalLoadFailure:error];
     [self recoverTerminalWebViewWithReason:@"webContentProcessTerminated" error:error];
 }
 
@@ -503,6 +590,49 @@ static void NotifyTerminalRegistryChanged(void) {
         unlock(&tty->lock);
         tty_put(tty);
     }];
+}
+
+- (void)fetchContentsWithCompletion:(void (^)(NSString *))completion {
+    if (completion == nil)
+        return;
+    if (!self.loaded) {
+        completion(nil);
+        return;
+    }
+    [self.webView evaluateJavaScript:@"exports.getContents(2000)"
+                   completionHandler:^(id result, NSError *error) {
+        // Never fail the save for this: the history is a nicety and the guest
+        // is the point. A nil here just means the window comes back empty, the
+        // way every window did before this existed.
+        completion([result isKindOfClass:NSString.class] && error == nil ? result : nil);
+    }];
+}
+
+- (void)writeRestoredContents:(NSString *)contents {
+    if (contents.length == 0)
+        return;
+    // Through the same path guest output takes, so hterm decodes it the same
+    // way -- and BEFORE the restored session writes anything, so the shell's
+    // first prompt lands after the history rather than in the middle of it.
+    NSData *data = [contents dataUsingEncoding:NSUTF8StringEncoding];
+    if (data.length == 0)
+        return;
+    [self sendOutput:data.bytes length:(int) data.length];
+}
+
+- (int)guestSessionId {
+    // Same care as setSize's lookup above: the value read from the terminal is
+    // an identity token only, and tty_lookup_ref re-finds the tty under the
+    // lock that free must hold, so a recycled pty number cannot aim this at
+    // another terminal's tty.
+    struct tty *tty = tty_lookup_ref(self.type, self.number, NULL);
+    if (tty == NULL)
+        return 0;
+    lock(&tty->lock, 0);
+    int session = (int) tty->session;
+    unlock(&tty->lock);
+    tty_put(tty);
+    return session;
 }
 
 - (void)setEnableVoiceOverAnnounce:(BOOL)enableVoiceOverAnnounce {
@@ -550,6 +680,36 @@ static void NotifyTerminalRegistryChanged(void) {
 }
 
 
+// The control characters xterm and hterm strip out of a bracketed paste:
+// everything below 0x20 except backspace, tab, newline and carriage return.
+// ESC falls inside that range, which is what stops a payload from closing its
+// own bracket.
+static NSCharacterSet *ISHPasteForbiddenCharacters(void) {
+    static NSCharacterSet *forbidden;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableCharacterSet *set = [NSMutableCharacterSet new];
+        [set addCharactersInRange:NSMakeRange(0x00, 0x08)];  // NUL .. BEL
+        [set addCharactersInRange:NSMakeRange(0x0b, 0x02)];  // VT, FF
+        [set addCharactersInRange:NSMakeRange(0x0e, 0x12)];  // SO .. US (incl. ESC)
+        forbidden = [set copy];
+    });
+    return forbidden;
+}
+
+NSString *ISHPasteSequence(NSString *text, BOOL bracketed, BOOL execute) {
+    NSString *body = [text ?: @"" stringByReplacingOccurrencesOfString:@"\n" withString:@"\r"];
+    if (bracketed) {
+        NSCharacterSet *forbidden = ISHPasteForbiddenCharacters();
+        if ([body rangeOfCharacterFromSet:forbidden].location != NSNotFound)
+            body = [[body componentsSeparatedByCharactersInSet:forbidden] componentsJoinedByString:@""];
+        body = [NSString stringWithFormat:@"\x1b[200~%@\x1b[201~", body];
+    }
+    if (execute)
+        body = [body stringByAppendingString:@"\r"];
+    return body;
+}
+
 - (void)sendInput:(NSData *)input {
     tty_t tty;
     @synchronized (self) {
@@ -591,6 +751,20 @@ static void NotifyTerminalRegistryChanged(void) {
     if (!self.loaded)
         return;
     [self.webView evaluateJavaScript:@"exports.scrollToBottom()" completionHandler:nil];
+}
+
+// Make hterm re-measure. Callers use this after something moved the terminal's
+// bounds at a moment the JS could not observe -- see exports.resync in term.js.
+// The guest is told the result whether or not hterm's own onTerminalResize fires:
+// it only fires when the size CHANGED, and a resync that confirms the current
+// size still has to leave the tty agreeing with it.
+- (void)resyncSize {
+    if (!self.loaded)
+        return;
+    [self.webView evaluateJavaScript:@"exports.resync()" completionHandler:^(id result, NSError *error) {
+        if (error == nil)
+            [self syncWindowSize];
+    }];
 }
 
 - (NSString *)arrow:(char)direction {

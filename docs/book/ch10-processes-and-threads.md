@@ -118,18 +118,48 @@ The implemented flag set is explicit in `kernel/fork.c`:
 CLONE_VM CLONE_FILES CLONE_FS CLONE_SIGHAND CLONE_SYSVSEM CLONE_VFORK
 CLONE_THREAD CLONE_SETTLS CLONE_CHILD_SETTID CLONE_PARENT_SETTID
 CLONE_CHILD_CLEARTID CLONE_DETACHED CLONE_PARENT CLONE_PIDFD CLONE_IO
-CLONE_NEWUTS
+CLONE_NEWUTS CLONE_NEWIPC CLONE_NEWNS CLONE_NEWUSER CLONE_NEWPID CLONE_NEWNET
 ```
 
-That covers everything a threading library or a shell needs. What it does not
-cover is the namespace family — `CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`,
-`CLONE_NEWIPC`, `CLONE_NEWUSER`, `CLONE_NEWCGROUP` — with the single exception
-of `CLONE_NEWUTS`, which is cheap because a UTS namespace is a hostname and a
-domain name in a refcounted struct.
+That covers everything a threading library or a shell needs. Of the namespace
+family it covers six. `CLONE_NEWUTS` is cheap because a UTS namespace is a
+hostname and a domain name in a refcounted struct; `CLONE_NEWIPC` is System V
+IPC kept per namespace; and `CLONE_NEWNS`, since 559, gives the child a mount
+table of its own — a copy of its parent's tree in which nothing it mounts,
+unmounts or pivots is seen by anyone else (`kernel/mnt_ns.h`; Chapter 16 has
+how a table of path strings holds more than one tree). `CLONE_NEWUSER`, also
+since 559, makes the child root in a user namespace of its own: the ids a task
+carries stay the machine's, and the namespace is a pair of maps through which
+they are read and written, plus the rule that its capabilities reach only
+what belongs to it (`kernel/user_ns.h`). That rule is the delicate part in a
+kernel that had decided privilege by "is euid 0" since its first day:
+`superuser()` and `current_capable()` now also ask "and in the initial user
+namespace", so nothing they guard is reachable from inside one, and the few
+things a namespace's root *is* given — the mount, UTS and user namespaces it
+makes, the ids its maps cover, the files those ids own — are asked for by
+name with `ns_capable()`. `CLONE_NEWPID`, the third of 559's, is the one that
+shows how far "one machine" bends. There is still one pid table and a task
+still has one slot in it, its machine pid, which is what the kernel holds and
+compares everywhere; a pid namespace gives each task in it a second number,
+counted from 1 as Linux counts them, and a task three namespaces deep has
+four (`kernel/pid_ns.h`). The lookups by number read a number as the
+caller's namespace's and find only tasks that have one there, so a number a
+guest hands the kernel is confined without the call site's knowing, and what
+holds a machine number asks the `_global` forms; a number handed back is
+translated for whoever is being told, and reads 0 for a task they have no
+number for. `ps` in one shows 1, 2, 3, and `/proc/<pid>/status` lists the
+whole column in `NSpid`. When that pid 1 exits, everything left inside is
+killed. `CLONE_NEWNET` completes what a sandbox asks for, and is the plainest
+case of all: guest sockets are host sockets and the host has one network, so
+a private network namespace is a loopback interface, and whatever veth pair
+or dummy link it is given, with nothing behind them, whose sockets are never
+allowed to touch the host (`kernel/net_ns.h`;
+Chapter 41 says exactly what that does and does not carry).
+`CLONE_NEWCGROUP` is refused.
 
-The absent ones are why nothing container-shaped runs here, and they are absent
-architecturally rather than accidentally: there is one filesystem tree, one pid
-space, and one network. Chapter 21 shows the one place that turns out to be an
+That is enough for a sandbox — bubblewrap runs, and Codex CLI's commands with
+it — and not for a container, and the reason is architectural rather than
+accidental: there is one network and one hierarchy of control groups. Chapter 21 shows the one place that turns out to be an
 advantage, and Chapter 41 is honest about the rest. `CLONE_IO` is accepted
 because on Linux it is only a hint about I/O scheduling, and AOK has no I/O
 scheduler for it to hint at.
@@ -325,8 +355,15 @@ much as its real one:
 > `init.scope` at the hierarchy root (EACCES for uid != 0), killing every
 > `user@` start with "Failed to allocate manager object".
 
-There is no cgroup implementation behind that string. What there is, is a
-correct answer to the question systemd asks.
+There is no cgroup implementation behind that string: no controllers, no
+limits, no accounting. What there is, is a correct answer to each question
+systemd asks. Membership is one of them, and its answers have to be live:
+`cgroup.procs`, `cgroup.threads` and `cgroup.events` are rendered from the
+process table on every read (`fs/tmp.c`), and a process that exits or moves
+raises `IN_MODIFY` on `cgroup.events` up its cgroup's ancestry. Until October
+2026 they were stored files. `cgroup.events` said `populated 1` forever, so
+systemd never saw a unit's cgroup empty, and every failed one-shot service on an
+Arch boot waited out its 90-second stop timeout.
 
 ## 10.10 Reporting faithfully what you do not implement
 
@@ -389,11 +426,16 @@ consulted it.
   bytes at a time forever.
 - **`RLIMIT_NPROC`.** `fork` now refuses with `EAGAIN` once the calling user
   already has that many processes ([kernel/fork.c](../../kernel/fork.c)).
-  Threads are charged on neither side of the comparison, and `CAP_SYS_RESOURCE`
-  or `CAP_SYS_ADMIN` is exempt, as on Linux. Note the default is 1024
-  (`init_rlimits` in [kernel/init.c](../../kernel/init.c)), so a parallel build
-  that previously ran unbounded can now meet it without anyone having asked for
-  a limit.
+  Threads are charged on neither side of the comparison, and real uid 0,
+  `CAP_SYS_RESOURCE` or `CAP_SYS_ADMIN` is exempt, as on Linux. Since 559 the
+  count is per user namespace and charged at every level above, against the
+  limit the namespace's creator had when it was made, as Linux's ucounts are
+  (`task_nproc_exceeded`). Before, a process could make a user namespace, raise
+  its soft limit to the hard one inside and fork up to that: 199 in
+  `tests/manual/userns_nproc.c`, where Linux 6.12 allows 9. Note the default is
+  1024 (`init_rlimits` in [kernel/init.c](../../kernel/init.c)), so a parallel
+  build that previously ran unbounded can now meet it without anyone having
+  asked for a limit.
 
 `prlimit64` grew the matching reach. Any nonzero pid used to be `EINVAL`,
 *including the caller's own* — which is the form glibc's `prlimit(2)` wrapper

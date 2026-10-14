@@ -44,9 +44,12 @@ Per `struct sighand`, shared across the group: the `action` table — 64
 
 > Process-directed signal queue, shared by every thread in the `CLONE_SIGHAND`
 > group (Linux's `signal_struct->shared_pending`). A signal landing here (as
-> opposed to one specific task's own `pending`/`queue`) can be observed and
-> dequeued by ANY sibling thread with it unblocked — not just whichever task
-> object the sender happened to address.
+> opposed to one specific task's own `pending`/`queue`) can be dequeued by
+> ANY sibling thread with it unblocked — not just whichever task object the
+> sender happened to address — and signalfd, sigwaitinfo and sigpending see
+> it from every thread. But only a thread TOLD to take it
+> (`task->group_sigpending`) is woken for it or has a wait ended by it, as on
+> Linux.
 
 That distinction is the whole of "a signal sent to a process is delivered to
 some thread of that process", and getting it wrong is not academic: `sigqueue`
@@ -59,6 +62,33 @@ targets the group, and whichever thread has `SIGTERM` unblocked and gets there
 first handles it. Modelling that as "deliver to the leader" works until the
 leader has the signal blocked, at which point a program that carefully dedicates
 one thread to signal handling stops receiving signals.
+
+Or until there is no leader to deliver to. A main thread may leave with
+`pthread_exit` while the rest of the process runs on, and the leader then stays
+in the process table as a corpse. The group senders — `kill(-pgid)`, the
+terminal's `^C`, `^Z` and hangup, the orphaned-group `SIGHUP`, a resize's
+`SIGWINCH`, `pidfd_send_signal` — kept the leader model after `kill(pid)` had
+dropped it, and the terminal's never reached such a process at all. They all
+queue the signal on the process now, as `kill(pid)` does, and tell one thread
+that can take it (`send_signal_to_process`, `group_signal_pick_locked`).
+
+"Some thread" means exactly one. Linux's `complete_signal` tells the thread
+the signal was sent to (for a child's `SIGCHLD`, the thread that forked it) if
+that thread can take it, otherwise one other thread that can. Every other
+thread carries on as if nothing had happened. AOK used to wake every thread
+that did not block the signal, and each of them counted the shared queue as
+its own. So they raced: a `SIGCHLD` handler ran in whichever sibling got there
+first, and the losers' sleeps, polls and reads failed with `EINTR` for a
+signal they never handled. Now each thread carries Linux's `TIF_SIGPENDING`
+for the shared queue, `group_sigpending`, and until it is set that thread's
+waits and syscall exits do not look at the queue at all.
+
+That creates a duty Linux also has: nothing may be left on the queue unseen.
+A thread told to take a signal that then blocks it, or exits, hands it to one
+that can (`group_signal_retarget`, Linux's `retarget_shared_pending`). A
+thread whose mask lets a queued signal through tells itself. And a told thread
+that finds its signal already taken by a sibling restarts its syscall, as
+Linux's `get_signal` does when it finds nothing to deliver.
 
 ## 12.3 Sending, and a lock that had to be invented
 
@@ -165,6 +195,27 @@ The conversion functions around them (`siginfo_to_i386_user`,
 per-ABI second copies Chapter 11 warned about, and they are exactly the case
 where a shared body is impossible: the structures genuinely differ.
 
+What the layouts do not settle is which mask each handler runs with, and that
+decides the order handlers run in. Linux sets up one handler at a time:
+`get_signal` chooses the next signal against the mask as it stands, and
+`signal_delivered` then adds the handler's `sa_mask` and, without
+`SA_NODEFER`, the signal itself. `receive_signals` works the same way
+(`signal_handler_mask_set`). A second pending signal that the first handler
+blocks waits for that handler's `sigreturn`. One it does not block gets a
+frame on top and runs first, which is why signals unblocked together run
+highest-numbered first. AOK once read the mask a single time, before
+delivering anything. A `SIGUSR2` blocked by the `SIGUSR1` handler's mask ran
+first, inside that handler, where Linux runs it afterwards.
+
+A frame keeps the mask `sigreturn` puts back. After `sigsuspend`, `pselect6`,
+`ppoll` or `epoll_pwait`, that is the mask from before the call
+(`sigmask_to_save`), while the first handler still runs with the call's
+temporary mask. A process-directed signal that a handler's mask blocks, and
+that this thread was told to take, goes to a sibling that can take it, as
+Section 12.2 describes. `SIGKILL` and `SIGSTOP` are removed from `sa_mask`
+when a handler is installed, so a handler built with `sigfillset` cannot
+hold back a `SIGKILL`.
+
 ## 12.6 Restarting what the signal interrupted
 
 A signal that arrives while a task is blocked in a syscall leaves a question:
@@ -176,21 +227,39 @@ Linux answers with a small taxonomy, and AOK implements it:
   `kernel/errno.h`) — restart if the handler was installed with `SA_RESTART`,
   otherwise `EINTR`.
 - `ERESTART_NOHAND` — restart across a job-control stop, but **never** across a
-  handler. `poll`, `select` and `epoll_wait` use this: a stopped-and-continued
-  process resumes its wait, but a process that ran a handler gets `EINTR`.
+  handler. `poll` and `select` use this: a stopped-and-continued process resumes
+  its wait, but a process that ran a handler gets `EINTR`. (`epoll_wait` is
+  stricter still and never restarts at all.)
 
-The second one needs machinery, because "cancel the restart because a handler is
-about to run" is a decision made in a different place from the one that set it
-up:
+Both need machinery, because the decision is made in a different place from the
+one that set it up. The syscall only rewinds the program counter; the handler
+setup in `receive_signal` settles whether the restart stands:
 
 ```c
-if (current->restart_nohand_pending) {
-    current->restart_nohand_pending = false;
+bool cancel = current->restart_nohand_pending ||
+    (current->restart_sys_pending && !(action->flags & SA_RESTART_));
+current->restart_nohand_pending = false;
+current->restart_sys_pending = false;
+if (cancel) {
     current->poll_restart_valid = false;
     current->sleep_restart_valid = false;
     cancel_syscall_restart();
 }
 ```
+
+For a long time only the `ERESTART_NOHAND` half existed, and an interrupted
+syscall chose between `ERESTART` and `EINTR` by looking at the handler it
+expected to run. A tracer makes that guess wrong. A traced task's signal goes to
+a signal-delivery-stop first, and the tracer may resume without it — gdb does,
+for `SIGINT` — so no handler runs and Linux restarts the call. `PTRACE_INTERRUPT`'s
+`SIGTRAP`, as it was then, was never delivered at all. AOK had guessed `EINTR`
+from both, so a
+program blocked in `read` failed as soon as a debugger interrupted it and let it
+go. Now such a call is set to restart, and whichever handler really runs first
+decides (`signal_restart_decided_at_delivery`), which is where Linux's
+`handle_signal` decides too. Both flags are cleared as the next syscall starts: a
+rewound program counter is only a restart until the syscall instruction runs
+again.
 
 There is a second subtlety underneath. A restarted *timed* wait must not restart
 its timeout. A `poll` with a 5-second timeout, stopped after 4 seconds and
@@ -261,6 +330,13 @@ Both measured against Linux 6.12."
 That is a small correction with a large symptom: a system console that stopped
 producing a login prompt and never recovered.
 
+**A hangup is the session leader's to hear.** On a pty hangup Linux's
+`tty_signal_session_leader` sends `SIGHUP` and `SIGCONT` to the session leader
+alone; the foreground group hears about it only when the leader exits. Until
+558 AOK signalled the whole foreground group, which killed a leader's child that
+Linux leaves running for the leader to deal with
+(`tests/manual/tty_hangup_leader_only.c`).
+
 ## 12.8 ptrace, and the same bug twice
 
 `ptrace` is where the process model, the signal model, and the scheduler all
@@ -279,7 +355,7 @@ stop signal. `deliver_sig` records a signal the tracer injected, which must be
 `signal_delivery_stop` — otherwise an injected signal loops forever.
 
 `PTRACE_ATTACH` — the request `gdb -p` and `strace -p` use — was missing until
-this cycle, and fell through to the default arm's `EPERM`, so a debugger could
+build 552, and fell through to the default arm's `EPERM`, so a debugger could
 not be pointed at a running guest process at all. It shares its implementation
 with `SEIZE` and differs in two ways the rest of the sub-struct keys off. It
 takes no options, so `seized` stays false and the tracee reports group-stops
@@ -289,6 +365,19 @@ an ordinary job-control stop — which the tracer collects from its first `wait`
 `PTRACE_INTERRUPT` is now gated on `seized` the way Linux gates it: an attached
 tracee gets `EIO`. `gdb -p <pid>` against a running guest process attaches,
 walks the stack, evaluates and detaches as a result.
+
+Implementing the request was not the same as guarding it. Through build 555,
+neither `PTRACE_ATTACH` nor `PTRACE_SEIZE` asked whether the caller was allowed
+to inspect the target at all — any user could attach to root's `sshd` and read
+or write its memory and registers. Build 556's `task_ptrace_may_access()`
+(`kernel/getset.c`) closed that the way Linux's `ptrace_may_access()` does: a
+thread of the caller's own process always may; otherwise the caller's real ids
+must match all three of the target's real, effective and saved ids, and the
+target must be dumpable, or the caller needs `CAP_SYS_PTRACE`. The same rule
+now gates every `/proc/<pid>` entry `fs/proc.c` marks `.ptrace_read` — `mem`,
+`environ`, `auxv`, `maps`, `smaps`, `fd/`, `cwd`, `exe`, and opening or
+`readlink`ing any of them — which is also why ktop's ARCH column no longer
+reads `/proc/<pid>/exe` for a process it does not own (Chapter 31).
 
 > **The bug that taught us this**
 >
@@ -376,6 +465,79 @@ because they are about how to prove a resumption happened at all:
   saying whether it was the control or the subject that hung. The first A/B run
   was misread for exactly that reason.
 
+**A stop the tracer is owed is not a signal.** Two stops a seized tracee reports
+have no signal behind them in Linux: the one `PTRACE_INTERRUPT` asks for, and a
+new child's first stop when its parent's tracer seized and follows forks. Both
+are `JOBCTL_TRAP_STOP`, a bit the task takes at its next signal check, before
+any signal and whatever its mask says, and both report `PTRACE_EVENT_STOP`
+(status `0x80057f`).
+
+AOK used signals for both, and each place a signal behaves differently from a
+flag was a bug:
+
+- The interrupt was a queued `SIGTRAP`. A tracee with SIGTRAP blocked was never
+  stopped, one with it set to `SIG_IGN` never received it, and one still
+  queued when the tracer detached was an ordinary fatal SIGTRAP from then on,
+  which is how `strace -p` used to kill what it attached to.
+- A new child got a `SIGSTOP` whether its tracer had seized or not. `strace -f`
+  seizes, and it takes a seized tracee's SIGSTOP for a real signal: it printed
+  `--- SIGSTOP ---` for every child, injected the signal, and the child really
+  stopped and sent its parent a `SIGCHLD` with `CLD_STOPPED`. A signal could not
+  have replaced the SIGSTOP either, because glibc blocks every signal around the
+  clone in `pthread_create` and `posix_spawn`, and the child starts with that
+  mask.
+
+Now it is a flag, `ptrace.trap_stop`. `PTRACE_INTERRUPT` sets it and wakes the
+task with the same pokes a signal uses. Clone sets it on a seized tracer's new
+child. `handle_interrupt`, `native_checkpoint` and a new task's first moments
+take it before any signal, any stop clears it, and a detach drops it. Every
+wait that ends for a pending signal also asks `task_trap_stop_pending`, in the
+same places it asks about a checkpoint freeze. The restart predicates count a
+trap as a stop, so a `read` the interrupt broke into restarts once the tracer
+resumes the task, as it does in Linux, instead of returning `EINTR`.
+`tests/manual/ptrace_seize_trap_stop.c` holds each of these to what Linux 6.12
+measured.
+
+**An exit belongs to the tracer first.** Linux's rule is "a zombie ptracee is
+only visible to its ptracer". When a traced task exits, its tracer hears first,
+whoever the task's parent is:
+
+- A traced thread becomes a zombie that only its tracer can reap, and it is
+  released when the tracer does. Until then its process can be neither reaped
+  nor announced, even to a tracer that is also the parent. The process's tgroup
+  counts these threads in `traced_zombies`, and the count also keeps the tgroup
+  alive for the thread structs that still point at it.
+- A traced process whose parent is somewhere else is reaped by the tracer first.
+  In the meantime the parent's `wait` says "not yet": `WNOHANG` returns 0, a
+  blocking wait blocks, and no SIGCHLD arrives. The tracer's reap untraces the
+  process and announces it to the parent, which reaps it and is the only one
+  charged its CPU time. A tracer that exits while holding such a zombie passes
+  it on the same way.
+
+One routine, `exit_notify_process_locked`, makes every announcement, whether it
+comes from `do_exit`, from the tracer's reap, from a tracer's exit, or from the
+release of a last thread zombie. It sends to the tracer or to the parent, and
+handles autoreap for a parent that ignores SIGCHLD.
+
+> **The bug that taught us this**
+>
+> Every `strace -f` of a program that made a thread or forked ended with
+> `strace: wait4(__WALL): No child processes` and exit status 1, and printed
+> `+++ exited` for the top process only. The program itself ran correctly. AOK
+> destroyed a thread the moment it exited and announced a process to its parent
+> alone, so the tracer's tracees vanished without a report. The one path that did
+> reach an exit was worse: a tracer waiting on a traced process by pid got into
+> the parent's reap and destroyed the process, so the real parent's own
+> `waitpid` failed.
+>
+> Fixing the report surfaced two bugs that had been hiding behind it. A signal a
+> tracer passes on at a signal-delivery-stop reached the tracee with no siginfo,
+> so a traced shell's SIGCHLD handler read `si_pid` 0. It now carries the stop's
+> siginfo, as Linux's `ptrace_signal` does. And Guard Malloc caught `PTRACE_CONT`
+> reading a thread that had already exited and been freed, which the old binary
+> did when strace was killed mid-run. `tests/manual/ptrace_tracee_exit.c` holds
+> the rules to Linux 6.12.
+
 ## 12.9 What this costs the rest of Part III
 
 Everything that blocks has to satisfy three obligations that come from this
@@ -398,11 +560,13 @@ right to be. Those three obligations are why.
 
 *Anchors:* [kernel/signal.c](../../kernel/signal.c),
 [kernel/signal.h](../../kernel/signal.h), [kernel/ptrace.c](../../kernel/ptrace.c),
+[kernel/exit.c](../../kernel/exit.c) (`exit_notify_process_locked`, `do_wait`),
 [kernel/calls.c](../../kernel/calls.c) (`handle_interrupt`'s group-stop path),
 [kernel/native.c](../../kernel/native.c) (`native_checkpoint`),
 [fs/tty.c](../../fs/tty.c), [fs/tty.h](../../fs/tty.h),
 [util/sync.c](../../util/sync.c) (`signal_thread_unwedge_wake_sigs`),
 `tests/manual/ptrace_group_stop.c`, `tests/manual/native_ptrace_group_stop.c`,
+`tests/manual/ptrace_seize_trap_stop.c`, `tests/manual/ptrace_tracee_exit.c`,
 `tests/manual/tty_hangup_reopen.c`, [docs/TODO.md](../../docs/TODO.md).
 
 *Story:* `PTRACE_SEIZE` of an already-stopped tracee hanging forever — a race

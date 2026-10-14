@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include "kernel/calls.h"
@@ -12,6 +13,7 @@
 #include "kernel/fs.h"
 #include "kernel/hostinfo.h"
 #include "fs/fd.h"
+#include "fs/real.h"
 
 #define AOKFS_MAGIC 0x414f4b31
 
@@ -30,6 +32,9 @@ enum aokfs_node_kind {
     aokfs_fixes_arch_dir,
     aokfs_fixes_arch_readme,
     aokfs_fixes_arch_script,
+    aokfs_fixes_codex_dir,
+    aokfs_fixes_codex_readme,
+    aokfs_fixes_codex_script,
     aokfs_tests_dir,
     // Individual /tests/* files are no longer enumerated here -- they come from
     // the build-time generator (tools/gen-aokfs.py + fs/aok-tests.manifest) and
@@ -50,6 +55,10 @@ enum aokfs_node_kind {
     // dirs above, but rooted at /tools/ktop/ against the *tools* generated
     // table (manifest names like "ktop/ktop.c" become paths under /tools/ktop/).
     aokfs_tools_ktop_dir,
+    // ish-AOK-bind: /tools/android/ (the scripts for running an Android
+    // system tree, plus their README). Listed next to ktop rather than
+    // at the end, where upstream appends its own and would conflict.
+    aokfs_tools_android_dir,
     // Same pattern as aokfs_tools_ktop_dir, rooted at /tools/pixman/ (the
     // pixman-accelerator LD_PRELOAD shim source + build script; manifest
     // names like "pixman/ish_pixman_shim.c" become paths under /tools/pixman/).
@@ -61,11 +70,9 @@ enum aokfs_node_kind {
     // /tools readdir below, or the files exist in the table but nothing can
     // reach them.
     aokfs_tools_crypto_dir,
-    // Same again, rooted at /tools/android/ (the two scripts for running an
-    // Android system tree, plus their README). They are guest-side scripts
-    // that have to be ON the device to be useful -- a chroot cannot be set up
-    // from a copy that only exists in the repo.
-    aokfs_tools_android_dir,
+    // And /tools/wayland/ (the Wayland buffer release guard's source and its
+    // build script, tools/wayland/ in the manifest).
+    aokfs_tools_wayland_dir,
     // /docs is flat (no subdirectories) -- same generated-table pattern as
     // /tools, minus the ktop-style subdirectory case.
     aokfs_docs_dir,
@@ -196,6 +203,7 @@ static bool aokfs_node_is_dir(enum aokfs_node_kind node) {
         node == aokfs_fakefs_dir ||
         node == aokfs_fixes_devuan_dir ||
         node == aokfs_fixes_arch_dir ||
+        node == aokfs_fixes_codex_dir ||
         node == aokfs_tools_dir ||
         node == aokfs_tests_dir ||
         node == aokfs_tests_audio_dir ||
@@ -203,9 +211,10 @@ static bool aokfs_node_is_dir(enum aokfs_node_kind node) {
         node == aokfs_tests_arm64_dir ||
         node == aokfs_tests_riscv64_dir ||
         node == aokfs_tools_ktop_dir ||
+        node == aokfs_tools_android_dir || // ish-AOK-bind
         node == aokfs_tools_pixman_dir ||
         node == aokfs_tools_crypto_dir ||
-        node == aokfs_tools_android_dir ||
+        node == aokfs_tools_wayland_dir ||
         node == aokfs_native_dir ||
         node == aokfs_docs_dir;
 }
@@ -229,7 +238,17 @@ static mode_t_ aokfs_node_mode(enum aokfs_node_kind node) {
         return S_IFDIR | 0555;
     if (aokfs_node_is_symlink(node))
         return S_IFLNK | 0777;
-    if (node == aokfs_tools_setup_ish_benchmark || aokfs_node_is_native(node))
+    if (aokfs_node_is_native(node)) {
+        const struct native_program *prog = aokfs_node_native(node);
+        // Root-owned (this filesystem reports uid 0 for everything), so the
+        // set-user-ID bit here means setuid-root and nothing else. Writable by
+        // nobody: the mode is generated, and a guest cannot chmod it away or
+        // onto anything.
+        if (prog != NULL && prog->setuid_root)
+            return S_IFREG | S_ISUID | 0755;
+        return S_IFREG | 0555;
+    }
+    if (node == aokfs_tools_setup_ish_benchmark)
         return S_IFREG | 0555;
     return S_IFREG | 0444;
 }
@@ -274,6 +293,12 @@ static const char *aokfs_node_path(enum aokfs_node_kind node) {
             return "/fixes/arch/README.txt";
         case aokfs_fixes_arch_script:
             return "/fixes/arch/fix-pacman.sh";
+        case aokfs_fixes_codex_dir:
+            return "/fixes/codex";
+        case aokfs_fixes_codex_readme:
+            return "/fixes/codex/README.txt";
+        case aokfs_fixes_codex_script:
+            return "/fixes/codex/fix-codex.sh";
         case aokfs_tests_dir:
             return "/tests";
         case aokfs_tests_x86_dir:
@@ -290,12 +315,14 @@ static const char *aokfs_node_path(enum aokfs_node_kind node) {
             return "/tools/setup-ish-benchmark.sh";
         case aokfs_tools_ktop_dir:
             return "/tools/ktop";
+        case aokfs_tools_android_dir: // ish-AOK-bind
+            return "/tools/android";
         case aokfs_tools_pixman_dir:
             return "/tools/pixman";
         case aokfs_tools_crypto_dir:
             return "/tools/crypto";
-        case aokfs_tools_android_dir:
-            return "/tools/android";
+        case aokfs_tools_wayland_dir:
+            return "/tools/wayland";
         case aokfs_tests_audio_dir:
             return "/tests/audio";
         case aokfs_audio_raw:
@@ -339,6 +366,9 @@ static bool aokfs_lookup_node(const char *path, enum aokfs_node_kind *node_out) 
         aokfs_fixes_arch_dir,
         aokfs_fixes_arch_readme,
         aokfs_fixes_arch_script,
+        aokfs_fixes_codex_dir,
+        aokfs_fixes_codex_readme,
+        aokfs_fixes_codex_script,
         aokfs_tests_dir,
         aokfs_tests_x86_dir,
         aokfs_tests_arm64_dir,
@@ -347,9 +377,10 @@ static bool aokfs_lookup_node(const char *path, enum aokfs_node_kind *node_out) 
         aokfs_tools_ish_benchmark,
         aokfs_tools_setup_ish_benchmark,
         aokfs_tools_ktop_dir,
+        aokfs_tools_android_dir, // ish-AOK-bind
         aokfs_tools_pixman_dir,
         aokfs_tools_crypto_dir,
-        aokfs_tools_android_dir,
+        aokfs_tools_wayland_dir,
         aokfs_tests_audio_dir,
         aokfs_audio_raw,
         aokfs_audio_wav,
@@ -470,7 +501,13 @@ static const char *aokfs_inline_file_data(enum aokfs_node_kind node, size_t *siz
         "is the same speed on every guest architecture. Link to them from anywhere:\n"
         "  ln -s /AOK/native/smallclue /usr/local/bin/df\n"
         "The link name selects the applet, exactly as on Linux. Use a SYMlink: /AOK is\n"
-        "a separate filesystem, so a hard link across it fails with EXDEV.\n";
+        "a separate filesystem, so a hard link across it fails with EXDEV.\n"
+        "\n"
+        "/AOK/bundled holds guest programs and libraries built ahead of time, so the\n"
+        "setup scripts in /AOK/tools link them in instead of compiling on the device:\n"
+        "a directory per distro release and CPU (devuan6-aarch64) for what uses that\n"
+        "distro's libraries, and per libc and CPU (glibc-x86_64, musl-aarch64) for\n"
+        "what needs only libc.\n";
     // /AOK/version is the documented build identifier, so it carries exactly
     // what `uname -v` reports -- including the build timestamp, because the
     // hand-maintained version number is routinely not bumped between builds
@@ -586,6 +623,70 @@ static const char *aokfs_inline_file_data(enum aokfs_node_kind node, size_t *siz
         "fi\n"
         "\n";
 
+    static const char fixes_codex_readme[] =
+        "Codex CLI under iSH-AOK\n"
+        "\n"
+        "Codex runs every shell command it issues inside its own sandbox. On Linux\n"
+        "that sandbox is bubblewrap (bwrap), which asks the kernel for user, mount,\n"
+        "PID, IPC and network namespaces. From build 559 AOK's kernel has all of\n"
+        "them, and the sandbox starts: there is nothing to fix.\n"
+        "\n"
+        "  codex sandbox -- /bin/echo works     # prints \"works\"\n"
+        "\n"
+        "Before 559 each command failed before it started (\"bwrap: Creating new\n"
+        "namespace failed\"), and this directory's script told Codex to run commands\n"
+        "without a sandbox, by putting\n"
+        "\n"
+        "  sandbox_mode = \"danger-full-access\"\n"
+        "\n"
+        "at the top of ~/.codex/config.toml. If you ran it then, that line is still\n"
+        "there and Codex is still running your commands unconfined. To take it out\n"
+        "again and let the sandbox do its work:\n"
+        "\n"
+        "  sh /AOK/fixes/codex/fix-codex.sh\n"
+        "\n"
+        "It removes only the line it added, and leaves a sandbox_mode you set\n"
+        "yourself alone.\n"
+        "\n"
+        "What the sandbox is here. A command sees the files Codex gives it, read-only\n"
+        "outside the workspace; it is pid 1 of a process tree that cannot see or\n"
+        "signal anything else; and with network access off (Codex's default) it has\n"
+        "a loopback interface and nothing more -- no route out, and no way to reach\n"
+        "the machine's own loopback. (Codex then also forbids the command to make\n"
+        "network sockets at all, as it does on any Linux: a test that starts a local\n"
+        "server needs Codex's network access turned on, here as there.)\n"
+        "\n"
+        "Codex's older Landlock sandbox is not offered: AOK does not implement\n"
+        "Landlock, and will not pretend to.\n";
+    static const char fixes_codex_script[] =
+        "#!/bin/sh\n"
+        "# Builds before 559 could not start Codex CLI's bubblewrap sandbox, and this\n"
+        "# script turned the sandbox off (sandbox_mode = \"danger-full-access\"). 559\n"
+        "# can, so this takes that line out again. See /AOK/fixes/codex/README.txt.\n"
+        "set -e\n"
+        "\n"
+        "dir=\"${CODEX_HOME:-$HOME/.codex}\"\n"
+        "config=\"$dir/config.toml\"\n"
+        "marker='AOK has no namespaces for bwrap'\n"
+        "\n"
+        "if [ ! -f \"$config\" ]; then\n"
+        "    echo \"ok: no $config; Codex runs commands in its sandbox\"\n"
+        "    exit 0\n"
+        "fi\n"
+        "if grep -q \"$marker\" \"$config\"; then\n"
+        "    tmp=\"$config.aok.$$\"\n"
+        "    grep -v \"$marker\" \"$config\" >\"$tmp\" || true\n"
+        "    mv \"$tmp\" \"$config\"\n"
+        "    echo \"removed: the sandbox_mode line an earlier build's fix added to $config\"\n"
+        "    echo \"Codex runs commands in its sandbox again.\"\n"
+        "    exit 0\n"
+        "fi\n"
+        "if grep -q '^[[:space:]]*sandbox_mode[[:space:]]*=' \"$config\"; then\n"
+        "    echo \"left alone: $config sets sandbox_mode itself:\"\n"
+        "    grep '^[[:space:]]*sandbox_mode[[:space:]]*=' \"$config\"\n"
+        "    exit 0\n"
+        "fi\n"
+        "echo \"ok: nothing to undo in $config; Codex runs commands in its sandbox\"\n";
     static const char fixes_devuan_readme[] =
         "pkcsslotd init fix\n"
         "\n"
@@ -806,6 +907,12 @@ static const char *aokfs_inline_file_data(enum aokfs_node_kind node, size_t *siz
         case aokfs_fixes_arch_script:
             *size_out = sizeof(fixes_arch_script) - 1;
             return fixes_arch_script;
+        case aokfs_fixes_codex_readme:
+            *size_out = sizeof(fixes_codex_readme) - 1;
+            return fixes_codex_readme;
+        case aokfs_fixes_codex_script:
+            *size_out = sizeof(fixes_codex_script) - 1;
+            return fixes_codex_script;
         case aokfs_tools_setup_ish_benchmark:
             *size_out = sizeof(setup_ish_benchmark) - 1;
             return setup_ish_benchmark;
@@ -1034,7 +1141,23 @@ static off_t_ aokfs_lseek(struct fd *fd, off_t_ off, int whence) {
     int err = aokfs_stat_common(fd->mount, node, &stat);
     if (err < 0)
         return err;
-    return generic_seek(fd, off, whence, stat.size);
+    err = generic_seek(fd, off, whence, stat.size);
+    if (err < 0)
+        return err;
+    // The RESULTING OFFSET, which is what lseek returns. generic_seek answers
+    // an error code -- 0 on success -- so returning it directly reported
+    // "position 0" for every successful seek on an /AOK file. proc, tmp and
+    // memfd all take fd->offset afterwards for this reason; this one did not.
+    //
+    // Sequential readers never noticed: cat, wc and sha256sum read to EOF
+    // without seeking and were byte-perfect. Anything that seeks did. glibc's
+    // buffered read of a file it has stat'd seeks to the block boundary below
+    // the end and fills from there, then computes ftell as "what lseek said,
+    // plus what is buffered" -- so with lseek always saying 0 it believed a
+    // 22420-byte script was 1940 bytes long and handed its reader the tail.
+    // `sh /AOK/tools/provision-ultimate-pscal.sh` failed to parse; the same
+    // bytes copied into the rootfs ran.
+    return fd->offset;
 }
 
 static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
@@ -1120,6 +1243,14 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
                 case 7: child = aokfs_tools_dir; break;
                 case 8: child = aokfs_docs_dir; break;
                 case 9: child = aokfs_native_dir; break;
+                case 10: {
+                    // /bundled: programs and libraries built ahead of time
+                    // for guest roots (fs/aok-bundled.manifest), a directory
+                    // derived from the generated table like /native/libs's.
+                    if (!aokfs_lookup_node("/bundled", &child))
+                        return 0;
+                    break;
+                }
                 default: return 0;
             }
             break;
@@ -1146,6 +1277,7 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
                 case 0: child = aokfs_fixes_devuan_dir; break;
                 case 1: child = aokfs_fixes_debian_link; break;
                 case 2: child = aokfs_fixes_arch_dir; break;
+                case 3: child = aokfs_fixes_codex_dir; break;
                 default: return 0;
             }
             break;
@@ -1153,6 +1285,13 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
             switch (fd->offset++) {
                 case 0: child = aokfs_fixes_arch_readme; break;
                 case 1: child = aokfs_fixes_arch_script; break;
+                default: return 0;
+            }
+            break;
+        case aokfs_fixes_codex_dir:
+            switch (fd->offset++) {
+                case 0: child = aokfs_fixes_codex_readme; break;
+                case 1: child = aokfs_fixes_codex_script; break;
                 default: return 0;
             }
             break;
@@ -1164,7 +1303,7 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
             }
             break;
         case aokfs_tools_dir: {
-            // The two bundled tool entries and the ktop/pixman/crypto
+            // The two bundled tool entries and the ktop/pixman/crypto/wayland
             // subdirectories first, then generated /tools/* files that belong
             // directly to /tools (one path component past the prefix -- the
             // subdirectories' own files live under their /tools/<name>/ node
@@ -1173,9 +1312,10 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
                 aokfs_tools_ish_benchmark,
                 aokfs_tools_setup_ish_benchmark,
                 aokfs_tools_ktop_dir,
+                aokfs_tools_android_dir, // ish-AOK-bind
                 aokfs_tools_pixman_dir,
                 aokfs_tools_crypto_dir,
-                aokfs_tools_android_dir,
+                aokfs_tools_wayland_dir,
             };
             size_t nfixed = sizeof(tools_fixed) / sizeof(tools_fixed[0]);
             size_t want = (size_t) fd->offset++;
@@ -1203,9 +1343,10 @@ static int aokfs_readdir(struct fd *fd, struct dir_entry *entry) {
             break;
         }
         case aokfs_tools_ktop_dir:
+        case aokfs_tools_android_dir: // ish-AOK-bind
         case aokfs_tools_pixman_dir:
         case aokfs_tools_crypto_dir:
-        case aokfs_tools_android_dir: {
+        case aokfs_tools_wayland_dir: {
             // One /tools/<name>/ subdirectory: the same generated-table scan
             // /tools itself does, but rooted at this node's own path, so a new
             // subdirectory needs no code here beyond its case label.
@@ -1313,13 +1454,54 @@ static int aokfs_close(struct fd *fd) {
     return 0;
 }
 
+// mmap: what ld.so does to every library, and the kernel's ELF loader to every
+// program, so without it nothing in /AOK/bundled could be used -- a preloaded
+// library was "failed to map segment" and exec called through a NULL ->mmap.
+// A file with a host descriptor behind it maps that, as realfs does. The rest
+// live in the app's own (read-only) memory, so the mapping is a private copy:
+// fresh host pages holding the bytes from the host page the offset falls in,
+// zero past EOF as on Linux. The files never change, so a MAP_SHARED reader
+// cannot tell a copy from the real thing; only a writable shared mapping has
+// to be refused, the descriptor being read-only (EACCES, as Linux).
+static int aokfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages,
+        off_t offset, int prot, int flags) {
+    enum aokfs_node_kind node = aokfs_decode_node(fd->fs_data);
+    if (aokfs_node_is_dir(node))
+        return _ENODEV;
+    if (offset % PAGE_SIZE != 0)
+        return _EINVAL;
+    if ((flags & MMAP_SHARED) && (prot & P_WRITE))
+        return _EACCES;
+    if (fd->real_fd >= 0)
+        return host_fd_mmap(fd->real_fd, mem, start, pages, offset, prot, flags);
+
+    size_t size = 0;
+    const char *data = aokfs_inline_file_data(node, &size);
+    off_t real_offset = (offset / real_page_size) * real_page_size;
+    size_t correction = (size_t) (offset - real_offset);
+    size_t map_len = (size_t) pages * PAGE_SIZE + correction;
+    char *memory = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (memory == MAP_FAILED)
+        return _ENOMEM;
+    if ((size_t) real_offset < size) {
+        size_t n = size - (size_t) real_offset;
+        memcpy(memory, data + real_offset, n < map_len ? n : map_len);
+    }
+    int err = pt_map(mem, start, pages, memory, correction, prot);
+    if (err < 0)
+        munmap(memory, map_len);
+    return err;
+}
+
 static const struct fd_ops aokfs_fdops = {
+    .name = "aokfs",
     .read = aokfs_read,
     .write = aokfs_write,
     .pread = aokfs_pread,
     .pwrite = aokfs_pwrite,
     .lseek = aokfs_lseek,
     .readdir = aokfs_readdir,
+    .mmap = aokfs_mmap,
     .close = aokfs_close,
 };
 

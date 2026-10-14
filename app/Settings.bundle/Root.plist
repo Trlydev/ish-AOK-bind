@@ -5,40 +5,38 @@
 	<key>PreferenceSpecifiers</key>
 	<array>
 		<dict>
+			<key>FooterText</key>
+			<string>Opens the app straight to the settings menu. Useful if you changed anything there and need to change it back but the app won't start.</string>
 			<key>Type</key>
 			<string>PSGroupSpecifier</string>
-			<key>FooterText</key>
-			<string>Opens the app straight to the settings menu. Useful if you changed anything there and need to change it back but the app won&apos;t start.</string>
 		</dict>
 		<dict>
-			<key>Type</key>
-			<string>PSToggleSwitchSpecifier</string>
-			<key>Title</key>
-			<string>Recovery Mode</string>
+			<key>DefaultValue</key>
+			<false/>
 			<key>Key</key>
 			<string>recovery</string>
-			<key>DefaultValue</key>
-			<false/>
-		</dict>
-		<dict>
+			<key>Title</key>
+			<string>Recovery Mode</string>
 			<key>Type</key>
 			<string>PSToggleSwitchSpecifier</string>
-			<key>Title</key>
-			<string>Open Diagnostics On Launch</string>
-			<key>Key</key>
-			<string>openDiagnosticsOnLaunch</string>
-			<key>DefaultValue</key>
-			<false/>
 		</dict>
 		<dict>
-			<key>Type</key>
-			<string>PSMultiValueSpecifier</string>
-			<key>Title</key>
-			<string>Initial Window</string>
+			<key>DefaultValue</key>
+			<false/>
 			<key>Key</key>
-			<string>Initial Window</string>
+			<string>openDiagnosticsOnLaunch</string>
+			<key>Title</key>
+			<string>Open Diagnostics On Next Launch</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
 			<key>DefaultValue</key>
 			<string>terminal</string>
+			<key>Key</key>
+			<string>Initial Window</string>
+			<key>Title</key>
+			<string>Initial Window</string>
 			<key>Titles</key>
 			<array>
 				<string>Workspace</string>
@@ -46,6 +44,8 @@
 				<string>Terminal (tty1)</string>
 				<string>Session Shell (pts/1)</string>
 			</array>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
 			<key>Values</key>
 			<array>
 				<string>workspace</string>
@@ -55,34 +55,54 @@
 			</array>
 		</dict>
 		<dict>
-			<key>Type</key>
-			<string>PSGroupSpecifier</string>
-			<key>Title</key>
-			<string>Simulated Swap</string>
 			<key>FooterText</key>
 			<string>Lets iSH-AOK move cold guest memory out to storage, so a large mostly-idle heap or a background process tree stops counting against the memory iOS allows the app. It will not make a working set that is genuinely too big run well.
 
-Off unless you turn it on: swapping writes to the device&apos;s flash, and the swap area takes up that much space in the app&apos;s container while it exists. Both settings take effect the next time iSH-AOK starts, and swap stays off until you have chosen a size as well as switched it on.</string>
+Off unless you turn it on: swapping writes to the device's flash, and the swap area takes up that much space in the app's container while it exists. Both settings take effect the next time iSH-AOK starts, and swap stays off until you have chosen a size as well as switched it on.
+
+The sizes offered here do not know how much room this device actually has. If there is not enough free space for the size you pick, iSH-AOK leaves swap off rather than quietly making a smaller area than you asked for; "cat /proc/ish/swap" in the guest says which of those happened.</string>
+			<key>Title</key>
+			<string>Simulated Swap</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
 		</dict>
 		<dict>
-			<key>Type</key>
-			<string>PSToggleSwitchSpecifier</string>
-			<key>Title</key>
-			<string>Enable Swap</string>
-			<key>Key</key>
-			<string>Enable Swap</string>
 			<key>DefaultValue</key>
 			<false/>
+			<key>Key</key>
+			<string>Enable Swap</string>
+			<key>Title</key>
+			<string>Enable Swap</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
 		</dict>
 		<dict>
-			<key>Type</key>
-			<string>PSMultiValueSpecifier</string>
+			<key>FooterText</key>
+			<string>Save the whole session when iSH-AOK goes to the background, and bring it back on the next launch. iOS ends this app routinely -- memory pressure, or a swipe away -- and without this that always loses the session.
+
+Off by default, because it spends storage and is not free of limits. A session running something iSH-AOK cannot describe is not saved: it says so, and the next launch starts normally. "cat /proc/ish/checkpoint" in the guest reports what the last attempt did and, if it refused, why.</string>
 			<key>Title</key>
-			<string>Swap Size</string>
+			<string>Suspend to Disk</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<false/>
 			<key>Key</key>
-			<string>Swap Size MB</string>
+			<string>Suspend To Disk</string>
+			<key>Title</key>
+			<string>Suspend to Disk</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
 			<key>DefaultValue</key>
 			<integer>0</integer>
+			<key>Key</key>
+			<string>Swap Size MB</string>
+			<key>Title</key>
+			<string>Swap Size</string>
 			<key>Titles</key>
 			<array>
 				<string>Not chosen (swap stays off)</string>
@@ -94,6 +114,8 @@ Off unless you turn it on: swapping writes to the device&apos;s flash, and the s
 				<string>8 GB</string>
 				<string>16 GB</string>
 			</array>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
 			<key>Values</key>
 			<array>
 				<integer>0</integer>
@@ -104,6 +126,86 @@ Off unless you turn it on: swapping writes to the device&apos;s flash, and the s
 				<integer>4096</integer>
 				<integer>8192</integer>
 				<integer>16384</integer>
+			</array>
+		</dict>
+		<dict>
+			<key>FooterText</key>
+			<string>Swap to a USB drive instead of the app's container. Writes go to a .aok-swap file on the drive, keeping internal flash wear-free. Turn this on, return to iSH-AOK and pick a folder on the drive; it is used from the next launch. If the drive is not attached at launch, swap stays off. To use a different folder, switch this off, return to iSH-AOK, then switch it on again.
+
+The file holds guest memory unencrypted, passwords and keys included. It is emptied when swap stops, but if iSH-AOK is killed it keeps its contents until the next launch empties it.
+
+exFAT drives (most USB sticks) cannot guarantee preallocated space. If the drive fills up while swap is active, affected guest processes will crash. Use a drive with plenty of free space.
+
+Pulling the drive while swap is active crashes any process whose memory was on it. Quit iSH-AOK before removing the drive.</string>
+			<key>Title</key>
+			<string>External USB Swap</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<false/>
+			<key>Key</key>
+			<string>Enable Swap On External</string>
+			<key>Title</key>
+			<string>Swap to External Drive</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
+			<key>FooterText</key>
+			<string>Holds cold memory compressed in RAM instead of writing it to storage. Measured 2.2–2.8x on real workloads, so a 128 MB pool holds roughly 300 MB of guest memory, and a page comes back about two orders of magnitude faster than a read from flash.
+
+Works on its own — Swap is NOT required, and with Swap off nothing is ever written to storage at all. If Swap is also on, this sits in front of it and only what does not compress reaches the file.
+
+Uses the RAM you give it, and it counts against the same memory limit the guest does — so a pool bigger than the device can spare makes things worse, not better. Anything above a quarter of this device's memory is reduced to that.</string>
+			<key>Title</key>
+			<string>Compressed Memory</string>
+			<key>Type</key>
+			<string>PSGroupSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<false/>
+			<key>Key</key>
+			<string>Enable Compressed Memory</string>
+			<key>Title</key>
+			<string>Enable Compressed Memory</string>
+			<key>Type</key>
+			<string>PSToggleSwitchSpecifier</string>
+		</dict>
+		<dict>
+			<key>DefaultValue</key>
+			<integer>128</integer>
+			<key>Key</key>
+			<string>Compressed Memory Size MB</string>
+			<key>Title</key>
+			<string>Compressed Memory Size</string>
+			<key>Titles</key>
+			<array>
+				<string>Off</string>
+				<string>32 MB</string>
+				<string>64 MB</string>
+				<string>128 MB</string>
+				<string>256 MB</string>
+				<string>512 MB</string>
+				<string>1 GB</string>
+				<string>2 GB</string>
+				<string>4 GB</string>
+			</array>
+			<key>Type</key>
+			<string>PSMultiValueSpecifier</string>
+			<key>Values</key>
+			<array>
+				<integer>0</integer>
+				<integer>32</integer>
+				<integer>64</integer>
+				<integer>128</integer>
+				<integer>256</integer>
+				<integer>512</integer>
+				<integer>1024</integer>
+				<integer>2048</integer>
+				<integer>4096</integer>
 			</array>
 		</dict>
 	</array>

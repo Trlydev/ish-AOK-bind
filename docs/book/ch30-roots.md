@@ -22,19 +22,62 @@ as an amd64 guest and an aarch64 image as an arm64 one.
 
 They arrive three ways:
 
-**Bundled.** Alpine 3.23.3 and Devuan 6 (excalibur), `aarch64` only. The Xcode
+**Bundled.** Alpine 3.24.2 and Devuan 6 (excalibur), `aarch64` only (Alpine
+3.23.3 was bundled until October 2026). The Xcode
 "Download Root" build phase installs those two archives into the app and deletes
 the i386 and x86_64 ones from Resources, so those two are the only roots present
 before anything is downloaded.
 
 **From the catalogue.** The same two distributions for `i386`, `x86_64` and
-`riscv64`, plus community images — Arch Linux (`x86_64` and `aarch64`) and
+`riscv64` (Alpine as both 3.24.2 and 3.23.3), plus community images — Arch Linux (`x86_64` and `aarch64`) and
 PSCAL + SmallCLUE — downloaded on demand into `/AOK/persist/roots` and imported
 from there. The catalogue itself is `deps/rootfs-manifest`.
+
+The catalogue is **downloaded**, and the copy inside the app is the fallback.
+That distinction is load-bearing: the app bundles a snapshot of `manifest.json`
+taken when it was built, so an installed build's idea of which filesystems
+exist used to be frozen at its release. Publishing a new rootfs left every
+existing install unable to see it, and withdrawing one left them asking for a
+URL that had stopped existing — "Couldn't download the filesystem image", with
+nothing fixable from the device. `refreshRootCatalogFromNetwork` fetches the
+published manifest at launch and whenever the Filesystems screen opens (rate
+limited), caches the last good copy in the App Group container, and falls back
+cache → in-app snapshot. A failed refresh — no network, an outage, an
+unparseable body — leaves the current catalogue exactly as it was; the picker
+is never emptied by one. The downloaded manifest goes through the same
+validation as the bundled one, because it decides which filesystems get
+fetched and from where; `downloadURL` must be `https`.
+
+The other half of that rule lives in the rootfs repo: an entry may be dropped
+from the manifest, but **an archive may never be deleted**, because installs
+that still hold an older manifest keep asking for it.
+
+A catalogue entry may also carry a `series` and a `version`. That is for images
+this project builds itself from sources that keep moving, rather than a
+distribution's own release: the PSCAL + SmallCLUE rootfs is rebuilt every so
+often with the same contents and newer code, and each build is published
+alongside the last. Every version stays in the manifest and stays downloadable,
+but the picker offers only the two most recent of each series — otherwise the
+list grows a row every time somebody rebuilds. A version that has fallen off
+the end is hidden, not withdrawn: `install source=catalog id=…` still takes it.
+That split is the difference between `bundledRootChoices` (everything the app
+knows) and `offeredRootChoices` (what it puts in front of you) in `Roots.m`.
 
 **Imported.** Any archive sitting in `/AOK/persist/roots`, whether it got there
 by download or because somebody dropped a `.tar.xz` in through the Files app
 (Chapter 31) or from the guest. Tap it and it becomes a named root.
+
+**Made on the spot.** Since 558 there is a fourth kind, which arrives no way at
+all: **iSH-AOK Native**, a root with no Linux distribution in it. Its `/bin` and
+`/usr/bin` are symlinks into `/AOK/native` (Part V), its login shell is native
+zsh, and SmallCLUE's `init` is pid 1. It is an ordinary, persistent fakefs —
+home directories and `~/.ssh` have to survive a relaunch — that starts empty,
+and `kernel/native_root.c` fills it in at *every* boot rather than once, because
+what it links is a property of the build: an update that adds an applet should
+find it on `PATH` at the next launch, and one that drops a program should not
+leave a link to nothing. The user's own files (`/etc/passwd`, `/etc/rc`) are
+written only when missing; only links that point into `/AOK/native` are ever
+re-pointed or removed. `/AOK/docs/native-mode.md` is the user's guide to it.
 
 ## 30.2 The control surface is a file
 
@@ -93,8 +136,32 @@ would leave the next launch with nothing to boot. Keying the screen's marker off
 the running root rather than the default one is the fix, not a decoration; the
 guard against deleting `/` had been checking only the default, so choosing a
 different one and then acting on the running root walked straight past it.
-`/proc/ish/roots` reports only the second of the two — `root default=1` and
-`default name=` — so which root actually booted is app-side knowledge today.
+`/proc/ish/roots` reports both: `default name=` (and `root default=1`) for the
+next launch, `booted name=` for this one. Any other root can be deleted from
+its own screen, and since 557 by swiping its row in the list too, where a user
+looked for it first and found nothing (#575).
+
+**Choosing the next root asks when.** The screen's Boot From This Filesystem
+used to set the default and quit on the spot: one tap, every running program
+ended, under a footer promising a restart. iOS does not let an app restart
+itself, so the "restart" was the home screen. It now offers Next Launch, which
+only records the choice (the row then reads "Boots next"), or Quit Now, which is
+the old behaviour chosen on purpose.
+
+**One launch can boot a different root without choosing it.** `ISH_BOOT_ROOT`,
+set in the app's launch environment, boots the named root for that launch and
+leaves the saved default alone:
+
+```sh
+xcrun devicectl device process launch -e '{"ISH_BOOT_ROOT":"Alpine3.24.2-aarch64"}' \
+    --terminate-existing app.ish.iSH-AOK
+```
+
+That is for driving a device from a Mac — a release's device leg boots each
+root in turn this way (Chapter 37). A name that is not an installed root fails
+the boot, naming the roots that are, rather than booting the default in its
+place: a test run that asked for one root and quietly got another would report
+that root's results as the one it asked for.
 
 **An install keeps running if you walk away.** The download and unpack belong to
 the app, not to the shell that asked for them. Ctrl-C, a dropped `ssh` session,
@@ -142,16 +209,34 @@ it**. A root whose `/etc` has been broken badly enough that it will not boot is
 still just a directory to the root that can boot, which is a recovery story that
 a single-root design does not have.
 
-It works because there are no mount namespaces (Chapters 10 and 21). There is
-one `/proc`, one `/sys` and one `/dev`, and they describe the single true system
-from wherever you are standing.
+It works because every root's processes share one mount table and one
+process table unless one of them asks for its own (Chapters 10 and 21). There
+is one `/proc`, one `/sys` and one `/dev`, and they describe the single true
+system from wherever you are standing.
 
 `/AOK/tools/mount-root.sh` sets up the bind mounts a chroot needs — `/proc`,
-`/sys`, `/dev`, `/run`, plus `/AOK/tools` and `/AOK/tests` from the booted root.
+`/sys`, `/dev`, `/dev/pts`, `/run`, plus `/AOK/native`, `/AOK/docs`, `/AOK/tools`,
+`/AOK/tests` and `/AOK/fakefs` from the booted root. (`/AOK/native` joined the
+list in 558, when a native-mode root's `$SHELL` turned out to be a program the
+chroot could not see.)
 Chapter 9 met the consequence: a test running inside such a chroot sees the
 *booted* root's `/proc` while standing in a different filesystem, which is why
 `test_common.h` detects that situation and skips the tests that cross-check the
 two.
+
+Running one *program* from another root, by path, is a different question, and
+on Linux the answer is no: `/AOK/roots/Devuan6-arm64/usr/bin/tmux` names its
+loader as `/lib/ld-linux-aarch64.so.1`, which means "in the root I came from",
+and looked up from here it is not there — `ENOENT`, about a file that plainly
+exists. Native mode made that the common case, so 558 answers it
+(`kernel/foreign_exec.c`), for exactly the programs that would otherwise fail.
+By default the task is chrooted into the program's root before its loader is
+opened, with the same binds `mount-root.sh` makes; the alternative runs it here
+with its root's loader and an `LD_LIBRARY_PATH` that the next exec takes back
+out; off is Linux's behaviour. It is a runtime choice —
+`/proc/ish/foreign_exec`, `ISH_FOREIGN_EXEC` in the CLI, and Settings → Other
+Filesystems → Programs From Other Roots — because each mode is right for
+different programs.
 
 ## 30.6 One sharp edge
 
@@ -184,6 +269,12 @@ account, no `ssh` daemon.
 that gap. They are **idempotent** — safe to run repeatedly — and they set up a
 generous CLI tool set, services on boot through the distribution's own init,
 a timezone, shell niceties, and a dependency-free editor configuration.
+
+`provision-ultimate-pscal.sh` is the fourth, and it is a different shape:
+a PSCAL root has no package manager, so it configures rather than installs —
+passwords (the image ships every account locked), your login and its place in
+`wheel` so the shipped `/etc/sudoers` authorises it, and an SSH identity kept
+in `/AOK/persist` so the next image update does not cost you the setup again.
 
 One line in the Alpine script is a small window onto the whole project:
 

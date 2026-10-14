@@ -36,11 +36,25 @@
 //    wrong arm and returned a negated result: exactly the right magnitude,
 //    wrong sign. That is why it looked like an argument-reduction bug.
 //
+//  * fptan (D9 F2), fdecstp (D9 F6) and fyl2xp1 (D9 F9) were missing from
+//    both engines' decode tables and raised SIGILL. 32-bit HotSpot's Math.tan
+//    is fptan, so a Java program on the i386 guest died there.
+//
+//  * fscale of a denormal was off by a factor of two: its exponent field of 0
+//    was unbiased as -16383, one short of the -16382 a denormal means, so
+//    fscale by 1 returned the operand unchanged. fxtract of a denormal gave the
+//    same wrong exponent and an unnormalized significand, and fprem, built on
+//    both, left 1.0 mod a denormal near 1.0. fscale also rounded to the
+//    precision-control width, which it does not on hardware, and took ST(1)
+//    through a C int, so a scale of 2^32 was 0; fxtract of zero gave -16383
+//    where hardware gives -inf and raises ZE.
+//
 // x86 only (i386 and x86_64 guests). Needs no privileges.
 #define _GNU_SOURCE
 #include <math.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -365,6 +379,209 @@ static void test_fninit(void) {
     check_d("FPU usable after fninit", out, 2.5);
 }
 
+// ----------------------------------------------- fptan, fyl2xp1, fdecstp
+
+static void test_fptan(void) {
+    static const double xs[] = {0.0, 0.5, 1.0, -1.0, 1.4};
+    for (volatile unsigned i = 0; i < sizeof xs / sizeof xs[0]; i++) {
+        double x = xs[i], t = 0, one = 0;
+        unsigned short sw = 0;
+        if (sigsetjmp(ill_jmp, 1) != 0) {
+            printf("FAIL: fptan(%g) raised signal %d\n", x, (int) ill_signo);
+            failures_total++;
+            continue;
+        }
+        // fptan replaces ST(0) with its tangent and pushes 1.0.
+        __asm__ volatile("fldl %3\n\tfptan\n\tfnstsw %2\n\tfstpl %1\n\tfstpl %0"
+                         : "=m"(t), "=m"(one), "=m"(sw) : "m"(x) : "memory");
+        char label[64];
+        snprintf(label, sizeof label, "fptan(%g)", x);
+        check_d(label, t, tan(x));
+        snprintf(label, sizeof label, "fptan(%g) pushed 1.0", x);
+        check_d(label, one, 1.0);
+        snprintf(label, sizeof label, "fptan(%g) C2", x);
+        check(label, (sw >> 10) & 1, 0);
+    }
+    // Out of range: C2 set, the operand left in place, nothing pushed.
+    if (sigsetjmp(ill_jmp, 1) == 0) {
+        double x = 1e30, out = 0;
+        unsigned short sw = 0;
+        __asm__ volatile("fldl %2\n\tfptan\n\tfnstsw %1\n\tfstpl %0"
+                         : "=m"(out), "=m"(sw) : "m"(x) : "memory");
+        check("fptan(1e30) C2", (sw >> 10) & 1, 1);
+        check_d("fptan(1e30) operand preserved", out, 1e30);
+    } else {
+        printf("FAIL: fptan(1e30) raised signal %d\n", (int) ill_signo);
+        failures_total++;
+    }
+}
+
+static void test_fyl2xp1(void) {
+    // ST(1) * log2(1 + ST(0)). Checked relative to the answer: at x = 1e-10
+    // the absolute error of forming 1 + x first is invisible next to 1e-12,
+    // and relative accuracy there is the instruction's reason to exist.
+    static const double xs[] = {1e-10, 0.25, -0.25};
+    static const double ys[] = {1.0, 3.0};
+    for (volatile unsigned i = 0; i < sizeof xs / sizeof xs[0]; i++) {
+        for (volatile unsigned j = 0; j < sizeof ys / sizeof ys[0]; j++) {
+            double x = xs[i], y = ys[j], out = 0;
+            if (sigsetjmp(ill_jmp, 1) != 0) {
+                printf("FAIL: fyl2xp1(%g, %g) raised signal %d\n", y, x, (int) ill_signo);
+                failures_total++;
+                continue;
+            }
+            __asm__ volatile("fldl %1\n\tfldl %2\n\tfyl2xp1\n\tfstpl %0"
+                             : "=m"(out) : "m"(y), "m"(x) : "memory");
+            double want = y * log1p(x) / log(2.0);
+            double rel = fabs(out - want) / fabs(want);
+            char label[128];
+            snprintf(label, sizeof label, "fyl2xp1(y=%g, x=%g) = %.17g, relative error <= 1e-12",
+                     y, x, out);
+            check(label, rel <= 1e-12, 1);
+        }
+    }
+}
+
+static void test_fdecstp(void) {
+    // TOP is bits 13:11 of the status word. fdecstp moves it down one, fincstp
+    // back up; the registers themselves do not move.
+    unsigned short before = 0, after = 0, back = 0;
+    if (sigsetjmp(ill_jmp, 1) != 0) {
+        printf("FAIL: fdecstp raised signal %d\n", (int) ill_signo);
+        failures_total++;
+        return;
+    }
+    __asm__ volatile("fnstsw %0\n\tfdecstp\n\tfnstsw %1\n\tfincstp\n\tfnstsw %2"
+                     : "=m"(before), "=m"(after), "=m"(back) : : "memory");
+    unsigned top0 = (before >> 11) & 7, top1 = (after >> 11) & 7, top2 = (back >> 11) & 7;
+    check("fdecstp moved TOP down one", top1, (top0 + 7) & 7);
+    check("fincstp moved it back", top2, top0);
+}
+
+// ------------------------------------------- fscale, fxtract, fprem
+
+// A 10-byte extended value, built from its bits: a denormal cannot come from a
+// double, and long double is 12 bytes on i386 and 16 on x86_64.
+struct ext {
+    uint64_t signif;
+    uint16_t se;
+} __attribute__((packed));
+
+#define SW_FLAGS 0x023f // IE DE ZE OE UE PE, and C1
+
+static void check_ext(const char *what, struct ext got, struct ext want) {
+    if (got.se == want.se && got.signif == want.signif) {
+        test_logf("  ok   %s = %04x:%016llx\n", what, got.se, (unsigned long long) got.signif);
+        return;
+    }
+    printf("FAIL: %s = %04x:%016llx (want %04x:%016llx)\n", what, got.se,
+           (unsigned long long) got.signif, want.se, (unsigned long long) want.signif);
+    failures_total++;
+}
+
+static void check_sw(const char *what, unsigned short sw, unsigned short want) {
+    sw &= SW_FLAGS;
+    if (sw == want) {
+        test_logf("  ok   %s status = %#05x\n", what, sw);
+        return;
+    }
+    printf("FAIL: %s status = %#05x (want %#05x; IE 1 DE 2 ZE 4 OE 8 UE 0x10 PE 0x20 C1 0x200)\n",
+           what, sw, want);
+    failures_total++;
+}
+
+// ST(0) = x, ST(1) = scale; returns the status word, stores the result.
+static unsigned short fscale_ext(struct ext x, struct ext scale, unsigned short cw, struct ext *out) {
+    unsigned short saved = 0, sw = 0;
+    __asm__ volatile("fnstcw %0" : "=m"(saved) :: "memory");
+    __asm__ volatile("fldcw %4\n\tfnclex\n\tfldt %3\n\tfldt %2\n\tfscale\n\t"
+                     "fnstsw %1\n\tfstpt %0\n\tfstp %%st(0)\n\tfldcw %5"
+                     : "=m"(*out), "=m"(sw) : "m"(x), "m"(scale), "m"(cw), "m"(saved) : "memory");
+    return sw;
+}
+
+static void test_fscale(void) {
+    static const struct {
+        const char *name;
+        struct ext x, scale;
+        unsigned short cw;
+        struct ext want;
+        unsigned short sw;
+    } cases[] = {
+        // Denormal operands, scaled within the range, out of it, and by 0.
+        {"fscale(denormal 0x123456789, 1)", {0x123456789, 0}, {0x8000000000000000, 0x3fff}, 0x037f,
+         {0x2468acf12, 0}, 0x002},
+        {"fscale(denormal, 0)", {0x123456789, 0}, {0, 0}, 0x037f, {0x123456789, 0}, 0x002},
+        {"fscale(denormal, -1): halfway, to even", {0x123456789, 0}, {0x8000000000000000, 0xbfff}, 0x037f,
+         {0x91a2b3c4, 0}, 0x032},
+        {"fscale(denormal, 31): the smallest exponent", {0x123456789, 0}, {0xf800000000000000, 0x4003}, 0x037f,
+         {0x91a2b3c480000000, 0x0001}, 0x002},
+        {"fscale(-denormal 1, 16445): -1.0", {1, 0x8000}, {0x807a000000000000, 0x400d}, 0x037f,
+         {0x8000000000000000, 0xbfff}, 0x002},
+        // A normal scaled down into the denormals, rounding there.
+        {"fscale(smallest normal + ulp, -1)", {0x8000000000000001, 0x0001}, {0x8000000000000000, 0xbfff}, 0x037f,
+         {0x4000000000000000, 0}, 0x030},
+        {"fscale(1.0, -16444): denormal 2", {0x8000000000000000, 0x3fff}, {0x8078000000000000, 0xc00d}, 0x037f,
+         {2, 0}, 0x000},
+        // Precision control does not apply: all 64 bits survive PC=24.
+        {"fscale(1 + 2^-63, 1) under PC=24", {0x8000000000000001, 0x3fff}, {0x8000000000000000, 0x3fff}, 0x007f,
+         {0x8000000000000001, 0x4000}, 0x000},
+        // Scales no int holds: out past the top, and away to nothing.
+        {"fscale(1.0, 2^32): overflow", {0x8000000000000000, 0x3fff}, {0x8000000000000000, 0x401f}, 0x037f,
+         {0x8000000000000000, 0x7fff}, 0x228},
+        {"fscale(1.0, -2^32): underflow", {0x8000000000000000, 0x3fff}, {0x8000000000000000, 0xc01f}, 0x037f,
+         {0, 0}, 0x030},
+        {"fscale(-denormal, +inf)", {0x123456789, 0x8000}, {0x8000000000000000, 0x7fff}, 0x037f,
+         {0x8000000000000000, 0xffff}, 0x002},
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        struct ext out = {0, 0};
+        unsigned short sw = fscale_ext(cases[i].x, cases[i].scale, cases[i].cw, &out);
+        check_ext(cases[i].name, out, cases[i].want);
+        check_sw(cases[i].name, sw, cases[i].sw);
+    }
+}
+
+static void test_fxtract(void) {
+    static const struct {
+        const char *name;
+        struct ext x, exp, sig;
+        unsigned short sw;
+    } cases[] = {
+        // 0x123456789 * 2^(-16382 - 63): the leading 1 is 31 places further down
+        {"fxtract(denormal 0x123456789)", {0x123456789, 0}, {0x803a000000000000, 0xc00d},
+         {0x91a2b3c480000000, 0x3fff}, 0x002},
+        {"fxtract(-smallest denormal)", {1, 0x8000}, {0x807a000000000000, 0xc00d},
+         {0x8000000000000000, 0xbfff}, 0x002},
+        {"fxtract(0.0)", {0, 0}, {0x8000000000000000, 0xffff}, {0, 0}, 0x004},
+    };
+    for (unsigned i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        struct ext e = {0, 0}, sig = {0, 0};
+        unsigned short sw = 0;
+        __asm__ volatile("fnclex\n\tfldt %3\n\tfxtract\n\tfnstsw %2\n\tfstpt %1\n\tfstpt %0"
+                         : "=m"(e), "=m"(sig), "=m"(sw) : "m"(cases[i].x) : "memory");
+        char label[96];
+        snprintf(label, sizeof label, "%s exponent", cases[i].name);
+        check_ext(label, e, cases[i].exp);
+        snprintf(label, sizeof label, "%s significand", cases[i].name);
+        check_ext(label, sig, cases[i].sig);
+        check_sw(cases[i].name, sw, cases[i].sw);
+    }
+}
+
+static void test_fprem_denormal(void) {
+    // 1.0 mod 0x123456789 * 2^-16445. C2 is looped on, as every caller does.
+    struct ext x = {0x8000000000000000, 0x3fff}, d = {0x123456789, 0}, out = {0, 0};
+    unsigned short sw = 0;
+    __asm__ volatile("fnclex\n\tfldt %3\n\tfldt %2\n"
+                     "1:\tfprem\n\tfnstsw %%ax\n\ttestw $0x400, %%ax\n\tjnz 1b\n\t"
+                     "movw %%ax, %1\n\tfstpt %0\n\tfstp %%st(0)"
+                     : "=m"(out), "=m"(sw) : "m"(x), "m"(d) : "eax", "cc", "memory");
+    check_ext("fprem(1.0, denormal)", out, (struct ext) {0x2946259a, 0});
+    // C1 is a quotient bit, not a rounding direction
+    check_sw("fprem(1.0, denormal)", sw & ~0x200, 0x002);
+}
+
 // -------------------------------------------------------------- fabs/fchs
 
 static void test_abs_chs(void) {
@@ -397,6 +614,12 @@ int main(int argc, char **argv) {
     test_pe_c1();
     test_fninit();
     test_abs_chs();
+    test_fptan();
+    test_fyl2xp1();
+    test_fdecstp();
+    test_fscale();
+    test_fxtract();
+    test_fprem_denormal();
 
     if (failures_total != 0) {
         printf("x87_fpu: FAIL failures=%u\n", failures_total);

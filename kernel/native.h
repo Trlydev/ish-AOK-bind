@@ -1,6 +1,8 @@
 #ifndef KERNEL_NATIVE_H
 #define KERNEL_NATIVE_H
 
+#include <stdbool.h>
+
 #include <stddef.h>
 #include <stdint.h>
 #include "misc.h"
@@ -57,12 +59,63 @@ struct native_program {
     // argv[0] is the name the caller invoked, as on any multicall binary.
     // envp is NULL-terminated. The return value becomes the exit status.
     int (*main)(int argc, char *const argv[], char *const envp[]);
+
+    // Runs as root however it was invoked, the way a setuid-root binary does.
+    //
+    // ONE flag rather than a mode and an owner, because two would be two
+    // things to disagree: fs/aok.c derives the mode it reports from this, and
+    // kernel/exec.c derives the credential change from this, so a program
+    // cannot end up looking setuid to stat(2) while gaining nothing on exec,
+    // or the reverse. That mismatch is how a security feature becomes a
+    // decoration.
+    //
+    // Safe here in a way it is NOT for smallclue: these are separate programs,
+    // so a setuid one cannot be talked into being `sh`. Setting it on a
+    // multicall entry point would hand every applet root. Anything carrying
+    // this flag is security-critical host code -- it runs unsandboxed in the
+    // app process -- and inherits the caller's environment, so it must
+    // sanitise what it trusts (PATH, IFS) itself.
+    bool setuid_root;
+
+    // ---- describing itself to a checkpoint (kernel/checkpoint.c) ----------
+    //
+    // A native program is a C function on a HOST thread. There is no
+    // serialising that stack, so a checkpoint cannot photograph one the way it
+    // photographs an emulated task -- and the project's rule is that a native
+    // program either knows how to DUMP ITS OWN STATE or the checkpoint refuses
+    // while it is running. This pair is the knowing half.
+    //
+    // ckpt_dump returns a malloc'd blob the same program can be re-launched
+    // with, or NULL if it cannot describe itself right now (which is a
+    // refusal, not a silent loss). It runs on the PROGRAM'S OWN THREAD, from
+    // its parking place in native_checkpoint, because that is the only thread
+    // its state exists on.
+    //
+    // ckpt_state_var names the environment variable through which a restored
+    // instance is told the descriptor its state arrives on. The restore
+    // creates a pipe, writes the blob, and dispatches -- which for a shell is
+    // exactly the channel its fork-by-relaunch child already uses, so nothing
+    // new has to be taught to the program itself.
+    //
+    // Both NULL means "cannot describe itself"; the checkpoint says so, by
+    // name.
+    char *(*ckpt_dump)(void);
+    const char *ckpt_state_var;
 };
 
 // NULL when no native program of that name is compiled into this build. Exec
 // then falls through to the ordinary path and runs the /AOK/native stub, which
 // reports the situation loudly rather than failing with ENOEXEC.
+// zsh's self-description, for the table's ckpt_dump slot. In kernel/zsh_glue.c.
+char *native_zsh_ckpt_dump(void);
+
 const struct native_program *native_program_lookup(const char *name);
+
+// The native program this task is RUNNING, or NULL. Set when the program is
+// dispatched and cleared when it ends; kernel/checkpoint.c asks so it can find
+// the ckpt_dump above without re-deriving the program from argv[0].
+struct task;
+const struct native_program *native_program_running(struct task *task);
 
 // Enumerating what this build actually has, so /AOK/native (fs/aok.c) is served
 // FROM the registry rather than from a second list beside it. Adding a native
@@ -94,6 +147,62 @@ int native_exec_set_pending(const struct native_program *prog, int argc,
 // from task_run_current, which covers a task whose very first image is native
 // and is therefore reached without any execve syscall returning.
 void native_exec_run_pending(void);
+
+// Marks the program just recorded by native_exec_set_pending as one a
+// checkpoint restore is bringing back rather than one being exec'd. Two things
+// change when it runs. A task whose terminal is held by one of its own jobs
+// waits for that job before the program starts, because a re-launched shell
+// has no job table and would otherwise read the terminal out from under it.
+// And a task that was an exec stand-in (standin_child != 0) resumes as that
+// wait instead of running its program at all. Call with current = the task.
+void native_exec_mark_restored(dword_t standin_child);
+// Whether the native program running on this thread was re-launched by a
+// checkpoint restore rather than started afresh (see native.c).
+bool native_program_was_restored(void);
+
+// The exec stand-in's wait, entered directly: waits for `child`, forwarding
+// signals, and exits with its status word. For a stand-in coming back from a
+// checkpoint. kernel/native_libc.c.
+//
+// Spelled __noreturn__, not noreturn: kernel/native_libc.h includes
+// <stdnoreturn.h>, whose `#define noreturn _Noreturn` turns the plain spelling
+// into an attribute clang does not know, and it is then dropped with only a
+// warning in every file that includes that header before this one.
+void nlibc_exec_standin_resume(dword_t child) __attribute__((__noreturn__));
+
+// exec from a native program, done for real. A native program cannot become
+// a guest image in the middle of a C function, so its exec is spawn-then-wait
+// (nlibc_exec_standin): the program runs as a CHILD, and the pid changes. For
+// a traced task that is not an exec at all to the one watching it. gdb starts
+// a program as `$SHELL -c 'exec prog'` under PTRACE_TRACEME and counts one trap
+// per exec; with $SHELL /AOK/native/zsh, the default login shell a release
+// asks people to use, the traced task never became `prog` -- an untraced child
+// ran it -- and gdb reported "During startup program exited normally" for
+// every program, while `set startup-with-shell off` worked.
+//
+// So a traced task's exec replaces its image in place, keeping its pid: the
+// exec commits (native_exec_in_place, kernel/native_io.c), and the program's
+// C stack is abandoned with a siglongjmp back to the native_exec_run_pending
+// that called its main, which returns into the new image -- or runs the next
+// program, if the exec was of a native one. What the program had allocated is
+// left behind, which is the price and why an untraced exec still stands in.
+//
+// Wanted when the task is traced and the unwind is safe: this thread is the
+// one native_exec_run_pending runs the program on, no shim call below is
+// mid-flight, the program has no threads of its own, and no host stdio lock is
+// held. Anything else keeps the stand-in.
+bool native_exec_in_place_wanted(void);
+// Whether this thread has a native_exec_run_pending to come back to, for the
+// task it is running.
+bool native_exec_landing_available(void);
+// The unwind itself; for native_exec_in_place, once the exec has committed.
+void native_exec_land(void) __attribute__((__noreturn__));
+// The shim's per-thread, per-program state, back to how a thread starts: once
+// a program has exec'd in place, the thread runs whatever comes next.
+// kernel/native_libc.c.
+void nlibc_program_state_reset(void);
+// Whether the calling thread is inside a host stdio callback. native_libc.c.
+bool nlibc_in_stdio(void);
 
 // Poll for pending signals and group-stops, and act on them.
 //

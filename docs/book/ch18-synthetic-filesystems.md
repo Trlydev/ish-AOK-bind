@@ -156,12 +156,16 @@ present and none can be taken away, because guest memory is the application's
 address space — and now says it, in 128 MiB blocks counted from `MemTotal`.
 
 **`lsns`** is the interesting one, because the missing piece was not a file at
-all. AOK already published all ten `/proc/<pid>/ns/*` links; what it did not do
+all. AOK already published the `/proc/<pid>/ns/*` links; what it did not do
 was answer questions *about* them. `lsns` is built almost entirely out of four
 ioctls, and `ENOTTY` to the first one made it give up and print nothing. The
-answers are all constrained by a fact AOK cannot change — there is exactly one
-namespace of each kind — and that turns out to be enough, because it is also
-true of a Linux box that has never created one. The distinctions matter, though:
+answers were written when there was exactly one namespace of each kind, and
+that turned out to be enough, because it is also true of a Linux box that has
+never created one; since 559 there can be more than one of six kinds, and the
+same four answer for those as Linux does. The links changed with them: what is
+listed is what can be made, so there is a `net` link and no `cgroup` or `time`
+one (Chapter 41 has what a listed kind that could not be made cost systemd and
+bubblewrap). The distinctions matter, though:
 `NS_GET_PARENT` is `EINVAL` for a kind that does not nest and `EPERM` for one
 that does but whose parent you may not see, and `lsns` uses exactly that
 difference to decide what is a hierarchy root. Reporting one for the other would
@@ -182,7 +186,7 @@ passes there too: 38 of its checks fail on the commit before this one.
 The fork adds a directory that no Linux has:
 
 ```sh
-cat /proc/ish/version        # iSH-AOK 1.3 (553)
+cat /proc/ish/version        # iSH-AOK 1.3 (557)
 cat /proc/ish/host_info      # the Mac or iPad underneath: OS, release, hardware
 cat /proc/ish/ips            # this device's network interfaces
 cat /proc/ish/colors         # the 16 ANSI colours, drawn -- a quick theme check
@@ -200,7 +204,19 @@ preference to its default.
 
 **`/proc/ish/<arch>_jit_fuse`** is Chapter 6's measurement surface: the
 instruction-fusion bits, readable and writable at run time, in the same variable
-the translator consults.
+the translator consults. 557 added more of the same kind: `hle` turns Chapter 8's
+interception on and off live, `jit_inherit` the fork-time copying of translated
+blocks (Chapter 6), `arm64_mops` the MOPS feature bit (Chapter 15), and
+`jit_timing` counts the time spent translating once a 1 is written to it. And
+one that only the host can answer: `host_vm` lists where the app's own memory
+is, by the host's region tags — the footprint jetsam kills on, then resident,
+dirty and compressed megabytes per tag — written when a game's race took the
+app from 1 GB to 3.9 GB and nothing inside the guest could say where it went.
+559 added three: `jit_cache`, the "Cache Translated Code" setting from inside
+the guest with the cache's counters (Chapter 15); `fault_reports`, which
+chooses which guest faults the kernel log reports (Chapter 28); and
+`host_fds`, the host descriptors every guest file, socket and pipe is made of,
+counted by kind against the limit.
 
 Both exist for the same reason, which is worth stating as a design principle. An
 app setting that can only be changed by tapping a switch cannot be scripted, and
@@ -242,6 +258,12 @@ for the shape is the argument of Section 18.4 restated: a device rather than a
 command, because it "composes with redirection and pipes the way a shell expects,
 and needs no binary in the guest filesystem". The command-line build has no iOS
 to ask, so these four exist only in the app.
+
+557 added the largest node of the family, and the one exception to that rule:
+`/dev/dri/renderD128` (`fs/virtgpu.c`), a virtio-gpu render node that stock Mesa
+drives and that replays the guest's Vulkan onto Metal in-process. Metal is on
+the Mac too, so it is in every Darwin build, the command-line one included
+(Chapter 32).
 
 Two of the standard nodes are worth a note too. `/dev/kmsg` is the kernel log, which the
 driver had always implemented and no rootfs had ever had a node for, so every

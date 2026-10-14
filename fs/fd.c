@@ -1,6 +1,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel/pid_ns.h"
 #include "debug.h"
 #include "kernel/calls.h"
 #include "kernel/resource.h"
@@ -14,6 +15,40 @@
 
 int fd_getflags(struct fd *fd);
 
+// Records the credentials an open was made under (Linux's f_cred), from
+// `current`. A descriptor can be made with no task running -- the console's
+// tty at startup, a restore before any task is current -- and then there are
+// no credentials to record; nothing is allowed to match an unknown one.
+//
+// Separate from fd_create because the checkpoint restore calls it again: it
+// reopens a process's descriptors before that process has its own
+// credentials back, and re-stamps them once it does.
+void fd_open_creds_stamp(struct fd *fd) {
+    if (current == NULL) {
+        fd->open_creds.known = false;
+        return;
+    }
+    fd->open_creds.known = true;
+    fd->open_creds.tgid = current->tgid;
+    fd->open_creds.exec_gen = current->exec_gen;
+    fd->open_creds.uid = current->uid;
+    fd->open_creds.gid = current->gid;
+    fd->open_creds.euid = current->euid;
+    fd->open_creds.egid = current->egid;
+    fd->open_creds.suid = current->suid;
+    fd->open_creds.sgid = current->sgid;
+    fd->open_creds.fsuid = current->fsuid;
+    fd->open_creds.fsgid = current->fsgid;
+}
+
+bool fd_pwrite_appends(const struct fd *fd) {
+    if (fd->pwrite_append == FD_PWRITE_APPEND_FORCE)
+        return true;
+    if (fd->pwrite_append == FD_PWRITE_APPEND_NEVER)
+        return false;
+    return (fd->flags & O_APPEND_) != 0;
+}
+
 struct fd *fd_create(const struct fd_ops *ops) {
     struct fd *fd = malloc(sizeof(struct fd));
     if (fd == NULL)
@@ -26,12 +61,28 @@ struct fd *fd_create(const struct fd_ops *ops) {
     fd->mount_flags = 0;
     fd->offset = 0;
     fd->stat.ctime = (dword_t)time(NULL);
+    fd_open_creds_stamp(fd);
     list_init(&fd->poll_fds);
     lock_init(&fd->poll_lock, "fd_create_poll\0");
     lock_init(&fd->lock, "fd_create\0");
     lock_init(&fd->dir_pos_lock, "fd_dirpos\0");
     cond_init(&fd->cond);
     return fd;
+}
+
+bool fd_open_creds_match(struct fd *fd) {
+    if (!fd->open_creds.known || current == NULL)
+        return false;
+    return fd->open_creds.tgid == current->tgid &&
+           fd->open_creds.exec_gen == current->exec_gen &&
+           fd->open_creds.uid == current->uid &&
+           fd->open_creds.gid == current->gid &&
+           fd->open_creds.euid == current->euid &&
+           fd->open_creds.egid == current->egid &&
+           fd->open_creds.suid == current->suid &&
+           fd->open_creds.sgid == current->sgid &&
+           fd->open_creds.fsuid == current->fsuid &&
+           fd->open_creds.fsgid == current->fsgid;
 }
 
 struct fd *fd_retain(struct fd *fd) {
@@ -86,6 +137,8 @@ int fd_close(struct fd *fd) {
             inode_release(fd->inode);
         if (fd->mount)
             mount_release(fd->mount);
+        if (fd->bind_mount)
+            mount_release(fd->bind_mount);
         free(fd);
 //        fd = NULL; // KLUGE?
     }
@@ -225,6 +278,26 @@ static int fdtable_expand(struct fdtable *table, fd_t max) {
     return fdtable_resize(table, max + 1);
 }
 
+// Whether f_install would find a descriptor now: a free slot below
+// RLIMIT_NOFILE, or room to grow the table to one. Linux reserves the
+// descriptor before accept() takes a connection off the queue
+// (get_unused_fd_flags, then do_accept), so a process at its limit gets
+// EMFILE at once and the connection stays queued for later. Taking the
+// connection first and failing to install it closed it: the client was
+// dropped. Another thread can still take the slot in between; accept then
+// fails on install as before, which is no worse.
+bool f_has_room(void) {
+    struct fdtable *table = current->files;
+    lock(&table->lock, 0);
+    unsigned limit = (unsigned) rlimit(RLIMIT_NOFILE_);
+    unsigned size = limit < table->size ? limit : table->size;
+    bool room = size < limit;
+    for (unsigned f = 0; !room && f < size; f++)
+        room = table->files[f] == NULL;
+    unlock(&table->lock);
+    return room;
+}
+
 struct fd *fdtable_get(struct fdtable *table, fd_t f) {
     if (f < 0 || (unsigned) f >= table->size)
         return NULL;
@@ -326,6 +399,39 @@ static int fdtable_finish_close(struct fd *fd, struct fdtable *owner) {
 // Detach and close in one step, for the two callers where no other thread can
 // be sharing this table -- fdtable_release runs when the last reference is
 // gone, and fdtable_do_cloexec runs on execve, after the other threads have
+// Put `fd` at an exact descriptor number, growing the table if it is short.
+//
+// f_install cannot do this -- it picks the lowest free number, which is the
+// right rule for open(2) and the wrong one for a restore, where the number is
+// part of what is being restored. dup2 has the mechanism but not the shape:
+// it copies an existing descriptor rather than adopting a new one.
+//
+// Takes ownership of `fd` on success, and closes it on failure, so a caller
+// never has to decide which. Anything already at that number is closed.
+int fdtable_install_at(struct fdtable *table, fd_t f, struct fd *fd, bool cloexec) {
+    if (f < 0) {
+        fd_close(fd);
+        return _EBADF;
+    }
+    lock(&table->lock, 0);
+    int err = fdtable_expand(table, f);
+    if (err < 0) {
+        unlock(&table->lock);
+        fd_close(fd);
+        return err;
+    }
+    struct fd *replaced = fdtable_detach(table, f);
+    table->files[f] = fd;
+    if (cloexec)
+        bit_set(f, table->cloexec);
+    else
+        bit_clear(f, table->cloexec);
+    unlock(&table->lock);
+    if (replaced != NULL)
+        fdtable_finish_close(replaced, table);
+    return 0;
+}
+
 // already been reaped. Anywhere else, use fdtable_detach and close outside
 // the lock; see the note above.
 static int fdtable_close(struct fdtable *table, fd_t f) {
@@ -400,7 +506,9 @@ static int fd_setown(struct fd *fd, pid_t_ who) {
     unlock(&pids_lock);
     if (!target_exists)
         return _ESRCH;
-    fd->owner = who;
+    // Kept as the machine's number (kernel/pid_ns.h): whoever asks later
+    // may be in another pid namespace.
+    fd->owner = who > 0 ? current_pid_global(who) : -current_pid_global(-who);
     return 0;
 }
 
@@ -553,9 +661,18 @@ dword_t sys_close_range(dword_t first, dword_t last, dword_t flags) {
 }
 
 int fd_getflags(struct fd *fd) {
-    if (fd->ops->getflags)
-        return fd->ops->getflags(fd);
-    return fd->flags;
+    // An O_PATH descriptor is a location, not an open file: Linux reports
+    // O_PATH and the lookup flags it was opened with, never an access mode --
+    // and no filesystem's getflags knows of it (realfs asks the host, whose
+    // open was an ordinary read-only one).
+    if (fd->flags & O_PATH_)
+        return fd->flags & (O_PATH_ | O_DIRECTORY_ | O_NOFOLLOW_);
+    int flags = fd->ops->getflags ? fd->ops->getflags(fd) : (int) fd->flags;
+    if (flags < 0)
+        return flags;
+    // Linux drops the creation flags once the open is done (do_dentry_open),
+    // and O_CLOEXEC is a descriptor flag (F_GETFD), never a status flag.
+    return flags & ~(O_CREAT_ | O_EXCL_ | O_NOCTTY_ | O_TRUNC_ | O_CLOEXEC_);
 }
 
 #define FD_ALLOWED_FLAGS (O_APPEND_ | O_NONBLOCK_)
@@ -571,6 +688,14 @@ static dword_t sys_fcntl_common(fd_t f, dword_t cmd, guest_addr_t arg, bool gues
     struct fd *fd = f_get_retain(f);
     if (fd == NULL)
         return _EBADF;
+    // An O_PATH descriptor answers only what is about the descriptor itself
+    // (Linux's check_fcntl_cmd); locks, seals, owners and status flags are
+    // about an open file, which it is not: EBADF.
+    if ((fd->flags & O_PATH_) && cmd != F_DUPFD_ && cmd != F_DUPFD_CLOEXEC_ &&
+            cmd != F_GETFD_ && cmd != F_SETFD_ && cmd != F_GETFL_) {
+        fd_close(fd);
+        return _EBADF;
+    }
     struct flock32_ flock32;
     struct flock_ flock;
     // struct flock_/flock32_ append an iSH-internal comm[16] after the guest-
@@ -635,7 +760,7 @@ static dword_t sys_fcntl_common(fd_t f, dword_t cmd, guest_addr_t arg, bool gues
 
         case F_GETOWN_:
             STRACE("fcntl(%d, F_GETOWN)", f);
-            ret = (dword_t) fd->owner;
+            ret = (dword_t) (fd->owner >= 0 ? current_pid_shown(fd->owner) : -current_pid_shown(-fd->owner));
             break;
         case F_SETOWN_: {
             pid_t_ who = (pid_t_) arg;
@@ -652,7 +777,7 @@ static dword_t sys_fcntl_common(fd_t f, dword_t cmd, guest_addr_t arg, bool gues
         case F_GETOWN_EX_: {
             STRACE("fcntl(%d, F_GETOWN_EX)", f);
             struct f_owner_ex_ owner_ex;
-            pid_t_ who = fd->owner;
+            pid_t_ who = fd->owner >= 0 ? current_pid_shown(fd->owner) : -current_pid_shown(-fd->owner);
             if (who < 0) {
                 owner_ex.type = F_OWNER_PGRP_;
                 owner_ex.pid = -who;

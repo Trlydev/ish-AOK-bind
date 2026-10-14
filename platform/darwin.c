@@ -8,6 +8,7 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 #include "kernel/errno.h"
+#include "kernel/task.h"   // guest_uptime_ticks, guest_cpu_usage_total
 #include "platform/platform.h"
 #include "debug.h"
 
@@ -20,9 +21,10 @@ struct cpu_usage get_total_cpu_usage(void) {
     // workload usage, and on a device running other apps this made the guest
     // see near-100% idle even while iSH itself was pegging a core. Use this
     // process's own cumulative user/system time instead; Mach has no
-    // per-process "idle" concept, so derive it from wall-clock uptime across
-    // the configured cpu count instead.
-    struct cpu_usage usage = {0};
+    // per-process "idle" concept, so the kernel derives idle from the guest's
+    // uptime across the configured cpu count (guest_cpu_usage_total), and keeps
+    // every field from running backward while it does.
+    uint64_t user_ns = 0, system_ns = 0;
     struct task_absolutetime_info info;
     mach_msg_type_number_t count = TASK_ABSOLUTETIME_INFO_COUNT;
     kern_return_t kr = task_info(mach_task_self(), TASK_ABSOLUTETIME_INFO,
@@ -30,15 +32,15 @@ struct cpu_usage get_total_cpu_usage(void) {
     if (kr == KERN_SUCCESS) {
         mach_timebase_info_data_t timebase;
         mach_timebase_info(&timebase);
-        double ns_per_mach_tick = (double) timebase.numer / (double) timebase.denom;
-        usage.user_ticks = (uint64_t) (info.total_user * ns_per_mach_tick / 10000000.0);
-        usage.system_ticks = (uint64_t) (info.total_system * ns_per_mach_tick / 10000000.0);
+        // Integer, and exact: numer is 125 on Apple silicon, so this stays in
+        // range for ~190 years of CPU time.
+        user_ns = info.total_user * timebase.numer / timebase.denom;
+        system_ns = info.total_system * timebase.numer / timebase.denom;
     }
-
-    struct uptime_info uptime = get_uptime();
-    uint64_t elapsed_ticks = (uint64_t) get_cpu_count() * uptime.uptime_ticks;
-    uint64_t busy_ticks = usage.user_ticks + usage.system_ticks;
-    usage.idle_ticks = elapsed_ticks > busy_ticks ? elapsed_ticks - busy_ticks : 0;
+    // A refused task_info() reports nothing new rather than zero: the ledger
+    // keeps what it reported last.
+    struct cpu_usage usage = {0};
+    guest_cpu_usage_total(user_ns, system_ns, &usage);
     return usage;
 }
 
@@ -202,88 +204,84 @@ CFTimeInterval getSystemUptime(void) {
 }
 
 struct uptime_info get_uptime(void) {
-    struct timeval now;
-    if (gettimeofday(&now, NULL) != 0) {
-        printk("ERROR: in gettimeofday() call\n");
-    }
-    // The guest's boot, set where pid 1 is created (kernel/init.c). NOT the
-    // host's kern.boottime, which this used to read into a local and never
-    // use: had it been used it would have reported when the DEVICE last
-    // booted, which is further from the truth than the value it ignored.
-    extern time_t boot_time;
-
-    struct {
-        uint32_t ldavg[3];
-        long scale;
-    } vm_loadavg;
-    size_t size = sizeof(vm_loadavg);
-    if (sysctlbyname("vm.loadavg", &vm_loadavg, &size, NULL, 0) != 0) {
-        printk("ERROR: in sysctlbyname(vm.loadavg) call\n");
-    }
-
-    // Adjust the scale of load averages
-    for (int i = 0; i < 3; i++) {
-        if (FSHIFT < 16)
-            vm_loadavg.ldavg[i] <<= 16 - FSHIFT;
-        else
-            vm_loadavg.ldavg[i] >>= FSHIFT - 16;
-    }
-
+    // Since the GUEST booted (kernel/init.c sets boot_time where pid 1 is
+    // created), on a monotonic clock. NOT the host's kern.boottime, which
+    // would report when the DEVICE last booted. It was whole seconds of wall
+    // clock -- `(gettimeofday().tv_sec - boot_time) * 100` -- which is what
+    // made /proc/stat's idle time run backward; guest_uptime_ns in
+    // kernel/task.c has the measurements and the choice of clock.
+    //
+    // The load averages are left 0. They were the HOST's, from
+    // sysctlbyname("vm.loadavg") on every call -- measured at 0.8 microseconds
+    // a call, paid three times per /proc/stat read and once per task created
+    // -- and nothing read them: /proc/loadavg and sysinfo(2) report the
+    // guest's own average (get_guest_loadavg), the only one a guest should see.
     struct uptime_info uptime = {
-        .uptime_ticks = (now.tv_sec - boot_time) * 100, // Ensure this calculation is as intended
-        .load_1m = vm_loadavg.ldavg[0],
-        .load_5m = vm_loadavg.ldavg[1],
-        .load_15m = vm_loadavg.ldavg[2],
+        .uptime_ticks = guest_uptime_ticks(),
     };
     return uptime;
 }
 
-int get_cpu_count(void) {
-     int ncpu = 1;
-     size_t size = sizeof(int);
-     sysctlbyname("hw.ncpu", &ncpu, &size, NULL, 0);
-     const char *override = getenv("ISH_GUEST_CPU_COUNT");
-     if (override != NULL && override[0] != '\0') {
-         long forced = strtol(override, NULL, 10);
-         if (forced > 0)
-             ncpu = (int) forced;
-     }
- #if TARGET_OS_OSX && defined(__aarch64__)
-     // Standalone CLI / macOS dev harness: default to 4 emulated CPUs so local
-     // and fakefs repro runs reproduce the concurrency -- and the TLB/COW/futex/
-     // heap races -- of a multi-core device, instead of the old 2-core cap that
-     // hid that whole class of bug. 4 exposes real parallelism without
-     // oversubscribing a big host (this branch is macOS-only; the iOS app is not
-     // TARGET_OS_OSX and keeps the true hw.ncpu). Override with
-     // ISH_GUEST_CPU_COUNT=N (e.g. =6 to match a device, =1 to force serial).
-     else
-         ncpu = 4;
- #endif
-     if (ncpu < 1)
-         ncpu = 1;
-     return ncpu;
+// The guest's CPUs, in the shape Linux gives a process in a cpuset or under
+// taskset: every CPU is online -- /proc/cpuinfo, /proc/stat's cpuN lines,
+// /proc/interrupts and /sys/devices/system/cpu list them all -- and the
+// affinity mask names the ones it may run on -- sched_getaffinity (nproc, Go's
+// GOMAXPROCS, Rust's available_parallelism, musl's sysconf) and
+// /proc/<pid>/status's Cpus_allowed. glibc's sysconf reads /sys, so on glibc
+// _SC_NPROCESSORS_ONLN is the online count, as it is there under taskset.
+//
+// On iOS the mask is smaller than the machine. Multi-threaded guest programs
+// start one thread per CPU they may use, and under emulation that many busy
+// threads saturates every core, starving the app's UI and drowning the guest
+// in lock, futex and TLB-shootdown overhead (Go compiles faster with fewer).
+// So a third of the cores (at least one) are left out of it.
+//
+// History: 555 had this shape. 096531e8 (in 556's cycle) took a report of
+// "nproc 6, /proc/cpuinfo 9" for a bug and cut every view to the reduced
+// count, so a 9-core M4 iPad listed 6 CPUs and three real cores disappeared;
+// caught on the device before 556 shipped, and put back.
+//
+// ISH_GUEST_CPU_COUNT=N sets both counts to N, with nothing reserved.
+// ISH_GUEST_CPU_RESERVE=1 applies the iOS reservation on the Mac as well, so
+// the CLI reaches the shape a device reports (tests/manual/cpu_count_agree).
+static int cpu_count_forced(void) {
+    const char *override = getenv("ISH_GUEST_CPU_COUNT");
+    long forced = override != NULL && override[0] != '\0' ? strtol(override, NULL, 10) : 0;
+    return forced > 0 ? (int) forced : 0;
 }
 
-// The number of CPUs to advertise to guest scheduler-sizing queries
-// (sched_getaffinity / nproc), as opposed to the true core count reported by
-// /proc/cpuinfo and /proc/stat. Multi-threaded guest workloads spawn one OS
-// thread per "available" CPU -- e.g. the Go runtime sets GOMAXPROCS from
-// sched_getaffinity, and `make -j$(nproc)` from nproc -- and under emulation
-// running hw.ncpu such threads saturates every core, both starving the app UI
-// and drowning the guest in lock/futex/TLB-shootdown overhead (Go actually
-// compiles *faster* with fewer threads). On iOS we reserve roughly a third of
-// the cores (at least one) so those programs leave headroom; /proc/cpuinfo
-// still reports the true count, so htop and friends show all CPUs.
-int get_cpu_count_for_affinity(void) {
+int get_cpu_count(void) {
+    int forced = cpu_count_forced();
+    if (forced > 0)
+        return forced;
+    int ncpu = 1;
+    size_t size = sizeof(int);
+    sysctlbyname("hw.ncpu", &ncpu, &size, NULL, 0);
+#if TARGET_OS_OSX && defined(__aarch64__)
+    // Standalone CLI / macOS dev harness: default to 4 emulated CPUs so local
+    // and fakefs repro runs reproduce the concurrency -- and the TLB/COW/futex/
+    // heap races -- of a multi-core device, instead of the old 2-core cap that
+    // hid that whole class of bug. 4 exposes real parallelism without
+    // oversubscribing a big host (this branch is macOS-only; the iOS app is not
+    // TARGET_OS_OSX and keeps the true hw.ncpu). Override with
+    // ISH_GUEST_CPU_COUNT=N (e.g. =6 to match a device, =1 to force serial).
+    ncpu = 4;
+#endif
+    if (ncpu < 1)
+        ncpu = 1;
+    return ncpu;
+}
+
+int get_cpu_count_allowed(void) {
     int ncpu = get_cpu_count();
-#if TARGET_OS_IPHONE
-    if (getenv("ISH_GUEST_CPU_COUNT") == NULL && ncpu > 2) {
+    if (cpu_count_forced() > 0)
+        return ncpu;
+    if ((TARGET_OS_IPHONE || getenv("ISH_GUEST_CPU_RESERVE") != NULL) && ncpu > 2) {
         int reserve = ncpu / 3;
         if (reserve < 1)
             reserve = 1;
         ncpu -= reserve;
     }
-#endif
     if (ncpu < 1)
         ncpu = 1;
     return ncpu;
@@ -703,6 +701,13 @@ static long mem_headroom_threshold_mb(void) {
 #define MEM_HEADROOM_CEILING_FRACTION 6
 #define MEM_HEADROOM_FRACTION_CAP (512ull * 1024 * 1024)
 
+// How much more machine-wide free memory a CRITICAL pressure notification asks
+// for than a warn does, before it refuses guest growth. This is what keeps
+// CRITICAL stronger than warn now that it is weighed against a reading rather
+// than believed on its own: at 4x the floor it refuses well before warn would,
+// and still only while the machine really is short. See host_mem_headroom_low.
+#define HOST_MEM_CRITICAL_FLOOR_SCALE 4ull
+
 uint64_t host_mem_headroom_floor(void) {
     uint64_t configured = (uint64_t) mem_headroom_threshold_mb() * 1024 * 1024;
     if (configured == 0)
@@ -823,9 +828,31 @@ bool host_mem_headroom_low(void) {
     // refused every mmap the shell needed and produced no output at all.
     // Warn instead drives the throttle (host_mem_should_reclaim), which slows
     // the guest and pages memory out without denying it anything.
-    if (host_mem_pressure_level() >= HOST_MEM_PRESSURE_CRITICAL)
-        return true;
-
+    //
+    // But CRITICAL is a NOTIFICATION, not a measurement, and it used to return
+    // true here on its own. dispatch delivers it on a level CHANGE, so the value
+    // is a latch: once raised it stands until the system chooses to send
+    // something else, and if it never does then every guest mmap in the app is
+    // refused for the rest of the process's life.
+    //
+    // MEASURED on a device, 2026-09-07, and it is why this is not a
+    // refinement. `stress --vm-bytes 5.5G` raised CRITICAL, the 5 GB mapping
+    // was refused (right), and then NINE SECONDS LATER -- with stress dead and
+    // its memory returned -- a 1 MiB mapping for the shell was refused too:
+    //
+    //     MEMORY PRESSURE CRITICAL (was normal): footprint 4915 MB, own headroom 1228 MB
+    //     WARNING: 744(stress) mmap refused, low iOS memory headroom (len=0x140001000)
+    //     WARNING: 745(zsh) mmap refused, low iOS memory headroom (len=0x100000)
+    //
+    // 1228 MB of our own headroom, and no "MEMORY PRESSURE normal" line ever
+    // followed. Every later command failed the same way, so the guest was
+    // bricked until the app restarted.
+    //
+    // So the notification now has to agree with a reading taken NOW. The SE
+    // case it was written for still refuses -- there the machine had 40 MB free,
+    // which is under any floor -- while a stale latch over a machine that has
+    // recovered no longer vetoes anything. CRITICAL stays stronger than warn by
+    // being weighed against a larger floor rather than by skipping the check.
     // And the DEVICE's own free memory, against the same floor. This guard was
     // written around a per-process ceiling, which is the right instrument when
     // the ceiling is much smaller than the machine -- and useless when it is not.
@@ -860,11 +887,17 @@ bool host_mem_headroom_low(void) {
     // that precedes a jetsam kill -- which is exactly where this last fired
     // usefully: pressure at WARN with 325 MB left, refusing the guest at
     // 1248 MB where it had previously run to 1.86 GB and been killed.
-    if (host_mem_pressure_level() >= HOST_MEM_PRESSURE_WARN) {
+    unsigned pressure = host_mem_pressure_level();
+    if (pressure >= HOST_MEM_PRESSURE_WARN) {
+        uint64_t floor = host_mem_headroom_floor();
+        if (pressure >= HOST_MEM_PRESSURE_CRITICAL &&
+                floor <= UINT64_MAX / HOST_MEM_CRITICAL_FLOOR_SCALE)
+            floor *= HOST_MEM_CRITICAL_FLOOR_SCALE;
         struct mem_usage machine = get_mem_usage();
-        if (machine.available != 0 && machine.available < host_mem_headroom_floor())
+        if (machine.available != 0 && machine.available < floor)
             return true;
     }
+
 
     // Fresh, not the 10 ms sample -- this is the jetsam guard, and the case for
     // paying a Mach trap here is measured out above mem_budget_read().
@@ -1614,4 +1647,85 @@ int host_mem_release_probe(unsigned long mb, char *report, size_t report_size) {
     else
         release_probe_printf(&r, "PAGER DESIGN: NOT VIABLE on this host -- no release primitive moved phys_footprint on ordinary anonymous memory, so there is no headroom for a pager to buy back and the design family in docs/simulated_swap_plan.md is dead here.\n");
     return 0;
+}
+
+// ---- the host's descriptor limit -------------------------------------------
+#include <sys/stat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+
+static long long host_fd_limit_started = -2; // -2: not recorded yet
+
+static long long host_fd_rlim(rlim_t v) {
+    return v == RLIM_INFINITY ? -1 : (long long) v;
+}
+
+void host_raise_fd_limit(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0)
+        return;
+    if (host_fd_limit_started == -2)
+        host_fd_limit_started = host_fd_rlim(rl.rlim_cur);
+    rlim_t want = rl.rlim_max;
+    // Darwin refuses a soft limit above kern.maxfilesperproc, RLIM_INFINITY
+    // included, with EINVAL.
+    int per_proc = 0;
+    size_t len = sizeof(per_proc);
+    if (sysctlbyname("kern.maxfilesperproc", &per_proc, &len, NULL, 0) == 0 && per_proc > 0) {
+        if (want == RLIM_INFINITY || want > (rlim_t) per_proc)
+            want = (rlim_t) per_proc;
+    } else if (want == RLIM_INFINITY) {
+        want = 10240; // OPEN_MAX, which every Darwin accepts
+    }
+    if (rl.rlim_cur != RLIM_INFINITY && (want == RLIM_INFINITY || want > rl.rlim_cur)) {
+        rl.rlim_cur = want;
+        // A refusal leaves the limit where it was, which is where it has
+        // always been.
+        (void) setrlimit(RLIMIT_NOFILE, &rl);
+    }
+}
+
+struct host_fd_usage host_fd_usage(void) {
+    struct host_fd_usage usage = {.highest = -1, .soft = -1, .hard = -1, .started = -1};
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+        usage.soft = host_fd_rlim(rl.rlim_cur);
+        usage.hard = host_fd_rlim(rl.rlim_max);
+    }
+    usage.started = host_fd_limit_started == -2 ? usage.soft : host_fd_limit_started;
+    // Ask about each number the table has had room for. The table only
+    // grows, so this covers every descriptor open now; it is bounded so that
+    // an enormous limit does not make the reading itself slow.
+    long top = getdtablesize();
+    if (top < 0 || top > 1 << 20)
+        top = 1 << 20;
+    int misses = 0;
+    for (long fd = 0; fd < top; fd++) {
+        struct stat st;
+        int res = fstat((int) fd, &st);
+        if (res == 0 || errno != EBADF) {
+            usage.open++;
+            usage.highest = fd;
+            misses = 0;
+            // (A failure other than EBADF is something open that fstat
+            // will not describe. It counts as other.)
+            if (res != 0)
+                usage.other++;
+            else if (S_ISREG(st.st_mode))
+                usage.files++;
+            else if (S_ISDIR(st.st_mode))
+                usage.dirs++;
+            else if (S_ISSOCK(st.st_mode))
+                usage.sockets++;
+            else if (S_ISFIFO(st.st_mode))
+                usage.pipes++;
+            else
+                usage.other++;
+        } else if (++misses > 65536) {
+            break; // a long way past the last one in use
+        }
+    }
+    return usage;
 }

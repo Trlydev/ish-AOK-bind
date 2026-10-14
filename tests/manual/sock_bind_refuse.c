@@ -88,11 +88,45 @@ static int connect_errno(int port, double *ms_out) {
     return e;
 }
 
+// Ten consecutive ports that are free right now, or -1.
+//
+// They used to be 19000 + (pid % 400) * 10, "so concurrent suite runs do not
+// collide". Guests share their host's loopback, and two guests started the
+// same way run this test with the SAME pid; and the exchange at the end
+// leaves a connection in TIME_WAIT on its server port (the server closes
+// first), which refuses a new bind of that port for half a minute -- on
+// Linux as well. So a second run inside that half minute, in another guest
+// or in this one again, failed its last step with EADDRINUSE and nothing
+// wrong anywhere. Asked of the host itself: a bind alone would not ask, as
+// AOK keeps a bind to itself until the socket listens or connects.
+static int free_ports(void) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    unsigned seed = (unsigned) getpid() * 2654435761u ^ (unsigned) now.tv_nsec ^ (unsigned) now.tv_sec;
+    for (int tries = 0; tries < 200; tries++) {
+        seed = seed * 1103515245u + 12345u;
+        int base = 19000 + (int) ((seed >> 8) % 800) * 10;
+        int ok = 1;
+        for (int i = 0; i < 10 && ok; i++) {
+            int s = mk();
+            ok = bind_to(s, base + i) == 0 && listen(s, 1) == 0;
+            close(s);
+        }
+        if (ok)
+            return base;
+    }
+    return -1;
+}
+
 int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(90));
-    // Ports are picked from the pid so concurrent suite runs do not collide.
-    int base = 19000 + (getpid() % 400) * 10;
+    int base = free_ports();
+    if (base < 0) {
+        printf("FAIL setup: no ten free ports between 19000 and 27000\n");
+        failures_total++;
+        return finish_suite("sock_bind_refuse");
+    }
 
     // ---- what a connection to each port state does ------------------------
     {

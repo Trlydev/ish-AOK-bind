@@ -31,6 +31,27 @@ NS_ASSUME_NONNULL_BEGIN
 // placement outright.
 @property (nonatomic) BOOL accessoryBarExternallyHosted;
 
+// Taking keyboard focus brings up the software keyboard when no hardware one
+// is attached. A touch (or the Workspace window coming to the front) takes it
+// only for a hardware keyboard: takeKeyboardFocusFromTouch. Auto-Show
+// Keyboard takes it when the display opens, unless the keyboard was put away
+// from the menu (keyboardPutAway, cleared by the menu's Show Keyboard):
+// takeKeyboardFocusIfWanted. Every tap used to take it, so on an iPad with no
+// keyboard the software one came back on each click in the desktop.
+@property (nonatomic) BOOL keyboardPutAway;
+- (void)takeKeyboardFocusIfWanted;
+- (void)takeKeyboardFocusFromTouch;
+
+// Frames straight from the guest for the desktop whose VNC port is `display`
+// (wl-present, fs/virtgpu.h). While they flow, directFrames is YES: the view
+// shows them instead of the RFB client's pixels, pauses the client's
+// framebuffer updates (VNC then carries only input), maps the pointer to
+// their size, and leaves the cursor to them (they have it drawn in). When the
+// presenter goes away the view goes back to VNC's pixels.
+- (void)startDirectFramesForDisplay:(uint32_t)display;
+- (void)stopDirectFrames;
+@property (nonatomic, readonly) BOOL directFrames;
+
 // The accessory key row (esc/tab/ctrl/alt/super/arrows) alone, no container,
 // lazily built. For accessoryBarExternallyHosted use: the owner embeds this
 // in its own container view with its own constraints. Deliberately NOT the

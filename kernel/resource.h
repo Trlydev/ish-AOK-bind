@@ -50,6 +50,16 @@ dword_t sys_prlimit64_guest(pid_t_ pid, dword_t resource, guest_addr_t new_limit
 dword_t sys_old_getrlimit32(dword_t resource, addr_t rlim_addr);
 
 rlim_t_ rlimit(int resource);
+// Both halves of one of the caller's limits.
+struct rlimit_ rlimit_both(int resource);
+// RLIMIT_CPU: the signal due for `used_ns` of process CPU time, if any, with
+// the soft limit raised past a SIGXCPU. Call with group->lock held. See
+// kernel/resource.c.
+struct tgroup;
+int rlimit_cpu_due_locked(struct tgroup *group, uint64_t used_ns);
+// Start the process's CPU sampler (kernel/time.c) so a finite RLIMIT_CPU is
+// enforced. Takes group->lock.
+void cpu_limit_watch(struct tgroup *group);
 
 struct rusage_ {
     struct timeval_ utime;
@@ -93,6 +103,16 @@ struct tgroup;
 struct rusage_ rusage_get_current(void);
 struct rusage_ rusage_get_group(void);
 struct rusage_ rusage_get_group_of(struct tgroup *group);
+// A live process's usage and its reaped children's -- Linux's RUSAGE_BOTH,
+// which wait4 reports for a child it finds stopped or continued. The caller
+// holds pids_lock; takes group->lock.
+struct rusage_ rusage_get_group_both_pids_locked(struct tgroup *group);
+// The same process-wide sum, utime and stime only (nothing else is filled):
+// /proc/<pid>/stat. Takes pids_lock and group->lock.
+struct rusage_ rusage_get_group_cpu_of(struct tgroup *group);
+// One thread's own utime and stime (nothing else is filled), live or already
+// exited: /proc/<pid>/task/<tid>/stat. Takes task->group->lock.
+struct rusage_ rusage_get_thread_cpu(struct task *task);
 // One live thread's usage, for the per-thread CPU clocks (kernel/time.c).
 struct rusage_ rusage_get_task(struct task *task);
 void rusage_add(struct rusage_ *dst, struct rusage_ *src);

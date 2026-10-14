@@ -1,6 +1,25 @@
 #include "gadgets.h"
 #include "emu/interrupt.h"
 
+# [vec_align16][orig_ip], after the address of a legacy-SSE 128-bit memory
+# operand is computed: MOVAPS/MOVDQA and the packed ops require it 16-byte
+# aligned, and a misaligned one is #GP(0) at the instruction -- SIGSEGV,
+# SI_KERNEL, no address, as Linux reports it (camd, both ABIs). The unaligned
+# forms (MOVUPS, MOVDQU, LDDQU, PCMPxSTRx) and the sub-128-bit operands never
+# get this gadget (jit/gen.c, vec_noalign).
+.gadget vec_align16
+    tst _addr, 15
+    b.ne 1f
+    gret 1
+1:
+    str xzr, [_cpu, CPU_segfault_addr]
+    strb wzr, [_cpu, CPU_segfault_was_write]
+    strb wzr, [_cpu, CPU_segfault_reported]
+    ldr x8, [_ip]
+    mov eip, w8
+    mov x0, INT_GPF
+    b jit_exit
+
 .gadget push
     sub _addr, esp, 4
     write_prep 32, push
@@ -16,6 +35,15 @@
     add esp, esp, 4
     gret 1
     read_bullshit 32, pop
+
+# [esp_add][delta]: ESP += delta (32 bits, so a negative delta wraps). _tmp and
+# the flags are untouched. The stack instructions jit/gen.c spells as loads and
+# stores at [esp+off] (16-bit PUSH/POP, PUSHA/POPA, CALLW/RETW) move ESP with
+# this once every access has succeeded; see gen_stack_access.
+.gadget esp_add
+    ldr w8, [_ip]
+    add esp, esp, w8
+    gret 1
 
 # ---- `push <reg>` / `pop <reg>` in ONE gadget ----
 #
@@ -91,13 +119,13 @@
     .gadget addr_\name
         ldr _addr, [_ip]
         add _addr, _addr, \reg
-        gret 1
+        gret_nomem 1
 .endm
 .each_reg x
 .purgem x
 .gadget addr_none
     ldr _addr, [_ip]
-    gret 1
+    gret_nomem 1
 .gadget_list addr, REG_LIST
 
 # Address-computation FUSED into the memory-operand load/store, saving one whole
@@ -324,6 +352,92 @@
 .endr
 .popsection
 
+# ---- `movzx <reg32>, byte/word [<base>+disp]` in ONE gadget ----
+#
+#     [fused_load16_mem_<base>][disp][orig_ip][zero_extend_16][store32_reg_<dst>]
+#     [fused_movzx16_<dst>_<base>][disp][orig_ip]
+#
+# ldrb/ldrh write all 32 bits of the guest register, zero-extended, which is
+# movzx's whole definition. Same slow-path reasoning as fmr32 above. movzwl was
+# 2.1% and movzbl 1.0% of 7-Zip's i386 instructions (2026-10-04), almost all
+# base+disp.
+.macro fmrz size, s, dst_name, dst, base_name, base
+    .gadget fused_movzx\size\()_\dst_name\()_\base_name
+        ldr _addr, [_ip]
+        add _addr, _addr, \base
+        add _ip, _ip, 8
+        read_prep \size, fmrz\size\()_\dst_name\()_\base_name
+        ldr\s \dst, [_xaddr]
+        gret 1
+        read_bullshit \size, fmrz\size\()_\dst_name\()_\base_name
+.endm
+.macro fmrz8_row dst_name, dst
+    .macro fmrz8_col base_name, base
+        fmrz 8, b, \dst_name, \dst, \base_name, \base
+    .endm
+    .each_reg fmrz8_col
+    .purgem fmrz8_col
+.endm
+.each_reg fmrz8_row
+.purgem fmrz8_row
+.macro fmrz16_row dst_name, dst
+    .macro fmrz16_col base_name, base
+        fmrz 16, h, \dst_name, \dst, \base_name, \base
+    .endm
+    .each_reg fmrz16_col
+    .purgem fmrz16_col
+.endm
+.each_reg fmrz16_row
+.purgem fmrz16_row
+.purgem fmrz
+
+# ---- `mov word [<base>+disp], <reg16>` in ONE gadget ----
+#
+# fmw32's 16-bit twin: strh stores the register's low half. write_done stays,
+# for the page-straddling store (a 2-byte store at offset 0xfff). movw stores
+# were 1.9% of 7-Zip's i386 instructions (2026-10-04).
+.macro fmw16 src_name, src, base_name, base
+    .gadget fused_movrm16_\src_name\()_\base_name
+        ldr _addr, [_ip]
+        add _addr, _addr, \base
+        add _ip, _ip, 8
+        write_prep 16, fmw16_\src_name\()_\base_name
+        strh \src, [_xaddr]
+        write_done 16, fmw16_\src_name\()_\base_name
+        gret 1
+        write_bullshit 16, fmw16_\src_name\()_\base_name
+.endm
+.macro fmw16_row src_name, src
+    .macro fmw16_col base_name, base
+        fmw16 \src_name, \src, \base_name, \base
+    .endm
+    .each_reg fmw16_col
+    .purgem fmw16_col
+.endm
+.each_reg fmw16_row
+.purgem fmw16_row
+.purgem fmw16
+
+# [reg * 8 + base], REG_LIST order. Name pasting in macros: see math.S xfrr_quad.
+.macro fmx_quad kind, reg, base
+    .quad NAME(gadget_fused_\kind\()_\reg\()_\base)
+.endm
+.macro fmx_table kind
+    .global.name fused_\kind\()_gadgets
+.endm
+.pushsection_rodata
+.irp kind, movzx8,movzx16,movrm16
+    fmx_table \kind
+    .irp reg, REG_LIST
+        .irp base, REG_LIST
+            fmx_quad \kind, \reg, \base
+        .endr
+    .endr
+.endr
+.popsection
+.purgem fmx_quad
+.purgem fmx_table
+
 # ---- `lea <reg>, [<base>+disp]` in ONE gadget ----
 #
 # LEA is 18.4% of the instructions that reach gen_mov in this repo's own i386
@@ -351,7 +465,7 @@
     .gadget fused_lea32_\dst_name\()_\base_name
         ldr w8, [_ip]
         add \dst, w8, \base
-        gret 1
+        gret_nomem 1
 .endm
 
 .macro flea32_row dst_name, dst
@@ -386,7 +500,7 @@
             .else N .ifc \times,8
                 add _addr, _addr, \reg, lsl 3
             .endif N .endif N .endif N .endif
-            gret
+            gret_nomem
     .endr
 .endm
 .each_reg x
@@ -402,10 +516,207 @@ NAME(si_gadgets):
 .endr
 .popsection
 
+# ---- `[<base> + <index>*<scale> + disp]` in ONE address gadget ----
+#
+#     [addr_<base>][disp][si_<index>_<scale>]   3 words, 2 dispatches
+#     [fused_addr_si_<base>_<index>_<scale>][disp]   2 words, 1
+#
+# Emitted by gen_addr() for every scaled-index operand with a base (the
+# address fusion into the memory op declines this form, so it always paid
+# both). Same result in _addr as the pair, so whatever consumes the address
+# -- a load, store, ALU op, x87 or SSE operand -- is unchanged. Scale is
+# baked in (4 per pair) so the gadget is two instructions and needs no
+# stream word for it. In 7-Zip ~3% of i386 instructions (byte loads and
+# compares through an index, mostly) take this form.
+.macro fasi base_name, base, index_name, index, times, shift
+    .gadget fused_addr_si_\base_name\()_\index_name\()_\times
+        ldr _addr, [_ip]
+        add _addr, _addr, \base
+        add _addr, _addr, \index, lsl \shift
+        gret_nomem 1
+.endm
+.macro fasi_row base_name, base
+    .macro fasi_col index_name, index
+        fasi \base_name, \base, \index_name, \index, 1, 0
+        fasi \base_name, \base, \index_name, \index, 2, 1
+        fasi \base_name, \base, \index_name, \index, 4, 2
+        fasi \base_name, \base, \index_name, \index, 8, 3
+    .endm
+    .each_reg fasi_col
+    .purgem fasi_col
+.endm
+.each_reg fasi_row
+.purgem fasi_row
+.purgem fasi
+
+# [(base * 8 + index) * 4 + log2(scale)], REG_LIST order for both registers.
+.macro fasi_quad base, index, times
+    .quad NAME(gadget_fused_addr_si_\base\()_\index\()_\times)
+.endm
+.pushsection_rodata
+.global.name fused_addr_si_gadgets
+.irp base, REG_LIST
+    .irp index, REG_LIST
+        .irp times, 1,2,4,8
+            fasi_quad \base, \index, \times
+        .endr
+    .endr
+.endr
+.popsection
+.purgem fasi_quad
+
 .gadget seg_gs
     ldr w8, [_cpu, CPU_tls_ptr]
     add _addr, _addr, w8
     gret
+
+# An FS override on i386: FS's base (emu/i386_sreg.c).
+.gadget seg_fs
+    ldr w8, [_cpu, CPU_i386_fs_base]
+    add _addr, _addr, w8
+    gret
+
+# The segment-register moves, MOV r/m, Sreg (8C), MOV Sreg, r/m (8E), PUSH and
+# POP of one, under emu/i386_sreg.c's model and Linux's rules (camd): CS reads
+# 0x23 and the rest what was last loaded; a selector loads into ES, DS, FS or
+# GS if it is null, names GDT entry 4, 5, 6 or 15, or a filled TLS entry
+# (12-14), whatever its RPL; SS takes RPL 3 only, and 0x2b or a TLS entry not
+# read_exec_only. LDT selectors never load. A load into FS or GS takes that
+# TLS entry's base (0 otherwise) as i386_fs_base / tls_ptr. A refusal is
+# #GP(sel & 0xfffc) at the instruction, a POP's ESP as it was. Operands
+# [orig_ip][sreg] (MOV to a register: [sreg | 16-bit << 8]).
+#define I386_TLS_MIN 12
+.macro i386_sreg_get                    /* w10 = the selector Sreg x11 reads */
+    mov  w10, 0x23
+    cmp  w11, 1                         /* CS */
+    b.eq .Lsg\@
+    mov  x10, CPU_i386_sreg             /* (past an add's 12-bit immediate) */
+    add  x10, _cpu, x10
+    ldrh w10, [x10, x11, lsl 1]
+.Lsg\@:
+.endm
+.macro i386_sreg_set                    /* selector w10 into Sreg x11, or #GP. Clobbers x12-x14 */
+    tbnz w10, 2, i386_sreg_gp           /* an LDT selector */
+    lsr  w13, w10, 3
+    sub  w12, w13, I386_TLS_MIN
+    cmp  w12, 3
+    b.hs .Lnotls\@
+    mov  w14, 12                        /* sizeof(struct i386_tls_desc) */
+    mov  x13, CPU_i386_tls
+    add  x13, _cpu, x13
+    umaddl x12, w12, w14, x13           /* x12 = the TLS entry */
+    b    .Ltls\@
+.Lnotls\@:
+    mov  x12, 0
+.Ltls\@:
+    cmp  w11, 2                         /* SS */
+    b.ne .Lnotss\@
+    and  w13, w10, 3
+    cmp  w13, 3
+    b.ne i386_sreg_gp
+    cmp  w10, 0x2b
+    b.eq .Lok\@
+    cbz  x12, i386_sreg_gp
+    ldr  w13, [x12, 8]
+    cbz  w13, i386_sreg_gp
+    tbnz w13, 3, i386_sreg_gp           /* read_exec_only */
+    b    .Lok\@
+.Lnotss\@:
+    lsr  w13, w10, 3
+    cbz  w13, .Lok\@
+    cmp  w13, 15
+    b.eq .Lok\@
+    sub  w14, w13, 4
+    cmp  w14, 2
+    b.ls .Lok\@                         /* 4, 5, 6 */
+    cbz  x12, i386_sreg_gp
+    ldr  w13, [x12, 8]
+    cbz  w13, i386_sreg_gp
+.Lok\@:
+    mov  x13, CPU_i386_sreg
+    add  x13, _cpu, x13
+    strh w10, [x13, x11, lsl 1]
+    mov  w14, 0
+    cbz  x12, .Lbase\@
+    ldr  w14, [x12]
+.Lbase\@:
+    cmp  w11, 4                         /* FS */
+    b.ne .Lgs\@
+    str  w14, [_cpu, CPU_i386_fs_base]
+.Lgs\@:
+    cmp  w11, 5                         /* GS */
+    b.ne .Ldone\@
+    str  x14, [_cpu, CPU_tls_ptr]
+.Ldone\@:
+.endm
+i386_sreg_gp:
+    str  xzr, [_cpu, CPU_segfault_addr]
+    strb wzr, [_cpu, CPU_segfault_was_write]
+    strb wzr, [_cpu, CPU_segfault_reported]
+    and  w10, w10, 0xfffc
+    mov  x0, INT_GPF_CODE_BASE
+    orr  x0, x0, x10
+    ldr  x8, [_ip]
+    mov  eip, w8
+    b    jit_exit
+
+.macro i386_sreg_reg_pair name, reg
+.gadget sreg_to_\name                   /* [sreg | 16-bit << 8], gret 1 */
+    ldr  x8, [_ip]
+    and  x11, x8, 7
+    i386_sreg_get
+    tbz  x8, 8, 1f
+    bfi  \reg, w10, 0, 16
+    gret 1
+1:  mov  \reg, w10
+    gret 1
+.gadget sreg_from_\name                 /* [orig_ip][sreg], gret 2 */
+    ldr  x11, [_ip, 8]
+    uxth w10, \reg
+    i386_sreg_set
+    gret 2
+.endm
+.each_reg i386_sreg_reg_pair
+
+.gadget sreg_to_mem                     /* two bytes; [orig_ip][sreg], gret 2 */
+    write_prep 16, sreg_to_mem
+    ldr  x11, [_ip, 8]
+    i386_sreg_get
+    strh w10, [_xaddr]
+    write_done 16, sreg_to_mem
+    gret 2
+    write_bullshit 16, sreg_to_mem
+.gadget sreg_from_mem                   /* two bytes; [orig_ip][sreg], gret 2 */
+    read_prep 16, sreg_from_mem
+    ldrh w10, [_xaddr]
+    ldr  x11, [_ip, 8]
+    i386_sreg_set
+    gret 2
+    read_bullshit 16, sreg_from_mem
+
+.macro i386_sreg_stack bits, s
+.gadget push_sreg\bits                  /* zero-extended, as AMD stores it; [orig_ip][sreg], gret 2 */
+    sub  _addr, esp, (\bits / 8)
+    write_prep \bits, push_sreg\bits
+    ldr  x11, [_ip, 8]
+    i386_sreg_get
+    str\s w10, [_xaddr]
+    write_done \bits, push_sreg\bits
+    sub  esp, esp, (\bits / 8)
+    gret 2
+    write_bullshit \bits, push_sreg\bits
+.gadget pop_sreg\bits                   /* the low word loaded; [orig_ip][sreg], gret 2 */
+    mov  _addr, esp
+    read_prep \bits, pop_sreg\bits
+    ldrh w10, [_xaddr]
+    ldr  x11, [_ip, 8]
+    i386_sreg_set
+    add  esp, esp, (\bits / 8)
+    gret 2
+    read_bullshit \bits, pop_sreg\bits
+.endm
+i386_sreg_stack 16, h
+i386_sreg_stack 32,
 
 .irp type, read,write
 
@@ -449,6 +760,8 @@ segfault_\type:
         mov w0, 1
     .endif
     strb w0, [_cpu, CPU_segfault_was_write]
+    mov w0, 1
+    strb w0, [_cpu, CPU_segfault_reported]
     ldr x0, [_ip]
     mov eip, w0
     sub w8, esp, 4

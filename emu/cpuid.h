@@ -6,7 +6,12 @@
 #include "kernel/abi.h"
 extern bool isGlibC;
 
+// cpuid_tables_init's override while it fills the amd64 and i386 tables:
+// -1 none, else the long mode to answer for.
+extern int cpuid_long_mode_override;
 static inline bool cpuid_guest_supports_long_mode(void) {
+    if (cpuid_long_mode_override >= 0)
+        return cpuid_long_mode_override;
     return current != NULL && current->abi == GUEST_ABI_AMD64;
 }
 
@@ -24,20 +29,15 @@ static inline dword_t cpuid_extended_max_leaf(void) {
 
 // ---- XSAVE state components ------------------------------------------------
 //
-// We support x87, SSE, AVX (YMM_Hi128) and the three AVX-512 components. MPX
-// (states 3 and 4) is not implemented, so it is absent from XCR0 and the later
-// components are packed up against the AVX one. Software is required to take
-// component offsets from CPUID leaf 0x0D rather than assume a fixed map -- real
-// silicon varies here too, since Ice Lake dropped MPX exactly like this -- so
-// the only hard requirement is that this table and the offsets the XSAVE
-// implementation uses agree.
-//
-// There is no XSAVE implementation yet, so this table is currently the only
-// definition of the map and nothing derives from it. Leaf 0x0D answers
-// unconditionally all the same, which is harmless only because
-// CPUID_ADVERTISE_VECTOR_STATE keeps the leaf-1 XSAVE bit dark: software
-// checks that bit before it goes looking here. Whoever writes XSAVE/XRSTOR
-// must take its offsets from these constants rather than repeat them.
+// x87, SSE, AVX (YMM_Hi128) and the three AVX-512 components. MPX (states 3
+// and 4) is not implemented, so it is absent from XCR0, but its space stays
+// where Intel's standard format puts it: the offsets are Sapphire Rapids'
+// (and every Intel AVX-512 part's since MPX went), which debuggers that read
+// an XSAVE image by XCR0 and size rather than by CPUID -- gdb's Intel layout
+// -- expect. AMD's Zen 4 packs the AVX-512 components up against AVX
+// instead; AOK is GenuineIntel. Leaf 0x0D reports these, emu/xsave.h and the
+// XSAVE/XRSTOR gadgets (jit/gadgets-aarch64/x87.S, through jit/offsets.c)
+// use them.
 #define XCR0_X87_       (1u << 0)
 #define XCR0_SSE_       (1u << 1)
 #define XCR0_YMM_       (1u << 2)
@@ -53,13 +53,13 @@ static inline dword_t cpuid_extended_max_leaf(void) {
 #define XSAVE_HEADER_SIZE_   64
 #define XSAVE_YMM_OFFSET_    576            // 512 + 64
 #define XSAVE_YMM_SIZE_      256            // 16 regs * 16 bytes of ymm_hi
-#define XSAVE_OPMASK_OFFSET_ 832            // 576 + 256
+#define XSAVE_OPMASK_OFFSET_ 1088           // (MPX's BNDREGS 960 and BNDCSR 1024 before it)
 #define XSAVE_OPMASK_SIZE_   64             // k0-k7, 8 bytes each
-#define XSAVE_ZMM_HI_OFFSET_ 896            // 832 + 64
-#define XSAVE_ZMM_HI_SIZE_   1024           // 16 regs * 32 bytes (bits 256-511)
-#define XSAVE_HI16_OFFSET_   1920           // 896 + 1024
+#define XSAVE_ZMM_HI_OFFSET_ 1152
+#define XSAVE_ZMM_HI_SIZE_   512            // 16 regs * 32 bytes (bits 256-511)
+#define XSAVE_HI16_OFFSET_   1664
 #define XSAVE_HI16_SIZE_     1024           // regs 16-31, 64 bytes each
-#define XSAVE_MAX_SIZE_      2944           // 1920 + 1024
+#define XSAVE_MAX_SIZE_      2688           // 1664 + 1024
 
 // XCR0 as XGETBV(0) reports it. iSH is the OS, so every component we support
 // is permanently enabled: there is no CR4.OSXSAVE to clear and no path for a
@@ -70,33 +70,28 @@ static inline qword_t xcr0_value(void) {
     return XCR0_SUPPORTED_;
 }
 
-// Whether to tell guests the vector state exists.
+// Whether to tell guests the vector state exists: AVX, AVX2, FMA, F16C, the
+// AVX-512 families, BF16, AVX-VNNI, AES-NI, PCLMULQDQ and GFNI, and XSAVE.
 //
-// The machinery below (leaf 7, leaf 0x0D, XGETBV, XCR0) is complete and
-// tested, but advertising AVX is only SAFE once the extended vector state
-// survives a signal. Until then glibc would start selecting AVX string
-// routines, those run inside signal handlers too, and a handler clobbering
-// ymm_hi has nowhere to restore it from -- kernel/signal.c's amd64_fpstate_ is
-// static_asserted to the 512-byte legacy FXSAVE layout, which holds only the
-// low 128 bits of xmm[0-15]. That would trade today's dormant gap for silent
-// register corruption in any program taking a signal mid-AVX, which is a
-// strictly worse bug than the one we are fixing.
+// On an aarch64 host, yes. Every VEX and EVEX instruction is gadgets or #UD
+// (jit/gen.c; tests/manual/x86/*_vex_ud.c and *_evex_ud.c check every
+// encoding against Intel's answer), in both guests; XSAVE and XRSTOR are
+// gadgets (jit/gadgets-aarch64/x87.S); and the extended state rides through
+// a signal frame -- the XSAVE math frame with Linux's magics, restored by
+// sigreturn -- ptrace's NT_X86_XSTATE and exec (emu/xsave.h,
+// tests/manual/x86/x86_xsave.c). That was what kept this dark: advertising
+// AVX while a signal handler could clobber ymm_hi with nothing to restore it
+// from would have traded a dormant gap for silent register corruption.
+// tests/manual/x86/cpuid_xsave.c runs an instruction for every bit set here,
+// on both guest ABIs (these bits are ABI-independent).
 //
-// So the enumeration lands dark and this flips to 1 in the same commit that
-// teaches the signal frame (and ptrace's regsets) to carry ymm_hi, zmm_hi,
-// xmm_ext and the opmask registers. XSAVE/XRSTOR must land with it too: bit 26
-// below promises those instructions exist, and today nothing implements them.
-//
-// The signal frame is not the only debt. Flipping this to 1 and running
-// tests/manual/x86/cpuid_xsave.c on an i386 guest reports thirteen features
-// advertised that the guest cannot execute: every AVX-512 bit (the i386 front
-// end reaches vector code only through gen_vex32, which is VEX-only -- there
-// is no EVEX decoder), BMI1 and BMI2, and the legacy SSE encodings of AESNI
-// and PCLMULQDQ. The amd64 guest is in better shape but shares the XSAVE gap.
-// Run that test on BOTH guest ABIs before believing the switch is safe: these
-// bits are advertised from ABI-independent functions, so i386 gets whatever
-// amd64 is promised.
+// Elsewhere (the x86_64-host backend, which Linux CI builds) the vector
+// instructions are the interpreter's and XSAVE is #UD, so it stays dark.
+#if defined(__aarch64__)
+#define CPUID_ADVERTISE_VECTOR_STATE 1
+#else
 #define CPUID_ADVERTISE_VECTOR_STATE 0
+#endif
 
 static inline dword_t cpuid_leaf1_ecx_features(void) {
     dword_t features = 0;
@@ -116,10 +111,10 @@ static inline dword_t cpuid_leaf1_ecx_features(void) {
     // encoding-restricted to long mode).
     features |= (1 << 23);  // popcnt
 #if CPUID_ADVERTISE_VECTOR_STATE
-    // AESNI and PCLMULQDQ go with the vector switch rather than ahead of it:
-    // avx_regress covers their VEX forms, but advertising them makes OpenSSL
-    // and friends emit the LEGACY SSE encodings, which is a separate claim
-    // needing its own evidence before it is made.
+    // AESNI and PCLMULQDQ go with the vector switch rather than ahead of it.
+    // Advertising them makes OpenSSL and friends emit the LEGACY SSE
+    // encodings: those are gadgets too now (jit/gadgets-aarch64/evex.inc),
+    // checked against an AMD Ryzen and SDE in tests/manual/x86/*_avx512_ext.c.
     features |= (1 << 1);   // pclmulqdq
     features |= (1 << 25);  // aesni
     // The XSAVE feature set (XSAVE/XRSTOR/XGETBV), and since we are the OS the
@@ -129,6 +124,12 @@ static inline dword_t cpuid_leaf1_ecx_features(void) {
     features |= (1 << 26);  // xsave
     features |= (1 << 27);  // osxsave
     features |= (1 << 28);  // avx
+    features |= (1 << 12);  // fma
+    features |= (1 << 29);  // f16c
+    // MOVBE (gadgets on aarch64 hosts, as the rest here): with LZCNT and
+    // LAHF_LM (leaf 0x80000001) it completes x86-64-v3, which glibc's
+    // hwcaps levels -- and distributions built for v3 -- look for.
+    features |= (1 << 22);  // movbe
 #endif
     // cmpxchg16b is implemented for the amd64 (long-mode) guest, so advertise it
     // -- feature-detecting software (glibc, C++ 128-bit lock-free CAS) checks
@@ -144,10 +145,67 @@ static inline dword_t cpuid_leaf1_edx_features(void) {
         | (1 << 4)    // tsc
         | (1 << 8)    // cx8
         | (1 << 15)   // cmov
+        // CLFLUSH (0F AE /7 mem) is a no-op in both engines -- the amd64 one in
+        // amd64_fxsave_op, which the JIT reaches through its 0f-rm bridge, and
+        // the i386 one in emu/decode.h's 0f ae group -- and a no-op is the
+        // correct emulation: there is one coherent view of guest memory, so
+        // there is no cache line to write back. HotSpot's x86_64 build refuses
+        // to start without this bit and the line size in leaf 1 EBX.
+        | (1 << 19)   // clflush
         | (1 << 23)   // mmx
         | (1 << 24)   // fxsr
         | (1 << 25)   // sse
         | (1 << 26);  // sse2
+}
+
+// Leaf 1 EAX, the processor signature: family 6, model 0, stepping 0.
+//
+// This was 0, and family 0 is not a harmless "unknown". Software treats a
+// family of 4 or below as a 486 or older, and HotSpot is the one that matters:
+// VM_Version::get_processor_features reads the feature bits only when
+// cpu_family() > 4, so every JVM saw no SSE2 at all and the x86_64 build
+// refused to start.
+//
+// Family 6 because every Intel core since the Pentium Pro is family 6. Model
+// 0 because no family-6 part uses it, and that is the point: software that
+// keys tuning on the model number finds nothing to key on and falls back to
+// the feature bits, exactly as it did at family 0. So the only thing that
+// moves is the "family > 4" kind of test. A real model is not neutral:
+//   - glibc 2.41 marks model 0x55 (Skylake-SP, which /proc/cpuinfo used to
+//     claim) Avoid_Non_Temporal_Memset, and that moves memset's ifunc from
+//     __memset_sse2_unaligned_erms to __memset_sse2_unaligned. Nehalem and
+//     Westmere models turn on Fast_Unaligned_Copy and friends, which move
+//     memmove and the strcpy family. The Atom models move more.
+//     `ld.so --list-diagnostics` in an amd64 glibc root shows the difference:
+//     at model 0 the only lines that change are the family and the raw
+//     leaf-1 words (and CLFSH, now set).
+//   - HotSpot pads every jump in generated code on the JCC-erratum models
+//     (compute_has_intel_jcc_erratum), and keys other choices on Skylake.
+//   - gcc's -march=native names a microarchitecture from a known model and
+//     guesses one from the feature bits otherwise. At model 0 gcc 14 passes
+//     the same -m/-mno- list as it did at family 0, and names it nehalem
+//     rather than core2.
+// Both guest ABIs get it: a 32-bit HotSpot has the same family > 4 test and
+// otherwise runs with no SSE at all.
+#define CPUID_SIGNATURE_FAMILY_   6u
+#define CPUID_SIGNATURE_MODEL_    0u
+#define CPUID_SIGNATURE_STEPPING_ 0u
+
+static inline dword_t cpuid_leaf1_eax_signature(void) {
+    // Family 6 keeps the model's high nibble in the extended-model field,
+    // bits 19:16; the extended family (27:20) is used only for family 15.
+    return ((CPUID_SIGNATURE_MODEL_ >> 4) << 16)
+        | (CPUID_SIGNATURE_FAMILY_ << 8)
+        | ((CPUID_SIGNATURE_MODEL_ & 0xf) << 4)
+        | CPUID_SIGNATURE_STEPPING_;
+}
+
+// Leaf 1 EBX: APIC ID 0 in 31:24, no logical-processor count in 23:16 (HTT is
+// not advertised, so it would mean nothing), and the CLFLUSH line size in
+// 15:8, counted in 8-byte units: 8 = 64 bytes, which is what every x86_64
+// part reports and the only value HotSpot accepts.
+static inline dword_t cpuid_leaf1_ebx(void) {
+    return 8u << 8;
 }
 
 // Leaf 7 subleaf 0: the structured extended feature flags. Everything here is
@@ -171,22 +229,46 @@ static inline dword_t cpuid_leaf7_ebx_features(void) {
         | (1u << 8)     // bmi2
         | (1u << 16)    // avx512f
         | (1u << 17)    // avx512dq
+        | (1u << 21)    // avx512_ifma
+        | (1u << 28)    // avx512cd
         | (1u << 30)    // avx512bw
         | (1u << 31);   // avx512vl
 #endif
 }
 
+// UMIP (bit 2): SGDT, SIDT, SMSW, SLDT and STR behave as on a UMIP processor
+// under Linux 5.10, which spoofs them (jit/gen.c UMIP_MEM) -- the JIT's
+// gadgets on an aarch64 host; elsewhere they are #UD.
+#if defined(__aarch64__)
+#define CPUID_LEAF7_ECX_UMIP (1u << 2)
+#else
+#define CPUID_LEAF7_ECX_UMIP 0u
+#endif
 static inline dword_t cpuid_leaf7_ecx_features(void) {
 #if !CPUID_ADVERTISE_VECTOR_STATE
-    return 0;
+    return CPUID_LEAF7_ECX_UMIP;
 #else
-    return (1u << 1)    // avx512_vbmi
+    return CPUID_LEAF7_ECX_UMIP
+        | (1u << 1)     // avx512_vbmi
         | (1u << 6)     // avx512_vbmi2
         | (1u << 8)     // gfni
         | (1u << 9)     // vaes
         | (1u << 10)    // vpclmulqdq
         | (1u << 11)    // avx512_vnni
-        | (1u << 14);   // avx512_vpopcntdq
+        | (1u << 12)    // avx512_bitalg
+        | (1u << 14)    // avx512_vpopcntdq
+        | (1u << 22);   // rdpid
+#endif
+}
+
+// Leaf 7 subleaf 1's EAX: AVX-VNNI (the VEX forms of VPDPBUSD and friends)
+// and AVX512_BF16.
+static inline dword_t cpuid_leaf7_1_eax_features(void) {
+#if !CPUID_ADVERTISE_VECTOR_STATE
+    return 0;
+#else
+    return (1u << 4)    // avx_vnni
+        | (1u << 5);    // avx512_bf16
 #endif
 }
 
@@ -204,8 +286,10 @@ static inline void cpuid_leaf_d(dword_t subleaf, dword_t *eax, dword_t *ebx,
             *ecx = XSAVE_MAX_SIZE_;
             break;
         case 1:
-            // No XSAVEOPT/XSAVEC/XGETBV1/XSAVES: plain XSAVE and XRSTOR only,
-            // so every bit here stays clear and software falls back to them.
+            // XSAVEOPT (XSAVE's gadget: its optimizations allow it to skip
+            // a write, never require it); no XSAVEC, XGETBV1 or XSAVES, so
+            // software that would compact falls back to XSAVE.
+            *eax = CPUID_ADVERTISE_VECTOR_STATE ? 1 : 0;
             break;
         case 2:
             *eax = XSAVE_YMM_SIZE_;
@@ -228,8 +312,15 @@ static inline void cpuid_leaf_d(dword_t subleaf, dword_t *eax, dword_t *ebx,
     }
 }
 
+// LAHF/SAHF in 64-bit mode (x86-64-v2) and LZCNT ("abm", x86-64-v3): both
+// gadgets on aarch64 hosts. (Leaf 0x80000001 is the amd64 guest's only.)
 static inline dword_t cpuid_leaf80000001_ecx_features(void) {
+#if !CPUID_ADVERTISE_VECTOR_STATE
     return 0;
+#else
+    return (1u << 0)    // lahf_lm
+        | (1u << 5);    // abm (lzcnt)
+#endif
 }
 
 static inline dword_t cpuid_leaf80000001_edx_features(void) {
@@ -237,6 +328,9 @@ static inline dword_t cpuid_leaf80000001_edx_features(void) {
     if (cpuid_guest_supports_long_mode()) {
         features |= (1 << 11); // syscall/sysret
         features |= (1 << 29); // lm
+#if CPUID_ADVERTISE_VECTOR_STATE
+        features |= (1 << 27); // rdtscp (gadgets on aarch64 hosts; IA32_TSC_AUX is getcpu's CPU)
+#endif
     }
     return features;
 }
@@ -255,17 +349,20 @@ static inline void do_cpuid(dword_t *eax, dword_t *ebx, dword_t *ecx, dword_t *e
             *ecx = 0x6c65746e; // ntel
             break;
         case 1:
-            *eax = 0x0; // say nothing about cpu model number
-            *ebx = 0x0; // processor number 0, flushes 0 bytes on clflush
+            *eax = cpuid_leaf1_eax_signature();
+            *ebx = cpuid_leaf1_ebx();
             *ecx = cpuid_leaf1_ecx_features();
             *edx = cpuid_leaf1_edx_features();
             break;
         case 7:
             if (subleaf == 0) {
-                *eax = 0; // highest subleaf
+                *eax = CPUID_ADVERTISE_VECTOR_STATE ? 1 : 0; // highest subleaf
                 *ebx = cpuid_leaf7_ebx_features();
                 *ecx = cpuid_leaf7_ecx_features();
                 *edx = 0;
+            } else if (subleaf == 1 && CPUID_ADVERTISE_VECTOR_STATE) {
+                *eax = cpuid_leaf7_1_eax_features();
+                *ebx = *ecx = *edx = 0;
             } else {
                 *eax = *ebx = *ecx = *edx = 0;
             }
@@ -311,5 +408,25 @@ static inline void do_cpuid(dword_t *eax, dword_t *ebx, dword_t *ecx, dword_t *e
             break;
     }
 }
+
+// What CPUID answers, as the CPUID gadgets look it up (jit/gadgets-aarch64/
+// misc.S cpuid_lookup): do_cpuid's answers for each leaf and subleaf it
+// distinguishes, filled once per guest ABI. The answers are the machine's
+// description, fixed for the process; the gadget is the instruction.
+struct cpuid_answer { dword_t eax, ebx, ecx, edx; };
+enum {
+    CPUID_SLOT_LEAF0, CPUID_SLOT_LEAF1, CPUID_SLOT_LEAF7_0,
+    CPUID_SLOT_LEAFD_0, CPUID_SLOT_LEAFD_1, CPUID_SLOT_LEAFD_2,
+    CPUID_SLOT_LEAFD_5, CPUID_SLOT_LEAFD_6, CPUID_SLOT_LEAFD_7,
+    CPUID_SLOT_EXT0, CPUID_SLOT_EXT1,
+    CPUID_SLOT_ABOVE_BASIC,   // a leaf above the basic maximum
+    CPUID_SLOT_ZERO,          // an unimplemented leaf or subleaf below it
+    CPUID_SLOT_ABOVE_EXT,     // any other extended leaf
+    CPUID_SLOT_LEAF7_1,
+    CPUID_SLOTS,
+};
+struct cpuid_table { struct cpuid_answer slot[CPUID_SLOTS]; };
+extern struct cpuid_table cpuid_tables[2];   // [0] i386, [1] amd64
+void cpuid_tables_init(void);
 
 #endif

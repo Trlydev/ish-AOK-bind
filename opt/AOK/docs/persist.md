@@ -21,6 +21,21 @@ For a cross-root tree that needs real filesystem semantics (uid/gid, modes,
 device nodes, hardlinks), use `/AOK/fakefs` instead; it survives exactly the
 same things. See [00-overview.md](00-overview.md) for where both sit.
 
+## Who owns what
+
+Every file here belongs to iSH-AOK itself on the host side, whichever Linux
+user made it, and the host has nowhere to record any other owner. So each
+file is shown as owned by **whoever is looking**: `ls -l` run as `mke` lists
+`mke`, run as root lists root. Every user of every root can create, change and
+remove anything under `/AOK/persist`, which is what a shared directory is for,
+and tools that insist a file be your own (git's "dubious ownership" check,
+sshd's `StrictModes`) are satisfied.
+
+`chmod` works and stays as you set it, so a key kept here can be `0600`.
+`chown` to yourself succeeds and changes nothing; to anyone else it fails with
+"Operation not permitted", even as root, because the owner cannot be stored.
+`/AOK/roots` behaves the same way.
+
 ## What already lives there
 
 | Path | Used for |
@@ -75,15 +90,22 @@ you built it in. That is the combination worth knowing about.
 every launch so they track the app:
 
     ws-motepad ws-filemanager ws-markdown ws-imageviewer ws-videoplayer
-    ws-audio ws-browser ws-llm ws-filesystems ws-storage ws-monitor
+    ws-audio ws-music ws-equalizer ws-eq ws-browser ws-llm ws-filesystems
+    ws-storage ws-monitor
     ws-networks ws-status ws-settings ws-themes ws-launcher ws-clock
-    ws-info ws-diagnostics ws-sessions
+    ws-info ws-diagnostics ws-sessions ws-wayland ws-desktops
+    ws-quickactions
 
 Each opens that applet in a Workspace window, optionally on a file:
 
     ws-markdown README.md          # relative paths are resolved for you
     ws-filemanager /etc
     ws-audio                       # no file: just open the applet
+
+`ws-wayland` opens the Wayland desktop, or brings forward the one already
+running rather than starting a second, as the dock does. In the Wayland
+Display startup mode there is no Workspace to open it in, so it says so and
+exits, like every `ws-` launcher outside Workspace.
 
 They are shell scripts, not binaries, so they work under any root regardless of
 architecture, and you can read one to see exactly what it does. They talk to
@@ -111,22 +133,28 @@ dynamic linker hunting through a directory of wrong-architecture libraries on
 every single exec. The rpath binds the lookup to the one binary that needs it.
 
 Two things this directory is host-backed and therefore cannot do: hold device
-nodes, or preserve Linux uid/gid and modes. If you need those, use
-`/AOK/fakefs`.
+nodes, or keep a Linux owner and group (see "Who owns what" above). If you
+need those, use `/AOK/fakefs`.
 
 ## Reaching them from a `PATH` iSH-AOK did not set
 
-`/AOK/persist/bin` is first on the `PATH` — but that is the `PATH` **iSH-AOK
-hands to the sessions it starts itself**. It covers the app's terminals and the
-command-line build, and nothing else. An `ssh` login, a `su -`, a cron job, or a
-service started by init takes its `PATH` from `/etc/profile` or from a
-compiled-in default, and none of those has ever heard of `/AOK/persist/bin`.
-Your program is right there and still works by full path, but `command -v`
-cannot find it. That is the shape this problem takes, and it is easy to read as
-"the program is broken" instead of "this login has a different `PATH`".
+A login shell sets `PATH` afresh from `/etc/profile`, which has never heard of
+`/AOK/persist/bin`. So on every boot iSH-AOK writes
+`/etc/profile.d/10-aok-persist-bin.sh` into the root, and every distro's
+`/etc/profile` reads that after setting `PATH`. That puts `/AOK/persist/bin`
+first for every login shell: the app's terminals, an `ssh` login and `su -`.
+The file is written only when it is missing or empty. To turn it off, replace
+its contents with a comment.
 
-Linking into a directory every distro already has on `PATH` fixes all of them at
-once:
+That still leaves out whatever does not run a login shell through
+`/etc/profile`: a cron job, a service started by init, `ssh host command`, and
+zsh, which never reads `/etc/profile.d`. Those take `PATH` from a compiled-in
+default. Your program is right there and still works by full path, but
+`command -v` cannot find it. That is the shape this problem takes, and it is
+easy to read as "the program is broken" instead of "this has a different
+`PATH`".
+
+Linking into a directory every distro already has on `PATH` covers those too:
 
 ```sh
 sh /AOK/tools/persist-links.sh
@@ -167,7 +195,7 @@ something failed.
 
 The same applies after you drop a new program into `bin`. The links are made
 when you run the script, not watched — so a new program is reachable by full
-path and from an app terminal immediately, and from an `ssh` login after the
+path and from any login shell immediately, and from cron or a service after the
 next run.
 
 ### What it will not do

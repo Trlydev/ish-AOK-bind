@@ -52,7 +52,13 @@
 // devices.txt 240-254 "local/experimental" range, which is what this is: AOK's
 // swap area is not a Linux device and 241 is a local number, not a claim on an
 // upstream one.
+
 #define AOKSWAP_MAJOR 241
+// --- DRM ---
+// /dev/dri/renderD128, the virtio-gpu render node (fs/virtgpu.c). Linux's own
+// numbers: render nodes are minors 128 and up of major 226.
+#define DRM_MAJOR 226
+#define DEV_VIRTGPU_RENDER_MINOR 128
 #define DEV_AOKSWAP_MINOR 0
 #define DEV_RTC_MINOR 2
 

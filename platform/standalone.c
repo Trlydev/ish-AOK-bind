@@ -16,6 +16,7 @@
 #include "fs/dev.h"
 #include "fs/proc/ish.h"
 #include "jit/jit.h"
+#include "kernel/BatteryStatus.h"
 #include "kernel/errno.h"
 #include "kernel/hostinfo.h"
 #if defined(__linux__) && defined(__aarch64__)
@@ -238,15 +239,107 @@ char *printUIDevice(void) {
     return "standalone";
 }
 
-char *printBatteryStatus(int type) {
-    switch (type) {
-        case 1:
-            return "Unknown\n";
-        case 2:
-            return "-1\n";
-        default:
-            return "Unknown -1\n";
+// The command-line twins of kernel/BatteryStatus.m; kernel/BatteryStatus.h says
+// why each needs both. There is no battery or thermal source here, so both say
+// UNKNOWN. That is the truth, and it already has a meaning a guest understands:
+// an empty /sys/class/power_supply, as on a Linux machine without a battery, and
+// "unknown" in /proc/ish/thermal_state.
+void hostBatteryStatus(struct host_battery_status *out) {
+    if (out == NULL)
+        return;
+    *out = (struct host_battery_status) {
+        .state = HOST_BATTERY_UNKNOWN,
+        .level = -1,
+        .low_power_mode = -1,
+    };
+}
+
+enum host_thermal_state hostThermalState(void) {
+    return HOST_THERMAL_UNKNOWN;
+}
+
+// The zone name from a path to a zone file: whatever follows "zoneinfo/".
+// macOS links /etc/localtime to /var/db/timezone/zoneinfo/<Name>; Linux to
+// /usr/share/zoneinfo/<Name>, or ../usr/share/zoneinfo/<Name> as timedatectl
+// writes it. The posix/ and right/ trees hold the same zones under the same
+// names, so they are looked through.
+static bool zone_name_from_path(const char *path, char *buf, size_t size) {
+    const char *name = NULL;
+    for (const char *at = strstr(path, "zoneinfo/"); at != NULL; at = strstr(at + 1, "zoneinfo/")) {
+        if (at == path || at[-1] == '/')
+            name = at + strlen("zoneinfo/");
     }
+    if (name == NULL)
+        return false;
+    if (strncmp(name, "posix/", 6) == 0 || strncmp(name, "right/", 6) == 0)
+        name += 6;
+    size_t len = strlen(name);
+    if (len == 0 || len >= size)
+        return false;
+    memcpy(buf, name, len + 1);
+    return true;
+}
+
+// Where the host keeps its zone. The /etc/localtime link comes first because it
+// is the setting itself: it is what libc reads, what timedatectl and Debian's
+// tzdata write, and all macOS has. /etc/timezone is only a fallback, for a Linux
+// host whose /etc/localtime is a copy rather than a link -- Debian 13 stopped
+// creating that file and keeps it updated only where it already exists.
+// The command-line build has no language list, only the locale it was started
+// in: "zh_CN.UTF-8" becomes "zh-CN". C and POSIX name no language.
+bool hostPreferredLanguages(char *buf, size_t size) {
+    if (buf == NULL || size == 0)
+        return false;
+    buf[0] = '\0';
+    const char *names[] = {"LC_ALL", "LC_MESSAGES", "LANG"};
+    const char *locale = NULL;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]) && locale == NULL; i++) {
+        const char *value = getenv(names[i]);
+        if (value != NULL && value[0] != '\0')
+            locale = value;
+    }
+    if (locale == NULL || strncmp(locale, "C.", 2) == 0 || strcmp(locale, "C") == 0 ||
+        strcmp(locale, "POSIX") == 0)
+        return false;
+    size_t len = strcspn(locale, ".@");
+    if (len == 0 || len + 2 > size)
+        return false;
+    for (size_t i = 0; i < len; i++)
+        buf[i] = locale[i] == '_' ? '-' : locale[i];
+    buf[len] = '\n';
+    buf[len + 1] = '\0';
+    return true;
+}
+
+bool hostTimeZoneName(char *buf, size_t size) {
+    if (buf == NULL || size == 0)
+        return false;
+    buf[0] = '\0';
+
+    char target[4096];
+    ssize_t n = readlink("/etc/localtime", target, sizeof(target) - 1);
+    if (n > 0) {
+        target[n] = '\0';
+        if (zone_name_from_path(target, buf, size))
+            return true;
+    }
+
+    FILE *file = fopen("/etc/timezone", "r");
+    if (file != NULL) {
+        char line[256];
+        bool ok = fgets(line, sizeof(line), file) != NULL;
+        fclose(file);
+        if (ok) {
+            line[strcspn(line, " \t\r\n")] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && len < size) {
+                memcpy(buf, line, len + 1);
+                return true;
+            }
+        }
+    }
+    buf[0] = '\0';
+    return false;
 }
 
 void jit_install_thread_exception_handler(void) {

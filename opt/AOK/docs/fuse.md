@@ -44,6 +44,18 @@ Linux. Report the mounting user in the `user_id=`/`group_id=` mount options and
 in the `uid`/`gid` you fill into each attribute reply, and an unprivileged mount
 behaves exactly like a privileged one.
 
+**A mount is for the user who made it** (from build 559, as on Linux). Only
+the uid and gid in its `user_id=` and `group_id=` options may use it — anyone
+else, root included, gets `EACCES`, and `statfs` tells them the type and
+nothing more. Mount with `-o allow_other` to open it to everyone; an ordinary
+user's `fusermount3` allows that only with `user_allow_other` in
+`/etc/fuse.conf`, as on Linux. Before 559 every mount was open to all.
+
+**A sandbox can mount one too.** Root of a [user namespace](namespaces.md) —
+`unshare -rm`, or a bubblewrap sandbox — may mount a FUSE filesystem in its own
+mount namespace, with `nodev` forced, as on Linux. The daemon then sees uids,
+gids and pids as that namespace has them.
+
 ## Things worth knowing
 
 - **Programs stored on a FUSE mount run.** `mmap` works — private mappings,
@@ -91,10 +103,14 @@ behaves exactly like a privileged one.
   here to `umount -f` its way out, so an unkillable task would be permanent;
   the caller gets `EINTR` instead. The daemon may still answer afterwards, and
   the answer is discarded.
-- **`readdirplus`, splice, and the newer `fsopen()`-based mount API are not
-  wired up.** libfuse falls back cleanly on all three; no daemon needs
-  changing. `FUSE_INIT` negotiates none of them, so a daemon is never told a
-  capability is present when it is not. `readdirplus` is the one with real
+- **The new mount API works too.** A daemon that mounts with `fsopen("fuse")`,
+  `fsconfig`, `fsmount` and `move_mount` instead of `mount(2)` gets, from
+  `fsmount()`, a handle naming the mount's root without opening it — as Linux
+  does. Opening it would send a request to a daemon that mounts first and
+  serves after, and before 558 that is exactly where such a daemon hung.
+- **`readdirplus` and splice are not wired up.** libfuse falls back cleanly on
+  both; no daemon needs changing. `FUSE_INIT` negotiates neither, so a daemon
+  is never told a capability is present when it is not. `readdirplus` is the one with real
   performance on the table, and it waits on an attribute cache: without
   somewhere to keep the attributes it returns, they would be fetched and
   discarded while each entry still had to be forgotten.

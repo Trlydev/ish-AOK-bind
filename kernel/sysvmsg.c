@@ -11,9 +11,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/sysvipc.h"
+#include "kernel/ipc_ns.h"
 #include "fs/proc.h"
 #include "kernel/task.h"
 #include "util/list.h"
@@ -66,27 +69,25 @@ struct msg_queue {
     cond_t rcv_cond;       // receivers waiting for a message
 };
 
-static struct list msg_queues = LIST_INITIALIZER(msg_queues);
-
-static lock_t msg_lock = LOCK_INITIALIZER;
-static int msg_next_id = 1;
+// The message queues, their lock and the next id are the calling task's IPC
+// namespace's (kernel/ipc_ns.h).
 
 static time_t_ msg_now(void) {
     return (time_t_) time(NULL);
 }
 
-static struct msg_queue *msg_find_by_key(dword_t key) {
+static struct msg_queue *msg_find_by_key(struct ipc_namespace *ns, dword_t key) {
     struct msg_queue *q;
-    list_for_each_entry(&msg_queues, q, qlist) {
+    list_for_each_entry(&ns->msg_queues, q, qlist) {
         if (!q->removed && q->key == key)
             return q;
     }
     return NULL;
 }
 
-static struct msg_queue *msg_find_by_id(int id) {
+static struct msg_queue *msg_find_by_id(struct ipc_namespace *ns, int id) {
     struct msg_queue *q;
-    list_for_each_entry(&msg_queues, q, qlist) {
+    list_for_each_entry(&ns->msg_queues, q, qlist) {
         if (!q->removed && q->id == id)
             return q;
     }
@@ -111,28 +112,29 @@ static void msg_queue_maybe_free(struct msg_queue *queue) {
 }
 
 int_t sys_msgget_guest(dword_t key, int_t msgflg) {
-    lock(&msg_lock, 0);
-    struct msg_queue *queue = key == IPC_PRIVATE_ ? NULL : msg_find_by_key(key);
+    struct ipc_namespace *ns = ipc_ns_current();
+    lock(&ns->msg_lock, 0);
+    struct msg_queue *queue = key == IPC_PRIVATE_ ? NULL : msg_find_by_key(ns, key);
     if (queue != NULL) {
         if ((msgflg & IPC_CREAT_) && (msgflg & IPC_EXCL_)) {
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             return _EEXIST;
         }
         int id = queue->id;
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return id;
     }
     if (!(msgflg & IPC_CREAT_) && key != IPC_PRIVATE_) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return _ENOENT;
     }
 
     queue = calloc(1, sizeof(*queue));
     if (queue == NULL) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return _ENOMEM;
     }
-    queue->id = msg_next_id++;
+    queue->id = ns->msg_next_id++;
     queue->key = key;
     queue->uid = queue->cuid = current->euid;
     queue->gid = queue->cgid = current->egid;
@@ -142,9 +144,9 @@ int_t sys_msgget_guest(dword_t key, int_t msgflg) {
     list_init(&queue->messages);
     cond_init(&queue->snd_cond);
     cond_init(&queue->rcv_cond);
-    list_add_tail(&msg_queues, &queue->qlist);
+    list_add_tail(&ns->msg_queues, &queue->qlist);
     int id = queue->id;
-    unlock(&msg_lock);
+    unlock(&ns->msg_lock);
     return id;
 }
 
@@ -181,6 +183,7 @@ static int msg_read_from_guest(guest_addr_t msgp, size_t msgsz,
 }
 
 int_t sys_msgsnd_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz, int_t msgflg) {
+    struct ipc_namespace *ns = ipc_ns_current();
     if (msgsz > MSGMAX_)
         return _EINVAL;
 
@@ -194,47 +197,51 @@ int_t sys_msgsnd_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz, int_t msgf
         return _EINVAL;
     }
 
-    lock(&msg_lock, 0);
-    struct msg_queue *queue = msg_find_by_id(msqid);
+    lock(&ns->msg_lock, 0);
+    struct msg_queue *queue = msg_find_by_id(ns, msqid);
     if (queue == NULL) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         free(msg);
         return _EINVAL;
     }
     // Sending needs write permission on the queue.
     if (!ipc_access_ok(queue->uid, queue->gid, queue->cuid, queue->cgid, queue->mode, 2)) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         free(msg);
         return _EACCES;
     }
     while (queue->cbytes + msgsz > queue->qbytes) {
         if (msgflg & IPC_NOWAIT_) {
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             free(msg);
             return _EAGAIN;
         }
         queue->waiters++;
-        err = wait_for(&queue->snd_cond, &msg_lock, NULL);
+        err = wait_for_blocked(&queue->snd_cond, &ns->msg_lock, NULL);
         queue->waiters--;
         if (queue->removed) {
             msg_queue_maybe_free(queue);
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             free(msg);
             return _EIDRM;
         }
         if (err < 0) {
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             free(msg);
-            return _EINTR;
+            // ERESTARTNOHAND, as on Linux: a handler running ends the wait with
+            // EINTR, but a job-control stop does not -- once continued, the
+            // call goes back to waiting. The plain _EINTR here failed it the
+            // moment the process was continued.
+            return signal_restart_or_eintr_nohand(_EINTR);
         }
     }
     list_add_tail(&queue->messages, &msg->mlist);
     queue->cbytes += msgsz;
     queue->qnum++;
-    queue->lspid = current->pid;
+    queue->lspid = current->tgid;
     queue->stime = msg_now();
     notify(&queue->rcv_cond);
-    unlock(&msg_lock);
+    unlock(&ns->msg_lock);
     return 0;
 }
 
@@ -262,18 +269,19 @@ static struct msg_msg *msg_pick(struct msg_queue *queue, sqword_t msgtyp, int_t 
 
 int_t sys_msgrcv_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz,
                        sqword_t msgtyp, int_t msgflg) {
+    struct ipc_namespace *ns = ipc_ns_current();
     if (msgflg & MSG_COPY_)
         return _EINVAL; // requires CONFIG_CHECKPOINT_RESTORE; nobody sane uses it
 
-    lock(&msg_lock, 0);
-    struct msg_queue *queue = msg_find_by_id(msqid);
+    lock(&ns->msg_lock, 0);
+    struct msg_queue *queue = msg_find_by_id(ns, msqid);
     if (queue == NULL) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return _EINVAL;
     }
     // Receiving needs read permission on the queue.
     if (!ipc_access_ok(queue->uid, queue->gid, queue->cuid, queue->cgid, queue->mode, 4)) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return _EACCES;
     }
     struct msg_msg *msg;
@@ -282,34 +290,35 @@ int_t sys_msgrcv_guest(int_t msqid, guest_addr_t msgp, qword_t msgsz,
         if (msg != NULL)
             break;
         if (msgflg & IPC_NOWAIT_) {
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             return _ENOMSG;
         }
         queue->waiters++;
-        int err = wait_for(&queue->rcv_cond, &msg_lock, NULL);
+        int err = wait_for_blocked(&queue->rcv_cond, &ns->msg_lock, NULL);
         queue->waiters--;
         if (queue->removed) {
             msg_queue_maybe_free(queue);
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             return _EIDRM;
         }
         if (err < 0) {
-            unlock(&msg_lock);
-            return _EINTR;
+            unlock(&ns->msg_lock);
+            // ERESTARTNOHAND, as msgsnd above.
+            return signal_restart_or_eintr_nohand(_EINTR);
         }
     }
 
     if (msg->size > msgsz && !(msgflg & MSG_NOERROR_)) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return _E2BIG;
     }
     list_remove(&msg->mlist);
     queue->cbytes -= msg->size;
     queue->qnum--;
-    queue->lrpid = current->pid;
+    queue->lrpid = current->tgid;
     queue->rtime = msg_now();
     notify(&queue->snd_cond);
-    unlock(&msg_lock);
+    unlock(&ns->msg_lock);
 
     size_t copy_size = msg->size > msgsz ? (size_t) msgsz : msg->size;
     int err = 0;
@@ -366,34 +375,35 @@ struct msqid64_ds_64_ {
 static_assert(sizeof(struct msqid64_ds_64_) == 120, "64-bit msqid64_ds size");
 
 int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
+    struct ipc_namespace *ns = ipc_ns_current();
     int cmd_base = cmd & ~IPC_64_;
 
     if (cmd_base == IPC_INFO_) // no tool we care about consumes the limits
         return _EINVAL;
 
-    lock(&msg_lock, 0);
-    struct msg_queue *queue = msg_find_by_id(msqid);
+    lock(&ns->msg_lock, 0);
+    struct msg_queue *queue = msg_find_by_id(ns, msqid);
     if (queue == NULL) {
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return _EINVAL;
     }
 
     if (cmd_base == IPC_RMID_) {
         if (!ipc_owner_ok(queue->uid, queue->cuid)) {
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             return _EPERM;
         }
         queue->removed = true;
         notify(&queue->snd_cond);
         notify(&queue->rcv_cond);
         msg_queue_maybe_free(queue);
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return 0;
     }
 
     if (cmd_base == IPC_SET_) {
         if (!ipc_owner_ok(queue->uid, queue->cuid)) {
-            unlock(&msg_lock);
+            unlock(&ns->msg_lock);
             return _EPERM;
         }
         // Only perms and qbytes are settable; read the ABI-appropriate
@@ -402,7 +412,7 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
         if (task_is_64bit(current)) {
             struct msqid64_ds_64_ info;
             if (user_read(buf, &info, sizeof(info))) {
-                unlock(&msg_lock);
+                unlock(&ns->msg_lock);
                 return _EFAULT;
             }
             uid = info.msg_perm.uid;
@@ -412,7 +422,7 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
         } else {
             struct msqid64_ds_i386_ info;
             if (user_read(buf, &info, sizeof(info))) {
-                unlock(&msg_lock);
+                unlock(&ns->msg_lock);
                 return _EFAULT;
             }
             uid = info.msg_perm.uid;
@@ -420,13 +430,20 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
             mode = (mode_t_) info.msg_perm.mode;
             qbytes = info.msg_qbytes;
         }
+        // The caller's user namespace's ids; one with no mapping is EINVAL.
+        uid = current_make_kuid(uid);
+        gid = current_make_kgid(gid);
+        if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID) {
+            unlock(&ns->msg_lock);
+            return _EINVAL;
+        }
         queue->uid = uid;
         queue->gid = gid;
         queue->mode = mode & 0777;
         queue->qbytes = (size_t) qbytes;
         queue->ctime = msg_now();
         notify(&queue->snd_cond); // capacity may have grown
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return 0;
     }
 
@@ -436,10 +453,10 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
             struct msqid64_ds_64_ info = {
                 .msg_perm = {
                     .key = queue->key,
-                    .uid = queue->uid,
-                    .gid = queue->gid,
-                    .cuid = queue->cuid,
-                    .cgid = queue->cgid,
+                    .uid = current_uid_shown(queue->uid),
+                    .gid = current_gid_shown(queue->gid),
+                    .cuid = current_uid_shown(queue->cuid),
+                    .cgid = current_gid_shown(queue->cgid),
                     .mode = (word_t) queue->mode,
                 },
                 .msg_stime = queue->stime,
@@ -448,8 +465,8 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
                 .msg_cbytes = queue->cbytes,
                 .msg_qnum = queue->qnum,
                 .msg_qbytes = queue->qbytes,
-                .msg_lspid = queue->lspid,
-                .msg_lrpid = queue->lrpid,
+                .msg_lspid = current_pid_shown(queue->lspid),
+                .msg_lrpid = current_pid_shown(queue->lrpid),
             };
             if (user_write(buf, &info, sizeof(info)))
                 err = _EFAULT;
@@ -457,10 +474,10 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
             struct msqid64_ds_i386_ info = {
                 .msg_perm = {
                     .key = queue->key,
-                    .uid = queue->uid,
-                    .gid = queue->gid,
-                    .cuid = queue->cuid,
-                    .cgid = queue->cgid,
+                    .uid = current_uid_shown(queue->uid),
+                    .gid = current_gid_shown(queue->gid),
+                    .cuid = current_uid_shown(queue->cuid),
+                    .cgid = current_gid_shown(queue->cgid),
                     .mode = queue->mode,
                 },
                 .msg_stime = (dword_t) queue->stime,
@@ -469,17 +486,17 @@ int_t sys_msgctl_guest(int_t msqid, int_t cmd, guest_addr_t buf) {
                 .msg_cbytes = (dword_t) queue->cbytes,
                 .msg_qnum = (dword_t) queue->qnum,
                 .msg_qbytes = (dword_t) queue->qbytes,
-                .msg_lspid = queue->lspid,
-                .msg_lrpid = queue->lrpid,
+                .msg_lspid = current_pid_shown(queue->lspid),
+                .msg_lrpid = current_pid_shown(queue->lrpid),
             };
             if (user_write(buf, &info, sizeof(info)))
                 err = _EFAULT;
         }
-        unlock(&msg_lock);
+        unlock(&ns->msg_lock);
         return err;
     }
 
-    unlock(&msg_lock);
+    unlock(&ns->msg_lock);
     return _EINVAL;
 }
 
@@ -500,19 +517,36 @@ int_t sys_msgctl(int_t msqid, int_t cmd, addr_t buf) {
 
 // /proc/sysvipc/msg -- see the note on proc_sysvipc_show_sem.
 void proc_sysvipc_show_msg(struct proc_data *buf) {
+    struct ipc_namespace *ns = ipc_ns_current();
     proc_printf(buf, "%10s %10s %-10s %10s %10s %5s %5s %5s %5s %5s %5s %10s %10s %10s\n",
                 "key", "msqid", "perms", "cbytes", "qnum", "lspid", "lrpid",
                 "uid", "gid", "cuid", "cgid", "stime", "rtime", "ctime");
-    lock(&msg_lock, 0);
+    lock(&ns->msg_lock, 0);
     struct msg_queue *q;
-    list_for_each_entry(&msg_queues, q, qlist) {
+    list_for_each_entry(&ns->msg_queues, q, qlist) {
         if (q->removed)
             continue;
         proc_printf(buf, "%10d %10d %-10o %10zu %10zu %5d %5d %5u %5u %5u %5u %10lld %10lld %10lld\n",
                     (int) q->key, q->id, q->mode & 0777, q->cbytes, q->qnum,
-                    (int) q->lspid, (int) q->lrpid,
-                    q->uid, q->gid, q->cuid, q->cgid,
+                    (int) current_pid_shown(q->lspid), (int) current_pid_shown(q->lrpid),
+                    current_uid_shown(q->uid), current_gid_shown(q->gid),
+                    current_uid_shown(q->cuid), current_gid_shown(q->cgid),
                     (long long) q->stime, (long long) q->rtime, (long long) q->ctime);
     }
-    unlock(&msg_lock);
+    unlock(&ns->msg_lock);
+}
+
+// The namespace is going (kernel/ipc_ns.c): every queue in it is removed, as
+// IPC_RMID would remove it. Nothing can be blocked on one -- a task in the
+// namespace keeps it alive -- so each is freed here.
+void msg_ns_teardown(struct ipc_namespace *ns) {
+    lock(&ns->msg_lock, 0);
+    struct msg_queue *queue, *tmp;
+    list_for_each_entry_safe(&ns->msg_queues, queue, tmp, qlist) {
+        queue->removed = true;
+        notify(&queue->snd_cond);
+        notify(&queue->rcv_cond);
+        msg_queue_maybe_free(queue);
+    }
+    unlock(&ns->msg_lock);
 }

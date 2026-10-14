@@ -3,10 +3,18 @@
 #include "debug.h"
 #include "kernel/fs.h"
 #include "fs/fd.h"
+#include "fs/proc.h"
 #include "kernel/errno.h"
 
 static struct mount adhoc_mount;
 static unsigned adhoc_inode_seq;
+
+// One more from the same sequence, for a caller that needs two fds to SHARE an
+// inode -- fs/pipe.c, where both ends of a pipe are one object to everything
+// that reads /proc/<pid>/fd.
+qword_t adhoc_next_inode(void) {
+    return __atomic_add_fetch(&adhoc_inode_seq, 1, __ATOMIC_RELAXED);
+}
 
 struct fd *adhoc_fd_create(const struct fd_ops *ops) {
     struct fd *fd = fd_create(ops);
@@ -91,8 +99,8 @@ static int adhoc_fsetattr(struct fd *fd, struct attr attr) {
 
 static int adhoc_getpath(struct fd *fd, char *buf) {
     // Render the way Linux does in /proc/<pid>/fd: sockets and pipes show their
-    // type plus inode; everything else is anon_inode:[class], where the class
-    // (eventfd, eventpoll, signalfd, ...) comes from the fd's ops. Previously
+    // type plus inode; everything else is anon_inode:<class>, where the class
+    // ("[eventfd]", "[eventpoll]", "inotify", ...) comes from the fd's ops. Previously
     // every adhoc fd reported "anon_inode:[unknown]" with a zero inode, so lsof
     // could not classify sockets/eventfds (the listener of a daemon like sshd
     // showed up as an unstattable anon_inode).
@@ -101,16 +109,23 @@ static int adhoc_getpath(struct fd *fd, char *buf) {
         snprintf(buf, MAX_PATH, "socket:[%lu]", ino);
     else if (S_ISFIFO(fd->stat.mode))
         snprintf(buf, MAX_PATH, "pipe:[%lu]", ino);
+    // A namespace fd reads as its namespace, the way /proc/<pid>/ns/* does:
+    // "pid:[4026531836]", not anon_inode:[nsfs].
+    else if (proc_ns_fd_link(fd, buf, MAX_PATH))
+        ;
     else {
         const char *cls = (fd->ops != NULL && fd->ops->anon_inode_class != NULL)
-            ? fd->ops->anon_inode_class : "anon_inode";
-        // Two classes spell their own brackets -- "[pidfd]" and "[fscontext]" --
-        // and wrapping those again produced `anon_inode:[[pidfd]]', which is not
-        // what any reader expects to parse. Seen on elogind, which holds three.
-        if (cls[0] == '[')
-            snprintf(buf, MAX_PATH, "anon_inode:%s", cls);
+            ? fd->ops->anon_inode_class : "[anon_inode]";
+        // The class is printed as spelled, brackets or not, as Linux prints
+        // the name its anon_inode_getfd caller passed: "[eventfd]" but
+        // "inotify" and "sync_file" (6.12). AOK bracketed every bare class,
+        // and lsof-like readers parse these. One that begins with '/' is a
+        // pseudo-filesystem's own name, printed whole: a dma-buf is "/dmabuf:"
+        // (its d_dname, "/dmabuf:<name>", with no name set).
+        if (cls[0] == '/')
+            snprintf(buf, MAX_PATH, "%s", cls);
         else
-            snprintf(buf, MAX_PATH, "anon_inode:[%s]", cls);
+            snprintf(buf, MAX_PATH, "anon_inode:%s", cls);
     }
     return 0;
 }
@@ -123,9 +138,9 @@ bool is_adhoc_fd(struct fd *fd) {
 // on Linux; mirror that on the fd's fake stat so fstat reflects the update.
 // (stress-ng --sockabuse futimens()es a socket fd in a loop.)
 static int adhoc_futime(struct fd *fd, struct timespec atime, struct timespec mtime) {
-    fd->stat.atime = (dword_t) atime.tv_sec;
+    fd->stat.atime = atime.tv_sec;
     fd->stat.atime_nsec = (dword_t) atime.tv_nsec;
-    fd->stat.mtime = (dword_t) mtime.tv_sec;
+    fd->stat.mtime = mtime.tv_sec;
     fd->stat.mtime_nsec = (dword_t) mtime.tv_nsec;
     return 0;
 }

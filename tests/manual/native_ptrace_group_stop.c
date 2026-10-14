@@ -184,8 +184,16 @@ static int await_group_stop_report(pid_t child, const char *label) {
         int event = (status >> 16) & 0xff;
         test_logf("    stop: sig=%d event=%d status=%#x\n", sig, event, status);
 
-        if (event == PTRACE_EVENT_STOP)
+        if (event == PTRACE_EVENT_STOP) {
+            // A seized group-stop carries the STOP SIGNAL, not SIGTRAP: every
+            // case here gets there through SIGSTOP, so the status word is
+            // exactly 0x80137f. Native and translated programs must report it
+            // identically -- the whole point of this file.
+            if (status != (int) ((PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f))
+                failf(label, (uint64_t) status, 0, 0,
+                      (PTRACE_EVENT_STOP << 16) | (SIGSTOP << 8) | 0x7f, 0, 0);
             return 1;
+        }
         // Signal-delivery-stop of SIGSTOP: deliver it, so the tracee actually
         // enters group-stop and reports it next time round.
         int deliver = (sig == SIGSTOP) ? SIGSTOP : 0;
@@ -196,6 +204,39 @@ static int await_group_stop_report(pid_t child, const char *label) {
     }
     failf(label, 0, 0, 0, 1, 0, 0);
     return 0;
+}
+
+// The two stops a SIGCONT sent to a seized tracee in its group-stop leads to,
+// in Linux's order: its notice, a PTRACE_EVENT_STOP carrying SIGTRAP (Linux's
+// JOBCTL_TRAP_NOTIFY), and then the SIGCONT's own signal-delivery-stop, for a
+// traced task ignores nothing. Each resumed; 1 once both are through.
+//
+// finish_case used to resume once and go straight to the read. Measured on
+// Linux 6.12, the tracee then sits in the notice and the read never returns:
+// the control case timed out there, as it did on AOK once AOK had the notice.
+static int service_sigcont_stops(pid_t child, const char *label) {
+    static const int expected[2] = {
+        (PTRACE_EVENT_STOP << 16) | (SIGTRAP << 8) | 0x7f,
+        (SIGCONT << 8) | 0x7f,
+    };
+    for (int i = 0; i < 2; i++) {
+        int status = 0;
+        pid_t w;
+        do {
+            w = waitpid(child, &status, 0);
+        } while (w < 0 && errno == EINTR);
+        test_logf("    after SIGCONT: status=%#x\n", status);
+        if (w != child || status != expected[i]) {
+            failf(label, (uint64_t) w, (uint64_t) status, 0, (uint64_t) child,
+                  (uint64_t) expected[i], 0);
+            return 0;
+        }
+        if (ptrace(PTRACE_CONT, child, 0, 0) != 0) {
+            failf(label, (uint64_t) errno, 0, 0, 0, 0, 0);
+            return 0;
+        }
+    }
+    return 1;
 }
 
 // Shared tail: the tracee is group-stopped and reported. Drain, resume, and
@@ -209,6 +250,8 @@ static void finish_case(pid_t child, int fd, const char *label) {
         failf(label, (uint64_t) errno, 0, 0, 0, 0, 0);
         return;
     }
+    if (!service_sigcont_stops(child, label))
+        return;
 
     char buf[256];
     ssize_t n;

@@ -1,10 +1,18 @@
 #include "debug.h"
+#include "kernel/net_ns.h"
 #include "kernel/task.h"
 #include "fs/fd.h"
 #include "fs/tty.h"
 #include "kernel/calls.h"
 #include "kernel/mm.h"
 #include "kernel/ptrace.h"
+#include "kernel/rseq.h"
+#include "kernel/ipc_ns.h"
+#include "kernel/uts.h"
+#include "kernel/mnt_ns.h"
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
+#include "fs/proc.h"
 #include "util/sync.h"
 #include <string.h>
 
@@ -45,15 +53,17 @@
 // stress-ng's clone stressor outright, not just noisy logging.
 #define IMPLEMENTED_FLAGS (CLONE_VM_|CLONE_FILES_|CLONE_FS_|CLONE_SIGHAND_|CLONE_SYSVSEM_|CLONE_VFORK_|CLONE_THREAD_|\
         CLONE_SETTLS_|CLONE_CHILD_SETTID_|CLONE_PARENT_SETTID_|CLONE_CHILD_CLEARTID_|CLONE_DETACHED_|CLONE_PARENT_|\
-        CLONE_PIDFD_|CLONE_IO_|CLONE_NEWUTS_)
+        CLONE_PIDFD_|CLONE_IO_|CLONE_NEWUTS_|CLONE_NEWIPC_|CLONE_NEWNS_|CLONE_NEWUSER_|CLONE_NEWPID_|\
+        CLONE_NEWNET_)
 // The remaining namespace flags are recognized but never implemented (no
-// mount/user/pid/ipc/cgroup/net namespaces; UTS is real, see kernel/uts.h).
+// mount/user/pid/cgroup/net namespaces; UTS and IPC are real, see kernel/uts.h
+// and kernel/ipc_ns.h).
 // Handled separately from IMPLEMENTED_FLAGS below so they get the errno real
 // Linux gives an unprivileged caller (EPERM: creating a new namespace needs
 // CAP_SYS_ADMIN/CAP_SYS_USER_NS) instead of the generic "unrecognized flag"
 // EINVAL -- callers that already fall back when they lack namespace privilege
 // need to see that, not a malformed-argument error.
-#define CLONE_NEW_FLAGS_ (CLONE_NEWNS_|CLONE_NEWCGROUP_|CLONE_NEWIPC_|CLONE_NEWUSER_|CLONE_NEWPID_|CLONE_NEWNET_)
+#define CLONE_NEW_FLAGS_ (CLONE_NEWCGROUP_)
 
 static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     struct tgroup *group = malloc(sizeof(struct tgroup));
@@ -85,7 +95,13 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     // running timer thread. Clear the array so the child inherits no timers.
     memset(group->posix_timers, 0, sizeof(group->posix_timers));
     group->doing_group_exit = false;
+    // The parent's unreaped traced threads are the parent's. Inherited, a
+    // child forked while one was outstanding could never be reaped: its exit
+    // would wait for a thread zombie that is not its own to be released.
+    group->traced_zombies = 0;
+    group->exit_notify_deferred = false;
     group->continued = false;
+    group->continue_unannounced = false;
     group->children_rusage = (struct rusage_) {};
     // Everything below is per-PROCESS state that Linux does not hand to a
     // child: copy_signal() builds the new signal_struct from zeroed memory and
@@ -124,7 +140,26 @@ static struct tgroup *tgroup_copy(struct tgroup *old_group) {
     cond_init(&group->child_exit);
     cond_init(&group->stopped_cond);
     lock_init(&group->lock, "tgroup_copy\0");
+    // The CPU sampler was not copied (itimer_vprof_sampler above), but the
+    // limit it enforces was: the child's own CPU time is held to it from 0.
+    if (group->limits[RLIMIT_CPU_].cur != RLIM_INFINITY_)
+        cpu_limit_watch(group);
     return group;
+}
+
+// A task that was to be a pid namespace's init and never ran: the namespace
+// has no init again, and the next process forked into it is.
+static void pid_ns_forget_init(struct pid_namespace *ns, pid_t_ pid) {
+    if (ns == NULL)
+        return;
+    // Its numbers go back too, and the namespace counts from 1 again: the
+    // next process forked into it is its init, and an init is pid 1.
+    complex_lockt(&pids_lock, 0);
+    pid_ns_unnumber((dword_t) pid);
+    pid_t_ was = pid;
+    if (atomic_compare_exchange_strong(&ns->init_pid, &was, 0))
+        ns->last_nr = 0;
+    unlock(&pids_lock);
 }
 
 static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest_addr_t ptid_addr,
@@ -152,6 +187,7 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
             return _ENOMEM;
         task_set_mm(task, new_mm);
     }
+    rseq_fork(task, (flags & CLONE_VM_) != 0);
 
     if (flags & CLONE_FILES_) {
         task->files->refcount++;
@@ -172,12 +208,106 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
             goto fail_free_files;
     }
 
+    // The parent's user namespace, or with CLONE_NEWUSER one of the child's
+    // own, in which it holds every capability (kernel/user_ns.h). First of
+    // the namespaces: the others made by this same call belong to it, and
+    // are the child's to administer. task_create_ left the field NULL.
+    if (flags & CLONE_NEWUSER_) {
+        struct user_namespace *ns = user_ns_new();
+        if (IS_ERR(ns)) {
+            err = (int) PTR_ERR(ns);
+            goto fail_free_fs;
+        }
+        user_ns_enter(task, ns);
+        err = _ENOMEM;
+    } else {
+        task->user_ns = user_ns_retain(current->user_ns);
+    }
+
+    // The pid namespace the parent's children are made in -- its own, or the
+    // one an unshare(CLONE_NEWPID) set aside -- or with CLONE_NEWPID a new
+    // one below that (kernel/pid_ns.h). The first process in a namespace is
+    // its init. A thread is in its process's namespace and no other.
+    {
+        struct pid_namespace *into = current->pid_ns_for_children != NULL ?
+            current->pid_ns_for_children : current->pid_ns;
+        if (flags & CLONE_THREAD_) {
+            task->pid_ns = pid_ns_retain(current->pid_ns);
+        } else if (flags & CLONE_NEWPID_) {
+            struct pid_namespace *ns = pid_ns_new(into, task->user_ns, &err);
+            if (ns == NULL)
+                goto fail_free_fs;
+            atomic_store(&ns->init_pid, task->pid);
+            task->pid_ns = ns;
+            err = _ENOMEM;
+        } else {
+            // Nothing is forked into a namespace whose init is gone.
+            if (into != NULL && atomic_load(&into->dead))
+                goto fail_free_fs;
+            task->pid_ns = pid_ns_retain(into);
+            pid_t_ nobody = 0;
+            if (into != NULL)
+                atomic_compare_exchange_strong(&into->init_pid, &nobody, task->pid);
+        }
+        // Its number in that namespace and in each one above it: 1 for an
+        // init, the next one free for anything else.
+        if (task->pid_ns != NULL) {
+            complex_lockt(&pids_lock, 0);
+            err = pid_ns_number_task(task);
+            unlock(&pids_lock);
+            if (err < 0)
+                goto fail_free_fs;
+            err = _ENOMEM;
+        }
+    }
+
+    // The parent's network namespace, or with CLONE_NEWNET one of the child's
+    // own: a loopback interface that is down, and nothing else
+    // (kernel/net_ns.h).
+    if (flags & CLONE_NEWNET_) {
+        task->net_ns = net_ns_new(task->user_ns);
+        if (task->net_ns == NULL)
+            goto fail_free_fs;
+    } else {
+        task->net_ns = net_ns_retain(current->net_ns);
+    }
+
+    // The parent's mount namespace, or with CLONE_NEWNS a copy of its tree
+    // with the child's root and working directory in the same places there
+    // (kernel/mnt_ns.h). task_create_ left the field NULL.
+    if (flags & CLONE_NEWNS_) {
+        struct mnt_namespace *parent_ns = mnt_ns_current();
+        struct mnt_namespace *ns = mnt_ns_copy(parent_ns, task->user_ns);
+        if (ns == NULL)
+            goto fail_free_fs;
+        err = mnt_ns_move_fs(task->fs, parent_ns, ns, true);
+        if (err < 0) {
+            mnt_ns_release(ns);
+            goto fail_free_fs;
+        }
+        err = _ENOMEM;
+        task->mnt_ns = ns;
+    } else {
+        task->mnt_ns = mnt_ns_retain(current->mnt_ns);
+    }
+
     if (flags & CLONE_NEWUTS_) {
         task->uts_ns = uts_ns_copy(task->uts_ns);
         if (task->uts_ns == NULL)
             goto fail_free_fs;
+        task->uts_ns->user_ns = user_ns_retain(task->user_ns);
     } else {
         uts_ns_retain(task->uts_ns);
+    }
+
+    // A new IPC namespace starts empty; otherwise the child sees its parent's
+    // objects.
+    if (flags & CLONE_NEWIPC_) {
+        task->ipc_ns = ipc_ns_new(task->user_ns);
+        if (task->ipc_ns == NULL)
+            goto fail_free_uts;
+    } else {
+        ipc_ns_retain(task->ipc_ns);
     }
 
     if (flags & CLONE_SIGHAND_) {
@@ -185,7 +315,7 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
     } else {
         task->sighand = sighand_copy(task->sighand);
         if (task->sighand == NULL)
-            goto fail_free_uts;
+            goto fail_free_ipc;
     }
 
     struct tgroup *old_group = task->group;
@@ -206,6 +336,22 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
 
     complex_lockt(&pids_lock, 0);
     lock(&old_group->lock, 0);
+    // The exit signal is set before the new process becomes a leader anyone's
+    // wait can see, as Linux's copy_process sets it before the child joins the
+    // task list: wait asks it which waits the child is for (wait_eligible), and
+    // a leader still carrying task_create_'s 0 is a clone child -- a sibling
+    // thread's waitpid(-1) caught in that window got ECHILD for a fork in
+    // flight.
+    //
+    // A CLONE_PARENT child is its creator's sibling, and announces itself to
+    // the parent they share the way its creator's process does: Linux takes
+    // current->group_leader's exit signal and ignores the one in the flags.
+    // A process cloned with SIGUSR1 that made a sibling asking for SIGCHLD
+    // made a clone child all the same, and the reverse a SIGCHLD child.
+    if (new_group != NULL && (flags & CLONE_PARENT_))
+        task->exit_signal = current->group->leader->exit_signal;
+    else
+        task->exit_signal = flags & CSIGNAL_;
     if (new_group != NULL) {
         list_add(&old_group->pgroup, &new_group->pgroup);
         list_add(&old_group->session, &new_group->session);
@@ -219,8 +365,10 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
 
     if (flags & CLONE_SETTLS_) {
         if (task->abi == GUEST_ABI_AMD64) {
-            // On amd64, CLONE_SETTLS passes the new thread's FS base directly.
+            // On amd64, CLONE_SETTLS passes the new thread's FS base directly,
+            // and like ARCH_SET_FS leaves the FS selector 0.
             task->cpu.tls_ptr = tls_addr;
+            task->cpu.amd64_sreg[AMD64_SREG_FS] = 0;
         } else if (task->abi == GUEST_ABI_ARM64) {
             // On arm64, CLONE_SETTLS passes the new thread's TPIDR_EL0
             // directly, same shape as amd64's FS base — NOT an i386
@@ -233,18 +381,28 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
             // register like arm64's TPIDR_EL0.
             task->cpu.riscv64_regs[riscv64_tp] = tls_addr;
         } else {
-            err = task_set_thread_area(task, (addr_t) tls_addr);
+            // i386: a struct user_desc in the caller's memory for an entry
+            // the child already has (Linux's do_set_thread_area with
+            // can_allocate 0, so -1 is EINVAL). The child's GS or FS follows
+            // the entry if it selects it, as it does for glibc and musl.
+            err = task_set_thread_area(task, -1, (addr_t) tls_addr, false);
             if (err < 0)
                 goto fail_unlink_group;
         }
     }
 
     err = _EFAULT;
-    if (flags & CLONE_CHILD_SETTID_)
-        if (user_put_task(task, ctid_addr, task->pid))
+    // Each is told the child's tid as its own pid namespace has it: a new
+    // namespace's init reads 1 in its own memory, and its parent the number
+    // the machine gave it (kernel/pid_ns.h).
+    if (flags & CLONE_CHILD_SETTID_) {
+        pid_t_ child_view = task_pid_shown(task, task->pid);
+        if (user_put_task(task, ctid_addr, child_view))
             goto fail_unlink_group;
+    }
     if (flags & CLONE_PARENT_SETTID_) {
-        if (user_put(ptid_addr, task->pid))
+        pid_t_ parent_view = current_pid_shown(task->pid);
+        if (user_put(ptid_addr, parent_view))
             goto fail_unlink_group;
     } else if (flags & CLONE_PIDFD_) {
         // Reuses the parent_tid slot to instead receive a pidfd for the new
@@ -272,7 +430,6 @@ static int copy_task(struct task *task, dword_t flags, guest_addr_t stack, guest
     }
     if (flags & CLONE_CHILD_CLEARTID_)
         task->clear_tid = ctid_addr;
-    task->exit_signal = flags & CSIGNAL_;
 
     // remember to do CLONE_SYSVSEM
     return 0;
@@ -314,6 +471,12 @@ fail_free_sighand:
     task->sighand = NULL;
     unlock(&pids_lock);
     sighand_release(dead_sighand);
+fail_free_ipc:
+    lock(&task->general_lock, 0);
+    struct ipc_namespace *dead_ipc_early = task->ipc_ns;
+    task->ipc_ns = NULL;
+    unlock(&task->general_lock);
+    ipc_ns_release(dead_ipc_early);
 fail_free_uts:
     lock(&task->general_lock, 0);
     struct uts_namespace *dead_uts = task->uts_ns;
@@ -324,8 +487,21 @@ fail_free_fs:
     lock(&task->general_lock, 0);
     struct fs_info *dead_fs = task->fs;
     task->fs = NULL;
+    struct mnt_namespace *dead_mnt_early = task->mnt_ns;
+    task->mnt_ns = NULL;
+    struct user_namespace *dead_user_early = task->user_ns;
+    task->user_ns = NULL;
+    struct pid_namespace *dead_pid_early = task->pid_ns;
+    task->pid_ns = NULL;
+    struct net_namespace *dead_net_early = task->net_ns;
+    task->net_ns = NULL;
     unlock(&task->general_lock);
+    net_ns_release(dead_net_early);
     fs_info_release(dead_fs);
+    mnt_ns_release(dead_mnt_early);
+    user_ns_release(dead_user_early);
+    pid_ns_forget_init(dead_pid_early, task->pid);
+    pid_ns_release(dead_pid_early);
 fail_free_files:
     lock(&task->general_lock, 0);
     struct fdtable *dead_files = task->files;
@@ -377,6 +553,16 @@ void task_never_ran_destroy(struct task *task) {
     task->fs = NULL;
     struct uts_namespace *dead_uts = task->uts_ns;
     task->uts_ns = NULL;
+    struct ipc_namespace *dead_ipc = task->ipc_ns;
+    task->ipc_ns = NULL;
+    struct mnt_namespace *dead_mnt = task->mnt_ns;
+    task->mnt_ns = NULL;
+    struct user_namespace *dead_user = task->user_ns;
+    task->user_ns = NULL;
+    struct pid_namespace *dead_pid = task->pid_ns;
+    task->pid_ns = NULL;
+    struct net_namespace *dead_net = task->net_ns;
+    task->net_ns = NULL;
     struct fdtable *dead_files = task->files;
     task->files = NULL;
     struct mm *dead_mm = task->mm;
@@ -384,11 +570,40 @@ void task_never_ran_destroy(struct task *task) {
     task->mem = NULL;
     task->cpu.mmu = NULL;
     unlock(&task->general_lock);
-    sighand_release(dead_sighand);
-    fs_info_release(dead_fs);
-    uts_ns_release(dead_uts);
-    fdtable_release(dead_files);
-    mm_release(dead_mm);
+    // do_exit frees a task's queued signals, and a task that never ran never
+    // gets there. One can still have some: sys_clone_common_ queues a traced
+    // child's SIGSTOP before task_start.
+    if (dead_sighand != NULL) {
+        lock(&dead_sighand->lock, 0);
+        struct sigqueue *sigqueue, *sigqueue_tmp;
+        list_for_each_entry_safe(&task->queue, sigqueue, sigqueue_tmp, queue) {
+            list_remove(&sigqueue->queue);
+            free(sigqueue);
+        }
+        task->pending = 0;
+        unlock(&dead_sighand->lock);
+    }
+    // Any of them can be gone already: a restored thread-group leader that
+    // had exited before the save is rebuilt the way do_exit left it, holding
+    // none of them (kernel/checkpoint.c), and a failed restore takes it apart
+    // here like any task that never ran.
+    if (dead_sighand != NULL)
+        sighand_release(dead_sighand);
+    if (dead_fs != NULL)
+        fs_info_release(dead_fs);
+    if (dead_uts != NULL)
+        uts_ns_release(dead_uts);
+    if (dead_ipc != NULL)
+        ipc_ns_release(dead_ipc);
+    mnt_ns_release(dead_mnt);
+    user_ns_release(dead_user);
+    pid_ns_forget_init(dead_pid, task->pid);
+    pid_ns_release(dead_pid);
+    net_ns_release(dead_net);
+    if (dead_files != NULL)
+        fdtable_release(dead_files);
+    if (dead_mm != NULL)
+        mm_release(dead_mm);
     task_destroy_unlinked(task, 3);
 }
 
@@ -453,11 +668,54 @@ static dword_t sys_clone_common_wrap(dword_t flags, guest_addr_t stack, guest_ad
 static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t ptid,
         guest_addr_t tls, guest_addr_t ctid, bool clear_sighand) {
     STRACE("clone(0x%x, 0x%x, 0x%x, 0x%x, 0x%x)", flags, stack, ptid, tls, ctid);
+    // A namespace this kernel does not have: EINVAL, Linux's own answer for a
+    // namespace type it was built without. NOT ENOSYS, although unshare says
+    // ENOSYS for the same flags (sys_unshare): each entry point's errno is the
+    // one its consumers read as "no sandbox here, carry on". systemd forks its
+    // generator sandbox with raw_clone(SIGCHLD|CLONE_NEWNS) and falls back to
+    // running the generators directly on EPERM/EACCES/EINVAL -- anything else
+    // is fatal, and PID 1 froze at "Failed to start up manager" when 557 made
+    // this ENOSYS (81e0abdb7). Its unshare(CLONE_NEWNS) path instead accepts
+    // EPERM/EACCES/EOPNOTSUPP/ENOSYS and not EINVAL, which is why unshare
+    // keeps ENOSYS. EPERM, the pre-557 answer, read as "you may not" to a root
+    // caller who may. tests/manual/namespace_errno.c holds both rules.
+    // (That history is CLONE_NEWNS's, which is real now; the rule stands for
+    // the kinds that are not.)
+    // (CLONE_NEWTIME is clone3/unshare-only: in clone its bit is part of the
+    // exit signal.)
+    // (Mount namespaces are real since 559, kernel/mnt_ns.h, so systemd's
+    // generator sandbox now gets one.)
     if (flags & CLONE_NEW_FLAGS_)
+        return _EINVAL;
+    // Creating any namespace but a user namespace needs CAP_SYS_ADMIN in
+    // the caller's own user namespace -- or comes with a new user namespace,
+    // in which the child holds it.
+    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ | CLONE_NEWPID_ | CLONE_NEWNET_)) &&
+            !(flags & CLONE_NEWUSER_) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN_))
         return _EPERM;
-    // Creating any namespace needs CAP_SYS_ADMIN in real Linux.
-    if ((flags & CLONE_NEWUTS_) && !superuser())
-        return _EPERM;
+    // A user namespace is a credential of the whole process and of nobody
+    // else's view of the filesystem (copy_process).
+    if ((flags & CLONE_NEWUSER_) && (flags & (CLONE_FS_ | CLONE_THREAD_)))
+        return _EINVAL;
+    // A pid namespace's first process is a process; one a caller has already
+    // set aside for its children (unshare) is where they go, threads
+    // excepted; and a namespace's init makes no siblings for itself, whose
+    // parent would be outside (copy_process).
+    if ((flags & CLONE_NEWPID_) && (flags & CLONE_THREAD_))
+        return _EINVAL;
+    if ((flags & CLONE_PARENT_) && current->pid_ns != NULL &&
+            atomic_load(&current->pid_ns->init_pid) == current->tgid)
+        return _EINVAL;
+    if (current->pid_ns_for_children != NULL && (flags & (CLONE_NEWPID_ | CLONE_THREAD_)))
+        return _EINVAL;
+    // A new mount namespace has a root and working directory of its own in
+    // it, which a shared fs_struct cannot be (copy_process: EINVAL).
+    if ((flags & (CLONE_NEWNS_ | CLONE_FS_)) == (CLONE_NEWNS_ | CLONE_FS_))
+        return _EINVAL;
+    // CLONE_SYSVSEM shares the parent's SEM_UNDO list, whose semaphores a new
+    // IPC namespace cannot reach, so Linux refuses the pair (copy_namespaces).
+    if ((flags & (CLONE_NEWIPC_ | CLONE_SYSVSEM_)) == (CLONE_NEWIPC_ | CLONE_SYSVSEM_))
+        return _EINVAL;
     // The low byte of flags (or clone3's separate exit_signal field, folded in
     // by sys_clone3_guest) becomes task->exit_signal and is later handed to
     // send_signal() uninspected when the child exits. Out-of-range values
@@ -495,12 +753,16 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
     // not count against it -- Linux charges the limit in copy_process, which
     // CLONE_THREAD reaches too, but the count it compares against is of
     // processes; keeping threads out of both sides is the same answer with
-    // less bookkeeping. root is exempt, as there.
+    // less bookkeeping. root is exempt, as there: real uid 0 (INIT_USER),
+    // or the capability in the initial user namespace.
+    //
+    // Counted per user namespace and charged at every level above, as Linux's
+    // ucounts do (task_nproc_exceeded): a namespace's processes count against
+    // its owner's limit outside, as that limit was when it was made.
     if (!(flags & CLONE_THREAD_)) {
-        rlim_t_ nproc = rlimit(RLIMIT_NPROC_);
-        if (nproc != RLIM_INFINITY_ && !current_capable(CAP_SYS_RESOURCE_) &&
+        if (current->uid != 0 && !current_capable(CAP_SYS_RESOURCE_) &&
                 !current_capable(CAP_SYS_ADMIN_) &&
-                task_count_for_uid(current->uid) >= nproc)
+                task_nproc_exceeded(current, rlimit(RLIMIT_NPROC_)))
             return _EAGAIN;
     }
 
@@ -518,7 +780,8 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         // not the grandparent's.
         complex_lockt(&pids_lock, 0);
         list_remove(&task->siblings);
-        list_add(&current->parent->children, &task->siblings);
+        // The youngest of its new siblings, so last, as for any child.
+        list_add_tail(&current->parent->children, &task->siblings);
         task->parent = current->parent;
         unlock(&pids_lock);
     }
@@ -593,10 +856,8 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         else
             ptrace_event = PTRACE_EVENT_FORK_;
 
-        if (current->ptrace.options & trace_option) {
-            ptrace_attach_fork_child(task, current);
-            trace_child = true;
-        }
+        if (current->ptrace.options & trace_option)
+            trace_child = ptrace_attach_fork_child(task, current);
     }
 
     // CLONE_CLEAR_SIGHAND: the child's dispositions start at SIG_DFL rather
@@ -620,6 +881,38 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         unlock(&task->sighand->lock);
     }
 
+    // A child the tracer is now attached to starts life owing it a stop, which
+    // is the tracer's first report of the new task. Linux's ptrace_init_task
+    // decides which: a tracer that seized is owed a PTRACE_EVENT_STOP
+    // (JOBCTL_TRAP_STOP), any other a SIGSTOP. Both are set before the task
+    // runs at all, and task_thread takes them before its first instruction.
+    //
+    // A seized child used to get the SIGSTOP too. strace -f takes a seized
+    // tracee's SIGSTOP for a real signal and injects it, so every child it
+    // followed printed "--- SIGSTOP {si_code=SI_KERNEL} ---", really stopped,
+    // and sent its parent a SIGCHLD with CLD_STOPPED. No signal could have
+    // replaced it: glibc blocks every signal around pthread_create's and
+    // posix_spawn's clone, and the child starts with that mask.
+    //
+    // The SIGSTOP is a bare pending bit in Linux, with no siginfo queued, so
+    // the tracer reads SI_USER from pid 0. Measured on 6.12.
+    //
+    // This was sent after task_start, and a child whose first act was _exit
+    // could, rarely, be gone before it arrived. Its tracer then never heard of
+    // it -- or, waiting on the pid the event named, reaped it from under its
+    // real parent, whose own waitpid then failed. Seen once in 2000 traced
+    // vforks, and once in 15 runs of tests/manual/ptrace_eventmsg.c.
+    if (trace_child) {
+        if (task->ptrace.seized) {
+            // Nothing else can see the task yet but its tracer, which learns
+            // the pid only from the event below.
+            task->ptrace.trap_stop = true;
+        } else {
+            struct siginfo_ stop_info = { .sig = SIGSTOP_, .code = SI_USER_ };
+            signal_queue_before_start(task, SIGSTOP_, stop_info);
+        }
+    }
+
     if (task_start(task) < 0) {
         // Host thread limit or memory exhaustion: the child never ran.
         // Unwind completely and give the guest a clean EAGAIN, matching
@@ -638,13 +931,11 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         }
         return _EAGAIN;
     }
-    if (trace_child)
-        send_signal(task, SIGSTOP_, SIGINFO_NIL);
     if (trace_child) {
         struct siginfo_ info = {
             .sig = SIGTRAP_,
             .code = SI_KERNEL_,
-            .kill.pid = current->pid,
+            .kill.pid = current_pid_shown(current->pid),
             .kill.uid = current->uid,
         };
         ptrace_event_stop(SIGTRAP_, &info, ptrace_event, pid);
@@ -658,17 +949,31 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         // using. Only a signal that will terminate us qualifies, and after one
         // of those we run no guest instructions at all -- handle_interrupt()
         // calls receive_signals() before the JIT is re-entered.
+        //
+        // A signal our tracer will see first is not one of those, whatever its
+        // disposition: the tracer can suppress it (signal_stops_for_tracer).
+        // Linux only turns a fatal signal into a SIGKILL for an untraced task
+        // (complete_signal), so a tracee's vfork wait ends for SIGKILL alone.
+        // PTRACE_INTERRUPT's trap was a SIGTRAP then, whose disposition is
+        // terminate, and it ended the wait too; it is a flag now
+        // (ptrace.trap_stop), which this wait never looks at. Measured with the
+        // child blocked
+        // on a pipe: after PTRACE_INTERRUPT, or a SIGINT the tracer then
+        // resumed without, the parent stopped at once, returned from vfork
+        // before the child had finished, and died of SIGSEGV on the stack they
+        // shared. Linux 6.12 reported no stop until the child had exited.
         bool fatal = false;
         lock(&vfork->lock, 0);
         while (!vfork->done) {
             lock(&current->sighand->lock, 0);
-            sigset_t_ pending = current->pending | current->sighand->pending;
+            sigset_t_ pending = current->pending | task_group_pending(current);
             pending &= ~current->blocked;
             // sigset_has() asserts 1 <= sig < NUM_SIGS (64), so this covers
             // every signal that can be represented in the mask.
             for (int sig = 1; sig <= 63 && !fatal; sig++) {
                 if (sigset_has(pending, sig) &&
-                        signal_action(current->sighand, sig) == SIGNAL_KILL)
+                        signal_action(current->sighand, sig) == SIGNAL_KILL &&
+                        !signal_stops_for_tracer(current, sig))
                     fatal = true;
             }
             unlock(&current->sighand->lock);
@@ -698,9 +1003,31 @@ static dword_t sys_clone_common_(dword_t flags, guest_addr_t stack, guest_addr_t
         // blocked on vfork->lock on its way to setting done, in which case it
         // no longer shares our stack and is a legitimately running new program.
         vfork_info_release(vfork);
+
+        // PTRACE_EVENT_VFORK_DONE: the child has exec'd or exited and let go of
+        // the memory it shared with us. gdb takes its breakpoints out of a
+        // vfork parent and puts them back only on this event, running nothing
+        // but the vforking thread until then. AOK never sent it, so under gdb
+        // a breakpoint after a vfork never fired, and a threaded program that
+        // vforked hung with its other threads held stopped.
+        //
+        // Linux reports it to any tracer that asked for it, whether or not the
+        // child was traced, with the child's pid -- and not when a fatal
+        // signal ended the wait.
+        if (!fatal && current->ptrace.traced &&
+                (current->ptrace.options & PTRACE_O_TRACEVFORKDONE_)) {
+            struct siginfo_ info = {
+                .sig = SIGTRAP_,
+                .code = SI_KERNEL_,
+                .kill.pid = current_pid_shown(current->pid),
+                .kill.uid = current->uid,
+            };
+            ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_VFORK_DONE_, pid);
+        }
     }
 
-    return pid;
+    // The child's number where the caller is (kernel/pid_ns.h).
+    return current_pid_shown(pid);
 }
 
 // A child of `current` with fork semantics, for a caller that will exec into
@@ -823,10 +1150,77 @@ dword_t sys_clone3(addr_t uargs_addr, dword_t size) {
     return sys_clone3_guest(uargs_addr, size);
 }
 
+// Whether the caller already has what unshare(2) was asked to split off its
+// thread group, signal handlers or address space to itself. None of the three
+// can be split off a running process, and Linux does not try either
+// (check_unshare_flags): it succeeds when there is nothing to split and
+// refuses with EINVAL when there is.
+static int unshare_check_shared(dword_t flags) {
+    if (!(flags & (CLONE_THREAD_ | CLONE_SIGHAND_ | CLONE_VM_)))
+        return 0;
+    int err = 0;
+    complex_lockt(&pids_lock, 0);
+    struct list *threads = &current->group->threads;
+    if (threads->next != threads->prev)
+        err = _EINVAL;
+    else if ((flags & (CLONE_SIGHAND_ | CLONE_VM_)) && current->sighand->refcount > 1)
+        err = _EINVAL;
+    else if ((flags & CLONE_VM_) && current->mm->refcount > 1) {
+        // The count also includes a /proc reader holding the mm for a moment,
+        // so look for another task actually running in it, as Linux's
+        // current_is_single_threaded does: a CLONE_VM child that is not a
+        // thread, or a vfork child that has not yet exec'd.
+        struct pid *entry;
+        list_for_each_entry(&alive_pids_list, entry, alive) {
+            struct task *task = entry->task;
+            if (task != NULL && task != current && task->mm == current->mm) {
+                err = _EINVAL;
+                break;
+            }
+        }
+    }
+    unlock(&pids_lock);
+    return err;
+}
+
+static bool current_is_only_thread(void) {
+    complex_lockt(&pids_lock, 0);
+    struct list *threads = &current->group->threads;
+    bool alone = threads->next == threads->prev;
+    unlock(&pids_lock);
+    return alone;
+}
+
+// Leaving the SEM_UNDO list is what exit does to it (Linux: "CLONE_SYSVSEM is
+// equivalent to sys_exit()"). The list here belongs to the whole process, so
+// it is applied now only when the caller is the process's only thread; with
+// others left sharing it Linux merely detaches the caller, and the others
+// keep it -- which AOK's per-process list already amounts to.
+static void sysv_undo_leave(void) {
+    if (current_is_only_thread())
+        sysv_sem_exit(current->ipc_ns, current->group);
+}
+
 dword_t sys_unshare(dword_t flags) {
     STRACE("unshare(%#x)", flags);
 
-    const dword_t supported = CLONE_FILES_ | CLONE_FS_ | CLONE_SYSVSEM_ | CLONE_NEWUTS_;
+    // Linux widens the request before it looks at it: an address space takes
+    // the signal handlers with it, and those take the thread group.
+    if (flags & CLONE_VM_)
+        flags |= CLONE_SIGHAND_;
+    if (flags & CLONE_SIGHAND_)
+        flags |= CLONE_THREAD_;
+
+    // A mount namespace takes the fs_struct with it: the root and working
+    // directory it holds are places in the old tree (ksys_unshare).
+    if (flags & CLONE_NEWNS_)
+        flags |= CLONE_FS_;
+    // A user namespace is the whole process's, and takes the fs_struct too.
+    if (flags & CLONE_NEWUSER_)
+        flags |= CLONE_THREAD_ | CLONE_FS_;
+    const dword_t supported = CLONE_THREAD_ | CLONE_SIGHAND_ | CLONE_VM_ |
+        CLONE_FILES_ | CLONE_FS_ | CLONE_SYSVSEM_ | CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ |
+        CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_;
     // Recognized, and not provided. The distinction from the ~known case
     // below is the whole point: a flag listed here is a real thing this
     // kernel does not have (ENOSYS), while one that is not listed at all is a
@@ -840,44 +1234,181 @@ dword_t sys_unshare(dword_t flags) {
     //   unshare: unshare failed: Invalid argument
     //
     // Six of those eight namespaces already answered ENOSYS; the odd one out
-    // decided the message.
-    const dword_t known_unsupported = CLONE_VM_ | CLONE_SIGHAND_ | CLONE_THREAD_ |
-        CLONE_NEWNS_ | CLONE_NEWCGROUP_ | CLONE_NEWIPC_ | CLONE_NEWTIME_ |
-        CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_ | CLONE_IO_;
+    // decided the message. ENOSYS, not clone's EINVAL: systemd's
+    // unshare(CLONE_NEWNS) treats ENOSYS as "not supported here" and EINVAL as
+    // a failure (see sys_clone_common_). (CLONE_IO is not a namespace, and Linux's unshare
+    // refuses it as malformed, so it is not listed here.)
+    const dword_t known_unsupported = CLONE_NEWCGROUP_ | CLONE_NEWTIME_;
     const dword_t known = supported | known_unsupported;
 
     if (flags & ~known)
         return _EINVAL;
+    int err = unshare_check_shared(flags);
+    if (err < 0)
+        return err;
     if (flags & known_unsupported)
         return _ENOSYS;
-    if ((flags & CLONE_NEWUTS_) && !superuser())
+    if ((flags & (CLONE_NEWUTS_ | CLONE_NEWIPC_ | CLONE_NEWNS_ | CLONE_NEWPID_ | CLONE_NEWNET_)) &&
+            !(flags & CLONE_NEWUSER_) && !ns_capable(current_user_ns(), CAP_SYS_ADMIN_))
         return _EPERM;
 
-    if (flags & CLONE_NEWUTS_) {
-        struct uts_namespace *new_uts = uts_ns_copy(current->uts_ns);
-        if (new_uts == NULL)
+    // Everything that can fail to allocate is allocated before anything
+    // changes, so a failure leaves the caller as it was. The user namespace
+    // first: the others made by this call belong to it.
+    struct user_namespace *new_user = NULL;
+    if (flags & CLONE_NEWUSER_) {
+        new_user = user_ns_new();
+        if (IS_ERR(new_user))
+            return (int) PTR_ERR(new_user);
+    }
+    struct user_namespace *owner = new_user != NULL ? new_user : current_user_ns();
+    // A pid namespace for the caller's CHILDREN: the caller stays who it is,
+    // where it is, and the next process it forks is the new namespace's init
+    // (unshare_pid_namespace). Made last of all below, since nothing after
+    // it can fail.
+    struct pid_namespace *new_pid = NULL;
+    if (flags & CLONE_NEWPID_) {
+        struct pid_namespace *below = current->pid_ns_for_children != NULL ?
+            current->pid_ns_for_children : current->pid_ns;
+        int pid_err = 0;
+        new_pid = pid_ns_new(below, owner, &pid_err);
+        if (new_pid == NULL) {
+            user_ns_release(new_user);
+            return pid_err;
+        }
+    }
+    struct mnt_namespace *old_mnt = mnt_ns_current(), *new_mnt = NULL;
+    if (flags & CLONE_NEWNS_) {
+        new_mnt = mnt_ns_copy(old_mnt, owner);
+        if (new_mnt == NULL) {
+            user_ns_release(new_user);
+            pid_ns_release(new_pid);
             return _ENOMEM;
-        struct uts_namespace *old_uts = current->uts_ns;
-        current->uts_ns = new_uts;
-        uts_ns_release(old_uts);
+        }
+    }
+    struct uts_namespace *new_uts = NULL;
+    if (flags & CLONE_NEWUTS_) {
+        new_uts = uts_ns_copy(current->uts_ns);
+        if (new_uts == NULL) {
+            mnt_ns_release(new_mnt);
+            user_ns_release(new_user);
+            pid_ns_release(new_pid);
+            return _ENOMEM;
+        }
+        new_uts->user_ns = user_ns_retain(owner);
+    }
+    struct ipc_namespace *new_ipc = NULL;
+    if (flags & CLONE_NEWIPC_) {
+        new_ipc = ipc_ns_new(owner);
+        if (new_ipc == NULL) {
+            if (new_uts != NULL)
+                uts_ns_release(new_uts);
+            mnt_ns_release(new_mnt);
+            user_ns_release(new_user);
+            pid_ns_release(new_pid);
+            return _ENOMEM;
+        }
     }
 
     if (flags & CLONE_FILES_) {
-        int err = fdtable_unshare_current();
-        if (err < 0)
+        err = fdtable_unshare_current();
+        if (err < 0) {
+            if (new_uts != NULL)
+                uts_ns_release(new_uts);
+            ipc_ns_release(new_ipc);
+            mnt_ns_release(new_mnt);
+            user_ns_release(new_user);
+            pid_ns_release(new_pid);
             return err;
+        }
     }
 
     if ((flags & CLONE_FS_) && current->fs->refcount != 1) {
         struct fs_info *old_fs = current->fs;
         struct fs_info *new_fs = fs_info_copy(old_fs);
-        if (new_fs == NULL)
+        if (new_fs == NULL) {
+            if (new_uts != NULL)
+                uts_ns_release(new_uts);
+            ipc_ns_release(new_ipc);
+            mnt_ns_release(new_mnt);
+            user_ns_release(new_user);
+            pid_ns_release(new_pid);
             return _ENOMEM;
+        }
+        lock(&current->general_lock, 0);
         current->fs = new_fs;
+        unlock(&current->general_lock);
         fs_info_release(old_fs);
     }
 
-    // SysV semaphore undo lists are not modeled separately, so treat this as a no-op.
+    // Into the copy of the tree: the root and working directory, now this
+    // task's alone, move to where they are there.
+    if (new_mnt != NULL) {
+        err = mnt_ns_move_fs(current->fs, old_mnt, new_mnt, true);
+        if (err < 0) {
+            if (new_uts != NULL)
+                uts_ns_release(new_uts);
+            ipc_ns_release(new_ipc);
+            mnt_ns_release(new_mnt);
+            user_ns_release(new_user);
+            pid_ns_release(new_pid);
+            return err;
+        }
+        lock(&current->general_lock, 0);
+        struct mnt_namespace *dead_mnt = current->mnt_ns;
+        current->mnt_ns = new_mnt;
+        unlock(&current->general_lock);
+        mnt_ns_release(dead_mnt);
+    }
+
+    // Into the user namespace: every capability, there and nowhere else.
+    if (new_user != NULL) {
+        lock(&current->general_lock, 0);
+        struct user_namespace *old_user = current->user_ns;
+        user_ns_enter(current, new_user);
+        unlock(&current->general_lock);
+        user_ns_release(old_user);
+    }
+
+    // A network namespace: allocated here, where nothing after it can fail.
+    // The caller's sockets stay in the one they were made in.
+    if (flags & CLONE_NEWNET_) {
+        struct net_namespace *new_net = net_ns_new(owner);
+        if (new_net != NULL) {
+            lock(&current->general_lock, 0);
+            struct net_namespace *old_net = current->net_ns;
+            current->net_ns = new_net;
+            unlock(&current->general_lock);
+            net_ns_release(old_net);
+        }
+    }
+    if (new_pid != NULL) {
+        lock(&current->general_lock, 0);
+        struct pid_namespace *old_for_children = current->pid_ns_for_children;
+        current->pid_ns_for_children = new_pid;
+        unlock(&current->general_lock);
+        pid_ns_release(old_for_children);
+    }
+
+    // A new IPC namespace leaves the SEM_UNDO list, because its semaphores
+    // are out of reach from there.
+    if (flags & (CLONE_SYSVSEM_ | CLONE_NEWIPC_))
+        sysv_undo_leave();
+
+    if (new_uts != NULL) {
+        lock(&current->general_lock, 0);
+        struct uts_namespace *old_uts = current->uts_ns;
+        current->uts_ns = new_uts;
+        unlock(&current->general_lock);
+        uts_ns_release(old_uts);
+    }
+    if (new_ipc != NULL) {
+        lock(&current->general_lock, 0);
+        struct ipc_namespace *old_ipc = current->ipc_ns;
+        current->ipc_ns = new_ipc;
+        unlock(&current->general_lock);
+        ipc_ns_release(old_ipc);
+    }
     return 0;
 }
 
@@ -912,6 +1443,14 @@ dword_t sys_kcmp(pid_t_ pid1, pid_t_ pid2, dword_t type, dword_t idx1, dword_t i
     if (t1 == NULL || t2 == NULL) {
         unlock(&pids_lock);
         return _ESRCH;
+    }
+    // Linux: both must be processes the caller may inspect
+    // (PTRACE_MODE_READ_REALCREDS), EPERM otherwise -- what two processes
+    // share is theirs to tell.
+    if (!task_ptrace_may_access(t1, PTRACE_MODE_READ_ | PTRACE_MODE_REALCREDS_) ||
+            !task_ptrace_may_access(t2, PTRACE_MODE_READ_ | PTRACE_MODE_REALCREDS_)) {
+        unlock(&pids_lock);
+        return _EPERM;
     }
     int res;
     switch (type) {
@@ -982,4 +1521,225 @@ void vfork_notify(struct task *task) {
     unlock(&vfork->lock);
 
     vfork_info_release(vfork);
+}
+
+// setns(2). `fd` is either a /proc/<pid>/ns/* descriptor, naming one
+// namespace (a nonzero `flags` must be its type), or a pidfd, whose process's
+// namespaces of every kind `flags` lists are joined together -- all of them
+// or, if any check fails, none.
+//
+// Mount, UTS, IPC, user, pid and network namespaces are real, and are
+// switched; cgroup and time have only their initial one, which the caller is
+// already in. What joining each does, as on Linux:
+//
+//   mount    the root and working directory become its root (a way out of a
+//            chroot, which is why it also needs CAP_SYS_CHROOT)
+//   user     the caller holds every capability in it, and keeps its ids. One
+//            cannot enter the namespace one is in (EINVAL) -- it would hand
+//            its owner's capabilities back -- so the way is only ever down.
+//   pid      the caller stays what it is; its children are made there
+//            (pid_ns_for_children). Its own namespace or one below it only.
+//   network  sockets made from here on are in it; the ones it has stay
+//
+// Each kind takes CAP_SYS_ADMIN over the user namespace that owns the target,
+// and in the user namespace the caller will be in afterwards -- the one being
+// joined, when one is. The checks run in Linux's order (kernel/nsproxy.c and
+// each kind's install): the descriptor, the flags, the target process, and
+// then per kind -- user, mnt, uts, ipc, pid, cgroup, net, time. atop joins
+// pid 1's UTS namespace to read the host name, and got ENOSYS from a stub
+// here; nsenter into a sandbox joins all of them.
+dword_t sys_setns(fd_t fd_no, dword_t flags) {
+    STRACE("setns(%d, %#x)", fd_no, flags);
+    const dword_t all_kinds = CLONE_NEWNS_ | CLONE_NEWCGROUP_ | CLONE_NEWUTS_ | CLONE_NEWIPC_ |
+        CLONE_NEWUSER_ | CLONE_NEWPID_ | CLONE_NEWNET_ | CLONE_NEWTIME_;
+    struct fd *fd = f_get(fd_no);
+    if (fd == NULL)
+        return _EBADF;
+
+    struct uts_namespace *uts = NULL;
+    struct ipc_namespace *ipc = NULL;
+    // The mount, user, pid and network namespaces to join: NULL is the
+    // initial one, which needs no reference; any other is held from here.
+    struct mnt_namespace *mnt = NULL;
+    struct user_namespace *user = NULL;
+    struct pid_namespace *pid = NULL;
+    struct net_namespace *net = NULL;
+    unsigned nstype;
+    void *ns;
+    int err = 0;
+    if (proc_ns_fd_info(fd, &nstype, &ns)) {
+        if (flags != 0 && flags != nstype)
+            return _EINVAL;
+        flags = nstype;
+        if (nstype == CLONE_NEWUTS_ && ns != NULL)
+            uts = uts_ns_retain(ns);
+        if (nstype == CLONE_NEWIPC_ && ns != NULL)
+            ipc = ipc_ns_retain(ns);
+        if (nstype == CLONE_NEWNS_ && ns != NULL)
+            mnt = mnt_ns_retain(ns);
+        if (nstype == CLONE_NEWUSER_)
+            user = user_ns_retain(ns);
+        if (nstype == CLONE_NEWPID_)
+            pid = pid_ns_retain(ns);
+        if (nstype == CLONE_NEWNET_)
+            net = net_ns_retain(ns);
+    } else {
+        // Anything that is neither a namespace fd nor a pidfd is EINVAL too.
+        if (flags == 0 || (flags & ~all_kinds))
+            return _EINVAL;
+        struct task *task = pidfd_task_ref(fd_no, &err);
+        if (task == NULL)
+            return err == _EBADF ? _EINVAL : err;
+        if (!task_ptrace_may_access(task, PTRACE_MODE_READ_ | PTRACE_MODE_REALCREDS_)) {
+            task_ref_cnt_mod(task, -1);
+            return _EPERM;
+        }
+        // One snapshot of the target's namespaces. A process already in its
+        // exit (or a zombie) has released them, and has none to join.
+        bool gone = true;
+        // Not a plain lock: see task_lock_unless_exiting.
+        if (task_lock_unless_exiting(task)) {
+            if (!task->exiting && task->uts_ns != NULL && task->ipc_ns != NULL) {
+                gone = false;
+                if (flags & CLONE_NEWUTS_)
+                    uts = uts_ns_retain(task->uts_ns);
+                if (flags & CLONE_NEWIPC_)
+                    ipc = ipc_ns_retain(task->ipc_ns);
+                if (flags & CLONE_NEWNS_)
+                    mnt = mnt_ns_retain(task->mnt_ns);
+                if (flags & CLONE_NEWUSER_)
+                    user = user_ns_retain(task->user_ns);
+                // (The one it is in, not the one its children are made in.)
+                if (flags & CLONE_NEWPID_)
+                    pid = pid_ns_retain(task->pid_ns);
+                if (flags & CLONE_NEWNET_)
+                    net = net_ns_retain(task->net_ns);
+            }
+            unlock(&task->general_lock);
+        }
+        task_ref_cnt_mod(task, -1);
+        if (gone)
+            return _ESRCH;
+    }
+
+    // The user namespace the caller will be in once this is done, and whether
+    // it will hold CAP_SYS_ADMIN and CAP_SYS_CHROOT there: asked of what it
+    // holds now, which over a namespace it may join is everything.
+    struct user_namespace *cred_ns = current_user_ns();
+    if (flags & CLONE_NEWUSER_) {
+        if (user == cred_ns)
+            err = _EINVAL;
+        else if (!current_is_only_thread() || current->fs->refcount != 1)
+            err = _EINVAL;
+        else if (!ns_capable(user, CAP_SYS_ADMIN_))
+            err = _EPERM;
+        else
+            cred_ns = user;
+    }
+    bool admin = ns_capable(cred_ns, CAP_SYS_ADMIN_);
+    if (err == 0 && (flags & CLONE_NEWNS_)) {
+        if (!ns_capable(mnt != NULL ? mnt->user_ns : NULL, CAP_SYS_ADMIN_) || !admin ||
+                !ns_capable(cred_ns, CAP_SYS_CHROOT_))
+            err = _EPERM;
+        // Only for a mount namespace alone: given other kinds as well, Linux
+        // works on a private copy of the fs_struct, which nobody shares.
+        else if (flags == CLONE_NEWNS_ && current->fs->refcount != 1)
+            err = _EINVAL;
+    }
+    if (err == 0 && (flags & CLONE_NEWUTS_) &&
+            (!ns_capable(uts != NULL ? uts->user_ns : NULL, CAP_SYS_ADMIN_) || !admin))
+        err = _EPERM;
+    if (err == 0 && (flags & CLONE_NEWIPC_) &&
+            (!ns_capable(ipc != NULL ? ipc->user_ns : NULL, CAP_SYS_ADMIN_) || !admin))
+        err = _EPERM;
+    if (err == 0 && (flags & CLONE_NEWPID_)) {
+        if (!ns_capable(pid != NULL ? pid->user_ns : NULL, CAP_SYS_ADMIN_) || !admin)
+            err = _EPERM;
+        // The one the caller is in, or one below it: there is no way up, and
+        // none across.
+        else if (!pid_ns_in(pid, current->pid_ns))
+            err = _EINVAL;
+    }
+    // (The one cgroup namespace is the machine's.)
+    if (err == 0 && (flags & CLONE_NEWCGROUP_) && (!current_capable(CAP_SYS_ADMIN_) || !admin))
+        err = _EPERM;
+    if (err == 0 && (flags & CLONE_NEWNET_) &&
+            (!ns_capable(net != NULL ? net->user_ns : NULL, CAP_SYS_ADMIN_) || !admin))
+        err = _EPERM;
+    if (err == 0 && (flags & CLONE_NEWTIME_)) {
+        if (!current_is_only_thread())
+            err = _EUSERS;
+        else if (!current_capable(CAP_SYS_ADMIN_) || !admin)
+            err = _EPERM;
+    }
+
+    // Into the mount namespace first, the one step here that can fail: the
+    // root and working directory both become its root (mntns_install).
+    if (err == 0 && (flags & CLONE_NEWNS_))
+        err = mnt_ns_move_fs(current->fs, mnt_ns_current(), mnt, false);
+    if (err < 0) {
+        if (uts != NULL)
+            uts_ns_release(uts);
+        if (ipc != NULL)
+            ipc_ns_release(ipc);
+        mnt_ns_release(mnt);
+        user_ns_release(user);
+        pid_ns_release(pid);
+        net_ns_release(net);
+        return err;
+    }
+    if (flags & CLONE_NEWUSER_) {
+        lock(&current->general_lock, 0);
+        struct user_namespace *old_user = current->user_ns;
+        user_ns_enter(current, user); // the reference taken above
+        unlock(&current->general_lock);
+        user_ns_release(old_user);
+    }
+    if (flags & CLONE_NEWNS_) {
+        lock(&current->general_lock, 0);
+        struct mnt_namespace *old_mnt = current->mnt_ns;
+        current->mnt_ns = mnt; // the reference taken above, or NULL
+        unlock(&current->general_lock);
+        mnt_ns_release(old_mnt);
+    }
+    if (flags & CLONE_NEWPID_) {
+        // Its own namespace is where its children are made when nothing is
+        // set aside, which is how that is written down.
+        lock(&current->general_lock, 0);
+        struct pid_namespace *old_for_children = current->pid_ns_for_children;
+        if (pid == current->pid_ns) {
+            current->pid_ns_for_children = NULL;
+            pid_ns_release(pid);
+        } else {
+            current->pid_ns_for_children = pid; // the reference taken above
+        }
+        unlock(&current->general_lock);
+        pid_ns_release(old_for_children);
+    }
+    if (flags & CLONE_NEWNET_) {
+        lock(&current->general_lock, 0);
+        struct net_namespace *old_net = current->net_ns;
+        current->net_ns = net; // the reference taken above, or NULL
+        unlock(&current->general_lock);
+        net_ns_release(old_net);
+    }
+    // Linux leaves the SEM_UNDO list on any IPC setns, even into the
+    // namespace the caller is already in.
+    if (flags & CLONE_NEWIPC_)
+        sysv_undo_leave();
+    if (uts != NULL) {
+        lock(&current->general_lock, 0);
+        struct uts_namespace *old_uts = current->uts_ns;
+        current->uts_ns = uts;
+        unlock(&current->general_lock);
+        uts_ns_release(old_uts);
+    }
+    if (ipc != NULL) {
+        lock(&current->general_lock, 0);
+        struct ipc_namespace *old_ipc = current->ipc_ns;
+        current->ipc_ns = ipc;
+        unlock(&current->general_lock);
+        ipc_ns_release(old_ipc);
+    }
+    return 0;
 }

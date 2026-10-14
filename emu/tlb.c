@@ -6,304 +6,36 @@
 #include "kernel/signal.h"
 #include "kernel/task.h"
 #include "kernel/abi.h"
+#include "jit/jit.h"
 
-static void arm64_watch_scan_value(guest_addr_t addr, const void *value, unsigned size);
+void arm64_watch_scan_value(guest_addr_t addr, const void *value, unsigned size);
 
-// AdvSIMD LD1/ST1 (load/store multiple single-element structures,
-// contiguous form): transfer `count` consecutive V registers (wrapping
-// mod 32) of `regbytes` (8 for the .8b/.4h/.2s arrangements, 16 for the
-// .16b/... Q=1 arrangements) each, starting at `addr`. Done in C because
-// the whole transfer can span page boundaries per register — reusing the
-// crosspage-capable tlb_read/tlb_write is far simpler and safer than
-// hand-rolling the multi-register crosspage assembly. Returns INT_NONE on
-// success, or INT_PF (with cpu->segfault_addr/was_write set from the tlb)
-// on the first faulting access; the calling gadget rewinds PC and exits.
-// The scalar-write zero-extension (Q=0 clears the upper 64 bits) falls out
-// of copying through a zero-initialized union.
+// The pair atomics below are the arm64 interpreter's (emu/arm64_interp.c);
+// the JIT's atomics are gadgets (jit/guest-arm64/atomics.S).
 //
-// Success returns 0, NOT INT_NONE (which is -1) — the gadget branches to
-// its fault path on a nonzero result, so INT_NONE would take the fault
-// path on every success. (Real bug: it did exactly that — every
-// successful ld1 exited INT_PF and the block re-ran forever.)
-int arm64_vldst_multi(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
-                      unsigned rt, unsigned count, unsigned regbytes, int is_load) {
-    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
-    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
-    // the TLB -- and it exists because these helpers deliberately BYPASS those
-    // macros: the gadget hands the raw guest address straight to C so the
-    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
-    // route ever strips the tag, so it has to happen here, on entry, before
-    // the address reaches a TLB index or an alignment check.
-    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
-    for (unsigned r = 0; r < count; r++) {
-        unsigned v = (rt + r) & 31;
-        if (is_load) {
-            union xmm_reg tmp = {};
-            if (!tlb_read(tlb, addr, &tmp, regbytes)) {
-                cpu->segfault_addr = tlb->segfault_addr;
-                cpu->segfault_was_write = false;
-                return INT_PF;
-            }
-            cpu->arm64_v[v] = tmp;
-        } else {
-            if (!tlb_write(tlb, addr, &cpu->arm64_v[v], regbytes)) {
-                cpu->segfault_addr = tlb->segfault_addr;
-                cpu->segfault_was_write = true;
-                return INT_PF;
-            }
-            arm64_watch_scan_value(addr, &cpu->arm64_v[v], regbytes);
-        }
-        addr += regbytes;
-    }
-    return 0;
-}
-
-// AdvSIMD structured load/store forms beyond the contiguous LD1/ST1
-// above (same crosspage-safety reasoning; OpenMinis splits these across
-// per-element micro-gadgets instead). spec packs the shape:
-//   [3:0] count  [5:4] esize_log2  [6] q  [11:8] lane
-//   [13:12] kind (1=interleaved multiple, 2=single lane, 3=replicate)
-//   [14] is_load
-// Returns 0 on success (see the INT_NONE note above), INT_PF on fault.
-int arm64_vldst_struct(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
-                       unsigned rt, unsigned spec) {
-    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
-    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
-    // the TLB -- and it exists because these helpers deliberately BYPASS those
-    // macros: the gadget hands the raw guest address straight to C so the
-    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
-    // route ever strips the tag, so it has to happen here, on entry, before
-    // the address reaches a TLB index or an alignment check.
-    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
-    unsigned count = spec & 0xf;
-    unsigned esize = 1u << ((spec >> 4) & 3);
-    unsigned q = (spec >> 6) & 1;
-    unsigned lane = (spec >> 8) & 0xf;
-    unsigned kind = (spec >> 12) & 3;
-    int is_load = (spec >> 14) & 1;
-    unsigned regbytes = q ? 16 : 8;
-
-    if (kind == 1) {
-        // LD2/LD3/LD4 (multiple structures): de-interleave count registers'
-        // worth of elements; ST2-4 interleave. Whole transfer buffered so a
-        // fault mid-way never leaves half-updated guest registers.
-        unsigned lanes = regbytes / esize;
-        unsigned total = count * regbytes;
-        uint8_t buf[64];
-        if (is_load) {
-            if (!tlb_read(tlb, addr, buf, total)) {
-                cpu->segfault_addr = tlb->segfault_addr;
-                cpu->segfault_was_write = false;
-                return INT_PF;
-            }
-            for (unsigned r = 0; r < count; r++) {
-                union xmm_reg tmp = {};
-                for (unsigned e = 0; e < lanes; e++)
-                    memcpy(&tmp.u8[e * esize], &buf[(e * count + r) * esize], esize);
-                cpu->arm64_v[(rt + r) & 31] = tmp;
-            }
-        } else {
-            for (unsigned r = 0; r < count; r++)
-                for (unsigned e = 0; e < lanes; e++)
-                    memcpy(&buf[(e * count + r) * esize],
-                           &cpu->arm64_v[(rt + r) & 31].u8[e * esize], esize);
-            if (!tlb_write(tlb, addr, buf, total)) {
-                cpu->segfault_addr = tlb->segfault_addr;
-                cpu->segfault_was_write = true;
-                return INT_PF;
-            }
-            arm64_watch_scan_value(addr, buf, total);
-        }
-        return 0;
-    }
-
-    if (kind == 2) {
-        // LD1-4/ST1-4 (single structure): one element per register at a
-        // fixed lane; loads leave the register's other lanes intact.
-        for (unsigned r = 0; r < count; r++) {
-            unsigned v = (rt + r) & 31;
-            if (is_load) {
-                uint8_t tmp[8];
-                if (!tlb_read(tlb, addr, tmp, esize)) {
-                    cpu->segfault_addr = tlb->segfault_addr;
-                    cpu->segfault_was_write = false;
-                    return INT_PF;
-                }
-                memcpy(&cpu->arm64_v[v].u8[lane * esize], tmp, esize);
-            } else {
-                if (!tlb_write(tlb, addr, &cpu->arm64_v[v].u8[lane * esize], esize)) {
-                    cpu->segfault_addr = tlb->segfault_addr;
-                    cpu->segfault_was_write = true;
-                    return INT_PF;
-                }
-            }
-            addr += esize;
-        }
-        return 0;
-    }
-
-    // kind == 3: LD1R-LD4R — load one element per register and replicate
-    // it across the register's arrangement (upper 64 bits zero if Q=0).
-    for (unsigned r = 0; r < count; r++) {
-        unsigned v = (rt + r) & 31;
-        uint8_t tmp[8];
-        if (!tlb_read(tlb, addr, tmp, esize)) {
-            cpu->segfault_addr = tlb->segfault_addr;
-            cpu->segfault_was_write = false;
-            return INT_PF;
-        }
-        union xmm_reg rep = {};
-        for (unsigned e = 0; e < regbytes / esize; e++)
-            memcpy(&rep.u8[e * esize], tmp, esize);
-        cpu->arm64_v[v] = rep;
-        addr += esize;
-    }
-    return 0;
-}
-
-// LSE atomic read-modify-write (LDADD/LDCLR/LDEOR/LDSET/LDSMAX/LDSMIN/
-// LDUMAX/LDUMIN and SWP). GENUINELY host-atomic: it resolves the guest
-// address to its backing host pointer and runs a real host __atomic RMW
-// there, so concurrent guest threads (each on its own host pthread) don't
-// lose updates. LSE requires natural alignment, so a valid access never
-// crosses a page — one host pointer suffices. size_bytes is 1/2/4/8;
-// op 0-7 are the arithmetic forms, op 8 is SWP. Returns 0 / INT_PF.
-//
-// The min/max variants and the sub-64-bit widths are done with a
-// compare-exchange loop (there's no direct __atomic_fetch_max, and byte/
-// half atomics still lower to LL/SC on the host anyway), which is itself
-// lock-free and race-free.
-// Misaligned LSE atomics take an alignment fault on real hardware (they
+// Misaligned atomics take an alignment fault on real hardware (they
 // are architecturally required to be naturally aligned). Enforcing that
 // here is also a host-memory-safety requirement, not just conformance:
 // the helpers below resolve ONE host page and then run a host atomic of
 // up to 16 bytes at the resolved pointer, so a misaligned guest atomic
 // straddling a page boundary would read/write host memory beyond the
 // page that was actually resolved. Natural alignment guarantees the
-// access can never cross a page. The kernel's interrupt plumbing has no
-// SIGBUS/BUS_ADRALN path for guest faults (see handle_interrupt in
-// kernel/calls.c: INT_* maps to SIGSEGV/SIGILL/SIGFPE only), so this
-// reports INT_GPF -> SIGSEGV rather than Linux's SIGBUS; a misaligned
-// atomic is a hard programming error and the fatal signal is what
-// matters. cpu->segfault_addr carries the misaligned address.
+// access can never cross a page. INT_ALIGN: SIGBUS/BUS_ADRALN at
+// cpu->segfault_addr, as Linux sends (INT_GPF, before it, was taken for a
+// page fault and retried forever).
 static int arm64_atomic_alignment_fault(struct cpu_state *cpu, guest_addr_t addr) {
     cpu->segfault_addr = addr;
     cpu->segfault_was_write = true;
-    return INT_GPF;
+    return INT_ALIGN;
 }
 
-int arm64_lse_rmw(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
-                  unsigned size_bytes, unsigned op, uint64_t operand,
-                  uint64_t *old_out) {
-    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
-    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
-    // the TLB -- and it exists because these helpers deliberately BYPASS those
-    // macros: the gadget hands the raw guest address straight to C so the
-    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
-    // route ever strips the tag, so it has to happen here, on entry, before
-    // the address reaches a TLB index or an alignment check.
-    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
-    if (addr & (size_bytes - 1))
-        return arm64_atomic_alignment_fault(cpu, addr);
-    void *ptr = tlb_write_ptr_slow(tlb, addr);
-    if (ptr == NULL) {
-        cpu->segfault_addr = tlb->segfault_addr;
-        cpu->segfault_was_write = true;
-        return INT_PF;
-    }
-    unsigned bits = size_bytes * 8;
-    uint64_t smask = bits < 64 ? (1ull << (bits - 1)) : 0;
-
-#define LSE_RMW_AT(TYPE) do {                                             \
-        TYPE *p = ptr;                                                    \
-        TYPE arg = (TYPE) operand;                                        \
-        TYPE old = __atomic_load_n(p, __ATOMIC_RELAXED), neu;            \
-        do {                                                             \
-            switch (op) {                                                \
-                case 0: neu = (TYPE) (old + arg); break;   /* LDADD */   \
-                case 1: neu = (TYPE) (old & ~arg); break;  /* LDCLR */   \
-                case 2: neu = (TYPE) (old ^ arg); break;   /* LDEOR */   \
-                case 3: neu = (TYPE) (old | arg); break;   /* LDSET */   \
-                case 4: neu = (int64_t) ((old ^ smask) - smask) >         \
-                              (int64_t) ((arg ^ smask) - smask)           \
-                              ? old : arg; break;          /* LDSMAX */  \
-                case 5: neu = (int64_t) ((old ^ smask) - smask) <         \
-                              (int64_t) ((arg ^ smask) - smask)           \
-                              ? old : arg; break;          /* LDSMIN */  \
-                case 6: neu = old > arg ? old : arg; break; /* LDUMAX */ \
-                case 7: neu = old < arg ? old : arg; break; /* LDUMIN */ \
-                default: neu = arg; break;                 /* SWP */     \
-            }                                                            \
-        } while (!__atomic_compare_exchange_n(p, &old, neu, true,        \
-                     __ATOMIC_SEQ_CST, __ATOMIC_RELAXED));               \
-        *old_out = (uint64_t) old;                                       \
-    } while (0)
-
-    switch (size_bytes) {
-        case 1: LSE_RMW_AT(uint8_t); break;
-        case 2: LSE_RMW_AT(uint16_t); break;
-        case 4: LSE_RMW_AT(uint32_t); break;
-        default: LSE_RMW_AT(uint64_t); break;
-    }
-#undef LSE_RMW_AT
-    return 0;
-}
-
-// Host-atomic compare-and-swap for the LSE CAS gadget and the STXR
-// store-conditional. Compares memory at size_bytes against `expected`; if
-// equal, atomically stores `desired` and sets *swapped=1, else leaves it
-// and sets *swapped=0. Always returns the observed old value (zero-
-// extended) in *old_out. Genuinely atomic against concurrent guest
-// threads — replaces the old load-compare-store, which had an ABA race
-// (two threads could both pass the compare and both store). Returns
-// 0 / INT_PF.
-int arm64_cas(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
-              unsigned size_bytes, uint64_t expected, uint64_t desired,
-              uint64_t *old_out, uint32_t *swapped) {
-    // AArch64 TBI. This is the C-side counterpart of read_prep/write_prep
-    // (jit/guest-arm64/gadgets.h), which mask the top byte before they touch
-    // the TLB -- and it exists because these helpers deliberately BYPASS those
-    // macros: the gadget hands the raw guest address straight to C so the
-    // transfer can span pages via tlb_read/tlb_write. Nothing else on that
-    // route ever strips the tag, so it has to happen here, on entry, before
-    // the address reaches a TLB index or an alignment check.
-    addr = (guest_addr_t) guest_abi_untag_addr(GUEST_ABI_ARM64, addr);
-    if (addr & (size_bytes - 1))
-        return arm64_atomic_alignment_fault(cpu, addr);
-    void *ptr = tlb_write_ptr_slow(tlb, addr);
-    if (ptr == NULL) {
-        cpu->segfault_addr = tlb->segfault_addr;
-        cpu->segfault_was_write = true;
-        return INT_PF;
-    }
-#define LSE_CAS_AT(TYPE) do {                                            \
-        TYPE exp = (TYPE) expected;                                      \
-        bool ok = __atomic_compare_exchange_n((TYPE *) ptr, &exp,        \
-                     (TYPE) desired, false, __ATOMIC_SEQ_CST,            \
-                     __ATOMIC_SEQ_CST);                                  \
-        *swapped = ok ? 1 : 0;                                           \
-        *old_out = (uint64_t) exp; /* CAS writes the observed value on fail */ \
-    } while (0)
-    switch (size_bytes) {
-        case 1: LSE_CAS_AT(uint8_t); break;
-        case 2: LSE_CAS_AT(uint16_t); break;
-        case 4: LSE_CAS_AT(uint32_t); break;
-        default: LSE_CAS_AT(uint64_t); break;
-    }
-#undef LSE_CAS_AT
-    return 0;
-}
-
-// Host-atomic compare-and-swap PAIR (CASP/CASPA/CASPL/CASPAL) for the
-// casp gadgets (jit/guest-arm64/atomics.S) and the interpreter. sz is the
+// Host-atomic compare-and-swap PAIR (CASP/CASPA/CASPL/CASPAL). sz is the
 // per-register width (4 for the W-pair form, 8 for the X-pair form); the
 // register pair maps to guest memory little-endian as [addr] = lo (Rs/Rt)
 // and [addr+sz] = hi (Rs+1/Rt+1), so the whole pair is one 2*sz-byte
 // little-endian value. expected/desired/old_out are {lo, hi} arrays
-// (arrays rather than four scalars keep the C ABI at 8 register args, so
-// the gadget's marshalling stays register-only like arm64_cas's).
 // old_out always receives the observed memory value, zero-extended per
-// half for the 32-bit form. Returns 0 / INT_PF / INT_GPF.
+// half for the 32-bit form. Returns 0 / INT_PF / INT_ALIGN.
 //
 // The 64-bit pair uses a 16-byte __atomic_compare_exchange on an
 // unsigned __int128 — on an ARMv8.0 baseline host clang lowers that to an
@@ -352,14 +84,13 @@ int arm64_casp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
     return 0;
 }
 
-// LDXP (load exclusive pair) for the ldxp gadgets (jit/guest-arm64/
-// atomics.S) and the interpreter. sz is the per-register width (4 for the
+// LDXP (load exclusive pair). sz is the per-register width (4 for the
 // W-pair form, 8 for the X-pair form); memory maps little-endian as
 // [addr] = lo (Rt) and [addr+sz] = hi (Rt2), same layout as arm64_casp.
 // Loads the pair, writes it to val_out (each half zero-extended for the
 // 32-bit form), and arms the exclusive monitor (excl_addr/excl_val/
 // excl_val_hi) with the address and observed pair. Returns 0 / INT_PF /
-// INT_GPF (alignment is the TOTAL pair size, per the ARM ARM — which also
+// INT_ALIGN (alignment is the TOTAL pair size, per the ARM ARM — which also
 // guarantees the single resolved host pointer covers the whole pair).
 //
 // The 64-bit pair is read as two 8-byte atomic loads, NOT one 16-byte
@@ -411,7 +142,7 @@ int arm64_ldxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 // (architected), but is PRESERVED on a fault return so the restarted
 // instruction can succeed once the fault (e.g. COW break) is resolved —
 // same contract as the stxr gadget's fault path. Returns 0 / INT_PF /
-// INT_GPF.
+// INT_ALIGN.
 int arm64_stxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                unsigned sz, uint64_t desired_lo, uint64_t desired_hi,
                uint32_t *status_out) {
@@ -464,13 +195,11 @@ int arm64_stxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
 //   aligned  -> one host atomic on the resolved host pointer. A naturally
 //               aligned access of 1/2/4/8/16 bytes cannot cross a page, so a
 //               single resolved page always covers it.
-//   unaligned-> fall back to atomic_l_lock around a read/compute/write pair.
-//               x86 permits a misaligned LOCK (unlike arm64's LSE atomics, so
-//               unlike arm64_lse_rmw above we cannot just fault), but such an
-//               access can straddle two pages and no host atomic spans that.
-//               It stays as weak as it was -- it does not interlock with a
-//               host atomic -- but it is vanishingly rare in real code and it
-//               is at least correct against other guest threads.
+//   unaligned-> x86_atomic_unaligned below. x86 makes a misaligned LOCK
+//               atomic too, against every other access to those bytes, and
+//               the i386 ABI makes the 64-bit case ordinary: it aligns
+//               uint64_t struct fields to 4 bytes, and Python 3.14 does a
+//               `lock cmpxchg8b` on one at startup.
 //
 // `fn` computes the new value from the observed old one and MUST BE PURE: on
 // the aligned path it is re-run for every compare-exchange retry. Flags are
@@ -486,38 +215,233 @@ static int x86_atomic_fault(struct cpu_state *cpu, struct tlb *tlb) {
     return INT_PF;
 }
 
-// The unaligned path, shared by every helper below: one global-lock-guarded
-// read/compute/write. Split out so the fast paths stay readable.
-static int x86_atomic_rmw_locked(struct cpu_state *cpu, struct tlb *tlb,
+// ---------------------------------------------------------------------
+// Misaligned LOCK.
+//
+// This used to take the global atomic_l_lock around a read and a write. That
+// serialised locked instructions against each other, and nothing else: a
+// plain store from another thread could land between the read and the write
+// and be lost. tests/manual/x86_unaligned_lock measured up to 60% of such
+// stores lost, on both x86 engines. Exact instead, two ways:
+//
+//   * The operand lies inside one 16-byte-aligned block. A 16-byte host
+//     compare-exchange on the block, changing only the operand's bytes, is a
+//     real atomic: a store anywhere in the block between the read and the
+//     exchange makes it fail and go round again. That holds against plain
+//     stores, host atomics, and other processes mapping the same page.
+//   * It straddles two blocks, and maybe two pages, which no host atomic
+//     covers. Take this address space's lock as a writer instead. Guest code
+//     only runs under the read side, and so does every syscall touching guest
+//     memory, so while it is held nothing else in this process reads or
+//     writes the operand. That is the emulator's split lock. Another process
+//     sharing the page is not held off, which is the one thing this does not
+//     cover.
+//
+//     The upgrade never lets go of the read side (read_to_write_lock_timed):
+//     this runs inside the JIT, holding jetsam_lock, and a structural writer
+//     that got in would wait for jetsam while this waited for it. When it
+//     cannot be the last reader in time, or another thread is already
+//     upgrading, it backs out and the instruction runs again.
+//
+// `step` sees the value the operand held and says what to store, if anything.
+// It must be pure: on the block path it is re-run for every retry.
+// ---------------------------------------------------------------------
+
+typedef bool (*x86_atomic_step)(qword_t old, qword_t *neu, void *ctx);
+
+static int x86_atomic_in_block(struct cpu_state *cpu, struct tlb *tlb,
+        guest_addr_t addr, unsigned size_bytes, x86_atomic_step step, void *ctx,
+        qword_t *old_out, qword_t *new_out) {
+    // 16-byte aligned, so the block is on one page, and so is its host copy.
+    unsigned __int128 *block = tlb_write_ptr_slow(tlb, addr & ~(guest_addr_t) 15);
+    if (block == NULL)
+        return x86_atomic_fault(cpu, tlb);
+    unsigned shift = (addr & 15) * 8;
+    unsigned __int128 ones = size_bytes == 8 ? (unsigned __int128) UINT64_MAX
+        : ((unsigned __int128) 1 << (size_bytes * 8)) - 1;
+    unsigned __int128 mask = ones << shift;
+    // Starting from a guess is fine: a wrong guess fails the exchange, which
+    // hands back what the block really holds.
+    unsigned __int128 cur = 0, neu;
+    qword_t old, val;
+    bool store;
+    do {
+        old = (qword_t) ((cur & mask) >> shift);
+        store = step(old, &val, ctx);
+        // Storing nothing still exchanges the block with itself, so `old` is
+        // a value it really held -- which is also what x86 does on a failed
+        // CMPXCHG: it writes back what it read.
+        neu = store ? (cur & ~mask) | (((unsigned __int128) val << shift) & mask) : cur;
+    } while (!__atomic_compare_exchange_n(block, &cur, neu, false,
+                 __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST));
+    *old_out = old;
+    *new_out = store ? val : old;
+    return 0;
+}
+
+// One thread at a time attempts the upgrade below. Two readers each waiting
+// to be the last reader would wait for each other; the loser backs out
+// instead of waiting here, because waiting while it holds the read lock would
+// keep the winner from ever being alone.
+static lock_t x86_split_lock = LOCK_INITIALIZER;
+
+// Hand the instruction back to be run again. A page fault on an address that
+// is mapped and writable resolves to nothing, so the engine leaves the JIT --
+// releasing mem read and jetsam -- and re-executes the instruction.
+static int x86_atomic_split_retry(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr) {
+    tlb->segfault_addr = addr;
+    return x86_atomic_fault(cpu, tlb);
+}
+
+// The split path's two halves. begin makes both pages present and writable
+// and takes the lock: 0, with the operand's first out[2] bytes at out[0] and
+// the rest at out[1]; or INT_PF with nothing held -- a fault, or a retry. end
+// lets go. jit/gadgets-aarch64's x86_lock_rmw does the operation in between.
+int x86_lock_split_begin(struct cpu_state *cpu, struct tlb *tlb,
+        guest_addr_t addr, unsigned size_bytes, uintptr_t out[3]) {
+    struct mem *mem = container_of(tlb->mmu, struct mem, mmu);
+    guest_addr_t last = addr + size_bytes - 1;
+    unsigned first = PAGE_SIZE - PGOFFSET(addr);
+    if (first > size_bytes)
+        first = size_bytes;
+    // Make both pages present and writable -- breaking copy-on-write and
+    // dropping code compiled from them -- while this thread holds only the
+    // read side, which is all those paths may be called with.
+    if (tlb_write_ptr_slow(tlb, addr) == NULL)
+        return x86_atomic_fault(cpu, tlb);
+    if (tlb_write_ptr_slow(tlb, last) == NULL) {
+        // Linux reports the first byte that faulted -- the start of the
+        // second page -- not the operand's last byte (camd: a `lock incl`
+        // two bytes before a PROT_NONE page gives si_addr = that page).
+        tlb->segfault_addr = last & ~(guest_addr_t) (PAGE_SIZE - 1);
+        return x86_atomic_fault(cpu, tlb);
+    }
+    if (trylock(&x86_split_lock) != 0)
+        return x86_atomic_split_retry(cpu, tlb, addr);
+    // Siblings running guest code hold the read side until their next exit
+    // from the JIT, which on its own can be a timer tick away: a poke sends
+    // them out at the next block boundary, as the mmap barrier does
+    // (kernel/mmap.c). The upgrade then holds them off until it is done.
+    struct timespec now_ts;
+    clock_gettime(CLOCK_MONOTONIC, &now_ts);
+    uint64_t now = (uint64_t) now_ts.tv_sec * 1000000000ull + (uint64_t) now_ts.tv_nsec;
+    // (A sibling that did one of these in the last 50ms is at it too.)
+    const uint64_t recent = 50ull * 1000 * 1000;
+    unsigned others = task_poke_shared_mem_counting(current, mem, now > recent ? now - recent : 1);
+    if (current != NULL) {
+        atomic_store_explicit(&current->split_lock_stamp, now, memory_order_relaxed);
+        // This one is taking the address space from a sibling that was
+        // running guest code and is not at this itself: afterwards this
+        // thread stands aside for a quantum. It pokes itself, which takes it
+        // out of the JIT at the next block boundary as a poke takes anyone,
+        // and kernel/task.c's run loop does the waiting there, holding
+        // nothing. Without it a thread doing these in a loop starves the
+        // rest of its process: each needs the address space to itself, the
+        // siblings are poked out of guest code for it, and the next begins
+        // a few instructions after the last ended -- a sibling got a block
+        // or two between them, and in 1.5 s a second thread had not
+        // finished starting (tests/manual/x86_unaligned_lock.c, "a thread
+        // never ran"). Only for such a sibling: threads that are all doing
+        // split operations hand the lock among themselves as before, where
+        // a quantum each turned seconds into minutes (docs/TODO.md).
+        //
+        // Not after every one: it has 200us of them between quanta. A
+        // compare-and-swap loop (i386's 64-bit atomics are cmpxchg8b in one)
+        // reads, tries, and on failure tries again with the value the
+        // failure handed it; a quantum between the failure and the retry
+        // gives the sibling time to change the value again, every time, and
+        // the loop never gets through.
+        if (others != 0 && now - current->split_lock_stood_aside >= 200000) {
+            current->split_lock_wait = true;
+            cpu_poke(&current->cpu);
+        }
+    }
+    if (!read_to_write_lock_timed(&mem->lock, 20 * 1000 * 1000)) {
+        unlock(&x86_split_lock);
+        return x86_atomic_split_retry(cpu, tlb, addr);
+    }
+    // No other writer could get in while this thread kept its read lock, so
+    // the pages faulted in above are still there. Look anyway: it is cheap,
+    // and a NULL here must be a fault, not a wild pointer.
+    char *lo = mem_ptr_locked(mem, addr, MEM_WRITE);
+    char *hi = mem_ptr_locked(mem, last, MEM_WRITE);
+    if (lo == NULL || hi == NULL) {
+        write_to_read_lock(&mem->lock);
+        unlock(&x86_split_lock);
+        return x86_atomic_split_retry(cpu, tlb, lo == NULL ? addr : last);
+    }
+    // The part on the second page, if the operand reaches one.
+    unsigned second = size_bytes - first;
+    out[0] = (uintptr_t) lo;
+    out[1] = second != 0 ? (uintptr_t) (hi - (second - 1)) : 0;
+    out[2] = first;
+    return 0;
+}
+
+void x86_lock_split_end(struct tlb *tlb) {
+    struct mem *mem = container_of(tlb->mmu, struct mem, mmu);
+    write_to_read_lock(&mem->lock);
+    unlock(&x86_split_lock);
+}
+
+static int x86_atomic_split(struct cpu_state *cpu, struct tlb *tlb,
+        guest_addr_t addr, unsigned size_bytes, x86_atomic_step step, void *ctx,
+        qword_t *old_out, qword_t *new_out) {
+    uintptr_t at[3];
+    int err = x86_lock_split_begin(cpu, tlb, addr, size_bytes, at);
+    if (err != 0)
+        return err;
+    char *lo = (char *) at[0], *hi_start = (char *) at[1];
+    unsigned first = (unsigned) at[2], second = size_bytes - first;
+    qword_t old = 0, val = 0;
+    memcpy(&old, lo, first);
+    if (second != 0)
+        memcpy((char *) &old + first, hi_start, second);
+    bool store = step(old, &val, ctx);
+    if (store) {
+        memcpy(lo, &val, first);
+        if (second != 0)
+            memcpy(hi_start, (char *) &val + first, second);
+    }
+    x86_lock_split_end(tlb);
+    *old_out = old;
+    *new_out = store ? val : old;
+    return 0;
+}
+
+static int x86_atomic_unaligned(struct cpu_state *cpu, struct tlb *tlb,
+        guest_addr_t addr, unsigned size_bytes, x86_atomic_step step, void *ctx,
+        qword_t *old_out, qword_t *new_out) {
+    if ((addr & 15) + size_bytes <= 16)
+        return x86_atomic_in_block(cpu, tlb, addr, size_bytes, step, ctx, old_out, new_out);
+    return x86_atomic_split(cpu, tlb, addr, size_bytes, step, ctx, old_out, new_out);
+}
+
+// An x86_atomic_fn as a step that always stores.
+struct x86_atomic_fn_step {
+    x86_atomic_fn fn;
+    void *ctx;
+};
+static bool x86_atomic_fn_as_step(qword_t old, qword_t *neu, void *ctx) {
+    struct x86_atomic_fn_step *s = ctx;
+    *neu = s->fn(old, s->ctx);
+    return true;
+}
+
+static int x86_atomic_rmw_unaligned(struct cpu_state *cpu, struct tlb *tlb,
         guest_addr_t addr, unsigned size_bytes, x86_atomic_fn fn, void *ctx,
         qword_t *old_out, qword_t *new_out) {
-    uint64_t old = 0, neu;
-    int err = 0;
-    lock(&atomic_l_lock, 0);
-    if (!tlb_read(tlb, addr, &old, size_bytes)) {
-        cpu->segfault_addr = tlb->segfault_addr;
-        cpu->segfault_was_write = false;
-        err = INT_PF;
-        goto out;
-    }
-    neu = fn(old, ctx);
-    if (!tlb_write(tlb, addr, &neu, size_bytes)) {
-        err = x86_atomic_fault(cpu, tlb);
-        goto out;
-    }
-    *old_out = old;
-    *new_out = neu;
-out:
-    unlock(&atomic_l_lock);
-    return err;
+    struct x86_atomic_fn_step s = { fn, ctx };
+    return x86_atomic_unaligned(cpu, tlb, addr, size_bytes, x86_atomic_fn_as_step, &s,
+                                old_out, new_out);
 }
 
 int x86_atomic_rmw(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                    unsigned size_bytes, x86_atomic_fn fn, void *ctx,
                    qword_t *old_out, qword_t *new_out) {
     if (addr & (size_bytes - 1))
-        return x86_atomic_rmw_locked(cpu, tlb, addr, size_bytes, fn, ctx,
-                                     old_out, new_out);
+        return x86_atomic_rmw_unaligned(cpu, tlb, addr, size_bytes, fn, ctx,
+                                        old_out, new_out);
     void *ptr = tlb_write_ptr_slow(tlb, addr);
     if (ptr == NULL)
         return x86_atomic_fault(cpu, tlb);
@@ -542,6 +466,15 @@ int x86_atomic_rmw(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
     return 0;
 }
 
+struct x86_cas_step {
+    qword_t expected, desired;
+};
+static bool x86_cas_as_step(qword_t old, qword_t *neu, void *ctx) {
+    struct x86_cas_step *c = ctx;
+    *neu = c->desired;
+    return old == c->expected;
+}
+
 // LOCK CMPXCHG / CMPXCHG8B. Compares [addr] against `expected`; on equal
 // stores `desired`. *old_out always receives the observed value -- which is
 // what CMPXCHG loads into the accumulator when the compare fails, and what
@@ -550,24 +483,11 @@ int x86_atomic_cas(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                    unsigned size_bytes, qword_t expected, qword_t desired,
                    qword_t *old_out, bool *swapped) {
     if (addr & (size_bytes - 1)) {
-        // No pure-function shape here: whether we store depends on the value
-        // we read, so the locked fallback is written out rather than reusing
-        // x86_atomic_rmw_locked.
-        uint64_t old = 0;
-        int err = 0;
-        lock(&atomic_l_lock, 0);
-        if (!tlb_read(tlb, addr, &old, size_bytes)) {
-            cpu->segfault_addr = tlb->segfault_addr;
-            cpu->segfault_was_write = false;
-            err = INT_PF;
-            goto out;
-        }
-        *old_out = old;
-        *swapped = old == expected;
-        if (*swapped && !tlb_write(tlb, addr, &desired, size_bytes))
-            err = x86_atomic_fault(cpu, tlb);
-out:
-        unlock(&atomic_l_lock);
+        struct x86_cas_step c = { expected, desired };
+        qword_t neu;
+        int err = x86_atomic_unaligned(cpu, tlb, addr, size_bytes, x86_cas_as_step, &c,
+                                       old_out, &neu);
+        *swapped = err == 0 && *old_out == expected;
         return err;
     }
     void *ptr = tlb_write_ptr_slow(tlb, addr);
@@ -622,7 +542,7 @@ int x86_atomic_xchg(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                     unsigned size_bytes, qword_t value, qword_t *old_out) {
     if (addr & (size_bytes - 1)) {
         qword_t neu;
-        return x86_atomic_rmw_locked(cpu, tlb, addr, size_bytes,
+        return x86_atomic_rmw_unaligned(cpu, tlb, addr, size_bytes,
                 x86_atomic_swap_fn, &value, old_out, &neu);
     }
     void *ptr = tlb_write_ptr_slow(tlb, addr);
@@ -637,72 +557,6 @@ int x86_atomic_xchg(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
     return 0;
 }
 
-// Soft fallbacks for arm64-guest gadgets whose native instructions are
-// optional host extensions: FEAT_SHA512 arrived with A13 and FEAT_CRC32
-// with A10, but we support devices back to A7-class hardware. gen.c
-// probes the host and emits the sha512_soft/crc32_soft gadgets (crypto.S,
-// dpextra.S) on older chips, so AT_HWCAP and ID_AA64ISAR0 can advertise
-// the same feature set on every device. Formulas verified bit-exact
-// against the native instructions on an M-series host (random vectors).
-
-static inline uint64_t ror64(uint64_t x, unsigned n) {
-    return x >> n | x << (64 - n);
-}
-static inline uint64_t sha512_cho(uint64_t x, uint64_t y, uint64_t z) {
-    return (x & (y ^ z)) ^ z;
-}
-static inline uint64_t sha512_maj(uint64_t x, uint64_t y, uint64_t z) {
-    return (x & y) | ((x | y) & z);
-}
-
-// packed = rd | rn<<8 | rm<<16 | op<<24; op: 0=H 1=H2 2=SU1 3=SU0.
-void arm64_sha512_soft(struct cpu_state *cpu, uint64_t packed) {
-    uint64_t *d = cpu->arm64_v[packed & 0x1f].qw;
-    // Snapshot operands: rd may alias rn/rm, and the instruction reads
-    // everything before writing.
-    uint64_t d0 = d[0], d1 = d[1];
-    uint64_t n0 = cpu->arm64_v[(packed >> 8) & 0x1f].qw[0];
-    uint64_t n1 = cpu->arm64_v[(packed >> 8) & 0x1f].qw[1];
-    uint64_t m0 = cpu->arm64_v[(packed >> 16) & 0x1f].qw[0];
-    uint64_t m1 = cpu->arm64_v[(packed >> 16) & 0x1f].qw[1];
-    switch ((packed >> 24) & 3) {
-        case 0: { // SHA512H
-            d1 += (ror64(m1, 14) ^ ror64(m1, 18) ^ ror64(m1, 41))
-                + sha512_cho(m1, n0, n1);
-            uint64_t t = d1 + m0;
-            d0 += (ror64(t, 14) ^ ror64(t, 18) ^ ror64(t, 41))
-                + sha512_cho(t, m1, n0);
-            break;
-        }
-        case 1: // SHA512H2
-            d1 += (ror64(m0, 28) ^ ror64(m0, 34) ^ ror64(m0, 39))
-                + sha512_maj(m0, m1, n0);
-            d0 += (ror64(d1, 28) ^ ror64(d1, 34) ^ ror64(d1, 39))
-                + sha512_maj(d1, m0, m1);
-            break;
-        case 2: // SHA512SU1
-            d0 += (ror64(n0, 19) ^ ror64(n0, 61) ^ (n0 >> 6)) + m0;
-            d1 += (ror64(n1, 19) ^ ror64(n1, 61) ^ (n1 >> 6)) + m1;
-            break;
-        case 3: // SHA512SU0 (two-reg; rm unused)
-            d0 += ror64(d1, 1) ^ ror64(d1, 8) ^ (d1 >> 7);
-            d1 += ror64(n0, 1) ^ ror64(n0, 8) ^ (n0 >> 7);
-            break;
-    }
-    d[0] = d0;
-    d[1] = d1;
-}
-
-uint32_t arm64_crc32_soft(uint32_t acc, uint64_t val, uint64_t size_log, uint64_t is_c) {
-    uint32_t poly = is_c ? 0x82F63B78u : 0xEDB88320u; // reflected CRC32C / CRC32
-    for (unsigned i = 0; i < (1u << size_log); i++) {
-        acc ^= (uint8_t) (val >> (8 * i));
-        for (int bit = 0; bit < 8; bit++)
-            acc = (acc >> 1) ^ (poly & -(acc & 1));
-    }
-    return acc;
-}
-
 void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
     if (tlb->mmu == mmu &&
             tlb->mem_changes == atomic_load_explicit(&mmu->changes, memory_order_relaxed)) {
@@ -715,9 +569,104 @@ void tlb_refresh(struct tlb *tlb, struct mmu *mmu) {
 }
 
 void tlb_flush(struct tlb *tlb) {
-    tlb->mem_changes = atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed);
+    // Acquire: every entry installed from here on is valid under this value,
+    // and whatever was published before the bump that produced it -- the JIT's
+    // code-write tracking flags, see tlb_handle_miss -- must be seen by then.
+    tlb->mem_changes = atomic_load_explicit(&tlb->mmu->changes, memory_order_acquire);
     for (unsigned i = 0; i < TLB_SIZE; i++)
         tlb->entries[i] = (struct tlb_entry) {.page = 1, .page_if_writable = 1};
+    for (unsigned v = 0; v < TLB_VICTIMS; v++)
+        tlb->victim[v] = (struct tlb_entry) {.page = 1, .page_if_writable = 1};
+    tlb->exec_ok_page = 0;
+}
+
+// ---- a compile decodes one version of its page ------------------------------
+//
+// Decoders fetch a field at a time: opcode, then ModRM, then displacement. A
+// store from another thread landing between two of those fetches gives a block
+// built from half the old instruction and half the new one, which no CPU ever
+// executes. HotSpot patches running code this way: making a method not entrant
+// writes a jmp-to-self (EB FE EB FE) over the aligned first word of its entry,
+// then the jump's fifth byte, then its first four bytes, relying on an x86
+// fetch seeing an aligned word whole. A 32-bit JVM on the i386 guest died of
+// it: the entry was `89 84 24 00 c0 ff ff`, a compile fetched the old 89 and
+// then the new ModRM, decoded `mov ebx, ebx; dec ecx`, and ran the jump's
+// displacement byte f1.
+//
+// So for a page that has been written to, jit.c takes a copy of the page
+// before compiling from it, an aligned 64-bit word at a time -- single-copy
+// atomic, so each aligned 4-byte store is in it whole or not at all, which is
+// what that patching protocol assumes of the hardware -- and every fetch the
+// compile makes from that page comes from the copy. The compile may see code
+// that is about to change; that is what a CPU fetching just before the store
+// sees, and the store is noted and drops the block (jit.c's SMC notes). What
+// it can no longer see is a mixture. Only the first page is copied: reading
+// ahead could materialize a page nothing else touches, and a block's tail on
+// the next page is fetched live, as before.
+static __thread struct {
+    bool active;
+    guest_addr_t base;
+    uint64_t words[PAGE_SIZE / 8];
+} fetch_snapshot;
+
+void tlb_fetch_snapshot_begin(struct tlb *tlb, guest_addr_t ip) {
+    fetch_snapshot.active = false;
+    guest_addr_t base = ip & ~(guest_addr_t) (PAGE_SIZE - 1);
+    const uint64_t *host = __tlb_read_ptr(tlb, base);
+    if (host == NULL)
+        return;
+    for (unsigned i = 0; i < PAGE_SIZE / 8; i++)
+        fetch_snapshot.words[i] = __atomic_load_n(&host[i], __ATOMIC_RELAXED);
+    fetch_snapshot.base = base;
+    fetch_snapshot.active = true;
+}
+
+void tlb_fetch_snapshot_end(void) {
+    fetch_snapshot.active = false;
+}
+
+// A fetch that touches the snapshot page takes those bytes from the copy, and
+// anything either side of it from memory.
+static bool tlb_fetch_snapshotted(struct tlb *tlb, guest_addr_t addr, void *out, unsigned size) {
+    guest_addr_t base = fetch_snapshot.base, end = base + PAGE_SIZE;
+    if (addr >= end || addr + size <= base)
+        return tlb_read(tlb, addr, out, size);
+    uint8_t *o = out;
+    if (addr < base) {
+        unsigned n = (unsigned) (base - addr);
+        if (!tlb_read(tlb, addr, o, n))
+            return false;
+        o += n;
+        addr += n;
+        size -= n;
+    }
+    unsigned n = (unsigned) (end - addr) < size ? (unsigned) (end - addr) : size;
+    memcpy(o, (const uint8_t *) fetch_snapshot.words + (addr - base), n);
+    if (n < size)
+        return tlb_read(tlb, addr + n, o + n, size - n);
+    return true;
+}
+
+bool tlb_fetch(struct tlb *tlb, guest_addr_t addr, void *out, unsigned size) {
+    tlb->fetch_denied = false;
+    if (size == 0)
+        return true;
+    uint64_t changes = atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed);
+    page_t first = PAGE(addr), last = PAGE(addr + size - 1);
+    for (page_t page = first; page <= last; page++) {
+        if (tlb->exec_ok_page == page + 1 && tlb->exec_ok_changes == changes)
+            continue;
+        if (!mmu_page_executable(tlb->mmu, page)) {
+            tlb->fetch_denied = true;
+            tlb->segfault_addr = page == first ? addr : (guest_addr_t) page << PAGE_BITS;
+            return false;
+        }
+        tlb->exec_ok_page = page + 1;
+        tlb->exec_ok_changes = changes;
+    }
+    if (fetch_snapshot.active)
+        return tlb_fetch_snapshotted(tlb, addr, out, size);
+    return tlb_read(tlb, addr, out, size);
 }
 
 void tlb_free(struct tlb *tlb) {
@@ -828,7 +777,6 @@ static const char *tlb_arm64_caller_name(void *from, uintptr_t *delta_out) {
         {(const void *) tlb_write_ptr_slow,      "tlb_write_ptr_slow"},
         {(const void *) __tlb_read_cross_page,   "__tlb_read_cross_page"},
         {(const void *) __tlb_write_cross_page,  "__tlb_write_cross_page"},
-        {(const void *) arm64_lse_rmw,           "arm64_lse_rmw"},
         {(const void *) tlb_handle_miss,         "tlb_handle_miss (recursed?)"},
         {(const void *) tlb_flush,               "tlb_flush (emu/tlb.c)"},
         // other TUs
@@ -888,8 +836,37 @@ static void tlb_note_tagged_miss(guest_addr_t addr, int type, void *from, void *
            from, name, (unsigned long) delta);
 }
 
+// The page an entry is about to lose goes to the front of the victims, and
+// those before `upto` move back one.
+static inline void tlb_evict(struct tlb *tlb, const struct tlb_entry *evicted, unsigned upto) {
+    struct tlb_entry keep = *evicted;
+    for (unsigned v = upto; v > 0; v--)
+        tlb->victim[v] = tlb->victim[v - 1];
+    tlb->victim[0] = keep;
+}
+
 __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int type) {
     bool tagged = unlikely((addr >> 56) != 0);
+    // The second chance (emu/tlb.h, TLB_VICTIMS): the page was evicted from
+    // its entry by another that hashes there, and is still good. It changes
+    // places with that one. Not when the table is stale, and not for a store
+    // that has to be revalidated: those take the whole path below.
+    struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
+    unsigned victim = TLB_VICTIMS;
+    for (unsigned v = 0; v < TLB_VICTIMS; v++)
+        if (tlb->victim[v].page == TLB_PAGE(addr))
+            victim = v;
+    if (victim != TLB_VICTIMS &&
+            (type != MEM_WRITE || (tlb->victim[victim].page_if_writable == TLB_PAGE(addr) &&
+                                   !tlb->mmu->requires_write_revalidate)) &&
+            atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed) == tlb->mem_changes) {
+        struct tlb_entry found = tlb->victim[victim];
+        tlb_evict(tlb, tlb_ent, victim);
+        *tlb_ent = found;
+        if (type == MEM_WRITE)
+            tlb->dirty_page = TLB_PAGE(addr);
+        return (void *) (found.data_minus_addr + addr);
+    }
     // SENSOR ONLY. A write miss is the closest thing AOK gets to a notification
     // that the guest is committing memory: the mmap guards approved the mapping
     // once, the pt entries were built then, and the host commits the physical
@@ -928,7 +905,14 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
     }
     tlb->dirty_page = TLB_PAGE(addr);
 
-    struct tlb_entry *tlb_ent = &tlb->entries[TLB_INDEX(addr)];
+    // (tlb_flush above may have emptied everything; the pointer stands.) A
+    // victim's copy of this page that could not serve -- read-only where a
+    // store came, or due revalidation -- goes, so the page is in one place;
+    // and the page this one evicts joins the victims.
+    if (victim != TLB_VICTIMS && tlb->victim[victim].page == TLB_PAGE(addr))
+        tlb->victim[victim] = (struct tlb_entry) {.page = TLB_PAGE_EMPTY, .page_if_writable = TLB_PAGE_EMPTY};
+    if (tlb_ent->page != TLB_PAGE(addr) && tlb_ent->page != TLB_PAGE_EMPTY)
+        tlb_evict(tlb, tlb_ent, TLB_VICTIMS - 1);
     tlb_ent->page = TLB_PAGE(addr);
     if (type == MEM_WRITE)
         tlb_ent->page_if_writable = tlb_ent->page;
@@ -936,6 +920,28 @@ __no_instrument void *tlb_handle_miss(struct tlb *tlb, guest_addr_t addr, int ty
         // 1 is not a valid page so this won't look like a hit
         tlb_ent->page_if_writable = TLB_PAGE_EMPTY;
     tlb_ent->data_minus_addr = (uintptr_t) ptr - TLB_PAGE(addr);
+#if ENGINE_JIT
+    // x86 code can be rewritten by a plain store. Once this entry is writable
+    // no store to the page reaches mmu_translate again, so an executable page
+    // -- or a shared one, which another mapping may execute -- is noted, after
+    // the install (see jit_note_code_write), and the next compile from it
+    // revokes the entry.
+    //
+    // jit_code_write_prepare sets the tracking flags and then bumps
+    // mmu->changes. This entry is valid under tlb->mem_changes, which
+    // tlb_flush read with acquire; if that was the bump or anything after it,
+    // the flags read here are set, so no entry valid after the bump goes
+    // unnoted.
+    struct jit *jit = tlb->mmu->jit;
+    if (type == MEM_WRITE && jit != NULL &&
+            atomic_load_explicit(&jit->track_code_writes, memory_order_relaxed)) {
+        unsigned flags = mmu_page_code_flags(tlb->mmu, PAGE(addr));
+        if (((flags & P_EXEC) || ((flags & P_SHARED) &&
+                atomic_load_explicit(&jit->track_shared_code, memory_order_relaxed))) &&
+                !jit_note_code_write(jit, PAGE(addr), tlb))
+            tlb_ent->page_if_writable = TLB_PAGE_EMPTY;
+    }
+#endif
     return (void *) (tlb_ent->data_minus_addr + addr);
 }
 
@@ -1074,9 +1080,10 @@ static __no_instrument void arm64_watch_record(struct tlb *tlb, guest_addr_t add
     }
 }
 
-// Direct value check for C-side bulk stores that see the data (the ld1/st1
-// helper and the crosspage flush): record any poison value in the buffer.
-static __no_instrument void arm64_watch_scan_value(guest_addr_t addr, const void *value, unsigned size) {
+// Direct value check for bulk stores that see the data (the crosspage
+// flush, and a64_vldst's stores while a watch is on): record any poison
+// value in the buffer.
+__no_instrument void arm64_watch_scan_value(guest_addr_t addr, const void *value, unsigned size) {
     if (arm64_watch_state != 2 || !arm64_watch_val_on)
         return;
     for (unsigned off = 0; off + 8 <= size; off += 4) {

@@ -12,6 +12,8 @@
 #include "fs/path.h"
 #include "fs/real.h"
 #include "fs/tty.h"
+#include "platform/platform.h"
+#include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
 #include "kernel/init.h"
 #include "kernel/personality.h"
@@ -19,7 +21,16 @@
 #include "kernel/task.h"
 #include "util/sync.h"
 
+// See kernel/init.h. Left NULL for the entry points (ptraceomatic, unicornomatic)
+// that boot a bare root and have nothing to set up in it.
+void (*ish_boot_setup_hook)(void) = NULL;
+
 int mount_root(const struct fs_ops *fs, const char *source) {
+    // The first thing the CLI and the app both do. A guest's open files are
+    // the host's, and a host that starts this process with room for 256 of
+    // them (launchd does, for an app; sshd does, for a suite leg) hands a
+    // busy guest EMFILE long before the guest's own limits say so.
+    host_raise_fd_limit();
     char source_realpath[MAX_PATH + 1];
     if (realpath(source, source_realpath) == NULL)
         return errno_map();
@@ -185,7 +196,9 @@ static void establish_signal_handlers(void) {
 }
 
 // copied from include/asm-generic/resource.h in the kernel
-static struct rlimit_ init_rlimits[16] = {
+// Not static: kernel/checkpoint.c builds tgroups of its own for restored
+// processes and needs the same starting point construct_task uses.
+struct rlimit_ init_rlimits[16] = {
     [RLIMIT_CPU_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_FSIZE_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_DATA_]       = {RLIM_INFINITY_, RLIM_INFINITY_},
@@ -194,7 +207,18 @@ static struct rlimit_ init_rlimits[16] = {
     [RLIMIT_RSS_]        = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_NPROC_]      = {1024, 1024},
     [RLIMIT_NOFILE_]     = {1024, 4096},
-    [RLIMIT_MEMLOCK_]    = {64*1024, 64*1024},
+    // 8 MiB, both limits, which is what an unprivileged process gets on a
+    // real Linux: verified on the Debian 13 oracle (kernel 6.12), where
+    // /proc/self/limits reads "Max locked memory 8388608 8388608" for an
+    // ordinary user. This was 64*1024 -- the historical kernel default, which
+    // no distro has shipped in years, since systemd sets DefaultLimitMEMLOCK=8M.
+    //
+    // It survived because the CLI harness runs as uid 0 and root ignores
+    // RLIMIT_MEMLOCK entirely, so every Mac run of the suite passed. The device
+    // leg runs over sshd as an ordinary user and mmap_lazy_split_commit failed
+    // three mlock assertions with ENOMEM -- the test is careful to stay inside
+    // 8 MiB precisely so it can run unprivileged, and it was right.
+    [RLIMIT_MEMLOCK_]    = {8*1024*1024, 8*1024*1024},
     [RLIMIT_AS_]         = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_LOCKS_]      = {RLIM_INFINITY_, RLIM_INFINITY_},
     [RLIMIT_SIGPENDING_] = {1024, 1024},
@@ -241,8 +265,11 @@ static struct task *construct_task(struct task *parent) {
     // a static: "pointer being freed was not allocated", SIGABRT out of
     // do_exit. Sharing the parent's UTS namespace is the right semantic (Linux
     // only gives a new one for CLONE_NEWUTS), so take the reference for it.
-    if (parent != NULL)
+    // The IPC namespace is aliased the same way and needs the same.
+    if (parent != NULL) {
         uts_ns_retain(task->uts_ns);
+        ipc_ns_retain(task->ipc_ns);
+    }
 
     //atomic_thread_fence(__ATOMIC_SEQ_CST);
     
@@ -261,7 +288,7 @@ static struct task *construct_task(struct task *parent) {
     cond_init(&group->stopped_cond);
     memcpy(group->limits, init_rlimits, sizeof(init_rlimits));
     group->leader = task;
-    group->personality = ADDR_NO_RANDOMIZE_;
+    group->personality = 0;
     list_add(&group->threads, &task->group_links);
     task->group = group;
     task->tgid = task->pid;
@@ -323,9 +350,18 @@ intptr_t become_first_process(void) {
 }
 
 intptr_t become_new_init_child(void) {
-    struct task *init = pid_get_task_ref(1);
+    struct task *init = pid_get_task_global_ref(1);
     if (init == NULL)
         return _ESRCH;
+    // An exited init stays in the pid table -- it has no parent, so it is never
+    // made a zombie or unlinked -- but its fs, files and namespaces are gone.
+    // Building a child from it dereferenced its NULL uts_ns, so opening a
+    // terminal after `reboot` crashed the app (#587). There is no machine left
+    // to join.
+    if (init->exiting) {
+        task_ref_cnt_mod(init, -1);
+        return _ESRCH;
+    }
 
     struct task *task = construct_task(init);
     task_ref_cnt_mod(init, -1);
@@ -409,7 +445,36 @@ int create_piped_stdio(void) {
     if (!(current->files->files[2] = open_fd_from_actual_fd(STDERR_FILENO))) {
         return -1;
     }
+    // Marked here and not in open_fd_from_actual_fd, which also wraps the
+    // pipes and /dev/null a captured guest command is given: those are not
+    // the host's standard streams, and a checkpoint must not re-attach them
+    // as if they were.
+    for (int i = 0; i < 3; i++)
+        current->files->files[i]->host_stdio = (uint8_t) (i + 1);
     return 0;
+}
+
+// A checkpoint restore re-attaches a saved guest's standard streams to
+// whatever THIS run was handed. It wraps a copy rather than the host's own
+// descriptor because nothing in the image decides when that may be closed:
+// the restore lets go of its references once every task is built, and when
+// that was the last one, closing the host's own 0, 1 and 2 handed their
+// numbers to the next fakefs opens -- every later write to "stdout" landed in
+// a guest file. Marked like create_piped_stdio's, so the resumed session's
+// standard streams still say what they are when it is saved again.
+struct fd *open_host_stdio_copy(int stream) {
+    if (stream < 0 || stream > 2)
+        return NULL;
+    int copy = fcntl(stream, F_DUPFD_CLOEXEC, 3);
+    if (copy < 0)
+        return NULL;
+    struct fd *fd = open_fd_from_actual_fd(copy);
+    if (fd == NULL) {
+        close(copy);
+        return NULL;
+    }
+    fd->host_stdio = (uint8_t) (stream + 1);
+    return fd;
 }
 
 static long ish_monotonic_ms_since(const struct timespec *start) {
@@ -460,6 +525,102 @@ int run_guest_command_capture_user(const char *user, const char *command,
                                           timeout_ms, max_output, result);
 }
 
+static int spawn_guest_child(const char *const *args, int argc, const char *env,
+                             int fd0, int fd1, int fd2,
+                             dword_t *pid_out, bool *own_pgroup_out);
+
+// A long-lived guest process with host ends of its stdio; see init.h.
+static int pipe_pair_nosigpipe(int fds[2], bool writer_is_host) {
+    if (pipe(fds) < 0)
+        return -errno;
+#ifdef F_SETNOSIGPIPE
+    // The host end we write to: a peer that exited must give EPIPE, not a
+    // SIGPIPE to the app (init ignores it globally; this does not rely on that).
+    if (writer_is_host)
+        fcntl(fds[1], F_SETNOSIGPIPE, 1);
+#else
+    (void) writer_is_host;
+#endif
+    return 0;
+}
+
+static void spawn_guest_child_close_all(int *fds, int count) {
+    for (int i = 0; i < count; i++) {
+        if (fds[i] >= 0)
+            close(fds[i]);
+    }
+}
+
+int guest_process_spawn_user(const char *user, const char *command, const char *env,
+                             struct guest_process *process) {
+    if (command == NULL || process == NULL)
+        return _EINVAL;
+    memset(process, 0, sizeof(*process));
+    process->stdin_fd = process->stdout_fd = process->stderr_fd = -1;
+    int in[2] = {-1, -1}, out[2] = {-1, -1}, err[2] = {-1, -1};
+    int rc = pipe_pair_nosigpipe(in, true);
+    if (rc == 0)
+        rc = pipe_pair_nosigpipe(out, false);
+    if (rc == 0)
+        rc = pipe_pair_nosigpipe(err, false);
+    if (rc < 0) {
+        int all[] = {in[0], in[1], out[0], out[1], err[0], err[1]};
+        spawn_guest_child_close_all(all, 6);
+        return rc;
+    }
+    const char *shell_args[] = {"/bin/sh", "-c", command};
+    const char *su_args[] = {"/bin/su", "-", user != NULL ? user : "", "-c", command};
+    bool as_user = user != NULL && user[0] != '\0';
+    dword_t pid = 0;
+    bool own_pgroup = false;
+    // The guest's ends (in[0], out[1], err[1]) are consumed by the spawn.
+    rc = spawn_guest_child(as_user ? su_args : shell_args, as_user ? 5 : 3, env,
+                           in[0], out[1], err[1], &pid, &own_pgroup);
+    if (rc < 0) {
+        int host[] = {in[1], out[0], err[0]};
+        spawn_guest_child_close_all(host, 3);
+        return rc;
+    }
+    process->pid = (int) pid;
+    process->own_pgroup = own_pgroup;
+    process->stdin_fd = in[1];
+    process->stdout_fd = out[0];
+    process->stderr_fd = err[0];
+    return 0;
+}
+
+static void capture_child_kill(dword_t child_pid, bool own_pgroup);
+
+void guest_process_stop(struct guest_process *process) {
+    if (process == NULL || process->pid <= 0)
+        return;
+    dword_t pid = (dword_t) process->pid;
+    capture_child_kill(pid, process->own_pgroup);
+    int host[] = {process->stdin_fd, process->stdout_fd, process->stderr_fd};
+    spawn_guest_child_close_all(host, 3);
+    process->stdin_fd = process->stdout_fd = process->stderr_fd = -1;
+    process->pid = 0;
+    // Reap, bounded, as the capture does: the guest's own init may win the
+    // race, which only loses an exit status nobody here reads.
+    struct task *saved = current;
+    struct task *init = pid_get_task_global_ref(1);
+    if (init == NULL)
+        return;
+    current = init;
+    struct timespec start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (;;) {
+        int status = 0;
+        if (wait_child_status(pid, &status, true /*nonblock*/) != 0)
+            break;
+        if (ish_monotonic_ms_since(&start) > 3000)
+            break;
+        nanosleep(&(struct timespec){.tv_nsec = 5 * 1000 * 1000}, NULL);
+    }
+    current = saved;
+    task_ref_cnt_mod(init, -1);
+}
+
 // SIGKILL the capture child and everything it spawned. Two nets, because
 // neither alone covers the tree: the process-group kill catches tasks that
 // reparented away inside the group (a shell that backgrounded a child and
@@ -483,7 +644,7 @@ static void capture_child_kill(dword_t child_pid, bool own_pgroup) {
     size_t count = 0;
 
     complex_lockt(&pids_lock, 0);
-    struct task *root = pid_get_task(child_pid);
+    struct task *root = pid_get_task_global(child_pid);
     if (root != NULL) {
         task_ref_cnt_mod(root, 1);
         victims[count++] = root;
@@ -523,6 +684,103 @@ collected:
         free(victims);
 }
 
+// Start `args` as a fresh child of init with fd0/fd1/fd2 (host descriptors,
+// -1 for none) as its stdin, stdout and stderr. Every descriptor passed is
+// consumed: wrapped into the child's fd table, which closes it when the child
+// exits, or closed here on failure. Returns 0 with the child running on its
+// own host thread, or a negative errno. MUST be called on a dedicated host
+// thread, not a guest task thread: it temporarily repoints `current`.
+static int spawn_guest_child(const char *const *args, int argc, const char *env,
+                             int fd0, int fd1, int fd2,
+                             dword_t *pid_out, bool *own_pgroup_out) {
+    struct task *saved = current;
+
+    intptr_t spawn_err = become_new_init_child();
+    if (spawn_err < 0) {
+        if (fd0 >= 0) close(fd0);
+        if (fd1 >= 0) close(fd1);
+        if (fd2 >= 0) close(fd2);
+        current = saved;
+        return (int) spawn_err;
+    }
+    struct task *child = current;
+    dword_t child_pid = child->pid;
+
+    // The child must own its process group (pgid == pid): the exec'd program
+    // may fork -- util-linux/shadow su runs the login shell in a child while
+    // it holds a PAM session open, and any shell forks for compound commands
+    // -- and the timeout/cleanup kills must reach those descendants too, or a
+    // timed-out command lingers as an orphan still holding the pipe write
+    // ends. construct_task already ran task_setsid on it (every init child is
+    // born a session+pgroup leader), so confirm rather than re-setsid (which
+    // would just return EPERM for an existing leader); if the invariant ever
+    // breaks, capture_child_kill falls back to the old per-pid kill instead
+    // of signaling a group the child doesn't own.
+    lock(&child->group->lock, 0);
+    bool own_pgroup = (dword_t) child->group->pgid == child_pid && (dword_t) child->group->sid == child_pid;
+    unlock(&child->group->lock);
+
+    // Pack argv as do_execve expects: "<arg>\0<arg>\0...\0\0", note the
+    // trailing double-NUL: args_size() walks `count` strings and then asserts
+    // the next byte is '\0' (see exec.c), so the buffer needs one extra
+    // terminator after the last argument -- exactly what xX_main_Xx writes.
+    size_t argv_size = 1; // the trailing terminator
+    for (int i = 0; i < argc; i++)
+        argv_size += strlen(args[i]) + 1;
+    char *argv = malloc(argv_size);
+    const char *envp = (env != NULL && env[0] != '\0') ? env
+        : "PATH=/AOK/persist/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
+          "HOME=/root\0TERM=dumb\0LANG=C.UTF-8\0";
+    int launch_err = argv != NULL ? 0 : _ENOMEM;
+    if (argv != NULL) {
+        size_t off = 0;
+        for (int i = 0; i < argc; i++) {
+            size_t len = strlen(args[i]) + 1;
+            memcpy(argv + off, args[i], len);
+            off += len;
+        }
+        argv[off] = '\0'; // trailing terminator required by args_size()
+        // Load the program image first, then wire stdio (matches the xX_main_Xx
+        // bootstrap order; do_execve does not need an fd table to be present).
+        launch_err = do_execve(args[0], argc, argv, envp);
+        free(argv);
+    }
+    if (launch_err < 0) {
+        if (fd0 >= 0) close(fd0);
+        if (fd1 >= 0) close(fd1);
+        if (fd2 >= 0) close(fd2);
+        current = saved;
+        return launch_err;
+    }
+
+    struct fd *in_fd = fd0 >= 0 ? open_fd_from_actual_fd(fd0) : NULL;
+    struct fd *out_fd = fd1 >= 0 ? open_fd_from_actual_fd(fd1) : NULL;
+    struct fd *err_fd = fd2 >= 0 ? open_fd_from_actual_fd(fd2) : NULL;
+    child->files->files[0] = in_fd;
+    child->files->files[1] = out_fd;
+    child->files->files[2] = err_fd;
+    // Each wrapped guest fd now owns its host descriptor and will close() it when
+    // the guest exits, which is what finally delivers EOF to a reader of the
+    // other end. Only close directly here for any wrap that failed (otherwise
+    // the write end would leak and the reader would never see EOF).
+    if (in_fd == NULL && fd0 >= 0) close(fd0);
+    if (out_fd == NULL && fd1 >= 0) close(fd1);
+    if (err_fd == NULL && fd2 >= 0) close(fd2);
+
+    if (task_start(child) < 0) {
+        // Host thread limit/memory: the child never ran. Its fdtable owns the
+        // wrapped descriptors, so the release inside task_never_ran_destroy
+        // closes them.
+        task_never_ran_destroy(child);
+        current = saved;
+        return _EAGAIN;
+    }
+    current = saved; // the child runs on its own thread now; stop impersonating it
+    *pid_out = child_pid;
+    *own_pgroup_out = own_pgroup;
+    return 0;
+}
+
 static int run_guest_command_capture_argv(const char *const *args, int argc,
                                           const char *env, int timeout_ms,
                                           size_t max_output,
@@ -550,97 +808,16 @@ static int run_guest_command_capture_argv(const char *const *args, int argc,
     }
     int null_fd = open("/dev/null", O_RDONLY); // guest stdin -> immediate EOF
 
-    struct task *saved = current;
-
-    intptr_t spawn_err = become_new_init_child();
+    dword_t child_pid = 0;
+    bool own_pgroup = false;
+    int spawn_err = spawn_guest_child(args, argc, env, null_fd, write_fd, write_fd2, &child_pid, &own_pgroup);
     if (spawn_err < 0) {
         close(read_fd);
-        close(write_fd);
-        close(write_fd2);
-        if (null_fd >= 0)
-            close(null_fd);
-        current = saved;
-        return (int) spawn_err;
+        if (spawn_err == _EAGAIN)
+            printk("ERROR: could not start host thread for command child\n");
+        return spawn_err;
     }
-    struct task *child = current;
-    dword_t child_pid = child->pid;
-
-    // The child must own its process group (pgid == pid): the exec'd program
-    // may fork -- util-linux/shadow su runs the login shell in a child while
-    // it holds a PAM session open, and any shell forks for compound commands
-    // -- and the timeout/cleanup kills must reach those descendants too, or a
-    // timed-out command lingers as an orphan still holding the pipe write
-    // ends. construct_task already ran task_setsid on it (every init child is
-    // born a session+pgroup leader), so confirm rather than re-setsid (which
-    // would just return EPERM for an existing leader); if the invariant ever
-    // breaks, capture_child_kill falls back to the old per-pid kill instead
-    // of signaling a group the child doesn't own.
-    lock(&child->group->lock, 0);
-    bool own_pgroup = child->group->pgid == child_pid && child->group->sid == child_pid;
-    unlock(&child->group->lock);
-
-    // Pack argv as do_execve expects: "<arg>\0<arg>\0...\0\0", note the
-    // trailing double-NUL: args_size() walks `count` strings and then asserts
-    // the next byte is '\0' (see exec.c), so the buffer needs one extra
-    // terminator after the last argument -- exactly what xX_main_Xx writes.
-    size_t argv_size = 1; // the trailing terminator
-    for (int i = 0; i < argc; i++)
-        argv_size += strlen(args[i]) + 1;
-    char *argv = malloc(argv_size);
-    const char *envp = (env != NULL && env[0] != '\0') ? env
-        : "PATH=/AOK/persist/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\0"
-          "HOME=/root\0TERM=dumb\0";
-    int launch_err = argv != NULL ? 0 : _ENOMEM;
-    if (argv != NULL) {
-        size_t off = 0;
-        for (int i = 0; i < argc; i++) {
-            size_t len = strlen(args[i]) + 1;
-            memcpy(argv + off, args[i], len);
-            off += len;
-        }
-        argv[off] = '\0'; // trailing terminator required by args_size()
-        // Load the program image first, then wire stdio (matches the xX_main_Xx
-        // bootstrap order; do_execve does not need an fd table to be present).
-        launch_err = do_execve(args[0], argc, argv, envp);
-        free(argv);
-    }
-    if (launch_err < 0) {
-        close(read_fd);
-        close(write_fd);
-        close(write_fd2);
-        if (null_fd >= 0)
-            close(null_fd);
-        current = saved;
-        return launch_err;
-    }
-
-    struct fd *in_fd = null_fd >= 0 ? open_fd_from_actual_fd(null_fd) : NULL;
-    struct fd *out_fd = open_fd_from_actual_fd(write_fd);
-    struct fd *err_fd = open_fd_from_actual_fd(write_fd2);
-    child->files->files[0] = in_fd;
-    child->files->files[1] = out_fd;
-    child->files->files[2] = err_fd;
-    // Each wrapped guest fd now owns its host descriptor and will close() it when
-    // the guest exits, which is what finally delivers EOF to read_fd. Only close
-    // directly here for any wrap that failed (otherwise the write end would leak
-    // and read_fd would never see EOF).
-    if (out_fd == NULL) close(write_fd);
-    if (err_fd == NULL) close(write_fd2);
-    if (in_fd == NULL && null_fd >= 0) close(null_fd);
-
     result->launched = 1;
-    if (task_start(child) < 0) {
-        // Host thread limit/memory: the child never ran. Its fdtable owns the
-        // pipe write ends, so the release inside task_never_ran_destroy closes
-        // them; only the read end is still ours to clean up.
-        printk("ERROR: could not start host thread for command child %d\n", child_pid);
-        result->launched = 0;
-        task_never_ran_destroy(child);
-        current = saved;
-        close(read_fd);
-        return _EAGAIN;
-    }
-    current = saved; // the child runs on its own thread now; stop impersonating it
 
     // Drain the pipe until EOF (guest exit closes both write ends), bounding total
     // bytes and wall-clock time. On timeout, SIGKILL the child's process group and
@@ -729,7 +906,8 @@ static int run_guest_command_capture_argv(const char *const *args, int argc,
     // poll with WNOHANG, escalate to SIGKILL if the child lingers, and give up
     // after a short grace. The captured output does not depend on this -- if the
     // guest's real init wins the reap race we just lose the exit code, not output.
-    struct task *init = pid_get_task_ref(1);
+    struct task *saved = current;
+    struct task *init = pid_get_task_global_ref(1);
     if (init != NULL) {
         current = init;
         int status = 0;

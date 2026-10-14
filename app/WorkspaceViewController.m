@@ -1,12 +1,17 @@
+#import <os/lock.h>
+#import <os/log.h>
 #import "WorkspaceViewController.h"
 
+#import "AboutNavigationController.h"
 #import "AboutViewController.h"
+#import "AppDelegate.h"
 #import "Diagnostics.h"
 #import "Roots.h"
 #import "SceneDelegate.h"
 #include "fs/devices.h"
 #include "kernel/init.h"
 #import "TerminalViewController.h"
+#import "Snippets.h"
 #import "DisplayViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
@@ -18,11 +23,20 @@
 #import "WorkspaceImageViewer.h"
 #import "WorkspaceVideoPlayer.h"
 #import "UIApplication+OpenURL.h"
+#import "UIViewController+Extras.h"
 #import <WebKit/WebKit.h>
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
+#import "GuestFileBridge.h"
+#import <objc/runtime.h>
 #include "kernel/task.h"
 #include "fs/proc/ish.h"
+#include "kernel/checkpoint.h"
 #include "kernel/errno.h"
+#include "kernel/swap.h"
+#import "AppGroup.h"
 #include <arpa/inet.h>
+#include <fts.h>
+#include <sys/stat.h>
 #include <ifaddrs.h>
 #include <mach/mach.h>
 #include <mach/task_info.h>
@@ -38,6 +52,10 @@
 @property (nonatomic) BOOL didOpenInitialTool;
 @property (nonatomic, strong) UIButton *modernMenuPip;
 @property (nonatomic) BOOL didEnsureDefaultWorkspaceUtilities;
+@property (nonatomic) BOOL didAskSessionResumeChoice;
+// The arrangement signature as of the last Save, for the applet's saved/unsaved
+// indicator. nil until this launch reads or writes a snapshot.
+@property (nonatomic, copy) NSString *savedDesktopsSignature;
 @property (nonatomic, strong) UIView *desktopSurfaceView;
 @property (nonatomic, strong) UIImageView *desktopWallpaperView;
 @property (nonatomic, copy) NSString *appliedWallpaperThemeIdentifier;
@@ -46,7 +64,11 @@
 @property (nonatomic) NSInteger activeDesktopIndex;
 @property (nonatomic) NSInteger desktopCount;
 @property (nonatomic, strong) NSMutableIndexSet *lockedDesktopIndices;
+// A name per Desktop index, "" for one without a name of its own. Shifted with the
+// Desktops like lockedDesktopIndices; trailing unnamed entries are dropped.
+@property (nonatomic, strong) NSMutableArray<NSString *> *desktopNames;
 @property (nonatomic, weak) UILabel *desktopIndicatorLabel;
+@property (nonatomic) BOOL rootMenuSaveInProgress;
 @property (nonatomic) NSInteger desktopWindowCascadeIndex;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dashboardWindow;
 @property (nonatomic, weak) ISHWorkspaceContainedWindowView *dockWindow;
@@ -66,6 +88,9 @@
 - (void)removeDesktopAtIndex:(NSInteger)index;
 - (BOOL)isDesktopLockedAtIndex:(NSInteger)index;
 - (void)toggleDesktopLockAtIndex:(NSInteger)index;
+- (NSString *)nameForDesktopAtIndex:(NSInteger)index;
+- (NSString *)customNameForDesktopAtIndex:(NSInteger)index;
+- (void)setName:(NSString *)name forDesktopAtIndex:(NSInteger)index;
 - (void)ensureDefaultWorkspaceUtilitiesOpen;
 - (void)ensureDefaultLLMChatWindowOpenIfNeeded;
 - (void)persistDefaultWorkspaceUtilityFrames;
@@ -74,6 +99,7 @@
 - (void)applyInitialPlacementToLauncherWindow:(ISHWorkspaceContainedWindowView *)windowView;
 - (void)persistLauncherWindowFrame;
 - (void)restoreLauncherWindowPlacement;
+- (nullable ISHWorkspaceContainedWindowView *)openTerminalWindowForArrangementDescriptor:(NSDictionary<NSString *, id> *)descriptor;
 - (void)persistDockWindowFrame;
 - (NSString *)persistentDockWindowDescriptorDefaultsKey;
 - (void)applyInitialPlacementToDockWindow:(ISHWorkspaceContainedWindowView *)windowView;
@@ -121,6 +147,7 @@ static NSString *const ISHWorkspaceToolDiagnosticsIdentifier = @"diagnostics";
 static NSString *const ISHWorkspaceToolLLMIdentifier = @"llm";
 static NSString *const ISHWorkspaceToolLauncherIdentifier = @"launcher";
 static NSString *const ISHWorkspaceToolAudioIdentifier = @"audio";
+static NSString *const ISHWorkspaceToolEqualizerIdentifier = @"equalizer";
 static NSString *const ISHWorkspaceToolMotePadIdentifier = @"motepad";
 static NSString *const ISHWorkspaceToolFileManagerIdentifier = @"filemanager";
 static NSString *const ISHWorkspaceToolMarkdownViewerIdentifier = @"markdown";
@@ -133,6 +160,12 @@ static NSString *const ISHWorkspaceToolDisplayIdentifier = @"display";
 // and this goes nil by itself, which is exactly the answer the guest should
 // get -- "there is no Workspace" rather than a dangling one.
 static __weak WorkspaceViewController *ISHWorkspaceActiveController = nil;
+// What each terminal had printed, keyed by terminal UUID, captured just before
+// a checkpoint. Populated by -captureTerminalContentsThen: and read by
+// -savedLayoutDescriptorForWindow:, which is synchronous and cannot wait for a
+// web view itself.
+static NSDictionary<NSString *, NSString *> *ISHWorkspaceCapturedTerminalContents = nil;
+
 
 // Every tool a guest may name. The guest gets this list by reading
 // /proc/ish/workspace, and anything not on it is refused: a guest asking the
@@ -145,17 +178,43 @@ static NSArray<NSString *> *ISHWorkspaceOpenableToolIdentifiers(void) {
         tools = @[ISHWorkspaceToolMotePadIdentifier, ISHWorkspaceToolFileManagerIdentifier,
                   ISHWorkspaceToolMarkdownViewerIdentifier, ISHWorkspaceToolImageViewerIdentifier,
                   ISHWorkspaceToolVideoPlayerIdentifier, ISHWorkspaceToolAudioIdentifier,
+                  ISHWorkspaceToolEqualizerIdentifier,
                   ISHWorkspaceToolBrowserIdentifier, ISHWorkspaceToolLLMIdentifier,
                   ISHWorkspaceToolFilesystemsIdentifier, ISHWorkspaceToolStorageIdentifier,
                   ISHWorkspaceToolMonitorIdentifier, ISHWorkspaceToolNetworksIdentifier,
                   ISHWorkspaceToolStatusIdentifier, ISHWorkspaceToolSettingsIdentifier,
                   ISHWorkspaceToolThemesIdentifier, ISHWorkspaceToolLauncherIdentifier,
                   ISHWorkspaceToolClockIdentifier, ISHWorkspaceToolInfoIdentifier,
-                  ISHWorkspaceToolDiagnosticsIdentifier, ISHWorkspaceToolSessionsIdentifier];
+                  ISHWorkspaceToolDiagnosticsIdentifier, ISHWorkspaceToolSessionsIdentifier,
+                  ISHWorkspaceToolDisplayIdentifier, ISHWorkspaceToolWorkspacesIdentifier,
+                  ISHWorkspaceToolShortcutsIdentifier];
     });
     return tools;
 }
 static NSString *const ISHWorkspaceSavedLayoutDefaultsKey = @"ISHWorkspaceSavedLayout";
+// When each scene's layout was written. A scene's persistentIdentifier does
+// NOT survive Suspend and Exit -- the session is discarded and the next launch
+// mints a fresh one -- so the layout just saved is looked up under a key that
+// no longer exists. Measured on the user's iPad: THIRTEEN orphaned scene keys,
+// the real arrangement (4 Desktops, windows on 1/2/3) filed under one of them,
+// and the resume reading a months-old "default" with everything on Desktop 0.
+// That is the missing Desktop count, the missing applets, and the applets
+// coming back on the wrong Desktops. Newest-wins is what makes a resume find
+// what the suspend just wrote.
+static NSString *const ISHWorkspaceSavedLayoutTimesDefaultsKey = @"ISHWorkspaceSavedLayoutTimes";
+// The Desktop arrangement the user deliberately saved, with the Save icon in the
+// Desktops applet.
+//
+// Deliberately NOT ISHWorkspaceSavedLayout. That one is rewritten automatically
+// on every suspend and every background transition, so a snapshot filed there is
+// overwritten by the next thing that happens to the app -- and it is read only
+// when a launch resumed a checkpoint, which is why pressing Save, killing the
+// app and restarting restored nothing at all. This key changes only when the
+// user presses Save, and every ordinary launch reads it.
+static NSString *const ISHWorkspaceSavedDesktopsDefaultsKey = @"ISHWorkspaceSavedDesktops";
+// Orphans accumulate forever otherwise -- one per launch, each holding a full
+// window list.
+static const NSUInteger ISHWorkspaceSavedLayoutSceneLimit = 8;
 static NSString *const ISHWorkspacePersistentWorkspacesWindowFrameDefaultsKey = @"ISHWorkspacePersistentWorkspacesWindowFrame";
 static NSString *const ISHWorkspaceLegacyPersistentWorkspacesWindowFrameDefaultsKeyPrefix = @"ISHWorkspacePersistentWorkspacesWindowFrame";
 static NSString *const ISHWorkspacePersistentDockWindowDescriptorDefaultsKey = @"ISHWorkspacePersistentDockWindowDescriptor";
@@ -168,6 +227,13 @@ static NSString *const ISHWorkspaceSavedLayoutKindDashboard = @"dashboard";
 static NSString *const ISHWorkspaceSavedLayoutKindDock = @"dock";
 static NSString *const ISHWorkspaceSavedLayoutKindTool = @"tool";
 static NSString *const ISHWorkspaceSavedLayoutKindTerminal = @"terminal";
+// The Desktops themselves -- how many there were and which was showing.
+//
+// Window descriptors carry a desktopIndex, and assignRestoredWindow: grows the
+// count to fit one, so a Desktop with something on it came back by accident of
+// its contents. An EMPTY Desktop had nothing to grow it and was simply lost,
+// and the Desktop you were looking at was never restored at all.
+static NSString *const ISHWorkspaceSavedLayoutKindDesktops = @"desktops";
 static NSString *const ISHWorkspaceTerminalRoleSessionShell = @"session-shell";
 static NSString *const ISHWorkspaceTerminalRoleSystemConsole = @"system-console";
 static NSString *const ISHWorkspaceTerminalRoleGeneric = @"terminal";
@@ -188,6 +254,14 @@ static BOOL ISHWorkspaceUsesPhoneLayout(void) {
 static BOOL ISHWorkspaceUsesModernStyle(void) {
     return UserPreferences.shared.workspaceStyle == WorkspaceStyleModern;
 }
+
+// Contrast helpers, defined with the rest of the theme maths further down but
+// needed by the window chrome above it. See ISHWorkspaceThemeOnSurfaceColor for
+// why a foreground is measured against its fill rather than assumed.
+static UIColor *ISHWorkspaceThemeOnSurfaceColor(UIColor *fill, CGFloat minimumContrast);
+static UIColor *ISHWorkspaceThemeMutedOnSurfaceColor(UIColor *ink, UIColor *fill,
+                                                     CGFloat minimumContrast);
+static UIColor *ISHWorkspaceThemeWashOverColor(UIColor *wash, CGFloat alpha, UIColor *base);
 
 // User-defined launcher shortcuts: each is @{@"name", @"command"} (a leaf that runs a command
 // in a fresh terminal) or @{@"name", @"children"} (a group whose "children" is itself an array
@@ -341,6 +415,8 @@ static NSString *ISHWorkspaceLauncherToolIdentifierForCommand(NSString *command)
         @"chat": ISHWorkspaceToolLLMIdentifier,
         @"music": ISHWorkspaceToolAudioIdentifier,
         @"audio": ISHWorkspaceToolAudioIdentifier,
+        @"equalizer": ISHWorkspaceToolEqualizerIdentifier,
+        @"eq": ISHWorkspaceToolEqualizerIdentifier,
         @"motepad": ISHWorkspaceToolMotePadIdentifier,
         @"editor": ISHWorkspaceToolMotePadIdentifier,
         @"notepad": ISHWorkspaceToolMotePadIdentifier,
@@ -428,6 +504,10 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
 @property (nonatomic) NSInteger workspaceDesktopIndex;
 @property (nonatomic, copy) NSString *workspaceToolIdentifier;
 @property (nonatomic, copy) NSString *workspaceTerminalRole;
+// For /proc/ish/applets: a number no other window this run has had, and when
+// the window was made (CACurrentMediaTime, so the age is monotonic).
+@property (nonatomic, readonly) NSUInteger workspaceWindowSerial;
+@property (nonatomic, readonly) CFTimeInterval workspaceOpenedAt;
 @property (nonatomic) BOOL pinnedToBottomCenter;
 - (void)bringWindowToFront;
 @property (nonatomic) BOOL resizeHandleAtTopRight;
@@ -466,6 +546,10 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
     self.minimumSize = CGSizeMake(280, 180);
     self.maximumSize = CGSizeZero;
     self.frameBeforeBoundsClamp = CGRectNull;
+    // Main thread only, like every other UIView init, so a plain counter.
+    static NSUInteger ISHWorkspaceNextWindowSerial = 1;
+    _workspaceWindowSerial = ISHWorkspaceNextWindowSerial++;
+    _workspaceOpenedAt = CACurrentMediaTime();
 
     self.panelView = [UIView new];
     self.panelView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -508,7 +592,8 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
     self.closeButton.alpha = showsCloseButton ? 1.0 : 0.0;
     self.closeButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.82];
     self.closeButton.layer.cornerRadius = ISHWorkspaceWindowButtonSize * 0.5;
-    self.closeButton.accessibilityLabel = @"Close Window";
+    self.closeButton.accessibilityLabel = NSLocalizedString(@"Close Window", @"accessibility label for window close button");
+    self.closeButton.accessibilityHint = NSLocalizedString(@"Closes the current workspace window.", @"accessibility hint for window close button");
     [self.closeButton addTarget:self action:@selector(closePressed:) forControlEvents:UIControlEventTouchUpInside];
     [self.titleBarView addSubview:self.closeButton];
 
@@ -667,9 +752,12 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
 
     self.panelView.backgroundColor = card;
     self.contentContainerView.backgroundColor = card;
-    // Focused window: solid accent title bar with white text. Otherwise the flat card.
+    // Focused window: solid accent title bar, with the text and glyphs measured
+    // against that accent rather than assumed white -- white is 5.16:1 on a teal
+    // accent and 1.49:1 on a mint one, and the palette editor can produce worse.
+    UIColor *titleBarInk = ISHWorkspaceThemeOnSurfaceColor(accent, 4.5);
     self.titleBarView.backgroundColor = active ? accent : card;
-    self.titleLabel.textColor = active ? UIColor.whiteColor : titleText;
+    self.titleLabel.textColor = active ? titleBarInk : titleText;
 
     // Hairline border in repose; a crisp accent ring marks focus.
     self.panelView.layer.borderWidth = active ? 1.5 : 1.0;
@@ -678,10 +766,10 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
     // Quiet, flat window controls: tinted glyphs, no filled chips or borders.
     self.closeButton.backgroundColor = UIColor.clearColor;
     self.closeButton.layer.borderWidth = 0.0;
-    [self.closeButton setTitleColor:(active ? UIColor.whiteColor : mutedGlyph) forState:UIControlStateNormal];
+    [self.closeButton setTitleColor:(active ? titleBarInk : mutedGlyph) forState:UIControlStateNormal];
     self.utilityButton.backgroundColor = UIColor.clearColor;
     self.utilityButton.layer.borderWidth = 0.0;
-    [self.utilityButton setTitleColor:(active ? UIColor.whiteColor : mutedGlyph) forState:UIControlStateNormal];
+    [self.utilityButton setTitleColor:(active ? titleBarInk : mutedGlyph) forState:UIControlStateNormal];
 
     self.resizeHandleView.backgroundColor = active ? [focusRing colorWithAlphaComponent:0.9] : hairline;
 
@@ -729,6 +817,7 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
     BOOL visible = title.length > 0 && handler != nil;
     [self.utilityButton setTitle:title forState:UIControlStateNormal];
     self.utilityButton.accessibilityLabel = title;
+    self.utilityButton.accessibilityHint = NSLocalizedString(@"Opens the utility menu for this window.", @"accessibility hint for window utility button");
     self.utilityButton.hidden = !visible;
     self.utilityButton.alpha = visible ? 1.0 : 0.0;
 }
@@ -852,6 +941,15 @@ static CGRect ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRect frame) {
         self.restoreFrameBeforeZoom = ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRectIntegral(self.frame));
         self.zoomedToFullscreen = YES;
         CGRect fullscreenFrame = self.superview.bounds;
+        // In an iPadOS 26 window the system's window controls sit over the top-leading
+        // corner, exactly where this window's close button lands when it fills the
+        // desktop (#580). Start below them there. They only reach lower than the safe
+        // area in a window, so full screen still zooms to the whole desktop.
+        CGFloat controlsTop = ISHWindowingControlsTopInset(self.superview);
+        if (controlsTop > self.superview.safeAreaInsets.top) {
+            fullscreenFrame.origin.y += controlsTop;
+            fullscreenFrame.size.height -= controlsTop;
+        }
         self.frame = ISHWorkspaceRectWithRoundedOriginPreservingSize(CGRectIntegral(fullscreenFrame));
         didRestore = NO;
     }
@@ -880,9 +978,11 @@ UINavigationController *ISHCreateWorkspaceNavigationControllerForTool(NSString *
     return navigationController;
 }
 
+// Only the Workspace calls this, so the navigation controller is the
+// Workspace's own class, which carries the window's text size to the pages.
 static UINavigationController *ISHCreateRootsNavigationController(void) {
     UIViewController *rootsViewController = [[UIStoryboard storyboardWithName:@"Roots" bundle:nil] instantiateInitialViewController];
-    return [[UINavigationController alloc] initWithRootViewController:rootsViewController];
+    return [[WorkspaceToolNavigationController alloc] initWithRootViewController:rootsViewController];
 }
 
 static UIViewController *ISHCreateRootsViewController(void) {
@@ -898,20 +998,40 @@ static UIViewController *ISHCreateRootsViewController(void) {
 // table's actual row height or the new two-button footer). Used both as the preferred open size
 // (root level, no back row) and by -autosizeLauncherWindowForItemCount:showsBackRow: (current
 // level) when shortcuts are added/removed/drilled into.
-static CGSize ISHWorkspaceLauncherContentSize(NSUInteger itemRowCount, BOOL showsBackRow) {
+//
+// The row heights follow the applet's text scale (WorkspaceTextScalable), and the
+// applet takes them from the same two functions, so a scaled list and the window
+// sized for it cannot disagree. The compaction pass asks the Launcher for this size
+// (-launcherContentSizeForDisplayedLevel) rather than taking the root level at 1.0
+// from the preferred size. The Add/Edit footer does not scale, and the width
+// only grows: narrower than the default, those fixed-size pills would clip.
+static CGFloat ISHWorkspaceLauncherRowHeight(CGFloat textScale) {
+    return ceil((ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0) * textScale);
+}
+
+static CGFloat ISHWorkspaceLauncherBackRowHeight(CGFloat textScale) {
+    return ceil((ISHWorkspaceUsesPhoneLayout() ? 28.0 : 30.0) * textScale);
+}
+
+static CGSize ISHWorkspaceLauncherContentSizeAtTextScale(NSUInteger itemRowCount, BOOL showsBackRow, CGFloat textScale) {
     BOOL phone = ISHWorkspaceUsesPhoneLayout();
     CGFloat inset = phone ? 12.0 : 16.0;
     CGFloat spacing = 8.0;
-    CGFloat width = phone ? 168.0 : 200.0;
-    CGFloat tableRowHeight = phone ? 34.0 : 38.0;              // matches _tableView.rowHeight
-    CGFloat backRowHeight = phone ? 28.0 : 30.0;                // matches launcherBackButton's minimum height
+    CGFloat defaultWidth = phone ? 168.0 : 200.0;
+    CGFloat width = MAX(defaultWidth, ceil(defaultWidth * textScale));
+    CGFloat tableRowHeight = ISHWorkspaceLauncherRowHeight(textScale);      // matches _tableView.rowHeight
+    CGFloat backRowHeight = ISHWorkspaceLauncherBackRowHeight(textScale);   // matches launcherBackButton's minimum height
     CGFloat footerRowHeight = (phone ? 26.0 : 28.0) + 8.0;      // Add/Edit pill height + its 4pt top/bottom margins
 
-    CGFloat itemsHeight = itemRowCount > 0 ? (itemRowCount * tableRowHeight) : (phone ? 28.0 : 32.0);
+    CGFloat itemsHeight = itemRowCount > 0 ? (itemRowCount * tableRowHeight) : ceil((phone ? 28.0 : 32.0) * textScale);
     CGFloat height = inset + itemsHeight + spacing + footerRowHeight + inset;
     if (showsBackRow)
         height += backRowHeight + spacing;
     return CGSizeMake(width, height);
+}
+
+static CGSize ISHWorkspaceLauncherContentSize(NSUInteger itemRowCount, BOOL showsBackRow) {
+    return ISHWorkspaceLauncherContentSizeAtTextScale(itemRowCount, showsBackRow, 1.0);
 }
 
 // The Desktops applet sizes itself to the Desktop count: a vertical list of "Desktop N" rows
@@ -925,10 +1045,13 @@ static CGSize ISHWorkspaceWorkspacesContentSize(NSUInteger count) {
     CGFloat spacing = phone ? 5.0 : 6.0;
     CGFloat cardPadding = phone ? 12.0 : 16.0;
     CGFloat actionsHeight = phone ? 36.0 : 44.0;
+    // The Session button is a row of its own, in both styles -- counted here or
+    // the window is a row too short and it is the one that gets clipped.
+    CGFloat sessionHeight = (phone ? 30.0 : 40.0) + spacing;
     CGFloat chrome = phone ? 24.0 : 32.0;
     CGFloat width = phone ? 214.0 : 254.0;
     CGFloat rowsHeight = n * rowHeight + n * spacing + newDesktopHeight;
-    CGFloat height = rowsHeight + cardPadding + actionsHeight + chrome;
+    CGFloat height = rowsHeight + cardPadding + actionsHeight + sessionHeight + chrome;
     return CGSizeMake(width, height);
 }
 
@@ -944,40 +1067,59 @@ static CGFloat ISHWorkspaceAudioWindowWidth(void) {
     return ISHWorkspaceAudioDeviceWidth() + 12.0;  // 6pt margin each side
 }
 
+// Each size is the WINDOW frame, the 24pt title bar included, and is meant to
+// show the applet's default display without clipping (measured 2026-09-13 by
+// opening every applet at its default on an iPhone 17 Pro and an iPad Pro 13"
+// simulator). Scroll-view applets may be shorter than their content; nothing
+// else may be. Placement clamps a default to the usable area, so a width that
+// is too wide for a smaller phone simply shrinks to fit.
 static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
     if (ISHWorkspaceUsesPhoneLayout()) {
+        // Time, the full date and the zone line. At 144x74 the date wrapped to
+        // two lines, the title bar covered the top of the time and the zone
+        // line was cut off.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-            return CGSizeMake(144, 74);
+            return CGSizeMake(220, 140);
+        // Wide enough that "Unavailable" and "478.42 GB free" stop breaking
+        // mid-word, tall enough for the Root/Startup row under them.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
-            return CGSizeMake(280, 154);
+            return CGSizeMake(368, 176);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
             return ISHWorkspaceMonitorContentSize();
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
-            return CGSizeMake(328, 176);
+            return CGSizeMake(328, 188);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
             return CGSizeMake(340, 248);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
             return ISHWorkspaceWorkspacesContentSize(1);
+        // All four cards; at 238 the Live terminals card was entirely hidden.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
-            return CGSizeMake(332, 238);
+            return CGSizeMake(332, 372);
+        // A list to read down: room for the summary and six rows.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
-            return CGSizeMake(336, 256);
+            return CGSizeMake(336, 420);
+        // All five rows of actions; at 184 three of them were below the edge.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
-            return CGSizeMake(312, 184);
+            return CGSizeMake(312, 364);
+        // At 248 the toolbar left a 108pt-tall page.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier])
-            return CGSizeMake(352, 248);
+            return CGSizeMake(352, 520);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
             return CGSizeMake(360, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
             return CGSizeMake(352, 620);
+        // These two scroll vertically, but at 352 their row subtitles and
+        // switch labels were truncated sideways, which scrolling cannot reveal.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolFilesystemsIdentifier])
-            return CGSizeMake(352, 620);
+            return CGSizeMake(376, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolSettingsIdentifier])
-            return CGSizeMake(352, 620);
+            return CGSizeMake(376, 620);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
             return CGSizeMake(352, 560);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
             return ISHWorkspaceLauncherContentSize(ISHWorkspaceLauncherShortcuts().count, NO);
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier])
+            return CGSizeMake(460, 300);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier])
             return CGSizeMake(ISHWorkspaceAudioWindowWidth(), 510);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMotePadIdentifier])
@@ -990,32 +1132,37 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
             return CGSizeMake(340, 420);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolVideoPlayerIdentifier])
             return CGSizeMake(340, 260);
+        // Room for the status text beside its three buttons, and a 16:9
+        // display under the toolbar.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolDisplayIdentifier])
-            return CGSizeMake(344, 300);
+            return CGSizeMake(364, 268);
         return CGSizeMake(344, 580);
     }
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-        return CGSizeMake(156, 76);
+        return CGSizeMake(240, 148);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
-        return CGSizeMake(318, 168);
+        return CGSizeMake(380, 196);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
         return ISHWorkspaceMonitorContentSize();
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
-        return CGSizeMake(360, 188);
+        return CGSizeMake(360, 206);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
         return CGSizeMake(460, 300);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
         return ISHWorkspaceWorkspacesContentSize(1);
+    // The Live terminals card sat wholly below the edge, so nothing even looked cut.
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
-        return CGSizeMake(460, 286);
+        return CGSizeMake(460, 384);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
-        return CGSizeMake(500, 320);
+        return CGSizeMake(520, 500);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
-        return CGSizeMake(400, 220);
+        return CGSizeMake(400, 396);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier])
         return CGSizeMake(620, 420);
+    // Its longest line ends near 600pt; at 820 about a fifth of the window was
+    // empty to the right of it.
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
-        return CGSizeMake(820, 760);
+        return CGSizeMake(640, 760);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
         return CGSizeMake(760, 700);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolFilesystemsIdentifier])
@@ -1026,6 +1173,8 @@ static CGSize ISHWorkspacePreferredToolContentSize(NSString *toolIdentifier) {
         return CGSizeMake(560, 620);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
         return ISHWorkspaceLauncherContentSize(ISHWorkspaceLauncherShortcuts().count, NO);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier])
+        return CGSizeMake(460, 300);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier])
         return CGSizeMake(ISHWorkspaceAudioWindowWidth(), 470);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMotePadIdentifier])
@@ -1055,10 +1204,13 @@ static CGSize ISHWorkspacePreferredDockContentSize(void) {
     return CGSizeMake(220, 64);
 }
 
+// Classic style's Layout Manager: a two-line note and two buttons, plus "New
+// Workspace Window" on iPad. At 312x176 / 360x214 the card ran off the bottom,
+// and on iPad the third button was hidden altogether.
 static CGSize ISHWorkspacePreferredDashboardContentSize(void) {
     if (ISHWorkspaceUsesPhoneLayout())
-        return CGSizeMake(312, 176);
-    return CGSizeMake(360, 214);
+        return CGSizeMake(312, 204);
+    return CGSizeMake(360, 284);
 }
 
 static CGSize ISHWorkspaceMinimumDashboardContentSize(void) {
@@ -1088,8 +1240,10 @@ static CGSize ISHWorkspaceMinimumTerminalContentSize(void) {
 
 static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
     if (ISHWorkspaceUsesPhoneLayout()) {
+        // Below this the date and zone lines overflow the card whatever the
+        // font scaling does; it is the smallest size that shows the whole face.
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-            return CGSizeMake(132, 68);
+            return CGSizeMake(180, 124);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
             return CGSizeMake(232, 132);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
@@ -1120,6 +1274,8 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
             return CGSizeMake(300, 360);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
             return CGSizeMake(200, 80);
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier])
+            return CGSizeMake(340, 240);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier])
             return CGSizeMake(ISHWorkspaceAudioWindowWidth(), 390);
         if ([toolIdentifier isEqualToString:ISHWorkspaceToolMotePadIdentifier])
@@ -1138,7 +1294,7 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
     }
 
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-        return CGSizeMake(150, 72);
+        return CGSizeMake(180, 124);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
         return CGSizeMake(260, 144);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
@@ -1163,6 +1319,8 @@ static CGSize ISHWorkspaceMinimumToolContentSize(NSString *toolIdentifier) {
         return CGSizeMake(420, 420);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
         return CGSizeMake(220, 96);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier])
+        return CGSizeMake(340, 240);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier])
         return CGSizeMake(ISHWorkspaceAudioWindowWidth(), 360);
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMotePadIdentifier])
@@ -1203,52 +1361,54 @@ static CGSize ISHWorkspaceSizeFromDescriptor(NSDictionary<NSString *, id> *descr
 
 static NSString *ISHWorkspaceToolTitle(NSString *toolIdentifier) {
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolClockIdentifier])
-        return @"Clock";
+        return NSLocalizedString(@"Clock", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
-        return @"Info";
+        return NSLocalizedString(@"Info", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
-        return @"Monitor";
+        return NSLocalizedString(@"Monitor", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolNetworksIdentifier])
-        return @"Networks";
+        return NSLocalizedString(@"Networks", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStatusIdentifier])
-        return @"Logs";
+        return NSLocalizedString(@"Logs", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolWorkspacesIdentifier])
-        return @"Desktops";
+        return NSLocalizedString(@"Desktops", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSessionsIdentifier])
-        return @"Sessions";
+        return NSLocalizedString(@"Sessions", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolStorageIdentifier])
-        return @"Storage";
+        return NSLocalizedString(@"Storage", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolShortcutsIdentifier])
-        return @"Quick Actions";
+        return NSLocalizedString(@"Quick Actions", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier])
-        return @"Browser";
+        return NSLocalizedString(@"Browser", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
-        return @"Themes";
+        return NSLocalizedString(@"Themes", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
-        return @"Diagnostics";
+        return NSLocalizedString(@"Diagnostics", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolFilesystemsIdentifier])
-        return @"Boot Images";
+        return NSLocalizedString(@"Boot Images", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolSettingsIdentifier])
-        return @"Settings";
+        return NSLocalizedString(@"Settings", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLLMIdentifier])
-        return @"LLM Chat";
+        return NSLocalizedString(@"LLM Chat", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
-        return @"Launcher";
+        return NSLocalizedString(@"Launcher", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier])
-        return @"Music";
+        return NSLocalizedString(@"Music", @"tool window title");
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier])
+        return NSLocalizedString(@"Equalizer", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMotePadIdentifier])
         return @"MotePad";
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolFileManagerIdentifier])
-        return @"File Manager";
+        return NSLocalizedString(@"File Manager", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMarkdownViewerIdentifier])
         return @"Markdown";
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolImageViewerIdentifier])
-        return @"Image Viewer";
+        return NSLocalizedString(@"Image Viewer", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolVideoPlayerIdentifier])
-        return @"Video Player";
+        return NSLocalizedString(@"Video Player", @"tool window title");
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDisplayIdentifier])
         return @"Wayland";
-    return @"Window";
+    return NSLocalizedString(@"Window", @"generic window title");
 }
 
 BOOL ISHShouldLaunchWorkspaceAtStartup(void) {
@@ -1264,34 +1424,34 @@ BOOL ISHShouldLaunchWaylandDisplayAtStartup(void) {
 static NSString *ISHInitialWindowTitle(void) {
     NSString *initialWindow = [NSUserDefaults.standardUserDefaults stringForKey:kPreferenceInitialWindowKey];
     if ([initialWindow isEqualToString:ISHInitialWindowWorkspaceValue])
-        return @"Workspace";
+        return NSLocalizedString(@"Workspace", @"startup screen setting value");
     if ([initialWindow isEqualToString:ISHInitialWindowChooseFilesystemValue])
-        return @"Choose Filesystem";
+        return NSLocalizedString(@"Choose Filesystem", @"startup screen setting value");
     if ([initialWindow isEqualToString:ISHInitialWindowWaylandValue])
-        return @"Wayland Display";
+        return NSLocalizedString(@"Wayland Display", @"startup screen setting value");
     if ([initialWindow isEqualToString:@"session-shell"])
-        return @"Session Shell (pts/1)";
-    return @"Plain Terminal";
+        return NSLocalizedString(@"Session Shell (pts/1)", @"startup screen setting value");
+    return NSLocalizedString(@"Plain Terminal", @"startup screen setting value");
 }
 
 static NSString *ISHWorkspaceTerminalDisplayName(Terminal *terminal) {
     if (terminal == nil)
-        return @"Unknown Terminal";
+        return NSLocalizedString(@"Unknown Terminal", @"terminal name when unknown");
     int consoleMajor = TTY_CONSOLE_MAJOR;
     int consoleMinor = 1;
     get_console_device(&consoleMajor, &consoleMinor);
     if (terminal.type == consoleMajor && terminal.number == consoleMinor) {
         if (consoleMajor == TTY_CONSOLE_MAJOR)
-            return [NSString stringWithFormat:@"System Console (tty%d)", consoleMinor];
+            return [NSString stringWithFormat:NSLocalizedString(@"System Console (tty%d)", @"terminal name"), consoleMinor];
         if (consoleMajor == TTY_PSEUDO_SLAVE_MAJOR)
-            return [NSString stringWithFormat:@"System Console (pts/%d)", consoleMinor];
-        return [NSString stringWithFormat:@"System Console (%d:%d)", consoleMajor, consoleMinor];
+            return [NSString stringWithFormat:NSLocalizedString(@"System Console (pts/%d)", @"terminal name"), consoleMinor];
+        return [NSString stringWithFormat:NSLocalizedString(@"System Console (%d:%d)", @"terminal name (major:minor)"), consoleMajor, consoleMinor];
     }
     if (terminal.type == TTY_CONSOLE_MAJOR)
-        return [NSString stringWithFormat:@"Terminal (tty%d)", terminal.number];
+        return [NSString stringWithFormat:NSLocalizedString(@"Terminal (tty%d)", @"terminal name"), terminal.number];
     if (terminal.type == TTY_PSEUDO_SLAVE_MAJOR)
-        return [NSString stringWithFormat:@"Pseudo Terminal (pts/%d)", terminal.number];
-    return [NSString stringWithFormat:@"Terminal (%d:%d)", terminal.type, terminal.number];
+        return [NSString stringWithFormat:NSLocalizedString(@"Pseudo Terminal (pts/%d)", @"terminal name"), terminal.number];
+    return [NSString stringWithFormat:NSLocalizedString(@"Terminal (%d:%d)", @"terminal name (major:minor)"), terminal.type, terminal.number];
 }
 
 static NSString *ISHWorkspaceTerminalRoleForTerminal(Terminal *terminal) {
@@ -1321,12 +1481,12 @@ static NSString *ISHWorkspaceDiagnosticsString(id value) {
 
 static NSString *ISHWorkspaceTitleForTerminalRole(NSString *terminalRole, Terminal *terminal) {
     if ([terminalRole isEqualToString:ISHWorkspaceTerminalRoleSystemConsole])
-        return @"System Console";
+        return NSLocalizedString(@"System Console", @"terminal window title");
     if ([terminalRole isEqualToString:ISHWorkspaceTerminalRoleSessionShell])
-        return @"Session Shell";
+        return NSLocalizedString(@"Session Shell", @"terminal window title");
     if (terminal != nil)
         return ISHWorkspaceTerminalDisplayName(terminal);
-    return @"Terminal";
+    return NSLocalizedString(@"Terminal", @"terminal window title");
 }
 
 static NSString *ISHWorkspaceSceneRoleDescription(UISceneSession *session) API_AVAILABLE(ios(13.0));
@@ -1460,13 +1620,13 @@ static NSString *ISHWorkspaceSceneActivationDescription(UIScene *scene) API_AVAI
 static NSString *ISHWorkspaceSceneActivationDescription(UIScene *scene) {
     switch (scene.activationState) {
         case UISceneActivationStateForegroundActive:
-            return @"Foreground active";
+            return NSLocalizedString(@"Foreground active", @"scene activation state");
         case UISceneActivationStateForegroundInactive:
-            return @"Foreground inactive";
+            return NSLocalizedString(@"Foreground inactive", @"scene activation state");
         case UISceneActivationStateBackground:
-            return @"Background";
+            return NSLocalizedString(@"Background", @"scene activation state");
         case UISceneActivationStateUnattached:
-            return @"Unattached";
+            return NSLocalizedString(@"Unattached", @"scene activation state");
     }
 }
 
@@ -1480,7 +1640,7 @@ static NSArray<NSDictionary<NSString *, id> *> *ISHWorkspaceSceneDescriptors(UIW
         if (scene == nil && ISHWorkspaceHiddenSessionIsForgotten(session))
             continue;
         NSString *role = ISHWorkspaceSceneRoleDescriptionForScene(session, scene);
-        NSString *state = scene != nil ? ISHWorkspaceSceneActivationDescription(scene) : @"Hidden";
+        NSString *state = scene != nil ? ISHWorkspaceSceneActivationDescription(scene) : NSLocalizedString(@"Hidden", @"scene state for a hidden workspace");
         NSString *identifier = session.persistentIdentifier ?: @"";
         NSString *terminalUUID = session.stateRestorationActivity.userInfo[ISHSceneTerminalUUIDUserInfoKey];
         Terminal *terminal = terminalUUID.length > 0
@@ -1493,9 +1653,9 @@ static NSArray<NSDictionary<NSString *, id> *> *ISHWorkspaceSceneDescriptors(UIW
         [descriptors addObject:@{
             @"identifier": identifier,
             @"title": title,
-            @"detail": detail ?: @"Unknown",
+            @"detail": detail ?: NSLocalizedString(@"Unknown", @"workspace scene detail fallback"),
             @"role": role ?: @"Unknown",
-            @"state": state ?: @"Unknown",
+            @"state": state ?: NSLocalizedString(@"Unknown", @"workspace scene state fallback"),
             @"isCurrent": @(session == currentWindowScene.session),
             @"isHidden": @(scene == nil),
         }];
@@ -1506,7 +1666,7 @@ static NSArray<NSDictionary<NSString *, id> *> *ISHWorkspaceSceneDescriptors(UIW
 static NSString *ISHWorkspaceNetworkSummaryText(void) {
     struct ifaddrs *interfaces = NULL;
     if (getifaddrs(&interfaces) != 0 || interfaces == NULL)
-        return @"Network: unavailable";
+        return NSLocalizedString(@"Network: unavailable", @"network summary");
 
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
     NSMutableArray<NSString *> *interfaceOrder = [NSMutableArray array];
@@ -1537,7 +1697,7 @@ static NSString *ISHWorkspaceNetworkSummaryText(void) {
         if (isLoopback) {
             // Prefer the IPv4 loopback address (127.0.0.1) over ::1.
             if (loopbackLine == nil || family == AF_INET)
-                loopbackLine = [NSString stringWithFormat:@"Loopback: %@ (%@)", interfaceName, address];
+                loopbackLine = [NSString stringWithFormat:NSLocalizedString(@"Loopback: %@ (%@)", @"network summary line: interface name, address"), interfaceName, address];
             continue;
         }
 
@@ -1573,27 +1733,27 @@ static NSString *ISHWorkspaceNetworkSummaryText(void) {
         [lines addObject:loopbackLine];
 
     if (activeInterfaces == 0 && loopbackLine == nil)
-        return @"Network: no active interfaces";
+        return NSLocalizedString(@"Network: no active interfaces", @"network summary");
 
-    return [NSString stringWithFormat:@"Active interfaces: %lu\n%@",
+    return [NSString stringWithFormat:NSLocalizedString(@"Active interfaces: %lu\n%@", @"network summary: count, then one line per interface"),
                                       (unsigned long) activeInterfaces,
                                       [lines componentsJoinedByString:@"\n"]];
 }
 
 static NSString *ISHWorkspaceBatterySummaryText(void) {
     if (UIDevice.currentDevice.batteryState == UIDeviceBatteryStateUnknown || UIDevice.currentDevice.batteryLevel < 0)
-        return @"unavailable";
+        return NSLocalizedString(@"unavailable", @"battery status unavailable");
 
-    NSString *stateDescription = @"On battery";
+    NSString *stateDescription = NSLocalizedString(@"On battery", @"battery state");
     switch (UIDevice.currentDevice.batteryState) {
         case UIDeviceBatteryStateCharging:
-            stateDescription = @"Charging";
+            stateDescription = NSLocalizedString(@"Charging", @"battery state");
             break;
         case UIDeviceBatteryStateFull:
-            stateDescription = @"Fully charged";
+            stateDescription = NSLocalizedString(@"Fully charged", @"battery state");
             break;
         case UIDeviceBatteryStateUnplugged:
-            stateDescription = @"On battery";
+            stateDescription = NSLocalizedString(@"On battery", @"battery state");
             break;
         case UIDeviceBatteryStateUnknown:
             break;
@@ -1607,85 +1767,22 @@ static NSString *ISHWorkspaceStorageSummaryText(void) {
         [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
     NSNumber *freeSize = attributes[NSFileSystemFreeSize];
     if (freeSize == nil)
-        return @"Free storage: unavailable";
+        return NSLocalizedString(@"Free storage: unavailable", @"storage summary");
     NSString *formattedSize = [NSByteCountFormatter stringFromByteCount:freeSize.longLongValue
                                                               countStyle:NSByteCountFormatterCountStyleFile];
-    return [NSString stringWithFormat:@"Free storage: %@", formattedSize];
+    return [NSString stringWithFormat:NSLocalizedString(@"Free storage: %@", @"storage summary with formatted size"), formattedSize];
 }
 
 static NSString *ISHWorkspacePrimaryNetworkLine(void) {
     NSArray<NSString *> *lines = [ISHWorkspaceNetworkSummaryText() componentsSeparatedByString:@"\n"];
     if (lines.count >= 2)
         return lines[1];
-    return lines.firstObject ?: @"Network: unavailable";
+    return lines.firstObject ?: NSLocalizedString(@"Network: unavailable", @"network summary");
 }
 
 static NSString *ISHWorkspaceByteCountString(uint64_t bytes) {
     return [NSByteCountFormatter stringFromByteCount:(long long) bytes
                                           countStyle:NSByteCountFormatterCountStyleFile];
-}
-
-static NSDictionary<NSString *, NSNumber *> *ISHWorkspaceDirectoryUsage(NSURL *directoryURL) {
-    if (directoryURL == nil)
-        return @{@"bytes": @0, @"files": @0, @"directories": @0};
-
-    uint64_t totalBytes = 0;
-    NSUInteger fileCount = 0;
-    NSUInteger directoryCount = 0;
-    NSArray<NSURLResourceKey> *keys = @[
-        NSURLIsDirectoryKey,
-        NSURLFileAllocatedSizeKey,
-        NSURLTotalFileAllocatedSizeKey,
-        NSURLFileSizeKey,
-    ];
-    NSDirectoryEnumerator<NSURL *> *enumerator =
-        [NSFileManager.defaultManager enumeratorAtURL:directoryURL
-                           includingPropertiesForKeys:keys
-                                              options:0
-                                         errorHandler:^BOOL(__unused NSURL *url, __unused NSError *error) {
-        return YES;
-    }];
-    for (NSURL *itemURL in enumerator) {
-        NSNumber *isDirectory = nil;
-        [itemURL getResourceValue:&isDirectory forKey:NSURLIsDirectoryKey error:nil];
-        if (isDirectory.boolValue) {
-            directoryCount += 1;
-            continue;
-        }
-        NSNumber *size = nil;
-        [itemURL getResourceValue:&size forKey:NSURLTotalFileAllocatedSizeKey error:nil];
-        if (size == nil)
-            [itemURL getResourceValue:&size forKey:NSURLFileAllocatedSizeKey error:nil];
-        if (size == nil)
-            [itemURL getResourceValue:&size forKey:NSURLFileSizeKey error:nil];
-        totalBytes += size.unsignedLongLongValue;
-        fileCount += 1;
-    }
-    return @{
-        @"bytes": @(totalBytes),
-        @"files": @(fileCount),
-        @"directories": @(directoryCount),
-    };
-}
-
-static NSArray<NSDictionary<NSString *, id> *> *ISHWorkspaceRootUsageRecords(void) {
-    NSMutableArray<NSDictionary<NSString *, id> *> *records = [NSMutableArray array];
-    NSString *defaultRoot = Roots.instance.defaultRoot;
-    for (NSString *rootName in Roots.instance.roots) {
-        NSURL *rootURL = [Roots.instance rootUrl:rootName];
-        NSDictionary<NSString *, NSNumber *> *usage = ISHWorkspaceDirectoryUsage(rootURL);
-        NSString *guestABI = [Roots.instance guestABIForRootNamed:rootName] ?: @"Unknown ABI";
-        [records addObject:@{
-            @"name": rootName,
-            @"isDefault": @([rootName isEqualToString:defaultRoot]),
-            @"abi": guestABI,
-            @"path": rootURL.path ?: @"",
-            @"bytes": usage[@"bytes"] ?: @0,
-            @"files": usage[@"files"] ?: @0,
-            @"directories": usage[@"directories"] ?: @0,
-        }];
-    }
-    return records;
 }
 
 static NSString *ISHWorkspaceUsageBarString(double ratio, NSUInteger width) {
@@ -1704,10 +1801,10 @@ static NSString *ISHWorkspaceDurationString(NSTimeInterval interval) {
     NSInteger minutes = (totalSeconds % 3600) / 60;
     NSInteger seconds = totalSeconds % 60;
     if (days > 0)
-        return [NSString stringWithFormat:@"%ldd %02ldh %02ldm", (long) days, (long) hours, (long) minutes];
+        return [NSString stringWithFormat:NSLocalizedString(@"%ldd %02ldh %02ldm", @"uptime: days, hours, minutes"), (long) days, (long) hours, (long) minutes];
     if (hours > 0)
-        return [NSString stringWithFormat:@"%ldh %02ldm %02lds", (long) hours, (long) minutes, (long) seconds];
-    return [NSString stringWithFormat:@"%ldm %02lds", (long) minutes, (long) seconds];
+        return [NSString stringWithFormat:NSLocalizedString(@"%ldh %02ldm %02lds", @"uptime: hours, minutes, seconds"), (long) hours, (long) minutes, (long) seconds];
+    return [NSString stringWithFormat:NSLocalizedString(@"%ldm %02lds", @"uptime: minutes, seconds"), (long) minutes, (long) seconds];
 }
 
 static BOOL ISHWorkspaceMemoryUsage(uint64_t *footprint, uint64_t *resident, uint64_t *physical) {
@@ -1755,32 +1852,37 @@ static BOOL ISHWorkspaceDeviceHasLowMemoryForWorkspace(void) {
     return ISHWorkspacePhysicalMemoryMarketedGB() < 4;
 }
 
+// Doubled for 557 (4 / 6 / 10 / 18 tabs at under 4 / 4 / 8 / 16 GB, from
+// 2 / 3 / 5 / 9): the maintainer's testing found the browser far lighter on
+// RAM than this limit had assumed.
 static NSUInteger ISHWorkspaceBrowserMaximumTabCount(void) {
     NSUInteger marketedGB = ISHWorkspacePhysicalMemoryMarketedGB();
     if (marketedGB < 4)
-        return 2;
-    return 3 + ((marketedGB - 4) / 2);
+        return 4;
+    return 2 * (3 + ((marketedGB - 4) / 2));
 }
 
 static NSString *ISHWorkspaceSystemStatusText(void) {
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
     NSString *version = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?";
     NSString *build = [NSBundle.mainBundle objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?";
-    [lines addObject:[NSString stringWithFormat:@"App: %@ (%@)", version, build]];
-    [lines addObject:[NSString stringWithFormat:@"Device: %@ / iOS %@",
-                      UIDevice.currentDevice.model ?: @"Unknown",
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"App: %@ (%@)", @"status text: app version (build)"), version, build]];
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Device: %@ / iOS %@", @"status text: device model / iOS version"),
+                      UIDevice.currentDevice.model ?: NSLocalizedString(@"Unknown", @"status text: unknown device model"),
                       UIDevice.currentDevice.systemVersion ?: @"?"]];
-    NSString *defaultRoot = Roots.instance.defaultRoot;
-    [lines addObject:[NSString stringWithFormat:@"Current root: %@",
-                      defaultRoot.length > 0 ? defaultRoot : @"unavailable"]];
+    // The root at /, which is not the default once the default has been
+    // changed, or when ISH_BOOT_ROOT picked this launch's root.
+    NSString *currentRoot = Roots.instance.bootedRoot ?: Roots.instance.rootToBoot;
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Current root: %@", @"status text"),
+                      currentRoot.length > 0 ? currentRoot : NSLocalizedString(@"unavailable", @"status text: no current root")]];
     [lines addObject:ISHWorkspaceStorageSummaryText()];
-    [lines addObject:[NSString stringWithFormat:@"Startup screen: %@", ISHInitialWindowTitle()]];
-    [lines addObject:[NSString stringWithFormat:@"Installed roots: %lu",
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Startup screen: %@", @"status text"), ISHInitialWindowTitle()]];
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Installed roots: %lu", @"status text"),
                       (unsigned long) Roots.instance.roots.count]];
-    [lines addObject:[NSString stringWithFormat:@"Active terminals: %lu",
+    [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Active terminals: %lu", @"status text"),
                       (unsigned long) Terminal.activeTerminals.count]];
     if (@available(iOS 13.0, *)) {
-        [lines addObject:[NSString stringWithFormat:@"Open scenes: %lu",
+        [lines addObject:[NSString stringWithFormat:NSLocalizedString(@"Open scenes: %lu", @"status text"),
                           (unsigned long) UIApplication.sharedApplication.connectedScenes.count]];
     }
     [lines addObject:@""];
@@ -1789,7 +1891,7 @@ static NSString *ISHWorkspaceSystemStatusText(void) {
     NSArray<NSDictionary<NSString *, id> *> *breadcrumbs = [ISHDiagnosticsStore recentBreadcrumbsWithLimit:5];
     if (breadcrumbs.count > 0) {
         [lines addObject:@""];
-        [lines addObject:@"Recent events:"];
+        [lines addObject:NSLocalizedString(@"Recent events:", @"status text heading")];
         for (NSDictionary<NSString *, id> *entry in breadcrumbs) {
             NSString *event = entry[@"event"] ?: @"event";
             NSString *timestamp = entry[@"timestamp"] ?: @"";
@@ -1811,6 +1913,13 @@ static NSString *const ISHWorkspaceGaugeStyleDidChangeNotification = @"ISHWorksp
 static NSString *const ISHWorkspaceToolThemeAuroraIdentifier = @"aurora";
 static NSString *const ISHWorkspaceToolThemeSolsticeIdentifier = @"solstice";
 static NSString *const ISHWorkspaceToolThemeGraphiteIdentifier = @"graphite";
+// The theme a workspace uses when nobody has chosen one.
+//
+// Graphite rather than Aurora since 555: Aurora's light background under the
+// launcher applet's own text did not carry enough contrast to read, and it is
+// the one surface a new user meets first. A theme that has been CHOSEN is
+// stored and is never touched by this; only "no preference yet" resolves here.
+static NSString *const ISHWorkspaceToolThemeDefaultIdentifier = ISHWorkspaceToolThemeGraphiteIdentifier;
 static BOOL ISHWorkspaceLowMemoryWarningShownThisLaunch = NO;
 static const uint64_t ISHWorkspaceOneGB = 1000ull * 1000ull * 1000ull;
 
@@ -2045,15 +2154,69 @@ static UIColor *ISHWorkspaceThemeFocusRingColor(UIColor *accent, UIColor *backgr
     return best;
 }
 
+// The colour to draw ON a filled surface -- a focused title bar, a selected row,
+// a chip. Measured against the fill, not assumed from the palette.
+//
+// Three places used to assume one, and each assumption held for some palettes
+// and failed for others. Measured: white glyphs are 5.16:1 on Aurora's teal
+// title bar and 1.49:1 on Graphite's mint one; the card colour as text on a
+// selected accent wash is 1.60:1 on Aurora, 1.67:1 on Solstice and 2.27:1 on
+// Graphite; the accent as text on a paler wash of itself is 4.77:1 on Graphite
+// and 3.69:1 on Aurora. Every one of those is a palette that is FINE -- Aurora's
+// primary on its card is 15:1 -- paired with a foreground nobody checked.
+//
+// And the palette editor lets anyone build a fourth palette that breaks a
+// different one, so measuring is the only answer that keeps working.
+//
+// Prefers the light pole where it clears the bar, so a deep accent keeps the
+// white-on-accent look it was drawn for; the dark pole is near-black rather than
+// black so it reads as ink and not as a hole.
+static UIColor *ISHWorkspaceThemeOnSurfaceColor(UIColor *fill, CGFloat minimumContrast) {
+    UIColor *light = UIColor.whiteColor;
+    UIColor *dark = [UIColor colorWithRed:0.05 green:0.06 blue:0.09 alpha:1.0];
+    CGFloat lightRatio = ISHWorkspaceThemeContrastRatio(light, fill);
+    if (lightRatio >= minimumContrast)
+        return light;
+    CGFloat darkRatio = ISHWorkspaceThemeContrastRatio(dark, fill);
+    if (darkRatio >= minimumContrast)
+        return dark;
+    return lightRatio >= darkRatio ? light : dark;
+}
+
+// A softer companion to the ink above, for secondary text on the same fill --
+// but only as soft as that fill allows. Aurora's selected row clears 10.75:1, so
+// fading to 82% still leaves 7.47; Graphite's clears 5.33:1 and the same fade
+// drops it to 4.19, under the bar. There the secondary text stays at full
+// strength and the hierarchy comes from size and weight instead, which is the
+// right trade: a dimmer label that cannot be read is not a hierarchy.
+static UIColor *ISHWorkspaceThemeMutedOnSurfaceColor(UIColor *ink, UIColor *fill,
+                                                     CGFloat minimumContrast) {
+    if (ink == nil || fill == nil)
+        return ink;
+    UIColor *muted = ISHWorkspaceThemeBlendColors([ink colorWithAlphaComponent:0.82], fill);
+    return ISHWorkspaceThemeContrastRatio(muted, fill) >= minimumContrast ? muted : ink;
+}
+
+// What a translucent wash actually paints over `base`. That composite is what
+// text on it has to contrast with -- neither the wash colour nor the base alone,
+// which is how a 34% accent over a near-white card came to be treated as though
+// it were the accent.
+static UIColor *ISHWorkspaceThemeWashOverColor(UIColor *wash, CGFloat alpha, UIColor *base) {
+    if (wash == nil || base == nil)
+        return base ?: wash;
+    return ISHWorkspaceThemeBlendColors([wash colorWithAlphaComponent:alpha], base);
+}
+
 static NSArray<NSString *> *ISHWorkspaceThemeEditableColorKeys(void) {
     return @[@"backgroundTop", @"backgroundBottom", @"card", @"primary", @"secondary", @"accent", @"accentAlt"];
 }
 
 static NSArray<NSDictionary<NSString *, NSString *> *> *ISHWorkspaceBuiltInThemeChoices(void) {
+    // The default first, which is the order a picker should offer them in.
     return @[
-        @{@"identifier": ISHWorkspaceToolThemeAuroraIdentifier, @"title": @"Aurora"},
-        @{@"identifier": ISHWorkspaceToolThemeSolsticeIdentifier, @"title": @"Solstice"},
-        @{@"identifier": ISHWorkspaceToolThemeGraphiteIdentifier, @"title": @"Graphite"},
+        @{@"identifier": ISHWorkspaceToolThemeGraphiteIdentifier, @"title": NSLocalizedString(@"Graphite", @"built-in theme name")},
+        @{@"identifier": ISHWorkspaceToolThemeAuroraIdentifier, @"title": NSLocalizedString(@"Aurora", @"built-in theme name")},
+        @{@"identifier": ISHWorkspaceToolThemeSolsticeIdentifier, @"title": NSLocalizedString(@"Solstice", @"built-in theme name")},
     ];
 }
 
@@ -2134,20 +2297,20 @@ static BOOL ISHWorkspaceThemeIdentifierIsValid(NSString *identifier) {
 static NSString *ISHWorkspaceCurrentThemeIdentifier(void) {
     NSString *identifier = [NSUserDefaults.standardUserDefaults stringForKey:ISHWorkspaceToolThemePreferenceKey];
     if (!ISHWorkspaceThemeIdentifierIsValid(identifier))
-        return ISHWorkspaceToolThemeAuroraIdentifier;
+        return ISHWorkspaceToolThemeDefaultIdentifier;
     return identifier;
 }
 
 static NSString *ISHWorkspaceCurrentThemeTitle(void) {
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(ISHWorkspaceCurrentThemeIdentifier());
-    return record[@"title"] ?: @"Aurora";
+    return record[@"title"] ?: NSLocalizedString(@"Graphite", @"built-in theme name");
 }
 
 static NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *ISHWorkspaceThemeEditablePaletteForIdentifier(NSString *identifier) {
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(identifier);
     NSDictionary<NSString *, NSDictionary<NSString *, NSNumber *> *> *palette = record[@"palette"];
     if (![palette isKindOfClass:NSDictionary.class])
-        return ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeAuroraIdentifier);
+        return ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeDefaultIdentifier);
     return palette;
 }
 
@@ -2228,6 +2391,75 @@ static CGSize ISHWorkspaceMonitorContentSize(void) {
     return CGSizeMake(width, contentHeight + ISHWorkspaceWindowTitleBarHeight);
 }
 
+// ---- Info and Monitor at a text scale (WorkspaceTextScalable) ----------------
+//
+// Both windows are sized to fit their tiles, so bigger text needs a bigger window, not a scroll.
+// Only the readings scale (a tile's subtitle, Info's Root and Startup values, Monitor's detail
+// rows), so only their rows add height. Across, the text widens by the scale and the insets,
+// icons and gaps beside it do not. Widening the window by exactly that keeps every value at the
+// fit it had at 1.0; left at the 1.0 width, adjustsFontSizeToFitWidth shrank the larger text
+// straight back. Neither window goes below its 1.0 size: smaller text only leaves room.
+
+// A line of text at `pointSize` times `textScale` (rounded as -workspaceScaledFontSize: rounds),
+// as tall as a label lays it out.
+static CGFloat ISHWorkspaceScaledLineHeight(CGFloat pointSize, CGFloat textScale, UIFontWeight weight) {
+    CGFloat scaledSize = round(pointSize * textScale * 2.0) / 2.0;
+    return ceil([UIFont systemFontOfSize:scaledSize weight:weight].lineHeight);
+}
+
+// `width` with all but its `chromeWidth` scaled.
+static CGFloat ISHWorkspaceScaledWindowWidth(CGFloat width, CGFloat chromeWidth, CGFloat textScale) {
+    return MAX(width, ceil(chromeWidth + (width - chromeWidth) * textScale));
+}
+
+static CGSize ISHWorkspaceMonitorContentSizeForTextScale(CGFloat textScale) {
+    CGSize size = ISHWorkspaceMonitorContentSize();
+    // The five detail rows are as tall as their 16pt icons until the 12pt text outgrows them. The
+    // card allowance above has slack past that; the growth goes on top of it.
+    CGFloat rowGrowth = MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, textScale, UIFontWeightSemibold)) -
+                        MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, 1.0, UIFontWeightSemibold));
+    // The 20pt header allowance in each of the two gauge rows, which the 12pt subtitle outgrows.
+    CGFloat headerGrowth = MAX(20.0, ISHWorkspaceScaledLineHeight(12.0, textScale, UIFontWeightRegular)) -
+                           MAX(20.0, ISHWorkspaceScaledLineHeight(12.0, 1.0, UIFontWeightRegular));
+    size.height += 5.0 * MAX(0.0, rowGrowth) + 2.0 * MAX(0.0, headerGrowth);
+    // A detail row's fixed part: the content stack's and the card's insets, the 18pt icon and the
+    // 10pt gaps either side of the title.
+    size.width = ISHWorkspaceScaledWindowWidth(size.width, 6.0 * 2.0 + 12.0 * 2.0 + 18.0 + 10.0 * 2.0, textScale);
+    return size;
+}
+
+static CGSize ISHWorkspaceInfoContentSizeForTextScale(CGFloat textScale) {
+    CGSize size = ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolInfoIdentifier);
+    // The gauge row's header is as tall as its 16pt icon until the 12pt subtitle outgrows it.
+    CGFloat headerGrowth = MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, textScale, UIFontWeightRegular)) -
+                           MAX(16.0, ISHWorkspaceScaledLineHeight(12.0, 1.0, UIFontWeightRegular));
+    // The stat row's value (-workspaceStatTileWithIcon:caption:valueLabel:).
+    CGFloat valuePointSize = ISHWorkspaceUsesPhoneLayout() ? 15.0 : 17.0;
+    CGFloat valueGrowth = ISHWorkspaceScaledLineHeight(valuePointSize, textScale, UIFontWeightSemibold) -
+                          ISHWorkspaceScaledLineHeight(valuePointSize, 1.0, UIFontWeightSemibold);
+    size.height += MAX(0.0, headerGrowth) + MAX(0.0, valueGrowth);
+    // Fixed across a row: the content stack's insets, the gap between the two tiles and each
+    // tile's insets.
+    size.width = ISHWorkspaceScaledWindowWidth(size.width, 6.0 * 2.0 + 8.0 + 12.0 * 2.0 * 2.0, textScale);
+    return size;
+}
+
+// The size an applet's window should have with its text at `textScale`: Info's and Monitor's grow
+// with the text, and every other applet's is its preferred size whatever the scale. Anything that
+// sizes a window back to "its" size has to ask this, not ISHWorkspacePreferredToolContentSize, or
+// it undoes the growth and adjustsFontSizeToFitWidth shrinks the larger text back again.
+// At 1.0 it is the preferred size exactly: the scaled width rounds up, and a fractional Monitor
+// width would otherwise move the compact-sizing threshold by a fraction of a point.
+static CGSize ISHWorkspacePreferredToolContentSizeForTextScale(NSString *toolIdentifier, CGFloat textScale) {
+    if (fabs(textScale - 1.0) < 0.001)
+        return ISHWorkspacePreferredToolContentSize(toolIdentifier);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolInfoIdentifier])
+        return ISHWorkspaceInfoContentSizeForTextScale(textScale);
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolMonitorIdentifier])
+        return ISHWorkspaceMonitorContentSizeForTextScale(textScale);
+    return ISHWorkspacePreferredToolContentSize(toolIdentifier);
+}
+
 static CGFloat ISHWorkspaceDensityValue(CGFloat compact, CGFloat roomy) {
     return compact + ((roomy - compact) * ISHWorkspaceCurrentDensity());
 }
@@ -2260,6 +2492,66 @@ static CGFloat ISHWorkspaceThemeFontSize(UIFontTextStyle textStyle) {
     return size;
 }
 
+// The monospaced detail text views (-workspaceThemeTextView), before any
+// per-window text scale.
+static CGFloat ISHWorkspaceThemeTextViewFontSize(void) {
+    return ISHWorkspaceDensityValue(ISHWorkspaceUsesPhoneLayout() ? 8.5 : 9.5,
+                                    ISHWorkspaceUsesPhoneLayout() ? 11.0 : 12.0);
+}
+
+// ---- first responder, and per-window text size ------------------------------
+//
+// The first responder itself is found by -[WorkspaceViewController
+// workspaceFirstResponder].
+
+// The workspace window a responder lives in -- a view inside it, or a view
+// controller whose view is -- or nil.
+static ISHWorkspaceContainedWindowView *ISHWorkspaceWindowContainingResponder(UIResponder *responder) {
+    UIView *view = nil;
+    if ([responder isKindOfClass:UIView.class])
+        view = (UIView *) responder;
+    else if ([responder isKindOfClass:UIViewController.class] && ((UIViewController *) responder).isViewLoaded)
+        view = ((UIViewController *) responder).view;
+    for (; view != nil; view = view.superview) {
+        if ([view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            return (ISHWorkspaceContainedWindowView *) view;
+    }
+    return nil;
+}
+
+// Safari's zoom levels. Relative steps suit an applet with several text sizes
+// (a Markdown heading and its body grow together) better than the terminal's
+// one point at a time.
+static const CGFloat ISHWorkspaceTextScaleSteps[] = {0.5, 0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0};
+static const size_t ISHWorkspaceTextScaleStepCount = sizeof(ISHWorkspaceTextScaleSteps) / sizeof(ISHWorkspaceTextScaleSteps[0]);
+
+static CGFloat ISHWorkspaceClampedTextScale(CGFloat scale) {
+    if (!(scale > 0))
+        return 1.0;
+    return MAX(ISHWorkspaceTextScaleSteps[0],
+               MIN(ISHWorkspaceTextScaleSteps[ISHWorkspaceTextScaleStepCount - 1], scale));
+}
+
+// The next step above (`step` > 0) or below (`step` < 0) `current`. A current
+// value between two steps -- restored from an older layout, say -- moves to the
+// nearer step in the direction asked.
+static CGFloat ISHWorkspaceSteppedTextScale(CGFloat current, NSInteger step) {
+    current = ISHWorkspaceClampedTextScale(current);
+    if (step > 0) {
+        for (size_t i = 0; i < ISHWorkspaceTextScaleStepCount; i++)
+            if (ISHWorkspaceTextScaleSteps[i] > current + 0.001)
+                return ISHWorkspaceTextScaleSteps[i];
+        return ISHWorkspaceTextScaleSteps[ISHWorkspaceTextScaleStepCount - 1];
+    }
+    if (step < 0) {
+        for (size_t i = ISHWorkspaceTextScaleStepCount; i > 0; i--)
+            if (ISHWorkspaceTextScaleSteps[i - 1] < current - 0.001)
+                return ISHWorkspaceTextScaleSteps[i - 1];
+        return ISHWorkspaceTextScaleSteps[0];
+    }
+    return 1.0;
+}
+
 static void ISHWorkspaceSetCurrentDensity(CGFloat density) {
     CGFloat clamped = MAX(0.0, MIN(1.0, density));
     [NSUserDefaults.standardUserDefaults setDouble:clamped forKey:ISHWorkspaceToolDensityPreferenceKey];
@@ -2269,12 +2561,12 @@ static void ISHWorkspaceSetCurrentDensity(CGFloat density) {
 static NSString *ISHWorkspaceCurrentDensityTitle(void) {
     CGFloat density = ISHWorkspaceCurrentDensity();
     if (density < 0.18)
-        return @"Ultra Compact";
+        return NSLocalizedString(@"Ultra Compact", @"tool density setting value");
     if (density < 0.42)
-        return @"Compact";
+        return NSLocalizedString(@"Compact", @"tool density setting value");
     if (density < 0.72)
-        return @"Balanced";
-    return @"Comfortable";
+        return NSLocalizedString(@"Balanced", @"tool density setting value");
+    return NSLocalizedString(@"Comfortable", @"tool density setting value");
 }
 
 static void ISHWorkspaceThemeDrawLinearGradient(CGContextRef context,
@@ -2464,7 +2756,7 @@ static void ISHWorkspaceDeleteCustomThemeRecord(NSString *identifier) {
     [records removeObjectsAtIndexes:indexes];
     [NSUserDefaults.standardUserDefaults setObject:records forKey:ISHWorkspaceCustomThemesDefaultsKey];
     if ([[NSUserDefaults.standardUserDefaults stringForKey:ISHWorkspaceToolThemePreferenceKey] isEqualToString:identifier]) {
-        [NSUserDefaults.standardUserDefaults setObject:ISHWorkspaceToolThemeAuroraIdentifier
+        [NSUserDefaults.standardUserDefaults setObject:ISHWorkspaceToolThemeDefaultIdentifier
                                                 forKey:ISHWorkspaceToolThemePreferenceKey];
     }
     [NSNotificationCenter.defaultCenter postNotificationName:ISHWorkspaceToolThemeDidChangeNotification object:nil];
@@ -2510,19 +2802,27 @@ static BOOL ISHWorkspaceThemeIdentifierIsBuiltIn(NSString *identifier) {
 @interface WorkspaceShortcutsToolViewController : WorkspaceThemedToolViewController
 @end
 
-@interface WorkspaceLauncherToolViewController : WorkspaceThemedToolViewController <UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UIDropInteractionDelegate>
+@interface WorkspaceLauncherToolViewController : WorkspaceThemedToolViewController <UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UIDropInteractionDelegate, WorkspaceStatefulTool>
+- (CGSize)launcherContentSizeForDisplayedLevel;
 @end
 
-@interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate>
+@interface WorkspaceBrowserToolViewController : WorkspaceThemedToolViewController <UITextFieldDelegate, WKNavigationDelegate, WKUIDelegate, WorkspaceStatefulTool, WorkspaceTextScalable, WorkspaceFileOpenable>
 @end
 
 @interface WorkspaceThemesToolViewController : WorkspaceThemedToolViewController
+@end
+
+@interface WorkspaceEqualizerToolViewController : WorkspaceThemedToolViewController
 @end
 
 @interface WorkspaceAudioPlayerToolViewController : WorkspaceThemedToolViewController
 @end
 
 @interface WorkspaceMotePadToolViewController : WorkspaceThemedToolViewController
+@end
+
+// Settings in a Workspace window; see its branch in the factory below.
+@interface WorkspaceSettingsNavigationController : AboutNavigationController <WorkspaceTextScalable>
 @end
 
 static UIViewController *ISHCreateWorkspaceToolViewController(NSString *toolIdentifier) {
@@ -2565,14 +2865,32 @@ static UIViewController *ISHCreateWorkspaceToolViewController(NSString *toolIden
         // top view controller. AboutViewController drills into sub-pages with
         // "if (self.navigationController) push; else present fullscreen;" — stripping the nav
         // controller forced the fullscreen-modal branch, which had no way back to the workspace.
-        return ISHCreateAboutNavigationController(NO, NO);
+        //
+        // The pages move out of the storyboard's navigation controller into a
+        // Workspace-only subclass of its class. The Workspace looks for the
+        // text-size protocol (Cmd+= / Cmd+-) on this object, and the storyboard's
+        // class could not adopt it without Settings adopting it everywhere else
+        // too. A subclass rather than a plain UINavigationController, because
+        // AboutNavigationController is what makes Settings follow the Light/Dark
+        // setting, and nothing else in the Workspace does.
+        UINavigationController *storyboardNavigationController = ISHCreateAboutNavigationController(NO, NO);
+        NSArray<UIViewController *> *pages = storyboardNavigationController.viewControllers;
+        storyboardNavigationController.viewControllers = @[];
+        WorkspaceSettingsNavigationController *navigationController = [WorkspaceSettingsNavigationController new];
+        navigationController.viewControllers = pages;
+        return navigationController;
     }
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolDiagnosticsIdentifier])
-        return ISHCreateDiagnosticsViewController();
+        // Wrapped, like Filesystems and Settings above and for the same reason:
+        // a bare view controller's bar button items have nowhere to render, so
+        // this window had no Share button and no way to export the report.
+        return ISHCreateDiagnosticsNavigationController();
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier])
         return [WorkspaceLauncherToolViewController new];
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier])
         return [WorkspaceAudioPlayerToolViewController new];
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier])
+        return [WorkspaceEqualizerToolViewController new];
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolMotePadIdentifier])
         return [WorkspaceMotePadToolViewController new];
     if ([toolIdentifier isEqualToString:ISHWorkspaceToolFileManagerIdentifier])
@@ -2623,6 +2941,8 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         return ISHWorkspaceToolFilesystemsIdentifier;
     if ([viewController isKindOfClass:WorkspaceAudioPlayerToolViewController.class])
         return ISHWorkspaceToolAudioIdentifier;
+    if ([viewController isKindOfClass:WorkspaceEqualizerToolViewController.class])
+        return ISHWorkspaceToolEqualizerIdentifier;
     if ([viewController isKindOfClass:WorkspaceMotePadToolViewController.class])
         return ISHWorkspaceToolMotePadIdentifier;
     if ([viewController isKindOfClass:WorkspaceFileManagerToolViewController.class])
@@ -2637,6 +2957,317 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
         return ISHWorkspaceToolDisplayIdentifier;
     return nil;
 }
+
+// A Workspace Terminal window's content: its terminals as tabs. The window's
+// hostedTerminalViewController is always the selected tab, so everything that
+// works on "the window's terminal" (focus, text size, Snippets, the dock) works
+// on the tab showing. The strip of tab buttons shows only with two or more.
+// Tab 0's role is the window's own (workspaceTerminalRole: Session Shell,
+// System Console or a plain Terminal); a tab opened later is a plain Terminal.
+@interface ISHWorkspaceTerminalTabsViewController : UIViewController
+@property (nonatomic, weak) ISHWorkspaceContainedWindowView *windowView;
+// Opens a new tab in this window (a new shell).
+@property (nonatomic, copy) void (^newTabHandler)(void);
+@property (nonatomic, readonly) NSArray<TerminalViewController *> *tabs;
+@property (nonatomic, readonly) NSInteger selectedIndex;
+- (void)addTab:(TerminalViewController *)tab role:(nullable NSString *)role select:(BOOL)select;
+- (void)selectTabAtIndex:(NSInteger)index;
+// Ends that tab's shell and removes it; closing the last closes the window.
+- (void)closeTab:(TerminalViewController *)tab;
+- (void)disposeAllSessions;
+// The role a tab is saved and restored with.
+- (NSString *)roleForTab:(TerminalViewController *)tab;
+// After a restore: the tabs in their saved order, with their roles.
+- (void)arrangeTabs:(NSArray<TerminalViewController *> *)tabs roles:(NSArray<NSString *> *)roles selectedIndex:(NSInteger)selectedIndex;
+- (BOOL)selectTabShowingTerminalUUID:(NSUUID *)terminalUUID orSessionUUID:(BOOL)orSession;
+@end
+
+@implementation ISHWorkspaceTerminalTabsViewController {
+    NSMutableArray<TerminalViewController *> *_tabs;
+    NSMutableArray<NSString *> *_roles;     // per tab; tab 0's is ignored (the window's)
+    NSInteger _selectedIndex;
+    UIStackView *_strip;
+    UIView *_content;
+    NSLayoutConstraint *_stripHeight;
+    NSString *_firstTabTitle;               // the window's title while tab 0 is not showing
+}
+
+static const CGFloat ISHTerminalTabStripHeight = 30.0;
+
+- (instancetype)init {
+    self = [super initWithNibName:nil bundle:nil];
+    if (self != nil) {
+        _tabs = [NSMutableArray array];
+        _roles = [NSMutableArray array];
+    }
+    return self;
+}
+
+- (NSArray<TerminalViewController *> *)tabs {
+    return [_tabs copy];
+}
+
+- (NSInteger)selectedIndex {
+    return _selectedIndex;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    _strip = [UIStackView new];
+    _strip.axis = UILayoutConstraintAxisHorizontal;
+    _strip.spacing = 6;
+    _strip.alignment = UIStackViewAlignmentCenter;
+    _strip.translatesAutoresizingMaskIntoConstraints = NO;
+    _strip.layoutMargins = UIEdgeInsetsMake(0, 8, 0, 8);
+    _strip.layoutMarginsRelativeArrangement = YES;
+    _strip.clipsToBounds = YES;
+    _content = [UIView new];
+    _content.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:_strip];
+    [self.view addSubview:_content];
+    _stripHeight = [_strip.heightAnchor constraintEqualToConstant:0];
+    [NSLayoutConstraint activateConstraints:@[
+        [_strip.topAnchor constraintEqualToAnchor:self.view.topAnchor],
+        [_strip.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_strip.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        _stripHeight,
+        [_content.topAnchor constraintEqualToAnchor:_strip.bottomAnchor],
+        [_content.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor],
+        [_content.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor],
+        [_content.bottomAnchor constraintEqualToAnchor:self.view.bottomAnchor],
+    ]];
+}
+
+- (void)addTab:(TerminalViewController *)tab role:(NSString *)role select:(BOOL)select {
+    [self loadViewIfNeeded];
+    [_tabs addObject:tab];
+    [_roles addObject:role ?: ISHWorkspaceTerminalRoleGeneric];
+    [self addChildViewController:tab];
+    tab.view.translatesAutoresizingMaskIntoConstraints = NO;
+    [_content addSubview:tab.view];
+    [NSLayoutConstraint activateConstraints:@[
+        [tab.view.topAnchor constraintEqualToAnchor:_content.topAnchor],
+        [tab.view.leadingAnchor constraintEqualToAnchor:_content.leadingAnchor],
+        [tab.view.trailingAnchor constraintEqualToAnchor:_content.trailingAnchor],
+        [tab.view.bottomAnchor constraintEqualToAnchor:_content.bottomAnchor],
+    ]];
+    [tab didMoveToParentViewController:self];
+    // A shell that exits closes its tab, and the window with the last one.
+    __weak typeof(self) weakSelf = self;
+    __weak typeof(tab) weakTab = tab;
+    tab.workspaceSessionDidEndHandler = ^{
+        TerminalViewController *strongTab = weakTab;
+        if (strongTab != nil)
+            [weakSelf closeTab:strongTab];
+    };
+    if (select || _tabs.count == 1)
+        [self selectTabAtIndex:(NSInteger) _tabs.count - 1];
+    else
+        [self refreshStrip];
+}
+
+static NSString *ISHTerminalTabTitleForRole(NSString *role, Terminal *terminal) {
+    if (role.length == 0 || [role isEqualToString:ISHWorkspaceTerminalRoleGeneric])
+        return NSLocalizedString(@"Terminal", @"terminal tab title");
+    return ISHWorkspaceTitleForTerminalRole(role, terminal);
+}
+
+// Tab 0's title is whatever the window was given (a Launcher shortcut's name,
+// "Session Shell", ...), kept aside while another tab shows; nil while tab 0
+// shows, as the window's title is then the one to keep.
+- (NSString *)titleForTabAtIndex:(NSInteger)index {
+    TerminalViewController *tab = _tabs[(NSUInteger) index];
+    if (index == 0)
+        return _selectedIndex == 0 ? self.windowView.titleLabel.text : _firstTabTitle;
+    return ISHTerminalTabTitleForRole(_roles[(NSUInteger) index], tab.terminal);
+}
+
+- (void)selectTabAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger) _tabs.count)
+        return;
+    // The window's title is tab 0's while tab 0 shows; kept aside while not.
+    if (_selectedIndex == 0 && index != 0 && _tabs.count > 1 && self.windowView.titleLabel.text.length > 0)
+        _firstTabTitle = self.windowView.titleLabel.text;
+    _selectedIndex = index;
+    for (NSUInteger i = 0; i < _tabs.count; i++)
+        _tabs[i].view.hidden = (NSInteger) i != index;
+    TerminalViewController *tab = _tabs[(NSUInteger) index];
+    self.windowView.hostedTerminalViewController = tab;
+    if (index != 0)
+        self.windowView.titleLabel.text = [self titleForTabAtIndex:index];
+    else if (_firstTabTitle != nil)
+        self.windowView.titleLabel.text = _firstTabTitle;
+    [self refreshStrip];
+    [tab focusTerminal];
+}
+
+- (void)closeTab:(TerminalViewController *)tab {
+    NSUInteger index = [_tabs indexOfObject:tab];
+    if (index == NSNotFound)
+        return;
+    if (_tabs.count == 1) {
+        // The last tab: the window goes, as it did before tabs.
+        if (self.windowView.closeHandler != nil)
+            self.windowView.closeHandler();
+        return;
+    }
+    if (index == 0) {
+        // The next tab becomes the first, and the window takes its role and title.
+        self.windowView.workspaceTerminalRole = _roles[1];
+        _firstTabTitle = ISHTerminalTabTitleForRole(_roles[1], _tabs[1].terminal);
+    }
+    [tab disposeSessionForWorkspaceClose];
+    [tab willMoveToParentViewController:nil];
+    [tab.view removeFromSuperview];
+    [tab removeFromParentViewController];
+    [_tabs removeObjectAtIndex:index];
+    [_roles removeObjectAtIndex:index];
+    NSInteger next = _selectedIndex;
+    if ((NSInteger) index < _selectedIndex || _selectedIndex >= (NSInteger) _tabs.count)
+        next = _selectedIndex - 1;
+    _selectedIndex = -1;
+    [self selectTabAtIndex:MAX(0, next)];
+}
+
+- (void)disposeAllSessions {
+    for (TerminalViewController *tab in [_tabs copy])
+        [tab disposeSessionForWorkspaceClose];
+}
+
+- (NSString *)roleForTab:(TerminalViewController *)tab {
+    NSUInteger index = [_tabs indexOfObject:tab];
+    if (index == NSNotFound)
+        return nil;
+    if (index == 0)
+        return self.windowView.workspaceTerminalRole;
+    return _roles[index];
+}
+
+- (void)arrangeTabs:(NSArray<TerminalViewController *> *)tabs roles:(NSArray<NSString *> *)roles selectedIndex:(NSInteger)selectedIndex {
+    if (tabs.count != _tabs.count || roles.count != tabs.count)
+        return;
+    [_tabs setArray:tabs];
+    [_roles setArray:roles];
+    self.windowView.workspaceTerminalRole = roles.firstObject;
+    _firstTabTitle = ISHWorkspaceTitleForTerminalRole(roles.firstObject, tabs.firstObject.terminal);
+    _selectedIndex = -1;
+    [self selectTabAtIndex:MAX(0, MIN(selectedIndex, (NSInteger) tabs.count - 1))];
+}
+
+- (BOOL)selectTabShowingTerminalUUID:(NSUUID *)terminalUUID orSessionUUID:(BOOL)orSession {
+    for (NSUInteger i = 0; i < _tabs.count; i++) {
+        TerminalViewController *tab = _tabs[i];
+        if ([tab.terminal.uuid isEqual:terminalUUID] || (orSession && [tab.sessionTerminalUUID isEqual:terminalUUID])) {
+            if ((NSInteger) i != _selectedIndex)
+                [self selectTabAtIndex:(NSInteger) i];
+            return YES;
+        }
+    }
+    return NO;
+}
+
+- (void)refreshStrip {
+    if (_strip == nil)
+        return;
+    for (UIView *view in _strip.arrangedSubviews.copy) {
+        [_strip removeArrangedSubview:view];
+        [view removeFromSuperview];
+    }
+    BOOL show = _tabs.count >= 2;
+    _stripHeight.constant = show ? ISHTerminalTabStripHeight : 0;
+    _strip.hidden = !show;
+    if (!show)
+        return;
+    for (NSUInteger i = 0; i < _tabs.count; i++) {
+        UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+        [button setTitle:[NSString stringWithFormat:@"%lu", (unsigned long) i + 1] forState:UIControlStateNormal];
+        button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:(NSInteger) i == _selectedIndex ? UIFontWeightBold : UIFontWeightRegular];
+        button.tag = (NSInteger) i;
+        button.layer.cornerRadius = 6;
+        button.layer.borderWidth = 1;
+        button.layer.borderColor = [button.tintColor colorWithAlphaComponent:(NSInteger) i == _selectedIndex ? 0.9 : 0.3].CGColor;
+        button.backgroundColor = (NSInteger) i == _selectedIndex ? [button.tintColor colorWithAlphaComponent:0.18] : UIColor.clearColor;
+        button.accessibilityLabel = [NSString stringWithFormat:NSLocalizedString(@"Tab %lu, %@", @"accessibility label for a terminal tab: number, title"), (unsigned long) i + 1, [self titleForTabAtIndex:(NSInteger) i]];
+        [button addTarget:self action:@selector(tabButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
+        __weak typeof(self) weakSelf = self;
+        TerminalViewController *tab = _tabs[i];
+        __weak typeof(tab) weakTab = tab;
+        button.menu = [UIMenu menuWithChildren:@[
+            [UIAction actionWithTitle:NSLocalizedString(@"Close Tab", @"terminal tab context menu action") image:[UIImage systemImageNamed:@"xmark"] identifier:nil
+                              handler:^(__unused UIAction *action) {
+                TerminalViewController *strongTab = weakTab;
+                if (strongTab != nil)
+                    [weakSelf closeTab:strongTab];
+            }],
+        ]];
+        [button.widthAnchor constraintGreaterThanOrEqualToConstant:34].active = YES;
+        [button.heightAnchor constraintEqualToConstant:22].active = YES;
+        [_strip addArrangedSubview:button];
+    }
+    UIButton *add = [UIButton buttonWithType:UIButtonTypeSystem];
+    [add setImage:[UIImage systemImageNamed:@"plus"] forState:UIControlStateNormal];
+    add.accessibilityLabel = NSLocalizedString(@"New Tab", @"accessibility label for new terminal tab button");
+    add.accessibilityHint = NSLocalizedString(@"Opens a new terminal tab.", @"accessibility hint for new terminal tab button");
+    [add addTarget:self action:@selector(newTab) forControlEvents:UIControlEventTouchUpInside];
+    [add.widthAnchor constraintEqualToConstant:30].active = YES;
+    [_strip addArrangedSubview:add];
+    [_strip addArrangedSubview:[UIView new]]; // pushes the buttons to the left
+}
+
+- (void)tabButtonTapped:(UIButton *)button {
+    [self selectTabAtIndex:button.tag];
+}
+
+- (void)newTab {
+    if (self.newTabHandler != nil)
+        self.newTabHandler();
+}
+
+// Cmd+T new tab, Cmd+W close tab, Cmd+Shift+[ and ] previous/next, Cmd+1-9
+// that tab. The terminal is the first responder and this its parent, so these
+// reach here after the terminal's own.
+- (NSArray<UIKeyCommand *> *)keyCommands {
+    NSMutableArray<UIKeyCommand *> *commands = [NSMutableArray array];
+    void (^add)(NSString *, UIKeyModifierFlags, SEL, NSString *) =
+        ^(NSString *input, UIKeyModifierFlags flags, SEL action, NSString *title) {
+        UIKeyCommand *command = [UIKeyCommand keyCommandWithInput:input modifierFlags:flags action:action];
+        if (title.length > 0)
+            command.discoverabilityTitle = title;
+        if (@available(iOS 15, *))
+            command.wantsPriorityOverSystemBehavior = YES;
+        [commands addObject:command];
+    };
+    add(@"t", UIKeyModifierCommand, @selector(newTab), NSLocalizedString(@"New Tab", @"keyboard shortcut title"));
+    add(@"w", UIKeyModifierCommand, @selector(closeSelectedTab), NSLocalizedString(@"Close Tab", @"keyboard shortcut title"));
+    add(@"]", UIKeyModifierCommand | UIKeyModifierShift, @selector(nextTab), _tabs.count > 1 ? NSLocalizedString(@"Next Tab", @"keyboard shortcut title") : @"");
+    add(@"[", UIKeyModifierCommand | UIKeyModifierShift, @selector(previousTab), _tabs.count > 1 ? NSLocalizedString(@"Previous Tab", @"keyboard shortcut title") : @"");
+    add(@"}", UIKeyModifierCommand, @selector(nextTab), @"");
+    add(@"{", UIKeyModifierCommand, @selector(previousTab), @"");
+    for (NSInteger n = 1; n <= 9; n++)
+        add([NSString stringWithFormat:@"%ld", (long) n], UIKeyModifierCommand, @selector(selectTabFromKey:), @"");
+    return commands;
+}
+
+- (void)closeSelectedTab {
+    if (_selectedIndex >= 0 && _selectedIndex < (NSInteger) _tabs.count)
+        [self closeTab:_tabs[(NSUInteger) _selectedIndex]];
+}
+
+- (void)nextTab {
+    if (_tabs.count > 1)
+        [self selectTabAtIndex:(_selectedIndex + 1) % (NSInteger) _tabs.count];
+}
+
+- (void)previousTab {
+    if (_tabs.count > 1)
+        [self selectTabAtIndex:(_selectedIndex + (NSInteger) _tabs.count - 1) % (NSInteger) _tabs.count];
+}
+
+- (void)selectTabFromKey:(UIKeyCommand *)command {
+    [self selectTabAtIndex:command.input.integerValue - 1];
+}
+
+@end
 
 @implementation WorkspaceViewController
 
@@ -2864,11 +3495,38 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
 
 - (CGRect)desktopUsableBounds {
     UIEdgeInsets insets = self.view.safeAreaInsets;
+    // In an iPadOS 26 window the system's close/minimize/zoom controls cover the
+    // desktop's top-leading corner, well below the 10pt top safe area a window
+    // reports, so a window placed at the top of the desktop sat with its title bar,
+    // close button included, under them (#580). In full screen this is 0, so
+    // nothing moves there.
+    insets.top = MAX(insets.top, ISHWindowingControlsTopInset(self.view));
     CGRect bounds = self.desktopSurfaceView.bounds;
     if (ISHWorkspaceUsesPhoneLayout()) {
         return UIEdgeInsetsInsetRect(bounds, UIEdgeInsetsMake(insets.top, insets.left, insets.bottom, insets.right));
     }
     return UIEdgeInsetsInsetRect(bounds, UIEdgeInsetsMake(insets.top, 0, 0, 0));
+}
+
+// Where a window is ALLOWED TO BE, as opposed to where a new one is PUT.
+//
+// desktopUsableBounds keeps clear of the status bar and the home indicator,
+// which is right for placing a window nobody has positioned yet -- one should
+// not be born under the notch. It is wrong as a limit on a window the person
+// has dragged somewhere on purpose: they moved it to the top edge because they
+// wanted it at the top edge, and clamping it back is the app overruling them.
+//
+// The symptom that named this: a window WOULD sit at the very top, and then
+// any re-layout -- a rotation, a tool opening, the portrait-sized pass iOS
+// runs while the app is backgrounded -- put it back below the status bar. It
+// looked like the window drifting on its own.
+//
+// The grab strip is what keeps this safe rather than the insets:
+// clampedDesktopFrame always leaves a title bar's height and 140pt of width
+// inside these bounds, so a window can reach any edge and still be draggable
+// back.
+- (CGRect)desktopWindowClampBounds {
+    return self.desktopSurfaceView.bounds;
 }
 
 - (CGRect)desktopFrameForWindowWithPreferredSize:(CGSize)preferredSize {
@@ -2904,17 +3562,31 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     CGRect usableBounds = [self desktopUsableBounds];
     if (CGRectGetWidth(usableBounds) <= 0 || CGRectGetHeight(usableBounds) <= 0)
         return ISHWorkspaceRectWithRoundedOriginPreservingSize(frame);
-    if (CGRectGetWidth(frame) > CGRectGetWidth(usableBounds))
-        frame.size.width = CGRectGetWidth(usableBounds);
-    if (CGRectGetHeight(frame) > CGRectGetHeight(usableBounds))
-        frame.size.height = CGRectGetHeight(usableBounds);
+    CGRect clampBounds = [self desktopWindowClampBounds];
+
+    // The SIZE is limited by the whole surface on an iPad, the same bounds the
+    // POSITION is limited by below, so a window can sit against any edge of the
+    // screen and also reach the opposite one. It used to be limited by the
+    // usable bounds, which leave out a band at the top: the status bar in full
+    // screen, and the window controls' ~53pt in an iPadOS window (#580). A
+    // window dragged up to the top edge could then never be resized down to the
+    // bottom one -- it stopped exactly that band short, and every re-layout
+    // pulled a taller one back. New windows are still PLACED inside the usable
+    // bounds (desktopFrameForWindowWithPreferredSize). The phone layout keeps
+    // the usable bounds: there the insets are the notch and home indicator on
+    // every side.
+    CGRect sizeBounds = ISHWorkspaceUsesPhoneLayout() ? usableBounds : clampBounds;
+    if (CGRectGetWidth(frame) > CGRectGetWidth(sizeBounds))
+        frame.size.width = CGRectGetWidth(sizeBounds);
+    if (CGRectGetHeight(frame) > CGRectGetHeight(sizeBounds))
+        frame.size.height = CGRectGetHeight(sizeBounds);
 
     CGFloat visibleWidth = MIN(CGRectGetWidth(frame), 140.0);
-    CGFloat minX = CGRectGetMinX(usableBounds) - (CGRectGetWidth(frame) - visibleWidth);
-    CGFloat maxX = CGRectGetMaxX(usableBounds) - visibleWidth;
+    CGFloat minX = CGRectGetMinX(clampBounds) - (CGRectGetWidth(frame) - visibleWidth);
+    CGFloat maxX = CGRectGetMaxX(clampBounds) - visibleWidth;
     CGFloat visibleHeight = MIN(CGRectGetHeight(frame), ISHWorkspaceWindowTitleBarHeight);
-    CGFloat minY = CGRectGetMinY(usableBounds);
-    CGFloat maxY = CGRectGetMaxY(usableBounds) - visibleHeight;
+    CGFloat minY = CGRectGetMinY(clampBounds);
+    CGFloat maxY = CGRectGetMaxY(clampBounds) - visibleHeight;
 
     if (maxX < minX)
         maxX = minX;
@@ -3124,6 +3796,22 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
     [self.desktopSurfaceView addSubview:windowView];
     [self.desktopWindows addObject:windowView];
     windowView.workspaceDesktopIndex = self.activeDesktopIndex;
+    // Opening a window changes the arrangement, so the Desktops applet's
+    // saved/unsaved indicator has to hear about it. Only Desktop-level events
+    // posted this before, which is why opening an applet left the Save icon
+    // sitting on green.
+    //
+    // On the NEXT runloop turn, not now: this runs inside
+    // createDesktopWindowWithTitle:, and every caller sets the thing that gives
+    // the window its identity -- workspaceToolIdentifier, or the hosted terminal
+    // -- only after that returns. Posting synchronously therefore describes a
+    // window with no identity, the arrangement signature comes out unchanged,
+    // and the icon stayed green anyway. That was the first version of this fix,
+    // and it is why the Save icon still read "saved" after opening a Clock.
+    __weak typeof(self) weakSelfForIndicator = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [weakSelfForIndicator postDesktopsDidChange];
+    });
     if (appliesInitialPlacement) {
         [self applyInitialFrameIfNeededToDesktopWindow:windowView];
         [self.desktopSurfaceView bringSubviewToFront:windowView];
@@ -3147,6 +3835,7 @@ NSString *ISHWorkspaceToolIdentifierForViewController(UIViewController *viewCont
             UIViewController *contentViewController = [strongSelf contentViewControllerForDesktopWindow:strongWindowView];
             if ([contentViewController conformsToProtocol:@protocol(WorkspaceFocusable)])
                 [(id<WorkspaceFocusable>) contentViewController workspaceToolDidBecomeFrontmost];
+            [strongSelf claimKeyboardFocusForTextScalableWindow:strongWindowView];
         }
         [strongSelf refreshDockButtons];
     };
@@ -3206,12 +3895,18 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         UIView *closingFirstResponder = ISHWorkspaceFindFirstResponder(strongWindowView);
         if (closingFirstResponder != nil)
             [closingFirstResponder resignFirstResponder];
+        // A closed Wayland window ends its desktop now, not whenever its view
+        // controller happens to be freed. (One handed to the full-screen view
+        // was parked first, and has no session left to end.)
+        if ([strongViewController isKindOfClass:DisplayViewController.class])
+            [(DisplayViewController *) strongViewController endSession];
         [strongViewController willMoveToParentViewController:nil];
         [strongViewController.view removeFromSuperview];
         [strongViewController removeFromParentViewController];
         [strongSelf.desktopWindows removeObject:strongWindowView];
         [strongWindowView removeFromSuperview];
         [strongSelf refreshDockButtons];
+        [strongSelf postDesktopsDidChange];   // closing one changes it too
         if (closingFirstResponder != nil)
             [[strongSelf frontmostDesktopTerminalWindow].hostedTerminalViewController focusTerminal];
     };
@@ -3243,6 +3938,69 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     return ISHWorkspaceTerminalRoleForTerminal(terminalViewController.terminal);
 }
 
+// What a terminal tab needs to come back: which terminal it showed, the shell
+// it owns, its role, its scrollback and its font size.
+- (nullable NSDictionary<NSString *, id> *)savedDescriptorForTerminalTab:(TerminalViewController *)hosted
+                                                                   role:(nullable NSString *)terminalRole {
+    NSUUID *sessionTerminalUUID = hosted.sessionTerminalUUID ?: hosted.terminal.uuid;
+    NSUUID *displayTerminalUUID = hosted.terminal.uuid;
+    if (terminalRole.length == 0 && hosted.terminal != nil)
+        terminalRole = ISHWorkspaceTerminalRoleForTerminal(hosted.terminal);
+    if (sessionTerminalUUID == nil && displayTerminalUUID == nil)
+        return nil;
+    NSMutableDictionary<NSString *, id> *descriptor = [@{
+        @"terminalUUID": (displayTerminalUUID ?: sessionTerminalUUID).UUIDString,
+    } mutableCopy];
+    if (sessionTerminalUUID != nil)
+        descriptor[@"sessionTerminalUUID"] = sessionTerminalUUID.UUIDString;
+    if (terminalRole.length > 0)
+        descriptor[@"terminalRole"] = terminalRole;
+    // The session leader pid -- the only identifier for this window's shell
+    // that survives a suspend to disk. The Terminal UUID above dies with
+    // the process and the restore hands out fresh pts numbers, but the
+    // checkpoint restores pids, so this is what lets the window ask for
+    // its OWN shell back rather than whichever one is next in the queue.
+    //
+    // Its OWN shell: the one on the pseudo-terminal this window started
+    // (sessionTerminal), not whatever it happens to be displaying. A System
+    // Console window shows tty1 while its shell sits on a pts behind it,
+    // and this used to record tty1's session -- the console login's --
+    // which no restore ever hands out, because only pts sessions come back
+    // through the queue. So the console window asked for a pid that could
+    // not match, fell back to queue order, and took the FIRST restored
+    // session: the other window's ktop. That window then got the console's
+    // hidden shell, or nothing. Reported as "the former ktop window was
+    // blank and the console window had a wedged ktop in it".
+    //
+    // A window does not always start the session it shows: one that adopted
+    // an existing pts never learned a pid, so the tty is asked for its
+    // session -- a session leader's pid IS the session id, which is what
+    // the restore reports. Only a window with no shell of its own falls
+    // through to the displayed terminal, and then only for a pts.
+    int sessionPid = hosted.sessionTerminal.guestSessionId;
+    if (sessionPid <= 0)
+        sessionPid = hosted.sessionPid;
+    if (sessionPid <= 0 && hosted.sessionTerminal == nil &&
+            hosted.terminal.type == TTY_PSEUDO_SLAVE_MAJOR)
+        sessionPid = hosted.terminal.guestSessionId;
+    if (sessionPid > 0)
+        descriptor[@"sessionPid"] = @(sessionPid);
+    // Whether there is a shell to ask for at all. A window with none (a
+    // console with nothing behind it) must not adopt one on the way back.
+    descriptor[@"ownsSession"] = @(sessionPid > 0);
+    // What this terminal had printed. Not part of the guest at all -- it
+    // lives in hterm -- so without this a resumed window came back blank
+    // and the session's whole history was gone.
+    NSString *captured = ISHWorkspaceCapturedTerminalContents[
+        (displayTerminalUUID ?: sessionTerminalUUID).UUIDString];
+    if (captured.length > 0)
+        descriptor[@"contents"] = captured;
+    CGFloat overrideFontSize = hosted.overrideFontSize;
+    if (overrideFontSize > 0)
+        descriptor[@"fontSize"] = @(overrideFontSize);
+    return descriptor;
+}
+
 - (NSDictionary<NSString *, id> *)savedLayoutDescriptorForWindow:(ISHWorkspaceContainedWindowView *)windowView {
     NSDictionary<NSString *, NSNumber *> *frameDescriptor = [self normalizedFrameDescriptorForFrame:windowView.frame];
     if (frameDescriptor == nil)
@@ -3266,24 +4024,30 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     }
 
     if (windowView.hostedTerminalViewController != nil) {
-        NSUUID *sessionTerminalUUID = [self persistentTerminalUUIDForWindow:windowView];
-        NSUUID *displayTerminalUUID = [self displayedTerminalUUIDForWindow:windowView];
-        NSString *terminalRole = [self persistentTerminalRoleForWindow:windowView];
-        if (sessionTerminalUUID == nil && displayTerminalUUID == nil)
+        // One entry per tab. The window's own fields are its FIRST tab's, as
+        // they were before tabs, so a layout saved with one tab is exactly what
+        // it always was and an older build still restores the first tab; the
+        // rest ride in "tabs", with the one showing in "selectedTab".
+        NSArray<TerminalViewController *> *tabs = [self terminalViewControllersInWindow:windowView];
+        ISHWorkspaceTerminalTabsViewController *tabsController = [self terminalTabsForWindow:windowView];
+        NSMutableArray<NSDictionary<NSString *, id> *> *tabDescriptors = [NSMutableArray array];
+        for (TerminalViewController *tab in tabs) {
+            NSString *role = tabsController != nil ? [tabsController roleForTab:tab]
+                                                   : [self persistentTerminalRoleForWindow:windowView];
+            NSDictionary<NSString *, id> *tabDescriptor = [self savedDescriptorForTerminalTab:tab role:role];
+            if (tabDescriptor != nil)
+                [tabDescriptors addObject:tabDescriptor];
+        }
+        if (tabDescriptors.count == 0)
             return nil;
-        NSMutableDictionary<NSString *, id> *descriptor = [@{
-            @"kind": ISHWorkspaceSavedLayoutKindTerminal,
-            @"frame": frameDescriptor,
-            @"terminalUUID": (displayTerminalUUID ?: sessionTerminalUUID).UUIDString,
-        } mutableCopy];
-        if (sessionTerminalUUID != nil)
-            descriptor[@"sessionTerminalUUID"] = sessionTerminalUUID.UUIDString;
-        if (terminalRole.length > 0)
-            descriptor[@"terminalRole"] = terminalRole;
-        CGFloat overrideFontSize = windowView.hostedTerminalViewController.overrideFontSize;
-        if (overrideFontSize > 0)
-            descriptor[@"fontSize"] = @(overrideFontSize);
+        NSMutableDictionary<NSString *, id> *descriptor = [tabDescriptors.firstObject mutableCopy];
+        descriptor[@"kind"] = ISHWorkspaceSavedLayoutKindTerminal;
+        descriptor[@"frame"] = frameDescriptor;
         descriptor[@"desktopIndex"] = @(windowView.workspaceDesktopIndex);
+        if (tabDescriptors.count > 1) {
+            descriptor[@"tabs"] = tabDescriptors;
+            descriptor[@"selectedTab"] = @(tabsController.selectedIndex);
+        }
         return descriptor;
     }
 
@@ -3302,6 +4066,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             NSDictionary<NSString *, id> *state = [(id<WorkspaceStatefulTool>) contentViewController workspaceToolStateForSaving];
             if (state.count > 0)
                 descriptor[@"state"] = state;
+        }
+        // The window's text size, beside its state rather than inside it, so
+        // an applet does not have to save it. The terminal branch above saves
+        // its own size as "fontSize" in the same way.
+        if ([contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)]) {
+            CGFloat textScale = ((id<WorkspaceTextScalable>) contentViewController).workspaceTextScale;
+            if (textScale > 0 && fabs(textScale - 1.0) > 0.001)
+                descriptor[@"textScale"] = @(textScale);
         }
         return descriptor;
     }
@@ -3353,6 +4125,19 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                                     inWindow:(ISHWorkspaceContainedWindowView *)windowView
                             displayTerminalUUID:(NSUUID *)displayTerminalUUID
                                   terminalRole:(NSString *)terminalRole {
+    Terminal *displayTerminal = [self showRestoredTerminalIn:terminalViewController
+                                         displayTerminalUUID:displayTerminalUUID
+                                                terminalRole:terminalRole];
+    NSString *effectiveRole = terminalRole.length > 0 ? terminalRole : ISHWorkspaceTerminalRoleForTerminal(displayTerminal);
+    windowView.workspaceTerminalRole = effectiveRole;
+    windowView.titleLabel.text = ISHWorkspaceTitleForTerminalRole(effectiveRole, displayTerminal);
+}
+
+// Which terminal a restored tab shows, by its role: the console, the session
+// shell, or the terminal it had. Returns it.
+- (Terminal *)showRestoredTerminalIn:(TerminalViewController *)terminalViewController
+                 displayTerminalUUID:(NSUUID *)displayTerminalUUID
+                        terminalRole:(NSString *)terminalRole {
     Terminal *displayTerminal = displayTerminalUUID != nil ? [Terminal terminalWithUUID:displayTerminalUUID] : terminalViewController.terminal;
     if ([terminalRole isEqualToString:ISHWorkspaceTerminalRoleSystemConsole]) {
         if ([ISHWorkspaceTerminalRoleForTerminal(displayTerminal) isEqualToString:ISHWorkspaceTerminalRoleSystemConsole]) {
@@ -3371,14 +4156,59 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     } else if (displayTerminal != nil) {
         terminalViewController.terminal = displayTerminal;
     }
-    NSString *effectiveRole = terminalRole.length > 0 ? terminalRole : ISHWorkspaceTerminalRoleForTerminal(displayTerminal);
-    windowView.workspaceTerminalRole = effectiveRole;
-    windowView.titleLabel.text = ISHWorkspaceTitleForTerminalRole(effectiveRole, displayTerminal);
+    return displayTerminal;
+}
+
+// A saved tab beyond a window's first, added to the window's tabs (unselected)
+// and reconnected to its own shell the way a restored window is. nil when that
+// terminal is already showing somewhere, or lives in another scene.
+- (nullable TerminalViewController *)restoreTerminalTab:(NSDictionary<NSString *, id> *)tab
+                                                   role:(NSString *)terminalRole
+                                             intoWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    ISHWorkspaceTerminalTabsViewController *tabs = [self terminalTabsForWindow:windowView];
+    NSUUID *displayTerminalUUID = [[NSUUID alloc] initWithUUIDString:tab[@"terminalUUID"] ?: @""];
+    NSUUID *sessionTerminalUUID = [[NSUUID alloc] initWithUUIDString:tab[@"sessionTerminalUUID"] ?: @""];
+    if (tabs == nil || (displayTerminalUUID == nil && sessionTerminalUUID == nil))
+        return nil;
+    if (@available(iOS 13.0, *)) {
+        UISceneSession *existingSession = [self sceneSessionHostingTerminalUUID:(displayTerminalUUID ?: sessionTerminalUUID)];
+        if (existingSession != nil && existingSession != self.view.window.windowScene.session)
+            return nil;
+    }
+    if (displayTerminalUUID != nil && [self desktopWindowDisplayingTerminalUUID:displayTerminalUUID] != nil)
+        return nil;
+    Terminal *displayTerminal = displayTerminalUUID != nil ? [Terminal terminalWithUUID:displayTerminalUUID] : nil;
+    if (displayTerminal != nil && displayTerminal.webView.superview != nil)
+        return nil;
+    TerminalViewController *terminalViewController = [self createDesktopTerminalViewController];
+    if (terminalViewController == nil)
+        return nil;
+    // As restoreDesktopTerminalWindowWithSessionUUID: all of it before the
+    // reconnect, which is what claims the restored shell.
+    terminalViewController.alwaysLoginAsRoot = [terminalRole isEqualToString:ISHWorkspaceTerminalRoleSessionShell];
+    terminalViewController.desiredRestoredSessionPid = [tab[@"sessionPid"] intValue];
+    terminalViewController.declinesRestoredSession = !(tab[@"ownsSession"] == nil || [tab[@"ownsSession"] boolValue]);
+    terminalViewController.freshSessionTerminalDisplayMode =
+        [terminalRole isEqualToString:ISHWorkspaceTerminalRoleSystemConsole]
+            ? ISHFreshSessionTerminalDisplayModeSystemConsole
+            : ISHFreshSessionTerminalDisplayModeSessionShell;
+    [tabs addTab:terminalViewController role:terminalRole select:NO];
+    [terminalViewController reconnectSessionFromTerminalUUID:(sessionTerminalUUID ?: displayTerminalUUID)];
+    [self showRestoredTerminalIn:terminalViewController displayTerminalUUID:displayTerminalUUID terminalRole:terminalRole];
+    NSString *savedContents = tab[@"contents"];
+    if ([savedContents isKindOfClass:NSString.class] && savedContents.length > 0)
+        [terminalViewController.terminal writeRestoredContents:savedContents];
+    CGFloat savedFontSize = [tab[@"fontSize"] doubleValue];
+    if (savedFontSize > 0)
+        terminalViewController.overrideFontSize = savedFontSize;
+    return terminalViewController;
 }
 
 - (ISHWorkspaceContainedWindowView *)restoreDesktopTerminalWindowWithSessionUUID:(NSUUID *)sessionTerminalUUID
                                                              displayTerminalUUID:(NSUUID *)displayTerminalUUID
-                                                                   terminalRole:(NSString *)terminalRole {
+                                                                   terminalRole:(NSString *)terminalRole
+                                                                      sessionPid:(int)sessionPid
+                                                                     ownsSession:(BOOL)ownsSession {
     if (displayTerminalUUID == nil && sessionTerminalUUID == nil)
         return nil;
 
@@ -3421,6 +4251,23 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     // fresh session, and a restored Session Shell window has to come back as root.
     terminalViewController.alwaysLoginAsRoot =
         [terminalRole isEqualToString:ISHWorkspaceTerminalRoleSessionShell];
+    // Which shell this window was showing before a suspend, by leader pid.
+    // Set BEFORE reconnect, because that is what starts the session and the
+    // session is what claims a restored one. 0 when the layout predates this
+    // or the window had no session, which falls back to queue order.
+    terminalViewController.desiredRestoredSessionPid = sessionPid;
+    // And no shell at all for a window that had none: see the property.
+    terminalViewController.declinesRestoredSession = !ownsSession;
+    // Which terminal a shell started HERE is shown on. Only a window whose
+    // saved session did not come back starts one, and the default answer for
+    // a fresh shell in Workspace mode is "the system console" -- which, for a
+    // window that is not the console, put tty1 into a second window. tty1 was
+    // already in the console window, so this one showed "Terminal already open
+    // in another window" and nothing else: the blank, unresponsive window.
+    terminalViewController.freshSessionTerminalDisplayMode =
+        [terminalRole isEqualToString:ISHWorkspaceTerminalRoleSystemConsole]
+            ? ISHFreshSessionTerminalDisplayModeSystemConsole
+            : ISHFreshSessionTerminalDisplayModeSessionShell;
     ISHWorkspaceContainedWindowView *windowView =
         [self openDesktopTerminalWindowWithTitle:title terminalViewController:terminalViewController];
     [terminalViewController reconnectSessionFromTerminalUUID:restoreUUID];
@@ -3444,11 +4291,17 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     // mirrors the first. Reuse whichever Music window is already open instead of spawning a duplicate
     // when another song is opened, summoning it to the current Desktop if it was hidden on another one
     // (same reveal behavior as openOrFocusWorkspaceToolIdentifier:).
-    if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier]) {
+    // The Browser likewise: a page opened from the File Manager or ws-browser
+    // becomes a tab in the Browser already open. The Equalizer has one set of
+    // settings to show.
+    if ([toolIdentifier isEqualToString:ISHWorkspaceToolAudioIdentifier] ||
+            [toolIdentifier isEqualToString:ISHWorkspaceToolBrowserIdentifier] ||
+            [toolIdentifier isEqualToString:ISHWorkspaceToolEqualizerIdentifier]) {
         ISHWorkspaceContainedWindowView *existing = [self desktopWindowForToolIdentifier:toolIdentifier];
         if (existing != nil) {
             existing.workspaceDesktopIndex = self.activeDesktopIndex;
             existing.hidden = NO;
+            [self postDesktopsDidChange];   // same reason as openOrFocus
             return existing;
         }
     }
@@ -3565,7 +4418,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     CGFloat stackInsetX = ISHWorkspaceUsesPhoneLayout() ? 4.0 : 6.0;
     CGFloat tileSpacing = ISHWorkspaceUsesPhoneLayout() ? 3.0 : 4.0;
     ISHWorkspaceContainedWindowView *windowView =
-        [self createDesktopWindowWithTitle:@"Dock"
+        [self createDesktopWindowWithTitle:NSLocalizedString(@"Dock", @"dock window title")
                              preferredSize:preferredSize
                           showsCloseButton:NO
                     appliesInitialPlacement:NO];
@@ -3591,18 +4444,18 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     appsRow.axis = UILayoutConstraintAxisHorizontal;
     appsRow.spacing = tileSpacing;
     appsRow.distribution = UIStackViewDistributionFillEqually;
-    self.dockUtilsButton = [self workspaceDockTileButtonWithTitle:@"Utils"
+    self.dockUtilsButton = [self workspaceDockTileButtonWithTitle:NSLocalizedString(@"Utils", @"dock button title for utilities")
                                                          selector:@selector(toggleClockFromDock:)
                                                        identifier:@"utils"];
-    self.dockUtilsButton.accessibilityHint = @"Touch and hold to show utilities menu.";
+    self.dockUtilsButton.accessibilityHint = NSLocalizedString(@"Touch and hold to show utilities menu.", @"accessibility hint for dock Utils button");
     UILongPressGestureRecognizer *utilsLongPressRecognizer =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleUtilsDockLongPress:)];
     utilsLongPressRecognizer.minimumPressDuration = 0.25;
     [self.dockUtilsButton addGestureRecognizer:utilsLongPressRecognizer];
-    self.dockTerminalButton = [self workspaceDockTileButtonWithTitle:@"Terminal"
+    self.dockTerminalButton = [self workspaceDockTileButtonWithTitle:NSLocalizedString(@"Terminal", @"dock button title")
                                                             selector:@selector(openOrFocusTerminalFromDock:)
                                                           identifier:ISHWorkspaceTerminalRoleSessionShell];
-    self.dockTerminalButton.accessibilityHint = @"Touch and hold to show terminal options.";
+    self.dockTerminalButton.accessibilityHint = NSLocalizedString(@"Touch and hold to show terminal options.", @"accessibility hint for dock Terminal button");
     UILongPressGestureRecognizer *terminalLongPressRecognizer =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleTerminalDockLongPress:)];
     terminalLongPressRecognizer.minimumPressDuration = 0.25;
@@ -3625,8 +4478,45 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     return windowView;
 }
 
-- (void)saveWorkspaceLayout:(id)sender {
+// Ask every terminal what it has printed, then run `completion` on main.
+//
+// Separate from saveWorkspaceLayout because the answer crosses into a web view
+// and comes back asynchronously, while building a descriptor is synchronous.
+- (void)captureTerminalContentsThen:(dispatch_block_t)completion {
+    NSMutableDictionary<NSString *, NSString *> *captured = [NSMutableDictionary dictionary];
+    dispatch_group_t group = dispatch_group_create();
+    for (UIView *subview in self.desktopSurfaceView.subviews) {
+        if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) subview;
+        for (TerminalViewController *tab in [self terminalViewControllersInWindow:windowView]) {
+            Terminal *terminal = tab.terminal;
+            NSString *key = terminal.uuid.UUIDString;
+            if (terminal == nil || key.length == 0)
+                continue;
+            dispatch_group_enter(group);
+            [terminal fetchContentsWithCompletion:^(NSString *contents) {
+                if (contents.length > 0)
+                    captured[key] = contents;
+                dispatch_group_leave(group);
+            }];
+        }
+    }
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        ISHWorkspaceCapturedTerminalContents = captured;
+        if (completion != nil)
+            completion();
+    });
+}
+
+// The full arrangement a suspend needs: geometry, applet state and the
+// terminals' scrollback. Split out so the suspend can file a copy beside its
+// image (ISHWorkspaceCaptureLayoutForSuspend) as well as in the defaults.
+- (NSArray<NSDictionary<NSString *, id> *> *)workspaceSuspendLayoutDescriptors {
     NSMutableArray<NSDictionary<NSString *, id> *> *layout = [NSMutableArray array];
+    // First, so the restore can size the Desktops before placing anything on
+    // them.
+    [layout addObject:[self desktopsLayoutDescriptor]];
     for (UIView *subview in self.desktopSurfaceView.subviews) {
         if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
@@ -3635,6 +4525,11 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         if (descriptor != nil)
             [layout addObject:descriptor];
     }
+    return layout;
+}
+
+- (void)saveWorkspaceLayout:(id)sender {
+    NSArray<NSDictionary<NSString *, id> *> *layout = [self workspaceSuspendLayoutDescriptors];
     if (ISHWorkspaceSupportsSceneWindows()) {
         id storedValue = [NSUserDefaults.standardUserDefaults objectForKey:ISHWorkspaceSavedLayoutDefaultsKey];
         NSMutableDictionary<NSString *, id> *layoutsByScene = [storedValue isKindOfClass:NSDictionary.class]
@@ -3644,30 +4539,392 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         if (sceneIdentifier.length == 0)
             sceneIdentifier = @"default";
         layoutsByScene[sceneIdentifier] = layout;
+
+        id storedTimes = [NSUserDefaults.standardUserDefaults objectForKey:ISHWorkspaceSavedLayoutTimesDefaultsKey];
+        NSMutableDictionary<NSString *, NSNumber *> *times = [storedTimes isKindOfClass:NSDictionary.class]
+            ? [storedTimes mutableCopy]
+            : [NSMutableDictionary dictionary];
+        times[sceneIdentifier] = @([NSDate date].timeIntervalSince1970);
+
+        // Keep the newest few. A scene key that no longer has a layout is not
+        // worth a timestamp either, so the two are pruned together and stay in
+        // step -- an entry in one and not the other is what would make
+        // newest-wins pick a key with nothing behind it.
+        for (NSString *staleKey in times.allKeys) {
+            if (layoutsByScene[staleKey] == nil)
+                [times removeObjectForKey:staleKey];
+        }
+        if (layoutsByScene.count > ISHWorkspaceSavedLayoutSceneLimit) {
+            NSArray<NSString *> *oldestFirst = [layoutsByScene.allKeys sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+                // No timestamp means it predates this and is the oldest thing here.
+                double ta = [times[a] doubleValue];
+                double tb = [times[b] doubleValue];
+                if (ta == tb)
+                    return [a compare:b];
+                return ta < tb ? NSOrderedAscending : NSOrderedDescending;
+            }];
+            NSUInteger excess = layoutsByScene.count - ISHWorkspaceSavedLayoutSceneLimit;
+            for (NSUInteger i = 0; i < excess; i++) {
+                NSString *drop = oldestFirst[i];
+                // Never the one just written, and never the compatibility key.
+                if ([drop isEqualToString:sceneIdentifier] || [drop isEqualToString:@"default"])
+                    continue;
+                [layoutsByScene removeObjectForKey:drop];
+                [times removeObjectForKey:drop];
+            }
+        }
+
         [NSUserDefaults.standardUserDefaults setObject:layoutsByScene forKey:ISHWorkspaceSavedLayoutDefaultsKey];
+        [NSUserDefaults.standardUserDefaults setObject:times forKey:ISHWorkspaceSavedLayoutTimesDefaultsKey];
     } else {
         [NSUserDefaults.standardUserDefaults setObject:layout forKey:ISHWorkspaceSavedLayoutDefaultsKey];
     }
+
+    // The scrollback belonged to THIS save.
+    //
+    // captureTerminalContentsThen: fills this in immediately before a suspend
+    // writes its layout; leaving it set means the next Save button press files
+    // the same stale text again -- and since the newest layout now wins on a
+    // resume, that stale text is what a later resume would paint into the
+    // windows. Consumed here, so a manual Save carries geometry and nothing
+    // else, which is all it is for.
+    ISHWorkspaceCapturedTerminalContents = nil;
 }
 
 - (void)restoreWorkspaceLayout:(id)sender {
     NSArray<NSDictionary<NSString *, id> *> *layout = [self savedWorkspaceLayoutForCurrentScene];
     if (![layout isKindOfClass:NSArray.class] || layout.count == 0) {
         UIAlertController *alert =
-            [UIAlertController alertControllerWithTitle:@"No Saved Layout"
-                                                message:@"Save a workspace arrangement for this workspace first, then restore it from here."
+            [UIAlertController alertControllerWithTitle:NSLocalizedString(@"No Saved Layout", @"alert title")
+                                                message:NSLocalizedString(@"Save a workspace arrangement for this workspace first, then restore it from here.", @"alert message when no saved layout exists")
                                          preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
         [self presentViewController:alert animated:YES completion:nil];
         return;
     }
+    [self applyArrangementWorkspaceLayout:layout];
+}
 
+// ---- the Desktops snapshot -------------------------------------------------
+//
+// What the Save icon in the Desktops applet writes and the Restore icon (and
+// every ordinary launch) reads: how many Desktops there are, which applet sits
+// on which, and where the windows are. No state -- an applet's contents and a
+// terminal's scrollback belong to suspend/checkpoint.
+
+- (NSArray<NSDictionary<NSString *, id> *> *)workspaceArrangementDescriptors {
+    NSMutableArray<NSDictionary<NSString *, id> *> *layout = [NSMutableArray array];
+    [layout addObject:[self desktopsLayoutDescriptor]];
+    for (UIView *subview in self.desktopSurfaceView.subviews) {
+        if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        NSDictionary<NSString *, id> *descriptor =
+            [self savedLayoutDescriptorForWindow:(ISHWorkspaceContainedWindowView *) subview];
+        if (descriptor == nil)
+            continue;
+        // Placement only. "state" is an applet's contents and "contents" is a
+        // terminal's scrollback; carrying either would make a Save of the
+        // ARRANGEMENT quietly file a copy of the work as well.
+        NSMutableDictionary<NSString *, id> *trimmed = [descriptor mutableCopy];
+        [trimmed removeObjectForKey:@"state"];
+        [trimmed removeObjectForKey:@"contents"];
+        [layout addObject:trimmed];
+    }
+    return layout;
+}
+
+// Drops trailing unnamed entries, so a Desktop without a name costs nothing in a
+// saved arrangement.
+static void ISHWorkspaceTrimDesktopNames(NSMutableArray<NSString *> *names) {
+    while (names.count > 0 && names.lastObject.length == 0)
+        [names removeLastObject];
+}
+
+// Names as a saved arrangement holds them. Anything that is not a string reads as
+// unnamed rather than failing the restore.
+static NSMutableArray<NSString *> *ISHWorkspaceDesktopNamesFromStored(id stored) {
+    NSMutableArray<NSString *> *names = [NSMutableArray array];
+    if ([stored isKindOfClass:NSArray.class]) {
+        for (id name in (NSArray *) stored)
+            [names addObject:[name isKindOfClass:NSString.class] ? name : @""];
+    }
+    ISHWorkspaceTrimDesktopNames(names);
+    return names;
+}
+
+// The names' part of the saved/unsaved signature: empty when no Desktop has a
+// name, so an arrangement saved before Desktops could be named still matches.
+static NSString *ISHWorkspaceDesktopNamesSignature(NSArray<NSString *> *names) {
+    NSMutableArray<NSString *> *trimmed = [names mutableCopy] ?: [NSMutableArray array];
+    ISHWorkspaceTrimDesktopNames(trimmed);
+    if (trimmed.count == 0)
+        return @"";
+    return [@"|names:" stringByAppendingString:[trimmed componentsJoinedByString:@"\x1e"]];
+}
+
+// What the indicator compares. Structure, not pixels: how many Desktops, and
+// which window is on which. Frames are saved but deliberately left out of this,
+// or nudging a window by a point would light up "unsaved" mid-drag.
+- (NSString *)workspaceArrangementSignature {
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (UIView *subview in self.desktopSurfaceView.subviews) {
+        if (![subview isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) subview;
+        if (windowView == self.dashboardWindow || windowView == self.dockWindow)
+            continue;
+        NSString *name = windowView.workspaceToolIdentifier;
+        if (name.length == 0 && windowView.hostedTerminalViewController != nil)
+            name = @"terminal";
+        if (name.length == 0)
+            continue;
+        [parts addObject:[NSString stringWithFormat:@"%@@%ld", name,
+                                                    (long) windowView.workspaceDesktopIndex]];
+    }
+    [parts sortUsingSelector:@selector(compare:)];
+    return [NSString stringWithFormat:@"%ld|%@%@", (long) self.desktopCount,
+                                      [parts componentsJoinedByString:@","],
+                                      ISHWorkspaceDesktopNamesSignature(self.desktopNames)];
+}
+
+- (NSArray<NSDictionary<NSString *, id> *> *)savedWorkspaceDesktops {
+    id stored = [NSUserDefaults.standardUserDefaults objectForKey:ISHWorkspaceSavedDesktopsDefaultsKey];
+    return [stored isKindOfClass:NSArray.class] ? stored : nil;
+}
+
+// The same signature, computed from a stored snapshot rather than the screen.
+//
+// So the indicator is right on a launch that did not apply the snapshot (a
+// checkpoint resume, say): without this, savedDesktopsSignature would still be
+// nil and a perfectly current arrangement would read as unsaved.
+- (NSString *)signatureForStoredArrangement:(NSArray<NSDictionary<NSString *, id> *> *)layout {
+    if (layout.count == 0)
+        return nil;
+    NSInteger count = 1;
+    NSArray *names = nil;
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    for (NSDictionary<NSString *, id> *descriptor in layout) {
+        NSString *kind = descriptor[@"kind"];
+        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDesktops]) {
+            count = MAX((NSInteger) 1, [descriptor[@"count"] integerValue]);
+            names = ISHWorkspaceDesktopNamesFromStored(descriptor[@"names"]);
+            continue;
+        }
+        NSString *name = nil;
+        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTool])
+            name = descriptor[@"toolIdentifier"];
+        else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTerminal])
+            name = @"terminal";
+        if (name.length == 0)
+            continue;
+        [parts addObject:[NSString stringWithFormat:@"%@@%ld", name,
+                                                    (long) [descriptor[@"desktopIndex"] integerValue]]];
+    }
+    [parts sortUsingSelector:@selector(compare:)];
+    return [NSString stringWithFormat:@"%ld|%@%@", (long) count, [parts componentsJoinedByString:@","],
+                                      ISHWorkspaceDesktopNamesSignature(names)];
+}
+
+- (BOOL)workspaceDesktopsArrangementIsSaved {
+    NSString *saved = self.savedDesktopsSignature;
+    if (saved == nil) {
+        saved = [self signatureForStoredArrangement:[self savedWorkspaceDesktops]];
+        self.savedDesktopsSignature = saved;
+    }
+    return saved != nil && [saved isEqualToString:[self workspaceArrangementSignature]];
+}
+
+- (void)saveWorkspaceDesktops {
+    NSArray<NSDictionary<NSString *, id> *> *layout = [self workspaceArrangementDescriptors];
+    [NSUserDefaults.standardUserDefaults setObject:layout
+                                            forKey:ISHWorkspaceSavedDesktopsDefaultsKey];
+    // Written through now rather than at the system's leisure: the next thing
+    // this is asked to survive is the app being killed.
+    [NSUserDefaults.standardUserDefaults synchronize];
+    self.savedDesktopsSignature = [self workspaceArrangementSignature];
+    [ISHDiagnosticsStore recordBreadcrumb:@"workspace.desktops.saved"
+                                  details:@{@"desktops": @(self.desktopCount),
+                                            @"windows": @(layout.count - 1)}];
+    [self postDesktopsDidChange];
+}
+
+- (void)restoreWorkspaceDesktops {
+    NSArray<NSDictionary<NSString *, id> *> *layout = [self savedWorkspaceDesktops];
+    if (layout.count == 0) {
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:NSLocalizedString(@"No Saved Desktops", @"alert title")
+                                                message:NSLocalizedString(@"Press Save first, then Restore brings that arrangement back.", @"alert message when no saved desktops exist")
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    [self applyArrangementWorkspaceLayout:layout];
+    self.savedDesktopsSignature = [self workspaceArrangementSignature];
+    [self postDesktopsDidChange];
+}
+
+// The Restore button: put the windows back where they were, and do nothing else.
+//
+// This used to call the resume path, which starts by closing every window -- and
+// a terminal window's close handler hangs up its pty, so Restore SIGHUPped every
+// shell in the workspace and then tried to rebuild the terminals from UUIDs it
+// had just killed. That is "the whole function seems to be borked", and it is
+// also why things landed on the wrong Desktop: what came back was not the window
+// that had been there, it was a new one built from a dead descriptor.
+//
+// A layout is an ARRANGEMENT: how many Desktops there are, which applet is on
+// which, and where the windows sit. Anything live -- a shell, its scrollback, an
+// applet's contents -- belongs to suspend/checkpoint and is deliberately not
+// touched here.
+- (void)applyArrangementWorkspaceLayout:(NSArray<NSDictionary<NSString *, id> *> *)layout {
+    NSDictionary<NSString *, id> *desktopsDescriptor = nil;
+    NSDictionary<NSString *, id> *dashboardDescriptor = nil;
+    NSDictionary<NSString *, id> *dockDescriptor = nil;
+    NSMutableArray<NSDictionary<NSString *, id> *> *toolDescriptors = [NSMutableArray array];
+    NSMutableArray<NSDictionary<NSString *, id> *> *terminalDescriptors = [NSMutableArray array];
+    for (NSDictionary<NSString *, id> *descriptor in layout) {
+        NSString *kind = descriptor[@"kind"];
+        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDesktops])
+            desktopsDescriptor = descriptor;
+        else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDashboard])
+            dashboardDescriptor = descriptor;
+        else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDock])
+            dockDescriptor = descriptor;
+        else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTool])
+            [toolDescriptors addObject:descriptor];
+        else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTerminal])
+            [terminalDescriptors addObject:descriptor];
+    }
+
+    // Desktops first -- a window cannot be put on one that does not exist yet.
+    // Never shrink past a Desktop that currently holds something: removing it
+    // would orphan whatever is on it, and Restore is not a licence to throw
+    // somebody's work away.
+    NSInteger highestLiveIndex = 0;
+    for (ISHWorkspaceContainedWindowView *windowView in self.desktopWindows) {
+        if (![windowView isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        highestLiveIndex = MAX(highestLiveIndex, windowView.workspaceDesktopIndex);
+    }
+    NSInteger savedCount = MAX((NSInteger) 1, [desktopsDescriptor[@"count"] integerValue]);
+    self.desktopCount = MAX(savedCount, highestLiveIndex + 1);
+    self.desktopNames = ISHWorkspaceDesktopNamesFromStored(desktopsDescriptor[@"names"]);
+
+    if (dashboardDescriptor != nil)
+        [self applySavedDashboardDescriptor:dashboardDescriptor];
+    if (dockDescriptor != nil)
+        [self applySavedDockDescriptor:dockDescriptor];
+
+    // The applets: open the ones that are missing, move the ones that are in the
+    // wrong place, and leave every one of them running.
+    NSMutableSet<NSString *> *wanted = [NSMutableSet set];
+    for (NSDictionary<NSString *, id> *descriptor in toolDescriptors) {
+        NSString *toolIdentifier = descriptor[@"toolIdentifier"];
+        if (toolIdentifier.length == 0 || [wanted containsObject:toolIdentifier])
+            continue;   // an older layout can name the same applet twice
+        [wanted addObject:toolIdentifier];
+        ISHWorkspaceContainedWindowView *windowView = [self desktopWindowForToolIdentifier:toolIdentifier];
+        if (windowView == nil)
+            windowView = [self openWorkspaceToolWindowWithIdentifier:toolIdentifier];
+        if (windowView == nil)
+            continue;
+        [self applySavedFrameDescriptor:descriptor[@"frame"]
+                               toWindow:windowView
+                           fallbackSize:ISHWorkspacePreferredToolContentSize(toolIdentifier)];
+        // Deliberately NOT descriptor[@"state"]: a saved arrangement says where
+        // the applet is, never what is in it.
+        [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
+    }
+
+    // An applet the layout does not mention was opened after the save, so
+    // restoring the arrangement closes it. Applets only -- a terminal is never
+    // closed from here whatever the layout says, because closing one kills a
+    // shell.
+    for (ISHWorkspaceContainedWindowView *windowView in self.desktopWindows.copy) {
+        if (![windowView isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        if (windowView == self.dashboardWindow || windowView == self.dockWindow)
+            continue;
+        if (windowView.hostedTerminalViewController != nil)
+            continue;
+        NSString *toolIdentifier = windowView.workspaceToolIdentifier;
+        if (toolIdentifier.length == 0 || [self isGlobalToolIdentifier:toolIdentifier])
+            continue;   // Desktops and Launcher belong to every Desktop
+        if ([wanted containsObject:toolIdentifier])
+            continue;
+        if (windowView.closeHandler != nil)
+            windowView.closeHandler();
+    }
+
+    // Terminals are moved, and never closed: closing one kills a shell. One
+    // whose window is gone -- every one, after a relaunch -- is opened fresh in
+    // its place (openTerminalWindowForArrangementDescriptor:); bringing back the
+    // SHELL it had is the checkpoint's job, not this one's.
+    for (NSDictionary<NSString *, id> *descriptor in terminalDescriptors) {
+        NSString *displayString = descriptor[@"terminalUUID"];
+        NSString *sessionString = descriptor[@"sessionTerminalUUID"];
+        NSUUID *displayUUID = displayString.length > 0
+            ? [[NSUUID alloc] initWithUUIDString:displayString] : nil;
+        NSUUID *sessionUUID = sessionString.length > 0
+            ? [[NSUUID alloc] initWithUUIDString:sessionString] : nil;
+        ISHWorkspaceContainedWindowView *windowView =
+            displayUUID != nil ? [self desktopWindowDisplayingTerminalUUID:displayUUID] : nil;
+        if (windowView == nil && sessionUUID != nil)
+            windowView = [self desktopWindowHostingTerminalUUID:sessionUUID];
+        if (windowView == nil)
+            windowView = [self openTerminalWindowForArrangementDescriptor:descriptor];
+        if (windowView == nil)
+            continue;
+        [self applySavedFrameDescriptor:descriptor[@"frame"]
+                               toWindow:windowView
+                           fallbackSize:ISHWorkspacePreferredTerminalContentSize()];
+        [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
+    }
+
+    NSInteger active = self.activeDesktopIndex;
+    if (desktopsDescriptor != nil) {
+        NSInteger saved = [desktopsDescriptor[@"active"] integerValue];
+        if (saved >= 0 && saved < self.desktopCount)
+            active = saved;
+    }
+    [self switchToDesktopIndex:active];
+    [self applyDesktopVisibility];
+    // switchToDesktopIndex posts this itself, but only when the Desktop actually
+    // changes -- and the count almost always has, which is what the Desktops
+    // applet is listing.
+    [self postDesktopsDidChange];
+    [self refreshWorkspaceStatus];
+    [self applyCompactSizingToOpenWorkspaceToolWindows];
+    [ISHDiagnosticsStore recordBreadcrumb:@"workspace.layout.arrangementApplied"
+                                  details:@{@"desktops": @(self.desktopCount),
+                                            @"active": @(self.activeDesktopIndex),
+                                            @"applets": @(wanted.count),
+                                            @"terminalsMoved": @(terminalDescriptors.count)}];
+}
+
+// The silent core of the restore above.
+//
+// Split out because a resume has to do exactly this and must NOT do the rest:
+// no "No Saved Layout" alert, because a resume is not a request -- nobody
+// asked, and an alert at launch would be an error message for something that
+// merely has nothing to put back.
+// After a checkpoint restore: the guest is running but NOTHING is on screen, so
+// this rebuilds the windows -- terminals included, adopting the sessions the
+// restore published. It closes what is there first, which is safe only because
+// there is nothing there.
+//
+// NOT what the Restore button wants. See applyArrangementWorkspaceLayout:.
+- (void)applyResumeWorkspaceLayout:(NSArray<NSDictionary<NSString *, id> *> *)layout {
+    NSDictionary<NSString *, id> *desktopsDescriptor = nil;
     NSDictionary<NSString *, id> *dashboardDescriptor = nil;
     NSDictionary<NSString *, id> *dockDescriptor = nil;
     NSMutableArray<NSDictionary<NSString *, id> *> *windowDescriptors = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *descriptor in layout) {
         NSString *kind = descriptor[@"kind"];
-        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDashboard]) {
+        if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDesktops]) {
+            desktopsDescriptor = descriptor;
+        } else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDashboard]) {
             dashboardDescriptor = descriptor;
         } else if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindDock]) {
             dockDescriptor = descriptor;
@@ -3677,6 +4934,12 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     }
 
     [self closeAllRestorableDesktopWindows];
+    // Before any window is placed: a Desktop that held nothing has no window to
+    // grow the count for it, so without this an empty Desktop disappears.
+    NSInteger savedDesktopCount = [desktopsDescriptor[@"count"] integerValue];
+    if (savedDesktopCount > self.desktopCount)
+        self.desktopCount = savedDesktopCount;
+    self.desktopNames = ISHWorkspaceDesktopNamesFromStored(desktopsDescriptor[@"names"]);
     if (dashboardDescriptor != nil)
         [self applySavedDashboardDescriptor:dashboardDescriptor];
     if (dockDescriptor != nil)
@@ -3685,7 +4948,60 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     NSSet<NSString *> *deduplicatedTerminalRoles =
         [NSSet setWithArray:@[ISHWorkspaceTerminalRoleSessionShell, ISHWorkspaceTerminalRoleSystemConsole]];
     NSMutableSet<NSString *> *restoredTerminalRoles = [NSMutableSet set];
+    // Terminals that can name their shell go first, in two senses. A window
+    // claims its restored session when it is created, and a window whose
+    // recorded pid matches nothing falls back to the next session in the
+    // queue -- so if that window is created first it takes a shell another
+    // window is about to ask for by name. Creating the exact matches first
+    // makes the fallback safe: by the time it runs, everything that could be
+    // claimed by name has been. The saved stacking order is put back below,
+    // so this changes who gets which shell and nothing the user can see.
+    //
+    // Every TAB claims a shell, so the unit here is a tab: a Terminal window's
+    // tabs are listed one by one ({window, tab, index}), exact claims first
+    // across all windows. The first of a window's tabs to be restored creates
+    // the window; the rest join it, and the saved order and selection are put
+    // back once all are in.
+    NSMutableArray<NSDictionary<NSString *, id> *> *orderedDescriptors = [NSMutableArray array];
+    NSMutableArray<NSDictionary<NSString *, id> *> *deferredTerminals = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *descriptor in windowDescriptors) {
+        if (![descriptor[@"kind"] isEqualToString:ISHWorkspaceSavedLayoutKindTerminal]) {
+            [orderedDescriptors addObject:descriptor];
+            continue;
+        }
+        NSArray *savedTabs = [descriptor[@"tabs"] isKindOfClass:NSArray.class] ? descriptor[@"tabs"] : nil;
+        if (savedTabs.count < 2)
+            savedTabs = @[descriptor];
+        for (NSUInteger index = 0; index < savedTabs.count; index++) {
+            NSDictionary<NSString *, id> *tab = savedTabs[index];
+            if (![tab isKindOfClass:NSDictionary.class])
+                continue;
+            NSDictionary<NSString *, id> *unit = @{@"kind": ISHWorkspaceSavedLayoutKindTerminal,
+                                                   @"window": descriptor, @"tab": tab, @"index": @(index)};
+            if (checkpoint_restored_session_pending([tab[@"sessionPid"] intValue]))
+                [orderedDescriptors addObject:unit];
+            else
+                [deferredTerminals addObject:unit];
+        }
+    }
+    [orderedDescriptors addObjectsFromArray:deferredTerminals];
+    // The terminal each restored tab ended up in, by window descriptor and tab
+    // index; for putting the tabs back in order below.
+    NSMapTable<NSDictionary<NSString *, id> *, NSMutableDictionary<NSNumber *, TerminalViewController *> *> *restoredTabs =
+        [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                  valueOptions:NSPointerFunctionsStrongMemory capacity:4];
+    NSMapTable<NSDictionary<NSString *, id> *, NSMutableDictionary<NSNumber *, NSString *> *> *restoredTabRoles =
+        [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                  valueOptions:NSPointerFunctionsStrongMemory capacity:4];
+    // Keyed by the descriptor OBJECT, not its contents: two windows of the
+    // same applet at the same spot (a cascade that wrapped, or two zoomed
+    // windows) have equal dictionaries, and an isEqual: map would hand both
+    // lookups the same window and leave the other one at the back.
+    NSMapTable<NSDictionary<NSString *, id> *, ISHWorkspaceContainedWindowView *> *windowsByDescriptor =
+        [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                                  valueOptions:NSPointerFunctionsWeakMemory
+                                      capacity:windowDescriptors.count];
+    for (NSDictionary<NSString *, id> *descriptor in orderedDescriptors) {
         NSString *kind = descriptor[@"kind"];
         NSDictionary<NSString *, id> *frameDescriptor = descriptor[@"frame"];
         if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTool]) {
@@ -3697,10 +5013,18 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             if ([self isGlobalToolIdentifier:toolIdentifier] && [self desktopWindowForToolIdentifier:toolIdentifier] != nil)
                 continue;
             ISHWorkspaceContainedWindowView *windowView = [self openWorkspaceToolWindowWithIdentifier:toolIdentifier];
+            if (windowView != nil)
+                [windowsByDescriptor setObject:windowView forKey:descriptor];
             [self applySavedFrameDescriptor:frameDescriptor
                                    toWindow:windowView
                                fallbackSize:ISHWorkspacePreferredToolContentSize(toolIdentifier)];
             [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
+            // Before the state: a restored viewer opens its file from the state,
+            // and should render it at the size it had.
+            NSNumber *textScale = [descriptor[@"textScale"] isKindOfClass:NSNumber.class] ? descriptor[@"textScale"] : nil;
+            UIViewController *scalableViewController = [self contentViewControllerForDesktopWindow:windowView];
+            if (textScale != nil && [scalableViewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+                ((id<WorkspaceTextScalable>) scalableViewController).workspaceTextScale = textScale.doubleValue;
             NSDictionary<NSString *, id> *toolState = [descriptor[@"state"] isKindOfClass:NSDictionary.class] ? descriptor[@"state"] : nil;
             if (toolState != nil) {
                 UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
@@ -3710,30 +5034,103 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             continue;
         }
         if ([kind isEqualToString:ISHWorkspaceSavedLayoutKindTerminal]) {
-            NSUUID *displayTerminalUUID = [[NSUUID alloc] initWithUUIDString:descriptor[@"terminalUUID"]];
-            NSUUID *sessionTerminalUUID = [[NSUUID alloc] initWithUUIDString:descriptor[@"sessionTerminalUUID"]];
+            // A unit: the saved window and one of its tabs (see above).
+            NSDictionary<NSString *, id> *windowDescriptor = descriptor[@"window"];
+            NSDictionary<NSString *, id> *tabDescriptor = descriptor[@"tab"];
+            NSNumber *tabIndex = descriptor[@"index"];
+            frameDescriptor = windowDescriptor[@"frame"];
+            NSUUID *displayTerminalUUID = [[NSUUID alloc] initWithUUIDString:tabDescriptor[@"terminalUUID"] ?: @""];
+            NSUUID *sessionTerminalUUID = [[NSUUID alloc] initWithUUIDString:tabDescriptor[@"sessionTerminalUUID"] ?: @""];
             if (displayTerminalUUID == nil && sessionTerminalUUID == nil)
                 continue;
             Terminal *displayTerminal = displayTerminalUUID != nil ? [Terminal terminalWithUUID:displayTerminalUUID] : nil;
-            NSString *terminalRole = [self terminalRoleFromSavedDescriptor:descriptor displayTerminal:displayTerminal];
+            NSString *terminalRole = [self terminalRoleFromSavedDescriptor:tabDescriptor displayTerminal:displayTerminal];
             if ([deduplicatedTerminalRoles containsObject:terminalRole] && [restoredTerminalRoles containsObject:terminalRole])
                 continue;
+            ISHWorkspaceContainedWindowView *tabsWindow = [windowsByDescriptor objectForKey:windowDescriptor];
+            if (tabsWindow != nil) {
+                // The window exists: this tab joins it.
+                TerminalViewController *restoredTab = [self restoreTerminalTab:tabDescriptor role:terminalRole intoWindow:tabsWindow];
+                if (restoredTab != nil) {
+                    [[restoredTabs objectForKey:windowDescriptor] setObject:restoredTab forKey:tabIndex];
+                    [[restoredTabRoles objectForKey:windowDescriptor] setObject:terminalRole forKey:tabIndex];
+                    if ([deduplicatedTerminalRoles containsObject:terminalRole])
+                        [restoredTerminalRoles addObject:terminalRole];
+                }
+                continue;
+            }
+            NSDictionary<NSString *, id> *fields = tabDescriptor; // the tab's, below
+            // A layout from before "ownsSession" was recorded says nothing
+            // either way; those windows keep the old behaviour and may adopt.
+            BOOL ownsSession = fields[@"ownsSession"] == nil || [fields[@"ownsSession"] boolValue];
             ISHWorkspaceContainedWindowView *windowView =
                 [self restoreDesktopTerminalWindowWithSessionUUID:(sessionTerminalUUID ?: displayTerminalUUID)
                                               displayTerminalUUID:displayTerminalUUID
-                                                    terminalRole:terminalRole];
+                                                    terminalRole:terminalRole
+                                                      sessionPid:[fields[@"sessionPid"] intValue]
+                                                     ownsSession:ownsSession];
             if (windowView != nil) {
+                [windowsByDescriptor setObject:windowView forKey:windowDescriptor];
+                if (windowView.hostedTerminalViewController != nil) {
+                    [restoredTabs setObject:[@{tabIndex: windowView.hostedTerminalViewController} mutableCopy]
+                                     forKey:windowDescriptor];
+                    [restoredTabRoles setObject:[@{tabIndex: terminalRole} mutableCopy] forKey:windowDescriptor];
+                }
                 if ([deduplicatedTerminalRoles containsObject:terminalRole])
                     [restoredTerminalRoles addObject:terminalRole];
                 [self applySavedFrameDescriptor:frameDescriptor
                                        toWindow:windowView
                                    fallbackSize:ISHWorkspacePreferredTerminalContentSize()];
-                [self assignRestoredWindow:windowView toDesktopFromDescriptor:descriptor];
-                CGFloat savedFontSize = [descriptor[@"fontSize"] doubleValue];
+                [self assignRestoredWindow:windowView toDesktopFromDescriptor:windowDescriptor];
+                // The history first, before the restored session writes a
+                // thing, so the shell's prompt lands after it rather than in
+                // the middle of it. sendOutput buffers until the web view has
+                // loaded, so this is safe this early.
+                NSString *savedContents = fields[@"contents"];
+                if ([savedContents isKindOfClass:NSString.class] && savedContents.length > 0)
+                    [windowView.hostedTerminalViewController.terminal
+                        writeRestoredContents:savedContents];
+                CGFloat savedFontSize = [fields[@"fontSize"] doubleValue];
                 if (savedFontSize > 0)
                     windowView.hostedTerminalViewController.overrideFontSize = savedFontSize;
             }
         }
+    }
+    // Each Terminal window's tabs in their saved order, the saved one showing.
+    for (NSDictionary<NSString *, id> *windowDescriptor in restoredTabs) {
+        ISHWorkspaceContainedWindowView *windowView = [windowsByDescriptor objectForKey:windowDescriptor];
+        ISHWorkspaceTerminalTabsViewController *tabsController = [self terminalTabsForWindow:windowView];
+        NSDictionary<NSNumber *, TerminalViewController *> *byIndex = [restoredTabs objectForKey:windowDescriptor];
+        NSDictionary<NSNumber *, NSString *> *rolesByIndex = [restoredTabRoles objectForKey:windowDescriptor];
+        if (tabsController == nil || byIndex.count < 2)
+            continue;
+        NSArray<NSNumber *> *indices = [byIndex.allKeys sortedArrayUsingSelector:@selector(compare:)];
+        NSMutableArray<TerminalViewController *> *ordered = [NSMutableArray array];
+        NSMutableArray<NSString *> *roles = [NSMutableArray array];
+        NSInteger selected = 0;
+        NSInteger savedSelected = [windowDescriptor[@"selectedTab"] integerValue];
+        for (NSNumber *index in indices) {
+            if (index.integerValue == savedSelected)
+                selected = (NSInteger) ordered.count;
+            [ordered addObject:byIndex[index]];
+            [roles addObject:rolesByIndex[index] ?: ISHWorkspaceTerminalRoleGeneric];
+        }
+        [tabsController arrangeTabs:ordered roles:roles selectedIndex:selected];
+    }
+    // The stacking the layout saved, front to back: the loop above created
+    // the windows in claiming order, not this one.
+    for (NSDictionary<NSString *, id> *descriptor in windowDescriptors) {
+        ISHWorkspaceContainedWindowView *windowView = [windowsByDescriptor objectForKey:descriptor];
+        if (windowView != nil && windowView.superview == self.desktopSurfaceView)
+            [self.desktopSurfaceView bringSubviewToFront:windowView];
+    }
+
+    // The Desktop that was showing -- after the windows, because switching
+    // decides which of them are visible.
+    if (desktopsDescriptor != nil) {
+        NSInteger active = [desktopsDescriptor[@"active"] integerValue];
+        if (active >= 0 && active < self.desktopCount)
+            [self switchToDesktopIndex:active];
     }
 
     [self applyDesktopVisibility];
@@ -3763,6 +5160,13 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
         ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        // Any tab; a match in a background tab is brought forward.
+        ISHWorkspaceTerminalTabsViewController *tabs = [self terminalTabsForWindow:windowView];
+        if (tabs != nil) {
+            if ([tabs selectTabShowingTerminalUUID:terminalUUID orSessionUUID:NO])
+                return windowView;
+            continue;
+        }
         TerminalViewController *terminalViewController = windowView.hostedTerminalViewController;
         if (terminalViewController == nil)
             continue;
@@ -3833,7 +5237,10 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (windowView == nil)
         return;
     [self.desktopSurfaceView bringSubviewToFront:windowView];
-    [windowView.hostedTerminalViewController focusTerminal];
+    if (windowView.hostedTerminalViewController != nil)
+        [windowView.hostedTerminalViewController focusTerminal];
+    else
+        [self claimKeyboardFocusForTextScalableWindow:windowView];
     [self refreshDockButtons];
 }
 
@@ -3842,6 +5249,11 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (gestureRecognizer.view == self.desktopSurfaceView)
         return touch.view == self.desktopSurfaceView || touch.view == self.desktopWallpaperView;
     return YES;
+}
+
+- (void)handleDesktopTap:(UITapGestureRecognizer *)recognizer {
+    if (recognizer.state == UIGestureRecognizerStateEnded)
+        [self becomeFirstResponder];
 }
 
 - (void)handleDesktopLongPress:(UILongPressGestureRecognizer *)recognizer {
@@ -3873,10 +5285,13 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     } else {
         [pip setTitle:@"☰" forState:UIControlStateNormal];
     }
-    pip.tintColor = UIColor.whiteColor;
-    [pip setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
     NSDictionary<NSString *, UIColor *> *pipTheme = ISHWorkspaceThemeDescriptor();
-    pip.backgroundColor = pipTheme[@"accent"] ?: [UIColor colorWithRed:0.20 green:0.48 blue:0.96 alpha:1.0];
+    UIColor *pipFill = pipTheme[@"accent"] ?: [UIColor colorWithRed:0.20 green:0.48 blue:0.96 alpha:1.0];
+    // Same rule as the title bar: the glyph is measured against the pill it sits on.
+    UIColor *pipInk = ISHWorkspaceThemeOnSurfaceColor(pipFill, 4.5);
+    pip.tintColor = pipInk;
+    [pip setTitleColor:pipInk forState:UIControlStateNormal];
+    pip.backgroundColor = pipFill;
     pip.layer.cornerRadius = 22.0;
     pip.layer.borderWidth = 1.5;
     pip.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.85].CGColor;
@@ -3884,8 +5299,8 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     pip.layer.shadowOpacity = 0.35;
     pip.layer.shadowRadius = 6.0;
     pip.layer.shadowOffset = CGSizeMake(0.0, 2.0);
-    pip.accessibilityLabel = @"Workspace menu";
-    pip.accessibilityHint = @"Opens the desktop menu for window management.";
+    pip.accessibilityLabel = NSLocalizedString(@"Workspace menu", @"accessibility label for workspace menu button");
+    pip.accessibilityHint = NSLocalizedString(@"Opens the desktop menu for window management.", @"accessibility hint for workspace menu button");
     [pip addTarget:self action:@selector(menuPipTapped:) forControlEvents:UIControlEventTouchUpInside];
     pip.hidden = !ISHWorkspaceUsesModernStyle();
     return pip;
@@ -3896,10 +5311,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 }
 
 - (void)presentIconManagerFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Windows"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Windows", @"action sheet title listing open windows") message:nil];
 
     NSUInteger listed = 0;
     for (ISHWorkspaceContainedWindowView *windowView in self.desktopWindows.copy) {
@@ -3907,30 +5319,23 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             continue;
         if (windowView == self.dashboardWindow || windowView == self.dockWindow)
             continue;
-        NSString *name = windowView.titleLabel.text.length > 0 ? windowView.titleLabel.text : @"Window";
+        NSString *name = windowView.titleLabel.text.length > 0 ? windowView.titleLabel.text : NSLocalizedString(@"Window", @"generic window name");
         __weak typeof(self) weakSelf = self;
         __weak typeof(windowView) weakWindow = windowView;
-        [sheet addAction:[UIAlertAction actionWithTitle:name
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:name
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [weakSelf focusDesktopWindow:weakWindow];
-        }]];
+        }];
         listed++;
     }
     if (listed == 0) {
-        UIAlertAction *empty = [UIAlertAction actionWithTitle:@"No open windows" style:UIAlertActionStyleDefault handler:nil];
+        UIAlertAction *empty = [sheet addActionWithTitle:NSLocalizedString(@"No open windows", @"action sheet placeholder item") style:UIAlertActionStyleDefault handler:nil];
         empty.enabled = NO;
-        [sheet addAction:empty];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 // Run a launcher shortcut: a {token} command opens the matching built-in tool or singleton
@@ -3956,13 +5361,19 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // An empty command just opens a fresh terminal (so a shortcut named "terminal" with no
 // command gives you a plain shell); a non-empty command is injected once the shell is up.
 - (void)launchTerminalWithCommand:(NSString *)command title:(NSString *)title {
-    NSString *windowTitle = title.length > 0 ? title : (command.length > 0 ? command : @"Terminal");
+    NSString *windowTitle = title.length > 0 ? title : (command.length > 0 ? command : NSLocalizedString(@"Terminal", @"terminal window title fallback"));
     TerminalViewController *terminalViewController = [self createDesktopTerminalViewController];
     if (terminalViewController == nil) {
         [self presentSceneActivationError:nil];
         return;
     }
     terminalViewController.freshSessionTerminalDisplayMode = ISHFreshSessionTerminalDisplayModeSessionShell;
+    // A window the user just asked for is not a restore. The restored-session
+    // queue outlives the launch that filled it, and "any session will do" --
+    // the full-screen terminal's rule -- handed a terminal opened minutes
+    // later some leftover shell instead of starting one, which shows up as a
+    // window that never prints a prompt.
+    terminalViewController.declinesRestoredSession = YES;
     ISHWorkspaceContainedWindowView *windowView =
         [self openDesktopTerminalWindowWithTitle:windowTitle terminalViewController:terminalViewController];
     [terminalViewController startNewSession];
@@ -3992,67 +5403,59 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // are reachable without leaving the popup.
 - (void)presentLauncherFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect path:(NSArray<NSNumber *> *)path {
     NSArray<NSDictionary<NSString *, id> *> *shortcuts = ISHWorkspaceLauncherArrayAtPath(path);
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Launcher"
-                                            message:shortcuts.count == 0 ? @"Add a shortcut to run a command in a new terminal." : nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Launcher", @"launcher action sheet title")
+                                                         message:shortcuts.count == 0 ? NSLocalizedString(@"Add a shortcut to run a command in a new terminal.", @"launcher message when there are no shortcuts") : nil];
     [shortcuts enumerateObjectsUsingBlock:^(NSDictionary<NSString *, id> *shortcut, NSUInteger idx, __unused BOOL *stop) {
         NSString *command = shortcut[@"command"] ?: @"";
         NSString *shortcutName = shortcut[@"name"];
         NSString *name = shortcutName.length > 0 ? shortcutName
-                       : (command.length > 0 ? command : @"Terminal");
+                       : (command.length > 0 ? command : NSLocalizedString(@"Terminal", @"launcher shortcut name fallback"));
         if (ISHWorkspaceShortcutIsGroup(shortcut)) {
-            [sheet addAction:[UIAlertAction actionWithTitle:[name stringByAppendingString:@" ›"]
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(__unused UIAlertAction *action) {
+            [sheet addActionWithTitle:[name stringByAppendingString:@" ›"]
+                                style:UIAlertActionStyleDefault
+                              handler:^(__unused UIAlertAction *action) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     [self presentLauncherFromView:sourceView sourceRect:sourceRect
                                               path:[path arrayByAddingObject:@(idx)]];
                 });
-            }]];
+            }];
         } else {
-            [sheet addAction:[UIAlertAction actionWithTitle:name
-                                                      style:UIAlertActionStyleDefault
-                                                    handler:^(__unused UIAlertAction *action) {
+            [sheet addActionWithTitle:name
+                                style:UIAlertActionStyleDefault
+                              handler:^(__unused UIAlertAction *action) {
                 [self runLauncherShortcutWithCommand:command title:name];
-            }]];
+            }];
         }
     }];
     if (path.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"‹ Back"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:NSLocalizedString(@"‹ Back", @"launcher action to go up one group level")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self presentLauncherFromView:sourceView sourceRect:sourceRect
                                           path:[path subarrayWithRange:NSMakeRange(0, path.count - 1)]];
             });
-        }]];
+        }];
     }
     if (path.count == 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Show on Desktop"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:NSLocalizedString(@"Show on Desktop", @"launcher action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Edit Shortcuts…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:NSLocalizedString(@"Edit Shortcuts…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         // Defer: presenting from a sheet handler races the sheet dismissal and
         // iOS 27 drops it (see presentDesktopRootMenuFromView).
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentLauncherEditorFromView:sourceView path:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 // Lean "+" entry point (used by the Launcher applet's own Add button, alongside its Edit
@@ -4061,57 +5464,48 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // and which also lists items for rename/delete — redundant with the applet's own inline
 // delete/drag chrome, so the applet uses this instead).
 - (void)presentAddLauncherOptionsFromView:(UIView *)sourceView path:(NSArray<NSNumber *> *)path {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Add"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Shortcut…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Add", @"launcher add sheet title") message:nil];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Shortcut…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherShortcutAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Built-in…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Built-in…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherBuiltinFromView:sourceView path:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Group…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Group…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherGroupAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)presentAddLauncherShortcutAtPath:(NSArray<NSNumber *> *)path {
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Add Shortcut"
-                                            message:@"A name, and a command to run in a new terminal. Leave it blank for just a terminal, or use a {token} like {clock} or {browser} to open a built-in."
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Add Shortcut", @"alert title")
+                                            message:NSLocalizedString(@"A name, and a command to run in a new terminal. Leave it blank for just a terminal, or use a {token} like {clock} or {browser} to open a built-in.", @"add shortcut alert message; keep {token}, {clock}, {browser} untranslated")
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"Name (e.g. skippy or terminal)";
+        textField.placeholder = NSLocalizedString(@"Name (e.g. skippy or terminal)", @"shortcut name placeholder");
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"Command (e.g. ssh skippy — blank for a shell)";
+        textField.placeholder = NSLocalizedString(@"Command (e.g. ssh skippy — blank for a shell)", @"shortcut command placeholder");
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
         textField.autocorrectionType = UITextAutocorrectionTypeNo;
     }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         NSString *command = alert.textFields[1].text ?: @"";
@@ -4123,7 +5517,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             [level addObject:@{@"name": name, @"command": command}];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -4131,14 +5525,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 // populated by drilling into it and using "Add Shortcut…"/"Add Built-in…"/"Add Group…" again.
 - (void)presentAddLauncherGroupAtPath:(NSArray<NSNumber *> *)path {
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Add Group"
-                                            message:@"A group holds its own list of shortcuts — e.g. \"Remote Login\" holding several hosts. Add shortcuts to it after creating it."
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Add Group", @"alert title")
+                                            message:NSLocalizedString(@"A group holds its own list of shortcuts — e.g. \"Remote Login\" holding several hosts. Add shortcuts to it after creating it.", @"add launcher group alert message")
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"Name (e.g. Remote Login)";
+        textField.placeholder = NSLocalizedString(@"Name (e.g. Remote Login)", @"launcher group name placeholder");
         textField.autocapitalizationType = UITextAutocapitalizationTypeWords;
     }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         NSString *name = alert.textFields[0].text ?: @"";
@@ -4148,7 +5542,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
             [level addObject:@{@"name": name, @"children": @[]}];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -4161,108 +5555,93 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
 
 - (void)presentLauncherEditorFromView:(UIView *)sourceView path:(NSArray<NSNumber *> *)path {
     NSArray<NSDictionary<NSString *, id> *> *shortcuts = ISHWorkspaceLauncherArrayAtPath(path);
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Edit Shortcuts"
-                                            message:shortcuts.count == 0 ? @"Add a shortcut to run a command — or just open a terminal." : @"Pick a shortcut to rename, change, move, or delete."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Edit Shortcuts", @"action sheet title")
+                                                         message:shortcuts.count == 0 ? NSLocalizedString(@"Add a shortcut to run a command — or just open a terminal.", @"edit shortcuts message when empty") : NSLocalizedString(@"Pick a shortcut to rename, change, move, or delete.", @"edit shortcuts message")];
     [shortcuts enumerateObjectsUsingBlock:^(NSDictionary<NSString *, id> *shortcut, NSUInteger idx, __unused BOOL *stop) {
         NSString *command = shortcut[@"command"];
         NSString *shortcutName = shortcut[@"name"];
         NSString *name = shortcutName.length > 0 ? shortcutName
-                       : (command.length > 0 ? command : @"Terminal");
+                       : (command.length > 0 ? command : NSLocalizedString(@"Terminal", @"launcher shortcut name fallback"));
         if (ISHWorkspaceShortcutIsGroup(shortcut))
             name = [name stringByAppendingString:@" ›"];
-        [sheet addAction:[UIAlertAction actionWithTitle:name
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:name
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self presentEditLauncherShortcutAtPath:path index:idx];
             });
-        }]];
+        }];
     }];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Shortcut…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Shortcut…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherShortcutAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Built-in…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Built-in…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherBuiltinFromView:sourceView path:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Group…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Group…", @"launcher action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentAddLauncherGroupAtPath:path];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 // Discoverable companion to the {token} syntax: pick a built-in tool and it's added as a
 // shortcut whose command is the matching {token}.
 - (void)presentAddLauncherBuiltinFromView:(UIView *)sourceView path:(NSArray<NSNumber *> *)path {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *builtins = [@[
-        @{@"name": @"New Terminal", @"command": @""},
-        @{@"name": @"Session Shell", @"command": @"{shell}"},
-        @{@"name": @"System Console", @"command": @"{console}"},
-        @{@"name": @"Web Browser", @"command": @"{browser}"},
-        @{@"name": @"Music", @"command": @"{music}"},
+        @{@"name": NSLocalizedString(@"New Terminal", @"built-in launcher shortcut name"), @"command": @""},
+        @{@"name": NSLocalizedString(@"Session Shell", @"built-in launcher shortcut name"), @"command": @"{shell}"},
+        @{@"name": NSLocalizedString(@"System Console", @"built-in launcher shortcut name"), @"command": @"{console}"},
+        @{@"name": NSLocalizedString(@"Web Browser", @"built-in launcher shortcut name"), @"command": @"{browser}"},
+        @{@"name": NSLocalizedString(@"Music", @"built-in launcher shortcut name"), @"command": @"{music}"},
+        @{@"name": NSLocalizedString(@"Equalizer", @"built-in launcher shortcut name"), @"command": @"{equalizer}"},
         @{@"name": @"MotePad", @"command": @"{motepad}"},
-        @{@"name": @"File Manager", @"command": @"{files}"},
+        @{@"name": NSLocalizedString(@"File Manager", @"built-in launcher shortcut name"), @"command": @"{files}"},
         @{@"name": @"Markdown", @"command": @"{markdown}"},
-        @{@"name": @"Image Viewer", @"command": @"{imageviewer}"},
-        @{@"name": @"Video Player", @"command": @"{videoplayer}"},
+        @{@"name": NSLocalizedString(@"Image Viewer", @"built-in launcher shortcut name"), @"command": @"{imageviewer}"},
+        @{@"name": NSLocalizedString(@"Video Player", @"built-in launcher shortcut name"), @"command": @"{videoplayer}"},
         @{@"name": @"Wayland", @"command": @"{display}"},
-        @{@"name": @"Clock", @"command": @"{clock}"},
-        @{@"name": @"Monitor", @"command": @"{monitor}"},
-        @{@"name": @"Networks", @"command": @"{networks}"},
-        @{@"name": @"Logs", @"command": @"{logs}"},
-        @{@"name": @"Storage", @"command": @"{storage}"},
-        @{@"name": @"Boot Images", @"command": @"{images}"},
-        @{@"name": @"Themes", @"command": @"{themes}"},
-        @{@"name": @"Sessions", @"command": @"{sessions}"},
-        @{@"name": @"Diagnostics", @"command": @"{diagnostics}"},
-        @{@"name": @"Settings", @"command": @"{settings}"},
+        @{@"name": NSLocalizedString(@"Clock", @"built-in launcher shortcut name"), @"command": @"{clock}"},
+        @{@"name": NSLocalizedString(@"Monitor", @"built-in launcher shortcut name"), @"command": @"{monitor}"},
+        @{@"name": NSLocalizedString(@"Networks", @"built-in launcher shortcut name"), @"command": @"{networks}"},
+        @{@"name": NSLocalizedString(@"Logs", @"built-in launcher shortcut name"), @"command": @"{logs}"},
+        @{@"name": NSLocalizedString(@"Storage", @"built-in launcher shortcut name"), @"command": @"{storage}"},
+        @{@"name": NSLocalizedString(@"Boot Images", @"built-in launcher shortcut name"), @"command": @"{images}"},
+        @{@"name": NSLocalizedString(@"Themes", @"built-in launcher shortcut name"), @"command": @"{themes}"},
+        @{@"name": NSLocalizedString(@"Sessions", @"built-in launcher shortcut name"), @"command": @"{sessions}"},
+        @{@"name": NSLocalizedString(@"Diagnostics", @"built-in launcher shortcut name"), @"command": @"{diagnostics}"},
+        @{@"name": NSLocalizedString(@"Settings", @"built-in launcher shortcut name"), @"command": @"{settings}"},
     ] mutableCopy];
     if (ISHLLMClientEnabled())
-        [builtins addObject:@{@"name": @"LLM Chat", @"command": @"{llm}"}];
+        [builtins addObject:@{@"name": NSLocalizedString(@"LLM Chat", @"built-in launcher shortcut name"), @"command": @"{llm}"}];
 
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Add Built-in"
-                                            message:@"Open a built-in tool straight from the Launcher."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Add Built-in", @"action sheet title")
+                                                         message:NSLocalizedString(@"Open a built-in tool straight from the Launcher.", @"add built-in sheet message")];
     for (NSDictionary<NSString *, NSString *> *builtin in builtins) {
-        [sheet addAction:[UIAlertAction actionWithTitle:builtin[@"name"]
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:builtin[@"name"]
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             ISHWorkspaceLauncherMutateAtPath(path, ^(NSMutableArray<NSDictionary<NSString *, id> *> *level) {
                 [level addObject:builtin];
             });
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)presentEditLauncherShortcutAtPath:(NSArray<NSNumber *> *)path index:(NSUInteger)index {
@@ -4273,24 +5652,24 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     BOOL isGroup = ISHWorkspaceShortcutIsGroup(shortcut);
 
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:isGroup ? @"Edit Group" : @"Edit Shortcut"
-                                            message:isGroup ? @"Rename, move, or delete this group. Drill into it from the list to edit what's inside."
-                                                             : @"Leave the command blank to just open a terminal."
+        [UIAlertController alertControllerWithTitle:isGroup ? NSLocalizedString(@"Edit Group", @"alert title") : NSLocalizedString(@"Edit Shortcut", @"alert title")
+                                            message:isGroup ? NSLocalizedString(@"Rename, move, or delete this group. Drill into it from the list to edit what's inside.", @"edit launcher group alert message")
+                                                             : NSLocalizedString(@"Leave the command blank to just open a terminal.", @"edit shortcut alert message")
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"Name";
+        textField.placeholder = NSLocalizedString(@"Name", @"shortcut name placeholder");
         textField.text = shortcut[@"name"];
         textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
     if (!isGroup) {
         [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-            textField.placeholder = @"Command (blank for a shell)";
+            textField.placeholder = NSLocalizedString(@"Command (blank for a shell)", @"shortcut command placeholder");
             textField.text = shortcut[@"command"];
             textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
             textField.autocorrectionType = UITextAutocorrectionTypeNo;
         }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         NSString *nameField = alert.textFields[0].text ?: @"";
@@ -4308,7 +5687,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         });
     }]];
     if (index > 0) {
-        [alert addAction:[UIAlertAction actionWithTitle:@"Move Up"
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Move Up", @"alert button to move a shortcut up")
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(__unused UIAlertAction *action) {
             ISHWorkspaceLauncherMutateAtPath(path, ^(NSMutableArray<NSDictionary<NSString *, id> *> *level) {
@@ -4319,7 +5698,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         }]];
     }
     if (index + 1 < shortcuts.count) {
-        [alert addAction:[UIAlertAction actionWithTitle:@"Move Down"
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Move Down", @"alert button to move a shortcut down")
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(__unused UIAlertAction *action) {
             ISHWorkspaceLauncherMutateAtPath(path, ^(NSMutableArray<NSDictionary<NSString *, id> *> *level) {
@@ -4330,9 +5709,11 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         }]];
     }
     NSString *deleteTitle = isGroup && ISHWorkspaceShortcutChildren(shortcut).count > 0
-        ? [NSString stringWithFormat:@"Delete Group and %lu Item%@", (unsigned long)ISHWorkspaceShortcutChildren(shortcut).count,
-                                      ISHWorkspaceShortcutChildren(shortcut).count == 1 ? @"" : @"s"]
-        : @"Delete";
+        ? [NSString stringWithFormat:ISHWorkspaceShortcutChildren(shortcut).count == 1
+                                          ? NSLocalizedString(@"Delete Group and %lu Item", @"alert button to delete a launcher group holding one item")
+                                          : NSLocalizedString(@"Delete Group and %lu Items", @"alert button to delete a launcher group and its items"),
+                                      (unsigned long)ISHWorkspaceShortcutChildren(shortcut).count]
+        : NSLocalizedString(@"Delete", @"alert button to delete a shortcut");
     [alert addAction:[UIAlertAction actionWithTitle:deleteTitle
                                               style:UIAlertActionStyleDestructive
                                             handler:^(__unused UIAlertAction *action) {
@@ -4341,7 +5722,7 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
                 [level removeObjectAtIndex:index];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -4352,14 +5733,14 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolLauncherIdentifier];
     if (window == nil)
         return;
-    [self resizeDesktopWindow:window toSize:ISHWorkspaceLauncherContentSize(itemCount, showsBackRow) animated:YES];
-}
-
-- (void)autosizeMonitorWindow {
-    ISHWorkspaceContainedWindowView *window = [self desktopWindowForToolIdentifier:ISHWorkspaceToolMonitorIdentifier];
-    if (window == nil)
-        return;
-    [self resizeDesktopWindow:window toSize:ISHWorkspaceMonitorContentSize() animated:YES];
+    // At the list's own text size, or its scaled rows run past the window.
+    CGFloat textScale = 1.0;
+    UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:window];
+    if ([contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+        textScale = ((id<WorkspaceTextScalable>) contentViewController).workspaceTextScale;
+    [self resizeDesktopWindow:window
+                       toSize:ISHWorkspaceLauncherContentSizeAtTextScale(itemCount, showsBackRow, textScale)
+                     animated:YES];
 }
 
 // In-app Desktops: a Desktop is a set of contained windows sharing a workspaceDesktopIndex.
@@ -4482,6 +5863,9 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
         }];
         _lockedDesktopIndices = shifted;
     }
+    if (indexToRemove < (NSInteger) _desktopNames.count)
+        [_desktopNames removeObjectAtIndex:(NSUInteger) indexToRemove];
+    ISHWorkspaceTrimDesktopNames(_desktopNames);
     self.desktopCount -= 1;
     if (self.activeDesktopIndex >= self.desktopCount)
         self.activeDesktopIndex = self.desktopCount - 1;
@@ -4501,6 +5885,45 @@ static UIView *ISHWorkspaceFindFirstResponder(UIView *view) {
     if (index == 0)
         return YES;  // the first Desktop is permanently protected and can't be removed
     return index >= 0 && [self.lockedDesktopIndices containsIndex:(NSUInteger)index];
+}
+
+// The names are what the Desktops applet, the switch toast and the Desktops menu
+// show. A Desktop without one is named for its position, so removing a Desktop
+// renumbers the unnamed ones after it, as it always has.
+- (NSString *)nameForDesktopAtIndex:(NSInteger)index {
+    return [self customNameForDesktopAtIndex:index]
+        ?: [NSString stringWithFormat:NSLocalizedString(@"Desktop %ld", @"default desktop name with number"), (long)(index + 1)];
+}
+
+- (NSString *)customNameForDesktopAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger) _desktopNames.count)
+        return nil;
+    NSString *name = _desktopNames[(NSUInteger) index];
+    return name.length > 0 ? name : nil;
+}
+
+// An empty (or all-space) name gives the Desktop back its positional one.
+- (void)setName:(NSString *)name forDesktopAtIndex:(NSInteger)index {
+    if (index < 0 || index >= self.desktopCount)
+        return;
+    NSString *trimmed = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet] ?: @"";
+    if (_desktopNames == nil)
+        _desktopNames = [NSMutableArray array];
+    while ((NSInteger) _desktopNames.count <= index)
+        [_desktopNames addObject:@""];
+    _desktopNames[(NSUInteger) index] = trimmed;
+    ISHWorkspaceTrimDesktopNames(_desktopNames);
+    [self postDesktopsDidChange];
+}
+
+// What both arrangement writers record for the Desktops themselves.
+- (NSDictionary<NSString *, id> *)desktopsLayoutDescriptor {
+    NSMutableDictionary<NSString *, id> *descriptor = [@{@"kind": ISHWorkspaceSavedLayoutKindDesktops,
+                                                         @"count": @(self.desktopCount),
+                                                         @"active": @(self.activeDesktopIndex)} mutableCopy];
+    if (_desktopNames.count > 0)
+        descriptor[@"names"] = [_desktopNames copy];
+    return descriptor;
 }
 
 - (void)toggleDesktopLockAtIndex:(NSInteger)index {
@@ -4543,7 +5966,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 // regardless of what's focused (see there for why): the branch lives here in the action instead.
 - (void)hotkeyPreviousDesktop:(UIKeyCommand *)command {
     UIView *responder = ISHWorkspaceFindFirstResponder(self.view);
-    if ([responder isKindOfClass:UITextView.class]) {
+    // EDITABLE text only. A read-only text view (the Markdown reader, the
+    // Diagnostics report) takes first responder when tapped, and a caret move
+    // there does nothing visible -- the chord would simply stop switching
+    // Desktops.
+    if ([responder isKindOfClass:UITextView.class] && ((UITextView *) responder).isEditable) {
         UITextView *textView = (UITextView *)responder;
         NSRange line = ISHWorkspaceLineRangeContainingIndex(textView.text, textView.selectedRange.location);
         textView.selectedRange = NSMakeRange(line.location, 0);
@@ -4554,7 +5981,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)hotkeyNextDesktop:(UIKeyCommand *)command {
     UIView *responder = ISHWorkspaceFindFirstResponder(self.view);
-    if ([responder isKindOfClass:UITextView.class]) {
+    if ([responder isKindOfClass:UITextView.class] && ((UITextView *) responder).isEditable) {
         UITextView *textView = (UITextView *)responder;
         NSRange line = ISHWorkspaceLineRangeContainingIndex(textView.text, textView.selectedRange.location);
         textView.selectedRange = NSMakeRange(NSMaxRange(line), 0);
@@ -4574,6 +6001,108 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 // iOS app switcher (system-reserved, unwinnable), and the guest terminal
 // doesn't claim Ctrl+Tab (plain Tab passes through; the RFB applet registers
 // unmodified \t only).
+// ---- text size: Cmd+= / Cmd++ / Cmd+- / Cmd+0 --------------------------------
+//
+// Terminal windows (TerminalViewController) and the Wayland display
+// (DisplayRFBView) bind these chords themselves. When one of them holds first
+// responder it is the nearer responder, so it wins and these never run. What
+// reaches here is everything else: an applet's text view, an applet that is
+// first responder itself, or the Workspace.
+
+// The Workspace takes first responder when a text-scalable applet with nothing
+// focused of its own comes to the front. Without that, a terminal in another
+// window kept first responder, and Cmd+= resized the terminal.
+- (BOOL)canBecomeFirstResponder {
+    return YES;
+}
+
+- (nullable id<WorkspaceTextScalable>)textScalableForDesktopWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
+    if ([contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+        return (id<WorkspaceTextScalable>) contentViewController;
+    return nil;
+}
+
+static UIResponder *ISHWorkspaceFirstResponderAmongViewControllers(UIViewController *viewController) {
+    if (viewController.isFirstResponder)
+        return viewController;
+    for (UIViewController *child in viewController.childViewControllers) {
+        UIResponder *responder = ISHWorkspaceFirstResponderAmongViewControllers(child);
+        if (responder != nil)
+            return responder;
+    }
+    return nil;
+}
+
+// The first responder inside the Workspace: the Workspace itself, a view
+// controller in one of its windows (the File Manager is first responder
+// itself), or a view.
+//
+// Asked of each responder with -isFirstResponder. It used to be found by
+// sending an action to nil and recording who received it, and that route is
+// not the first responder: it goes where UIKit sends EDITING actions, which can
+// still be a text view after something else took first responder. Measured:
+// with MotePad's editor left behind and the Workspace first responder, it named
+// the editor, and Cmd+= resized MotePad while a Markdown window was in front.
+- (nullable UIResponder *)workspaceFirstResponder {
+    return ISHWorkspaceFirstResponderAmongViewControllers(self) ?: ISHWorkspaceFindFirstResponder(self.view);
+}
+
+// Called when a non-terminal window comes to the front. Leaves focus alone when
+// the window already holds it -- MotePad's editor, a text field being typed in
+// -- or when the applet has no text to scale, so tapping a Clock does not take
+// the keyboard from a terminal.
+- (void)claimKeyboardFocusForTextScalableWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    if (windowView == nil || [self textScalableForDesktopWindow:windowView] == nil)
+        return;
+    if (ISHWorkspaceWindowContainingResponder([self workspaceFirstResponder]) == windowView)
+        return;
+    [self becomeFirstResponder];
+}
+
+// The window a text-size chord is for: the one holding first responder, else
+// the frontmost window on the active Desktop.
+- (nullable ISHWorkspaceContainedWindowView *)textSizeTargetWindow {
+    ISHWorkspaceContainedWindowView *focused = ISHWorkspaceWindowContainingResponder([self workspaceFirstResponder]);
+    if (focused != nil && focused != self.dockWindow && !focused.hidden &&
+            focused.superview == self.desktopSurfaceView)
+        return focused;
+    for (UIView *view in self.desktopSurfaceView.subviews.reverseObjectEnumerator) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        if (windowView == self.dockWindow || windowView.hidden)
+            continue;
+        return windowView;
+    }
+    return nil;
+}
+
+- (void)adjustTextSizeForToolViewController:(UIViewController *)viewController step:(NSInteger)step {
+    if (![viewController conformsToProtocol:@protocol(WorkspaceTextScalable)])
+        return;
+    id<WorkspaceTextScalable> scalable = (id<WorkspaceTextScalable>) viewController;
+    scalable.workspaceTextScale = ISHWorkspaceSteppedTextScale(scalable.workspaceTextScale, step);
+}
+
+- (void)hotkeyTextSize:(UIKeyCommand *)command {
+    NSInteger step = [command.input isEqualToString:@"-"] ? -1 : [command.input isEqualToString:@"0"] ? 0 : 1;
+    ISHWorkspaceContainedWindowView *windowView = [self textSizeTargetWindow];
+    if (windowView == nil)
+        return;
+    TerminalViewController *terminal = windowView.hostedTerminalViewController;
+    if (terminal != nil) {
+        if (step > 0)
+            [terminal increaseFontSize:nil];
+        else if (step < 0)
+            [terminal decreaseFontSize:nil];
+        else
+            [terminal resetFontSize:nil];
+        return;
+    }
+    [self adjustTextSizeForToolViewController:[self contentViewControllerForDesktopWindow:windowView] step:step];
+}
+
 - (void)hotkeyCycleWindows:(UIKeyCommand *)command {
     NSMutableArray<ISHWorkspaceContainedWindowView *> *windows = [NSMutableArray array];
     for (UIView *view in self.desktopSurfaceView.subviews) {
@@ -4595,23 +6124,24 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 }
 
 - (NSArray<UIKeyCommand *> *)keyCommands {
-    BOOL textEditing = [ISHWorkspaceFindFirstResponder(self.view) isKindOfClass:UITextView.class];
+    UIView *editingResponder = ISHWorkspaceFindFirstResponder(self.view);
+    BOOL textEditing = [editingResponder isKindOfClass:UITextView.class] && ((UITextView *) editingResponder).isEditable;
     UIKeyCommand *previous = [UIKeyCommand keyCommandWithInput:UIKeyInputLeftArrow
                                                  modifierFlags:UIKeyModifierCommand
                                                         action:@selector(hotkeyPreviousDesktop:)
-                                          discoverabilityTitle:textEditing ? @"Move to Start of Line" : @"Previous Desktop"];
+                                          discoverabilityTitle:textEditing ? NSLocalizedString(@"Move to Start of Line", @"keyboard shortcut title") : NSLocalizedString(@"Previous Desktop", @"keyboard shortcut title")];
     UIKeyCommand *next = [UIKeyCommand keyCommandWithInput:UIKeyInputRightArrow
                                              modifierFlags:UIKeyModifierCommand
                                                     action:@selector(hotkeyNextDesktop:)
-                                      discoverabilityTitle:textEditing ? @"Move to End of Line" : @"Next Desktop"];
+                                      discoverabilityTitle:textEditing ? NSLocalizedString(@"Move to End of Line", @"keyboard shortcut title") : NSLocalizedString(@"Next Desktop", @"keyboard shortcut title")];
     UIKeyCommand *cycleForward = [UIKeyCommand keyCommandWithInput:@"\t"
                                                      modifierFlags:UIKeyModifierControl
                                                             action:@selector(hotkeyCycleWindows:)
-                                              discoverabilityTitle:@"Next Window"];
+                                              discoverabilityTitle:NSLocalizedString(@"Next Window", @"keyboard shortcut title")];
     UIKeyCommand *cycleBackward = [UIKeyCommand keyCommandWithInput:@"\t"
                                                       modifierFlags:UIKeyModifierControl | UIKeyModifierShift
                                                              action:@selector(hotkeyCycleWindows:)
-                                               discoverabilityTitle:@"Previous Window"];
+                                               discoverabilityTitle:NSLocalizedString(@"Previous Window", @"keyboard shortcut title")];
     // Without this, iOS's own system-reserved default for Cmd+Arrow silently wins over the app:
     // the command still shows up in the Cmd-hold discoverability HUD (which lists everything
     // registered, not just what wins), but the action never fires. Same fix TerminalView.m
@@ -4633,11 +6163,88 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         cycleForward.wantsPriorityOverSystemBehavior = YES;
         cycleBackward.wantsPriorityOverSystemBehavior = YES;
     }
-    return @[previous, next, cycleForward, cycleBackward];
+    // Text size. Always present, by the rule above; only the titles vary. A
+    // focused terminal lists its own identical commands in the Cmd-hold HUD,
+    // so these go untitled then rather than appearing twice.
+    BOOL terminalFocused = ISHWorkspaceWindowContainingResponder([self workspaceFirstResponder]).hostedTerminalViewController != nil;
+    NSMutableArray<UIKeyCommand *> *commands = [@[previous, next, cycleForward, cycleBackward] mutableCopy];
+    NSArray<NSArray<NSString *> *> *textSizeChords = @[@[@"+", NSLocalizedString(@"Increase Text Size", @"keyboard shortcut title")], @[@"=", @""],
+                                                      @[@"-", NSLocalizedString(@"Decrease Text Size", @"keyboard shortcut title")], @[@"0", NSLocalizedString(@"Reset Text Size", @"keyboard shortcut title")]];
+    for (NSArray<NSString *> *chord in textSizeChords) {
+        UIKeyCommand *textSize = [UIKeyCommand keyCommandWithInput:chord[0]
+                                                     modifierFlags:UIKeyModifierCommand
+                                                            action:@selector(hotkeyTextSize:)];
+        if (!terminalFocused && chord[1].length > 0)
+            textSize.discoverabilityTitle = chord[1];
+        if (@available(iOS 15, *))
+            textSize.wantsPriorityOverSystemBehavior = YES;
+        [commands addObject:textSize];
+    }
+    // Ctrl+Option+Left/Right and Ctrl+Option+1-9 switch Desktops too: the
+    // keys the Wayland desktop switches its own desktops with, so one habit
+    // works in both. Inside a Wayland window its view takes them first and
+    // they go to labwc; everywhere else they come here. Unlike Cmd+arrows,
+    // never a caret move in a text view.
+    NSArray<NSArray *> *ctrlOptArrows = @[@[UIKeyInputLeftArrow, NSLocalizedString(@"Previous Desktop", @"keyboard shortcut title"), NSStringFromSelector(@selector(hotkeyCtrlOptPreviousDesktop:))],
+                                          @[UIKeyInputRightArrow, NSLocalizedString(@"Next Desktop", @"keyboard shortcut title"), NSStringFromSelector(@selector(hotkeyCtrlOptNextDesktop:))]];
+    for (NSArray *arrow in ctrlOptArrows) {
+        UIKeyCommand *command = [UIKeyCommand keyCommandWithInput:arrow[0]
+                                                    modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                                           action:NSSelectorFromString(arrow[2])];
+        if (@available(iOS 15, *))
+            command.wantsPriorityOverSystemBehavior = YES;
+        [commands addObject:command];
+    }
+    for (NSInteger n = 1; n <= 9; n++) {
+        UIKeyCommand *command = [UIKeyCommand keyCommandWithInput:[NSString stringWithFormat:@"%ld", (long) n]
+                                                    modifierFlags:UIKeyModifierControl | UIKeyModifierAlternate
+                                                           action:@selector(hotkeyGoToDesktop:)];
+        if (@available(iOS 15, *))
+            command.wantsPriorityOverSystemBehavior = YES;
+        [commands addObject:command];
+    }
+    return commands;
+}
+
+- (void)hotkeyCtrlOptPreviousDesktop:(UIKeyCommand *)command {
+    [self switchToDesktopIndex:self.activeDesktopIndex - 1];
+}
+
+- (void)hotkeyCtrlOptNextDesktop:(UIKeyCommand *)command {
+    [self switchToDesktopIndex:self.activeDesktopIndex + 1];
+}
+
+- (void)hotkeyGoToDesktop:(UIKeyCommand *)command {
+    NSInteger index = command.input.integerValue - 1;
+    if (index >= 0 && index < self.desktopCount)
+        [self switchToDesktopIndex:index];
 }
 
 // A brief "Desktop N / M" toast so the swipe-only switch stays oriented.
 - (void)showDesktopIndicator {
+    [self showDesktopToastWithText:
+        ([self customNameForDesktopAtIndex:self.activeDesktopIndex] != nil
+             ? [NSString stringWithFormat:@"  %@  %ld / %ld  ",
+                [self customNameForDesktopAtIndex:self.activeDesktopIndex],
+                (long)(self.activeDesktopIndex + 1), (long)self.desktopCount]
+             : [NSString stringWithFormat:NSLocalizedString(@"  Desktop %ld / %ld  ", @"toast when switching desktops: current / total"),
+                (long)(self.activeDesktopIndex + 1), (long)self.desktopCount])
+                           holdFor:0.7];
+}
+
+// The same transient label the desktop switch uses, for anything that needs to
+// say one short thing and get out of the way. `holdFor` is how long it stays at
+// full strength before fading; a NEGATIVE hold keeps it there, for "doing
+// something slow", where the fade has to wait for the something to finish.
+//
+// The desktop switch keeps the 0.7s it was tuned with -- it says two numbers
+// you already expected. A message you have to READ needs longer.
+- (void)hideDesktopToast {
+    self.desktopIndicatorLabel.hidden = YES;
+    self.desktopIndicatorLabel.alpha = 0.0;
+}
+
+- (void)showDesktopToastWithText:(NSString *)text holdFor:(NSTimeInterval)holdFor {
     if (self.desktopIndicatorLabel == nil) {
         UILabel *label = [UILabel new];
         label.translatesAutoresizingMaskIntoConstraints = NO;
@@ -4657,32 +6264,95 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         ]];
         self.desktopIndicatorLabel = label;
     }
-    self.desktopIndicatorLabel.text =
-        [NSString stringWithFormat:@"  Desktop %ld / %ld  ", (long)(self.activeDesktopIndex + 1), (long)self.desktopCount];
+    self.desktopIndicatorLabel.text = text;
     [self.view bringSubviewToFront:self.desktopIndicatorLabel];
     self.desktopIndicatorLabel.hidden = NO;
+    [self.desktopIndicatorLabel.layer removeAllAnimations];
     self.desktopIndicatorLabel.alpha = 1.0;
-    [UIView animateWithDuration:0.3 delay:0.7 options:UIViewAnimationOptionBeginFromCurrentState animations:^{
+    if (holdFor < 0.0)
+        return;
+    [UIView animateWithDuration:0.3 delay:holdFor options:UIViewAnimationOptionBeginFromCurrentState animations:^{
         self.desktopIndicatorLabel.alpha = 0.0;
     } completion:nil];
 }
 
-- (void)presentDesktopRootMenuFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Workspace"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+// The root menu's "Save Session". Shares suspendSessionShortcut's save, and
+// adds the explanation the Sessions card gets from its own body text: from a
+// menu item there is nowhere else to say why nothing happened.
+- (void)saveSessionFromRootMenu {
+    if (!UserPreferences.shared.shouldSuspendToDisk) {
+        UIAlertController *alert = [UIAlertController
+            alertControllerWithTitle:NSLocalizedString(@"Suspend to Disk is off", @"alert title")
+                             message:NSLocalizedString(@"Turn on Suspend to Disk in the iOS Settings app, under iSH-AOK, and this session is saved whenever iSH-AOK goes to the background -- and comes back on the next launch.", @"alert message when Suspend to Disk is off")
+                      preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Open Settings", @"alert button")
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(__unused UIAlertAction *a) {
+            [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        }]];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Not Now", @"alert button")
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
+    if (self.rootMenuSaveInProgress)
+        return;
+    // The Wayland desktop and GPU programs cannot be saved: ask first.
+    ISHSuspendSessionConfirmGPUThen(self, @"Save", ^(BOOL leaveOutGPU) {
+        self.rootMenuSaveInProgress = YES;
+        [self showDesktopToastWithText:NSLocalizedString(@"  Saving session…  ", @"toast while saving the session") holdFor:-1.0];
+        // Off the main thread; see suspendSessionShortcut for why.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            int err = ISHSuspendSessionSaveNow(leaveOutGPU);
+            struct checkpoint_status ck;
+            checkpoint_get_status(&ck);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self.rootMenuSaveInProgress = NO;
+                if (err == 0) {
+                    [self showDesktopToastWithText:
+                        [NSString stringWithFormat:NSLocalizedString(@"  Session saved — %lu processes  ", @"toast after saving the session"), ck.tasks]
+                                           holdFor:2.5];
+                    return;
+                }
+                [self hideDesktopToast];
+                UIAlertController *alert = [UIAlertController
+                    alertControllerWithTitle:NSLocalizedString(@"Session not saved", @"alert title")
+                                     message:ck.last_refusal[0] != '\0'
+                                             ? @(ck.last_refusal)
+                                             : NSLocalizedString(@"iSH-AOK could not write the session.", @"alert message when saving the session failed")
+                              preferredStyle:UIAlertControllerStyleAlert];
+                [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button")
+                                                          style:UIAlertActionStyleDefault
+                                                        handler:nil]];
+                [self presentViewController:alert animated:YES completion:nil];
+            });
+        });
+    });
+}
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"New Terminal"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+- (void)presentDesktopRootMenuFromView:(UIView *)sourceView sourceRect:(CGRect)sourceRect {
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Workspace", @"workspace menu title") message:nil];
+
+    [sheet addActionWithTitle:NSLocalizedString(@"New Terminal", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openDesktopTerminalHerePreferringConsole:NO
                                          reuseExisting:NO
                                        trackPrimaryRole:NO];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Terminal…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    // Raised from a Terminal window's own menu button: a tab in that window.
+    ISHWorkspaceContainedWindowView *menuTerminalWindow = [self terminalWindowForMenuSourceView:sourceView];
+    if (menuTerminalWindow != nil) {
+        [sheet addActionWithTitle:NSLocalizedString(@"New Tab", @"workspace menu item")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
+            [self openNewTerminalTabInWindow:menuTerminalWindow];
+        }];
+    }
+    [sheet addActionWithTitle:NSLocalizedString(@"Terminal…", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         // Any item that presents another controller (nested sheet, Launcher,
         // Windows, Utilities, Style chooser) must defer to the next runloop:
         // presenting synchronously from a UIAlertAction handler races this
@@ -4692,65 +6362,133 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentTerminalDockActionsFromView:sourceView];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Launcher"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    // Snippets are a terminal feature, but in Workspace the terminal's own ways
+    // in are both awkward: the long press is on the Paste key, which lives in an
+    // accessory bar that needs the keyboard up, and Cmd-J needs a hardware one.
+    // The root menu is the surface every Workspace style has and all three ways
+    // of raising it -- the desktop long press, the corner button, and a window's
+    // own menu button -- land here, so this is the one place that reaches them
+    // from anywhere on the desktop.
+    [sheet addActionWithTitle:NSLocalizedString(@"Snippets…", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self presentSnippetsForMenuSourceView:sourceView];
+        });
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Launcher", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentLauncherFromView:sourceView sourceRect:sourceRect];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Windows"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Windows", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentIconManagerFromView:sourceView sourceRect:sourceRect];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"New Desktop"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"New Desktop", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self createNewDesktop];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Utilities…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Utilities…", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
         });
-    }]];
+    }];
+    // Suspend to disk, one tap from the root menu. It lives in the Sessions
+    // utility as well, but that is five taps deep and nobody found it -- and a
+    // feature whose whole job is to be used BEFORE iOS kills the app is not
+    // one to go looking for. Always offered, including when the preference is
+    // off: that is the only way the menu can say the feature exists.
+    // The Wayland desktop full screen, taking its running session along: the
+    // way back from the full-screen view's own "Open Workspace".
+    [sheet addActionWithTitle:NSLocalizedString(@"Wayland Full Screen", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self showWaylandFullScreen];
+        });
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Save Session", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self saveSessionFromRootMenu];
+        });
+    }];
     BOOL autoShowKeyboard = UserPreferences.shared.autoShowKeyboard;
-    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Auto-Show Keyboard: %@", autoShowKeyboard ? @"On" : @"Off"]
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Auto-Show Keyboard: %@", @"workspace menu item; %@ is On or Off"), autoShowKeyboard ? NSLocalizedString(@"On", @"setting state") : NSLocalizedString(@"Off", @"setting state")]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         UserPreferences.shared.autoShowKeyboard = !autoShowKeyboard;
         // Re-present so the toggled state is reflected; see the "Terminal…"
         // handler above for why this must defer to the next runloop.
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentDesktopRootMenuFromView:sourceView sourceRect:sourceRect];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Settings"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Settings", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolSettingsIdentifier];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Workspace Style…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Workspace Style…", @"workspace menu item")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentWorkspaceStyleChooserFromView:sourceView];
         });
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
+}
+
+// Which terminal window a snippet belongs to. Two of the three ways the root
+// menu is raised name a window -- a window's own menu button is a subview of it
+// -- and a snippet picked there belongs to that window rather than to whatever
+// happens to be in front. The desktop long press and the corner button name
+// nothing, and then the frontmost terminal window is the only honest answer.
+// A non-terminal window's menu button names no terminal either, so it falls
+// through to the same place.
+- (ISHWorkspaceContainedWindowView *)terminalWindowForMenuSourceView:(UIView *)sourceView {
+    for (UIView *view = sourceView; view != nil; view = view.superview) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        return windowView.hostedTerminalViewController != nil ? windowView : nil;
     }
-    [self presentViewController:sheet animated:YES completion:nil];
+    return nil;
+}
+
+- (void)presentSnippetsForMenuSourceView:(UIView *)sourceView {
+    ISHWorkspaceContainedWindowView *windowView =
+        [self terminalWindowForMenuSourceView:sourceView] ?: [self frontmostDesktopTerminalWindow];
+    TerminalViewController *terminalViewController = windowView.hostedTerminalViewController;
+    // Open the library either way. A desktop with no terminal window on it --
+    // every window an applet, or the terminals living inside a guest desktop in
+    // the Wayland applet -- still has snippets worth reading and editing, and
+    // the first version of this refused with a toast, which from the other side
+    // of the screen is a menu item that does nothing. With no terminal the sheet
+    // says so in its prompt and a tap opens the snippet instead of inserting it.
+    if (terminalViewController != nil) {
+        // Bring the target to the front before the sheet covers the desktop. The
+        // text is about to appear on that window's command line, and a snippet
+        // put into a window the user cannot see is how a command gets run twice.
+        [self focusDesktopWindow:windowView];
+    }
+    // Presented from the Workspace (it is what is on screen) but delegated to
+    // the terminal, which is the only thing that knows whether the guest has
+    // bracketed paste on and therefore how the text has to be wrapped.
+    [ISHSnippetsViewController presentFromViewController:self delegate:terminalViewController];
 }
 
 // Reached by long-pressing the terminal accessory bar's 4-way arrow key in place (see
@@ -4760,44 +6498,35 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if (self.desktopCount <= 1)
         return;
 
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Switch Desktop"
-                                            message:nil
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Switch Desktop", @"action sheet title") message:nil];
 
     if (self.activeDesktopIndex > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Previous Desktop"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:NSLocalizedString(@"Previous Desktop", @"switch desktop action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self switchToDesktopIndex:self.activeDesktopIndex - 1];
-        }]];
+        }];
     }
     if (self.activeDesktopIndex < self.desktopCount - 1) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Next Desktop"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:NSLocalizedString(@"Next Desktop", @"switch desktop action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self switchToDesktopIndex:self.activeDesktopIndex + 1];
-        }]];
+        }];
     }
     for (NSInteger index = 0; index < self.desktopCount; index++) {
         if (index == self.activeDesktopIndex)
             continue;
-        NSString *title = [NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)];
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        NSString *title = [self nameForDesktopAtIndex:index];
+        [sheet addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self switchToDesktopIndex:index];
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
 
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceRect;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceRect];
 }
 
 - (ISHWorkspaceContainedWindowView *)desktopWindowHostingTerminalUUID:(NSUUID *)terminalUUID {
@@ -4808,6 +6537,12 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
             continue;
         ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        ISHWorkspaceTerminalTabsViewController *tabs = [self terminalTabsForWindow:windowView];
+        if (tabs != nil) {
+            if ([tabs selectTabShowingTerminalUUID:terminalUUID orSessionUUID:YES])
+                return windowView;
+            continue;
+        }
         TerminalViewController *terminalViewController = windowView.hostedTerminalViewController;
         if (terminalViewController == nil)
             continue;
@@ -4853,11 +6588,20 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         [self createDesktopWindowWithTitle:title
                              preferredSize:windowSize
                           showsCloseButton:YES];
-    windowView.hostedTerminalViewController = terminalViewController;
     windowView.resizable = YES;
     windowView.titleBarDoubleTapZoomEnabled = YES;
     windowView.minimumSize = ISHWorkspaceMinimumTerminalContentSize();
-    [self attachViewController:terminalViewController toDesktopWindow:windowView];
+    // The window holds its terminals as tabs; this one is the first.
+    ISHWorkspaceTerminalTabsViewController *tabs = [ISHWorkspaceTerminalTabsViewController new];
+    tabs.windowView = windowView;
+    tabs.preferredContentSize = preferredSize;
+    [self attachViewController:tabs toDesktopWindow:windowView];
+    [tabs addTab:terminalViewController role:nil select:YES];
+    __weak typeof(self) weakSelf = self;
+    __weak typeof(windowView) weakTabsWindow = windowView;
+    tabs.newTabHandler = ^{
+        [weakSelf openNewTerminalTabInWindow:weakTabsWindow];
+    };
 
     // A workspace terminal window owns its shell session (desktop-style): closing the window
     // ends the shell, and an exiting shell ("exit") closes the window instead of relaunching the
@@ -4866,20 +6610,50 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     //     programmatic close) first disposes the session, then tears the window down.
     //   - Hand the terminal a workspaceSessionDidEndHandler so a shell exit routes back through
     //     that same close handler rather than respawning.
+    //     (Every tab's shell: the window closes with all of them.)
+    //   - Each tab's workspaceSessionDidEndHandler (set by the tabs controller) closes that
+    //     tab, and the window with its last one, rather than respawning.
     dispatch_block_t genericCloseHandler = windowView.closeHandler;
-    __weak typeof(terminalViewController) weakTerminalViewController = terminalViewController;
+    __weak typeof(tabs) weakTabs = tabs;
     windowView.closeHandler = ^{
-        [weakTerminalViewController disposeSessionForWorkspaceClose];
+        [weakTabs disposeAllSessions];
         if (genericCloseHandler != nil)
             genericCloseHandler();
     };
-    __weak typeof(windowView) weakWindowView = windowView;
-    terminalViewController.workspaceSessionDidEndHandler = ^{
-        ISHWorkspaceContainedWindowView *strongWindowView = weakWindowView;
-        if (strongWindowView.closeHandler != nil)
-            strongWindowView.closeHandler();
-    };
     return windowView;
+}
+
+- (nullable ISHWorkspaceTerminalTabsViewController *)terminalTabsForWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    UIViewController *content = windowView != nil ? [self contentViewControllerForDesktopWindow:windowView] : nil;
+    return [content isKindOfClass:ISHWorkspaceTerminalTabsViewController.class]
+        ? (ISHWorkspaceTerminalTabsViewController *) content : nil;
+}
+
+// Every terminal a window holds, the selected one included.
+- (NSArray<TerminalViewController *> *)terminalViewControllersInWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    ISHWorkspaceTerminalTabsViewController *tabs = [self terminalTabsForWindow:windowView];
+    if (tabs != nil)
+        return tabs.tabs;
+    return windowView.hostedTerminalViewController != nil ? @[windowView.hostedTerminalViewController] : @[];
+}
+
+// A new tab in a Terminal window: a fresh shell, as a plain Terminal (the
+// default-user preference applies, whatever the window's first tab is).
+- (void)openNewTerminalTabInWindow:(ISHWorkspaceContainedWindowView *)windowView {
+    ISHWorkspaceTerminalTabsViewController *tabs = [self terminalTabsForWindow:windowView];
+    if (tabs == nil)
+        return;
+    TerminalViewController *terminalViewController = [self createDesktopTerminalViewController];
+    if (terminalViewController == nil)
+        return;
+    terminalViewController.freshSessionTerminalDisplayMode = ISHFreshSessionTerminalDisplayModeSessionShell;
+    terminalViewController.alwaysLoginAsRoot = NO;
+    terminalViewController.declinesRestoredSession = YES;
+    [tabs addTab:terminalViewController role:ISHWorkspaceTerminalRoleGeneric select:YES];
+    [terminalViewController startNewSession];
+    [terminalViewController showSessionShellForCurrentSession];
+    [self focusDesktopWindow:windowView];
+    [self refreshDockButtons];
 }
 
 - (void)workspaceClearArrangedSubviewsFromStack:(UIStackView *)stackView {
@@ -4922,7 +6696,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Desktop";
+    self.title = NSLocalizedString(@"Desktop", @"workspace view controller title");
     if (@available(iOS 13.0, *)) {
         self.view.backgroundColor = UIColor.systemBackgroundColor;
     } else {
@@ -4942,6 +6716,15 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     desktopRootMenuRecognizer.minimumPressDuration = 0.4;
     desktopRootMenuRecognizer.delegate = self;
     [self.desktopSurfaceView addGestureRecognizer:desktopRootMenuRecognizer];
+
+    // A tap on the bare desktop gives the Workspace the keyboard, so its
+    // shortcuts (Desktop switching among them) work with no window focused;
+    // without it nothing held first responder and every key went nowhere.
+    UITapGestureRecognizer *desktopFocusRecognizer =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(handleDesktopTap:)];
+    desktopFocusRecognizer.cancelsTouchesInView = NO;
+    desktopFocusRecognizer.delegate = self;
+    [self.desktopSurfaceView addGestureRecognizer:desktopFocusRecognizer];
 
     UILongPressGestureRecognizer *desktopTwoFingerMenuRecognizer =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleDesktopTwoFingerLongPress:)];
@@ -4988,7 +6771,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     ]];
 
     ISHWorkspaceContainedWindowView *dashboardWindow =
-        [self createDesktopWindowWithTitle:@"Layout Manager"
+        [self createDesktopWindowWithTitle:NSLocalizedString(@"Layout Manager", @"window title")
                              preferredSize:ISHWorkspacePreferredDashboardContentSize()
                           showsCloseButton:YES];
     self.dashboardWindow = dashboardWindow;
@@ -5021,12 +6804,12 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     self.layoutManagerWorkspaceLabel = [self workspaceLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
     self.layoutManagerWorkspaceLabel.numberOfLines = 2;
     [windowCardStack addArrangedSubview:self.layoutManagerWorkspaceLabel];
-    [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:@"Save Current Layout"
+    [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:NSLocalizedString(@"Save Current Layout", @"layout manager button")
                                                                     selector:@selector(saveWorkspaceLayout:)]];
-    [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:@"Restore Saved Layout"
+    [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:NSLocalizedString(@"Restore Saved Layout", @"layout manager button")
                                                                    selector:@selector(restoreWorkspaceLayout:)]];
     if (ISHWorkspaceSupportsSceneWindows() && !ISHWorkspaceUsesModernStyle()) {
-        [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:@"New Workspace Window"
+        [windowCardStack addArrangedSubview:[self workspaceActionButtonWithTitle:NSLocalizedString(@"New Workspace Window", @"layout manager button")
                                                                        selector:@selector(openNewWorkspaceWindow:)]];
     }
 
@@ -5144,16 +6927,145 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     ISHWorkspaceActiveController = self;
+    // Nothing focused yet: take the keyboard, so the Workspace's shortcuts work
+    // before anything is tapped. A window that claims it later still does.
+    if ([self workspaceFirstResponder] == nil)
+        [self becomeFirstResponder];
     [self applyCurrentThemeWallpaperIfNeededForced:NO];
     [self applyCompactSizingToOpenWorkspaceToolWindows];
+    // Which saved session, before a single window opens.
+    //
+    // Everything below latches. -didEnsureDefaultWorkspaceUtilities fires once
+    // and reads checkpoint_get_status to decide between restoring the saved
+    // arrangement and opening the default utilities -- so running it before the
+    // question is answered and the guest rebuilt misses the resume branch and
+    // never retries it. The comment down there predicted exactly this case
+    // ("the session picker still up, say"); this is what stops it happening.
+    if ([self presentSessionResumeChoiceIfNeeded])
+        return;
+    [self performWorkspaceLaunchWork];
+}
+
+// The question, and the boot that was waiting on it.
+//
+// YES means "asked, and this pass is over": the launch work runs again from the
+// completion, with the answer in hand.
+- (BOOL)presentSessionResumeChoiceIfNeeded {
+    if (!ISHSessionResumeChoicePending())
+        return NO;
+    // Asked, and still unanswered -- which is a state this can genuinely be
+    // re-entered in: backgrounding the app with the sheet up and coming back
+    // runs viewDidAppear again. Answering "no, carry on" there would run the
+    // launch work with the boot still held, so every terminal it opened would
+    // fail and the layout latch would fire on the wrong branch.
+    if (self.didAskSessionResumeChoice)
+        return YES;
+    // Something else is on screen (a tool's own alert). Presenting into that
+    // loses the sheet, so come back for it -- the launch work must not run
+    // ahead of the answer either way.
+    if (self.presentedViewController != nil) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t) (250 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            if (strongSelf != nil && ![strongSelf presentSessionResumeChoiceIfNeeded])
+                [strongSelf performWorkspaceLaunchWork];
+        });
+        return YES;
+    }
+    self.didAskSessionResumeChoice = YES;
+    __weak typeof(self) weakSelf = self;
+    ISHSessionPresentResumePicker(self, ^(NSString *imageToConsume) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf == nil)
+            return;
+        // The boot ISHSessionHoldBootUntilResumeChoice was holding. A resume
+        // rebuilds the guest from the image inside this call, so
+        // checkpoint_get_status only describes THIS launch once it returns --
+        // which is why the layout work comes after it and not before.
+        intptr_t bootError = [AppDelegate ensureBooted];
+        [ISHDiagnosticsStore recordBreadcrumb:@"workspace.sessionChoice.answered"
+                                      details:@{@"bootError": @(bootError),
+                                                @"consumed": @(imageToConsume.length > 0)}];
+        ISHSessionConsumeResumedImage(imageToConsume);
+        [strongSelf performWorkspaceLaunchWork];
+    });
+    return YES;
+}
+
+- (void)performWorkspaceLaunchWork {
     if (!self.didOpenInitialTool && self.initialToolIdentifier.length > 0) {
         self.didOpenInitialTool = YES;
         [self openWorkspaceToolWithIdentifier:self.initialToolIdentifier];
     }
     if (!self.didEnsureDefaultWorkspaceUtilities) {
         self.didEnsureDefaultWorkspaceUtilities = YES;
-        NSArray<NSDictionary<NSString *, id> *> *savedLayout = [self savedWorkspaceLayoutForCurrentScene];
+        // The arrangement belonging to the image this launch actually resumed,
+        // falling back to the shared one only when that image has none (an
+        // older suspend, written before layouts were filed beside their image).
+        NSArray<NSDictionary<NSString *, id> *> *savedLayout =
+            ISHWorkspaceLayoutForSessionImage(ISHSessionRestoredImagePath());
+        if (savedLayout.count == 0)
+            savedLayout = [self savedWorkspaceLayoutForCurrentScene];
         BOOL hasSavedLayout = [savedLayout isKindOfClass:NSArray.class] && savedLayout.count > 0;
+        // Did this launch resume a suspended session? Then the guest is
+        // ALREADY RUNNING, and the arrangement that was showing it has to come
+        // back with it -- terminals included. Without this the restore
+        // published its sessions and nothing ever claimed them: a device
+        // suspend-and-exit in Workspace mode came back with the shells alive
+        // and not one terminal on screen, which reads as total data loss.
+        //
+        // applyResumeWorkspaceLayout ends by opening the default utilities
+        // itself, so the branch below is the ordinary not-resuming launch.
+        // Make the boot decision HAPPEN before asking what it was.
+        //
+        // The picker path already does this: its completion calls ensureBooted
+        // and only then runs this work, "which is why the layout work comes
+        // after it and not before". Every launch WITHOUT a picker -- nothing to
+        // ask, or already answered -- skipped straight here, read a status
+        // describing a guest that had not been restored yet, and latched on the
+        // ordinary Desktops branch. The session then came back with its shells
+        // alive and not one terminal on screen, which is exactly the case the
+        // comment below predicted and the breadcrumb was added to catch.
+        //
+        // ensureBooted happens exactly once however many callers reach it, so
+        // this is the same call the picker makes, not a second boot.
+        intptr_t launchBootError = [AppDelegate ensureBooted];
+        struct checkpoint_status resumeStatus;
+        checkpoint_get_status(&resumeStatus);
+        // Recorded either way, because this runs ONCE per launch and latches:
+        // if the workspace somehow appears before the restore has happened
+        // (the session picker still up, say) the resume branch is missed and
+        // never retried, and the symptom -- no terminals -- looks identical to
+        // the bug this replaced. The breadcrumb says which branch ran and why,
+        // so the next report is one line to diagnose instead of a hunt.
+        [ISHDiagnosticsStore recordBreadcrumb:@"workspace.launch.layout"
+                                      details:@{@"restored": @(resumeStatus.restored),
+                                                @"hasSavedLayout": @(hasSavedLayout),
+                                                @"windows": @(savedLayout.count),
+                                                @"bootError": @(launchBootError),
+                                                @"applied": @(resumeStatus.restored && hasSavedLayout)}];
+        os_log(OS_LOG_DEFAULT,
+               "workspace launch layout: restored=%{public}d saved=%{public}d "
+               "windows=%{public}lu boot=%{public}ld -> %{public}s",
+               resumeStatus.restored, hasSavedLayout ? 1 : 0,
+               (unsigned long) savedLayout.count, (long) launchBootError,
+               (resumeStatus.restored && hasSavedLayout) ? "resume layout"
+                       : ([self savedWorkspaceDesktops].count > 0 ? "desktops snapshot"
+                                                                 : "defaults"));
+        if (resumeStatus.restored && hasSavedLayout) {
+            [self applyResumeWorkspaceLayout:savedLayout];
+        } else if ([self savedWorkspaceDesktops].count > 0) {
+            // An ordinary launch with a Desktops snapshot on file.
+            //
+            // This branch did not exist, which is the whole of "Save Desktop(s)
+            // still doesn't work": the saved layout was consulted ONLY when the
+            // launch had resumed a checkpoint, so pressing Save, killing the app
+            // and restarting took the else below and opened the defaults. The
+            // snapshot had been written correctly every time and never once read.
+            [self restoreWorkspaceDesktops];
+            [self ensureDefaultLLMChatWindowOpenIfNeeded];
+        } else {
         [self ensureDefaultWorkspaceUtilitiesOpen];
         // Honor a saved arrangement: don't force the LLM chat back open if it was closed before
         // saving, and reopen the Launcher (at its saved spot) if it was shown on the desktop.
@@ -5168,6 +7080,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
                                fallbackSize:ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolLauncherIdentifier)];
         }
         [self applyDesktopVisibility];
+        }
     }
     if (self.dockWindow != nil) {
         [self applyInitialPlacementToDockWindow:self.dockWindow];
@@ -5219,7 +7132,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
     titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleHeadline];
     titleLabel.textColor = theme[@"primary"];
-    titleLabel.text = @"Limited Memory Device";
+    titleLabel.text = NSLocalizedString(@"Limited Memory Device", @"low memory warning title");
     [card addSubview:titleLabel];
 
     UILabel *bodyLabel = [UILabel new];
@@ -5227,7 +7140,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     bodyLabel.numberOfLines = 0;
     bodyLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
     bodyLabel.textColor = theme[@"secondary"];
-    bodyLabel.text = @"This device has less than 4 GB of RAM. Workspace is more stable with fewer windows and browser tabs open. Browser tabs are limited to 2 on this device.";
+    bodyLabel.text = NSLocalizedString(@"This device has less than 4 GB of RAM. Workspace is more stable with fewer windows and browser tabs open. Browser tabs are limited to 2 on this device.", @"low memory warning body");
     [card addSubview:bodyLabel];
 
     UIView *toggleRow = [UIView new];
@@ -5245,7 +7158,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     toggleLabel.numberOfLines = 2;
     toggleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
     toggleLabel.textColor = theme[@"primary"];
-    toggleLabel.text = @"Don't show this warning again";
+    toggleLabel.text = NSLocalizedString(@"Don't show this warning again", @"low memory warning toggle label");
     [toggleRow addSubview:toggleLabel];
 
     UIButton *okButton = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -5255,7 +7168,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     okButton.layer.borderColor = theme[@"stroke"].CGColor;
     okButton.backgroundColor = [theme[@"cardAlt"] colorWithAlphaComponent:0.96];
     okButton.titleLabel.font = [UIFont systemFontOfSize:15 weight:UIFontWeightSemibold];
-    [okButton setTitle:@"OK" forState:UIControlStateNormal];
+    [okButton setTitle:NSLocalizedString(@"OK", @"low memory warning button") forState:UIControlStateNormal];
     [okButton setTitleColor:theme[@"primary"] forState:UIControlStateNormal];
     [okButton addTarget:self action:@selector(dismissStartupLowMemoryWarning:) forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:okButton];
@@ -5407,6 +7320,40 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if ([sceneLayout isKindOfClass:NSArray.class])
         return (NSArray<NSDictionary<NSString *, id> *> *) sceneLayout;
 
+    // This scene has no layout of its own, which after a Suspend and Exit is the
+    // NORMAL case rather than an error: the session that saved was discarded on
+    // exit and this launch minted a fresh identifier. Falling straight through
+    // to "default" handed the resume whatever arrangement happened to be filed
+    // under that name -- on the reporting device, one with three Desktops and
+    // every window on the first, against a save that had four and windows on
+    // three of them.
+    //
+    // The newest layout is the one the suspend just wrote, so that is the one a
+    // fresh scene should adopt.
+    id storedTimes = [NSUserDefaults.standardUserDefaults objectForKey:ISHWorkspaceSavedLayoutTimesDefaultsKey];
+    if ([storedTimes isKindOfClass:NSDictionary.class]) {
+        NSDictionary<NSString *, id> *times = (NSDictionary<NSString *, id> *) storedTimes;
+        NSString *newestKey = nil;
+        double newest = 0;
+        for (NSString *key in times) {
+            if (![layoutsByScene[key] isKindOfClass:NSArray.class])
+                continue;   // a timestamp with nothing behind it
+            double when = [times[key] doubleValue];
+            if (when > newest) {
+                newest = when;
+                newestKey = key;
+            }
+        }
+        if (newestKey != nil) {
+            [ISHDiagnosticsStore recordBreadcrumb:@"workspace.layout.adoptedNewest"
+                                          details:@{@"scene": sceneIdentifier ?: @"",
+                                                    @"adopted": newestKey,
+                                                    @"windows": @([layoutsByScene[newestKey] count])}];
+            return (NSArray<NSDictionary<NSString *, id> *> *) layoutsByScene[newestKey];
+        }
+    }
+
+    // Nothing stamped: data written before this existed.
     id defaultLayout = layoutsByScene[@"default"];
     if ([defaultLayout isKindOfClass:NSArray.class])
         return (NSArray<NSDictionary<NSString *, id> *> *) defaultLayout;
@@ -5430,7 +7377,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         return;
     }
 
-    self.layoutManagerWorkspaceLabel.text = [NSString stringWithFormat:@"%@ layout. Save and restore only affects this workspace.", [self currentWorkspaceDisplayName]];
+    self.layoutManagerWorkspaceLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%@ layout. Save and restore only affects this workspace.", @"layout manager label; %@ is the workspace name"), [self currentWorkspaceDisplayName]];
     [self refreshDockButtons];
 }
 
@@ -5441,9 +7388,9 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     ISHWorkspaceContainedWindowView *workspacesWindow = [self desktopWindowForToolIdentifier:ISHWorkspaceToolWorkspacesIdentifier];
     BOOL utilsFrontmost = frontmostWindow == clockWindow || frontmostWindow == workspacesWindow;
     BOOL utilsActive = clockWindow != nil || workspacesWindow != nil;
-    NSString *utilsState = clockWindow != nil ? @"Clock" : (workspacesWindow != nil ? @"Scenes" : @"Menu");
+    NSString *utilsState = clockWindow != nil ? NSLocalizedString(@"Clock", @"dock Utils tile state") : (workspacesWindow != nil ? NSLocalizedString(@"Scenes", @"dock Utils tile state") : NSLocalizedString(@"Menu", @"dock Utils tile state"));
     [self configureDockTileButton:self.dockUtilsButton
-                            title:@"Utils"
+                            title:NSLocalizedString(@"Utils", @"dock tile title for utilities")
                             state:utilsState
                            active:utilsActive
                         frontmost:utilsFrontmost];
@@ -5452,11 +7399,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     ISHWorkspaceContainedWindowView *frontmostTerminalWindow = [self frontmostDesktopTerminalWindow];
     BOOL hasTerminalWindow = frontmostTerminalWindow != nil;
     BOOL frontmostIsTerminal = frontmostTerminalWindow != nil && frontmostWindow == frontmostTerminalWindow;
-    NSString *terminalState = @"Shell";
+    NSString *terminalState = NSLocalizedString(@"Shell", @"dock Terminal tile state");
     if (shellWindow != nil || hasTerminalWindow)
-        terminalState = @"Active";
+        terminalState = NSLocalizedString(@"Active", @"dock Terminal tile state");
     [self configureDockTileButton:self.dockTerminalButton
-                            title:@"Terminal"
+                            title:NSLocalizedString(@"Terminal", @"dock tile title")
                             state:terminalState
                            active:hasTerminalWindow
                         frontmost:frontmostIsTerminal];
@@ -5492,7 +7439,20 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         if (!ISHWorkspaceUsesPhoneLayout() && [toolIdentifier isEqualToString:ISHWorkspaceToolThemesIdentifier])
             continue;
 
-        CGSize targetSize = ISHWorkspacePreferredToolContentSize(toolIdentifier);
+        // At the window's text size: this runs after a restore has applied the saved scale, and on
+        // every theme and density change, and shrinking an Info or Monitor that grew for its text
+        // back to the 1.0 size shrank the text back with it.
+        UIViewController *contentViewController = [self contentViewControllerForDesktopWindow:windowView];
+        CGFloat textScale = [contentViewController conformsToProtocol:@protocol(WorkspaceTextScalable)]
+            ? ((id<WorkspaceTextScalable>) contentViewController).workspaceTextScale : 1.0;
+        CGSize targetSize = ISHWorkspacePreferredToolContentSizeForTextScale(toolIdentifier, textScale);
+        // The Launcher's preferred size is its root level at text size 1.0.
+        // This pass runs on every theme change, resume and appearance, and the
+        // Launcher only autosizes when its list changes, so shrinking to that
+        // size left a scaled or drilled-into list cut off until the next edit.
+        if ([toolIdentifier isEqualToString:ISHWorkspaceToolLauncherIdentifier] &&
+                [contentViewController isKindOfClass:WorkspaceLauncherToolViewController.class])
+            targetSize = [(WorkspaceLauncherToolViewController *) contentViewController launcherContentSizeForDisplayedLevel];
         CGRect currentFrame = windowView.frame;
         BOOL shouldShrinkWidth = CGRectGetWidth(currentFrame) > targetSize.width + 24.0;
         BOOL shouldShrinkHeight = CGRectGetHeight(currentFrame) > targetSize.height + 24.0;
@@ -5713,67 +7673,74 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         existingWindow.workspaceDesktopIndex = self.activeDesktopIndex;
         existingWindow.hidden = NO;
         [self focusDesktopWindow:existingWindow];
+        // Summoning an applet from another Desktop CHANGES the arrangement, so
+        // the saved/unsaved indicator has to hear about it. Opening an applet
+        // that already existed took this branch and posted nothing, which is
+        // why the Save icon stayed green after opening a Clock -- the window was
+        // already there, hidden, and only its Desktop moved.
+        [self postDesktopsDidChange];
         return;
     }
     [self openWorkspaceToolWithIdentifier:toolIdentifier];
 }
 
 - (NSArray<NSDictionary<NSString *, id> *> *)dockUtilityGroupDescriptors {
-    NSMutableArray<NSDictionary<NSString *, id> *> *workspaceItems = [NSMutableArray arrayWithObject:@{@"title": @"Layout Manager", @"identifier": @"dashboard"}];
+    NSMutableArray<NSDictionary<NSString *, id> *> *workspaceItems = [NSMutableArray arrayWithObject:@{@"title": NSLocalizedString(@"Layout Manager", @"utility menu item"), @"identifier": @"dashboard"}];
     // Desktops are in-app (not iOS scenes), so the applet is available on every device.
-    [workspaceItems addObject:@{@"title": @"Desktops", @"identifier": ISHWorkspaceToolWorkspacesIdentifier}];
+    [workspaceItems addObject:@{@"title": NSLocalizedString(@"Desktops", @"utility menu item"), @"identifier": ISHWorkspaceToolWorkspacesIdentifier}];
     [workspaceItems addObjectsFromArray:@[
-        @{@"title": @"Launcher", @"identifier": ISHWorkspaceToolLauncherIdentifier},
-        @{@"title": @"Quick Actions", @"identifier": ISHWorkspaceToolShortcutsIdentifier},
-        @{@"title": @"Browser", @"identifier": ISHWorkspaceToolBrowserIdentifier},
-        @{@"title": @"Music", @"identifier": ISHWorkspaceToolAudioIdentifier},
+        @{@"title": NSLocalizedString(@"Launcher", @"utility menu item"), @"identifier": ISHWorkspaceToolLauncherIdentifier},
+        @{@"title": NSLocalizedString(@"Quick Actions", @"utility menu item"), @"identifier": ISHWorkspaceToolShortcutsIdentifier},
+        @{@"title": NSLocalizedString(@"Browser", @"utility menu item"), @"identifier": ISHWorkspaceToolBrowserIdentifier},
+        @{@"title": NSLocalizedString(@"Music", @"utility menu item"), @"identifier": ISHWorkspaceToolAudioIdentifier},
+        @{@"title": NSLocalizedString(@"Equalizer", @"utility menu item"), @"identifier": ISHWorkspaceToolEqualizerIdentifier},
         @{@"title": @"MotePad", @"identifier": ISHWorkspaceToolMotePadIdentifier},
-        @{@"title": @"File Manager", @"identifier": ISHWorkspaceToolFileManagerIdentifier},
-        @{@"title": @"Sessions", @"identifier": ISHWorkspaceToolSessionsIdentifier},
-        @{@"title": @"Themes", @"identifier": ISHWorkspaceToolThemesIdentifier},
+        @{@"title": NSLocalizedString(@"File Manager", @"utility menu item"), @"identifier": ISHWorkspaceToolFileManagerIdentifier},
+        @{@"title": NSLocalizedString(@"Sessions", @"utility menu item"), @"identifier": ISHWorkspaceToolSessionsIdentifier},
+        @{@"title": NSLocalizedString(@"Themes", @"utility menu item"), @"identifier": ISHWorkspaceToolThemesIdentifier},
     ]];
     if (ISHLLMClientEnabled())
-        [workspaceItems addObject:@{@"title": @"LLM Chat", @"identifier": ISHWorkspaceToolLLMIdentifier}];
+        [workspaceItems addObject:@{@"title": NSLocalizedString(@"LLM Chat", @"utility menu item"), @"identifier": ISHWorkspaceToolLLMIdentifier}];
     return @[
         @{
-            @"title": @"Workspace",
-            @"message": @"Launchers and workspace-wide controls.",
+            @"title": NSLocalizedString(@"Workspace", @"utility group title"),
+            @"message": NSLocalizedString(@"Launchers and workspace-wide controls.", @"utility group description"),
             @"items": workspaceItems,
         },
         @{
-            @"title": @"Media",
-            @"message": @"Document and image viewers.",
+            @"title": NSLocalizedString(@"Media", @"utility group title"),
+            @"message": NSLocalizedString(@"Document and image viewers.", @"utility group description"),
             @"items": @[
                 @{@"title": @"Markdown", @"identifier": ISHWorkspaceToolMarkdownViewerIdentifier},
-                @{@"title": @"Image Viewer", @"identifier": ISHWorkspaceToolImageViewerIdentifier},
-                @{@"title": @"Video Player", @"identifier": ISHWorkspaceToolVideoPlayerIdentifier},
+                @{@"title": NSLocalizedString(@"Image Viewer", @"utility menu item"), @"identifier": ISHWorkspaceToolImageViewerIdentifier},
+                @{@"title": NSLocalizedString(@"Video Player", @"utility menu item"), @"identifier": ISHWorkspaceToolVideoPlayerIdentifier},
                 @{@"title": @"Wayland", @"identifier": ISHWorkspaceToolDisplayIdentifier},
             ],
         },
         @{
-            @"title": @"Status",
-            @"message": @"Live clocks, runtime summaries, and process views.",
+            @"title": NSLocalizedString(@"Status", @"utility group title"),
+            @"message": NSLocalizedString(@"Live clocks, runtime summaries, and process views.", @"utility group description"),
             @"items": @[
-                @{@"title": @"Clock", @"identifier": ISHWorkspaceToolClockIdentifier},
-                @{@"title": @"Monitor", @"identifier": ISHWorkspaceToolMonitorIdentifier},
-                @{@"title": @"Networks", @"identifier": ISHWorkspaceToolNetworksIdentifier},
-                @{@"title": @"Logs", @"identifier": ISHWorkspaceToolStatusIdentifier},
+                @{@"title": NSLocalizedString(@"Clock", @"utility menu item"), @"identifier": ISHWorkspaceToolClockIdentifier},
+                @{@"title": NSLocalizedString(@"Monitor", @"utility menu item"), @"identifier": ISHWorkspaceToolMonitorIdentifier},
+                @{@"title": NSLocalizedString(@"Networks", @"utility menu item"), @"identifier": ISHWorkspaceToolNetworksIdentifier},
+                @{@"title": NSLocalizedString(@"Logs", @"utility menu item"), @"identifier": ISHWorkspaceToolStatusIdentifier},
             ],
         },
         @{
-            @"title": @"Storage",
-            @"message": @"Roots, filesystem summaries, and storage detail.",
+            @"title": NSLocalizedString(@"Storage", @"utility group title"),
+            @"message": NSLocalizedString(@"Roots, filesystem summaries, and storage detail.", @"utility group description"),
             @"items": @[
-                @{@"title": @"Storage", @"identifier": ISHWorkspaceToolStorageIdentifier},
-                @{@"title": @"Boot Images", @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
+                @{@"title": NSLocalizedString(@"Storage", @"utility menu item"), @"identifier": ISHWorkspaceToolStorageIdentifier},
+                @{@"title": NSLocalizedString(@"Boot Images", @"utility menu item"), @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
             ],
         },
         @{
-            @"title": @"Support",
-            @"message": @"Settings and diagnostics tools.",
+            @"title": NSLocalizedString(@"Support", @"utility group title"),
+            @"message": NSLocalizedString(@"Settings and diagnostics tools.", @"utility group description"),
             @"items": @[
-                @{@"title": @"Settings", @"identifier": ISHWorkspaceToolSettingsIdentifier},
-                @{@"title": @"Diagnostics", @"identifier": ISHWorkspaceToolDiagnosticsIdentifier},
+                @{@"title": NSLocalizedString(@"Settings", @"utility menu item"), @"identifier": ISHWorkspaceToolSettingsIdentifier},
+                @{@"title": NSLocalizedString(@"Diagnostics", @"utility menu item"), @"identifier": ISHWorkspaceToolDiagnosticsIdentifier},
             ],
         },
     ];
@@ -5786,12 +7753,10 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 }
 
 - (void)presentUtilityGroup:(NSDictionary<NSString *, id> *)groupDescriptor fromView:(UIView *)sourceView {
-    NSString *groupTitle = groupDescriptor[@"title"] ?: @"Utils";
+    NSString *groupTitle = groupDescriptor[@"title"] ?: NSLocalizedString(@"Utils", @"utilities sheet title fallback");
     NSString *groupMessage = groupDescriptor[@"message"];
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:groupTitle
-                                            message:groupMessage
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:groupTitle
+                                                         message:groupMessage];
 
     for (NSDictionary<NSString *, NSString *> *descriptor in groupDescriptor[@"items"]) {
         NSString *toolIdentifier = descriptor[@"identifier"];
@@ -5801,11 +7766,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
             ? (self.dashboardWindow.hidden ? nil : self.dashboardWindow)
             : [self desktopWindowForToolIdentifier:toolIdentifier];
         NSString *actionTitle = existingWindow != nil
-            ? [NSString stringWithFormat:@"Focus %@", title]
-            : [NSString stringWithFormat:@"Open %@", title];
-        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+            ? [NSString stringWithFormat:NSLocalizedString(@"Focus %@", @"action to focus an open utility window"), title]
+            : [NSString stringWithFormat:NSLocalizedString(@"Open %@", @"action to open a utility window"), title];
+        [sheet addActionWithTitle:actionTitle
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             if (existingWindow != nil) {
                 [self focusDesktopWindow:existingWindow];
             } else if (isDashboardDescriptor) {
@@ -5813,111 +7778,92 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
             } else {
                 [self openWorkspaceToolWithIdentifier:toolIdentifier];
             }
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
-                                              style:UIAlertActionStyleCancel
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:NSLocalizedString(@"Back", @"action sheet back button")
+                        style:UIAlertActionStyleCancel
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
         });
-    }]];
+    }];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockUtilsButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)presentUtilsDockActionsFromView:(UIView *)sourceView {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Utils"
-                                            message:@"Choose a utility group."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Utils", @"utilities action sheet title")
+                                                         message:NSLocalizedString(@"Choose a utility group.", @"utilities action sheet message")];
 
     for (NSDictionary<NSString *, id> *groupDescriptor in [self dockUtilityGroupDescriptors]) {
-        NSString *title = groupDescriptor[@"title"] ?: @"Group";
+        NSString *title = groupDescriptor[@"title"] ?: NSLocalizedString(@"Group", @"utility group title fallback");
         NSArray *items = groupDescriptor[@"items"];
         NSString *actionTitle = items.count > 0
             ? [NSString stringWithFormat:@"%@ (%lu)", title, (unsigned long) items.count]
             : title;
-        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:actionTitle
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self presentUtilityGroup:groupDescriptor fromView:sourceView];
             });
-        }]];
+        }];
     }
 
-    NSString *workspaceStyleTitle = ISHWorkspaceUsesModernStyle() ? @"Modern" : @"Classic";
-    [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Workspace Style: %@", workspaceStyleTitle]
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    NSString *workspaceStyleTitle = ISHWorkspaceUsesModernStyle() ? NSLocalizedString(@"Modern", @"workspace style name") : NSLocalizedString(@"Classic", @"workspace style name");
+    [sheet addActionWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Workspace Style: %@", @"utilities menu item; %@ is Classic or Modern"), workspaceStyleTitle]
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentWorkspaceStyleChooserFromView:sourceView];
         });
-    }]];
+    }];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button")
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockUtilsButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)presentWorkspaceStyleChooserFromView:(UIView *)sourceView {
     UserPreferences *preferences = UserPreferences.shared;
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Workspace Style"
-                                            message:@"Pick the Classic or Modern workspace experience. Both stay available; this only changes how the desktop and its windows look and behave."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Workspace Style", @"action sheet title")
+                                                         message:NSLocalizedString(@"Pick the Classic or Modern workspace experience. Both stay available; this only changes how the desktop and its windows look and behave.", @"workspace style sheet message")];
 
     NSArray<NSNumber *> *styles = @[@(WorkspaceStyleClassic), @(WorkspaceStyleModern)];
     NSDictionary<NSNumber *, NSString *> *styleTitles = @{
-        @(WorkspaceStyleClassic): @"Classic",
-        @(WorkspaceStyleModern): @"Modern",
+        @(WorkspaceStyleClassic): NSLocalizedString(@"Classic", @"workspace style name"),
+        @(WorkspaceStyleModern): NSLocalizedString(@"Modern", @"workspace style name"),
     };
     for (NSNumber *style in styles) {
         BOOL selected = preferences.workspaceStyle == (WorkspaceStyle) style.integerValue;
         NSString *actionTitle = selected
             ? [NSString stringWithFormat:@"✓ %@", styleTitles[style]]
             : styleTitles[style];
-        [sheet addAction:[UIAlertAction actionWithTitle:actionTitle
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:actionTitle
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             preferences.workspaceStyle = (WorkspaceStyle) style.integerValue;
             // Re-skin every open window immediately. Modern currently mirrors Classic, so
             // this is a no-op visual change until the Modern skin rung lands.
             [self refreshDockButtons];
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Back"
-                                              style:UIAlertActionStyleCancel
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:NSLocalizedString(@"Back", @"action sheet back button")
+                        style:UIAlertActionStyleCancel
+                      handler:^(__unused UIAlertAction *action) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self presentUtilsDockActionsFromView:sourceView];
         });
-    }]];
+    }];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockUtilsButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockUtilsButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockUtilsButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
 - (void)handleTerminalDockLongPress:(UILongPressGestureRecognizer *)recognizer {
@@ -5927,76 +7873,70 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 }
 
 - (void)presentTerminalDockActionsFromView:(UIView *)sourceView {
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Terminal"
-                                            message:@"Open or focus shell, console, or another active terminal."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Terminal", @"terminal action sheet title")
+                                                         message:NSLocalizedString(@"Open or focus shell, console, or another active terminal.", @"terminal action sheet message")];
 
     ISHWorkspaceContainedWindowView *primaryShellWindow = [self desktopWindowForTerminalRole:ISHWorkspaceTerminalRoleSessionShell];
-    NSString *primaryActionTitle = primaryShellWindow != nil ? @"Focus Session Shell" : @"Open Session Shell";
-    [sheet addAction:[UIAlertAction actionWithTitle:primaryActionTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    NSString *primaryActionTitle = primaryShellWindow != nil ? NSLocalizedString(@"Focus Session Shell", @"terminal sheet action") : NSLocalizedString(@"Open Session Shell", @"terminal sheet action");
+    [sheet addActionWithTitle:primaryActionTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openTerminalHerePreferringConsole:NO];
-    }]];
+    }];
 
     ISHWorkspaceContainedWindowView *primaryConsoleWindow = [self desktopWindowForTerminalRole:ISHWorkspaceTerminalRoleSystemConsole];
-    NSString *consoleActionTitle = primaryConsoleWindow != nil ? @"Focus System Console" : @"Open System Console";
-    [sheet addAction:[UIAlertAction actionWithTitle:consoleActionTitle
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    NSString *consoleActionTitle = primaryConsoleWindow != nil ? NSLocalizedString(@"Focus System Console", @"terminal sheet action") : NSLocalizedString(@"Open System Console", @"terminal sheet action");
+    [sheet addActionWithTitle:consoleActionTitle
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openTerminalHerePreferringConsole:YES];
-    }]];
+    }];
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Open Another Shell Window"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [sheet addActionWithTitle:NSLocalizedString(@"Open Another Shell Window", @"terminal sheet action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         [self openDesktopTerminalHerePreferringConsole:NO
                                          reuseExisting:NO
                                        trackPrimaryRole:NO];
-    }]];
+    }];
 
     NSUUID *primaryTerminalUUID = primaryShellWindow.hostedTerminalViewController.terminal.uuid;
     for (Terminal *terminal in [Terminal activeTerminals]) {
         if (primaryTerminalUUID != nil && [terminal.uuid isEqual:primaryTerminalUUID])
             continue;
-        NSString *title = [NSString stringWithFormat:@"Focus %@", ISHWorkspaceTerminalDisplayName(terminal)];
-        [sheet addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        NSString *title = [NSString stringWithFormat:NSLocalizedString(@"Focus %@", @"terminal sheet action; %@ is a terminal name"), ISHWorkspaceTerminalDisplayName(terminal)];
+        [sheet addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self openExistingTerminalHereWithUUID:terminal.uuid];
-        }]];
+        }];
     }
 
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button")
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    UIPopoverPresentationController *popoverPresentationController = sheet.popoverPresentationController;
-    if (popoverPresentationController != nil) {
-        popoverPresentationController.sourceView = sourceView ?: self.dockTerminalButton;
-        popoverPresentationController.sourceRect = sourceView != nil ? sourceView.bounds : self.dockTerminalButton.bounds;
-        popoverPresentationController.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    UIView *anchor = sourceView ?: self.dockTerminalButton;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
 }
 
-- (void)openDesktopTerminalHerePreferringConsole:(BOOL)preferConsole
-                                  reuseExisting:(BOOL)reuseExisting
-                                trackPrimaryRole:(BOOL)trackPrimaryRole {
+// Returns the window it opened or focused, or nil.
+- (nullable ISHWorkspaceContainedWindowView *)openDesktopTerminalHerePreferringConsole:(BOOL)preferConsole
+                                                                        reuseExisting:(BOOL)reuseExisting
+                                                                      trackPrimaryRole:(BOOL)trackPrimaryRole {
     NSString *terminalRole = preferConsole ? ISHWorkspaceTerminalRoleSystemConsole : ISHWorkspaceTerminalRoleSessionShell;
     if (reuseExisting) {
         ISHWorkspaceContainedWindowView *existingWindow = [self desktopWindowForTerminalRole:terminalRole];
         if (existingWindow != nil) {
             [self focusDesktopWindow:existingWindow];
-            return;
+            return existingWindow;
         }
     }
 
     TerminalViewController *terminalViewController = [self createDesktopTerminalViewController];
     if (terminalViewController == nil) {
         [self presentSceneActivationError:nil];
-        return;
+        return nil;
     }
     terminalViewController.freshSessionTerminalDisplayMode =
         preferConsole ? ISHFreshSessionTerminalDisplayModeSystemConsole
@@ -6005,9 +7945,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     // untracked dock "Terminal" windows are ordinary terminals that honor the
     // default-user preference, so they're titled accordingly.
     terminalViewController.alwaysLoginAsRoot = !preferConsole && trackPrimaryRole;
+    // Opened from the dock, now, by the user: see launchTerminalWithCommand.
+    terminalViewController.declinesRestoredSession = YES;
 
-    NSString *title = preferConsole ? @"System Console"
-                    : trackPrimaryRole ? @"Session Shell" : @"Terminal";
+    NSString *title = preferConsole ? NSLocalizedString(@"System Console", @"terminal window title")
+                    : trackPrimaryRole ? NSLocalizedString(@"Session Shell", @"terminal window title") : NSLocalizedString(@"Terminal", @"terminal window title");
     ISHWorkspaceContainedWindowView *windowView =
         [self openDesktopTerminalWindowWithTitle:title terminalViewController:terminalViewController];
     [terminalViewController startNewSession];
@@ -6025,6 +7967,30 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         windowView.titleLabel.text = title;
     }
     [self refreshDockButtons];
+    return windowView;
+}
+
+// A terminal a saved arrangement names whose window is not here -- the case on
+// every launch, since the Terminal it named went with the last process. It
+// comes back as a fresh shell in a window of the same kind, with as many tabs
+// as it had: an arrangement carries no processes, and a terminal that is
+// simply missing read as "layouts do not save terminals". A Session Shell or
+// System Console that IS open is used rather than doubled, as everywhere else.
+- (nullable ISHWorkspaceContainedWindowView *)openTerminalWindowForArrangementDescriptor:(NSDictionary<NSString *, id> *)descriptor {
+    NSString *role = [descriptor[@"terminalRole"] isKindOfClass:NSString.class] ? descriptor[@"terminalRole"] : nil;
+    BOOL console = [role isEqualToString:ISHWorkspaceTerminalRoleSystemConsole];
+    BOOL primary = console || [role isEqualToString:ISHWorkspaceTerminalRoleSessionShell];
+    ISHWorkspaceContainedWindowView *windowView =
+        [self openDesktopTerminalHerePreferringConsole:console reuseExisting:primary trackPrimaryRole:primary];
+    if (windowView == nil)
+        return nil;
+    NSArray *savedTabs = [descriptor[@"tabs"] isKindOfClass:NSArray.class] ? descriptor[@"tabs"] : nil;
+    NSUInteger have = [self terminalViewControllersInWindow:windowView].count;
+    for (NSUInteger tab = have; tab < savedTabs.count; tab++)
+        [self openNewTerminalTabInWindow:windowView];
+    if (savedTabs.count > 1)
+        [[self terminalTabsForWindow:windowView] selectTabAtIndex:[descriptor[@"selectedTab"] integerValue]];
+    return windowView;
 }
 
 - (void)openTerminalHerePreferringConsole:(BOOL)preferConsole {
@@ -6080,12 +8046,12 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if (@available(iOS 13.0, *)) {
         [self.view.window endEditing:YES];
         if (identifier.length == 0) {
-            [self presentSceneActivationError:nil title:@"Unable to focus window"];
+            [self presentSceneActivationError:nil title:NSLocalizedString(@"Unable to focus window", @"error alert title")];
             return;
         }
         UISceneSession *targetSession = ISHWorkspaceSceneSessionWithPersistentIdentifier(identifier);
         if (targetSession == nil) {
-            [self presentSceneActivationError:nil title:@"Unable to focus window"];
+            [self presentSceneActivationError:nil title:NSLocalizedString(@"Unable to focus window", @"error alert title")];
             return;
         }
         [UIApplication.sharedApplication requestSceneSessionActivation:targetSession
@@ -6093,7 +8059,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
                                                               options:nil
                                                          errorHandler:^(NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self presentSceneActivationError:error title:@"Unable to focus window"];
+                [self presentSceneActivationError:error title:NSLocalizedString(@"Unable to focus window", @"error alert title")];
             });
         }];
     } else {
@@ -6105,7 +8071,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if (@available(iOS 13.0, *)) {
         UISceneSession *targetSession = ISHWorkspaceSceneSessionWithPersistentIdentifier(identifier);
         if (targetSession == nil) {
-            [self presentSceneActivationError:nil title:@"Unable to close workspace"];
+            [self presentSceneActivationError:nil title:NSLocalizedString(@"Unable to close workspace", @"error alert title")];
             return;
         }
         if (ISHWorkspaceConnectedSceneForSession(targetSession) == nil) {
@@ -6116,11 +8082,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
                                                                 options:nil
                                                            errorHandler:^(NSError *error) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self presentSceneActivationError:error title:title ?: @"Unable to close workspace"];
+                [self presentSceneActivationError:error title:title ?: NSLocalizedString(@"Unable to close workspace", @"error alert title")];
             });
         }];
     } else {
-        [self presentSceneActivationError:nil title:@"Unable to close workspace"];
+        [self presentSceneActivationError:nil title:NSLocalizedString(@"Unable to close workspace", @"error alert title")];
         return;
     }
 }
@@ -6143,12 +8109,30 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     }
 }
 
+// The Wayland windows hand their session over (parked, not ended) and close;
+// the full-screen display takes the session over, or starts one. This
+// Workspace stays alive, to come back to.
+- (void)showWaylandFullScreen {
+    for (UIView *view in [self.desktopWindows copy]) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        UIViewController *content = [self contentViewControllerForDesktopWindow:windowView];
+        if (![content isKindOfClass:DisplayViewController.class])
+            continue;
+        [(DisplayViewController *) content parkSession];
+        if (windowView.closeHandler != nil)
+            windowView.closeHandler();
+    }
+    ISHWindowShowWaylandDisplay(self.view.window);
+}
+
 - (void)closeHiddenWorkspaceWindows:(id)sender {
     (void) sender;
     if (@available(iOS 13.0, *)) {
         NSArray<UISceneSession *> *sessions = [self hiddenWorkspaceSceneSessions];
         if (sessions.count == 0) {
-            [self presentSceneActivationError:nil title:@"No hidden workspace windows"];
+            [self presentSceneActivationError:nil title:NSLocalizedString(@"No hidden workspace windows", @"error alert title")];
             return;
         }
         for (UISceneSession *session in sessions) {
@@ -6159,7 +8143,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
             }];
         }
     } else {
-        [self presentSceneActivationError:nil title:@"Unable to close workspace"];
+        [self presentSceneActivationError:nil title:NSLocalizedString(@"Unable to close workspace", @"error alert title")];
     }
 }
 
@@ -6167,7 +8151,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if (@available(iOS 13.0, *)) {
         [self focusSceneWithPersistentIdentifier:sender.accessibilityIdentifier];
     } else {
-        [self presentSceneActivationError:nil title:@"Unable to focus window"];
+        [self presentSceneActivationError:nil title:NSLocalizedString(@"Unable to focus window", @"error alert title")];
     }
 }
 
@@ -6181,7 +8165,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         UISceneSession *existingSession = [self sceneSessionHostingTerminalUUID:terminalUUID];
         UISceneSession *currentSession = self.view.window.windowScene.session;
         if (existingSession != nil && existingSession != currentSession) {
-            [self focusSceneSession:existingSession title:@"Unable to focus terminal window"];
+            [self focusSceneSession:existingSession title:NSLocalizedString(@"Unable to focus terminal window", @"error alert title")];
             return;
         }
     }
@@ -6191,7 +8175,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         return;
     }
     if (terminal.webView.superview != nil) {
-        [self presentSceneActivationError:nil title:@"Terminal already open in another window"];
+        [self presentSceneActivationError:nil title:NSLocalizedString(@"Terminal already open in another window", @"error alert title")];
         return;
     }
 
@@ -6208,11 +8192,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)openNewWorkspaceWindow:(id)sender {
     if (!ISHWorkspaceSupportsSceneWindows()) {
-        [self presentSceneActivationError:nil title:@"Workspace windows are unavailable on this device"];
+        [self presentSceneActivationError:nil title:NSLocalizedString(@"Workspace windows are unavailable on this device", @"error alert title")];
         return;
     }
     [self requestSceneWithActivityType:ISHSceneActivityTypeWorkspace
-                               title:@"Unable to open workspace"
+                               title:NSLocalizedString(@"Unable to open workspace", @"error alert title")
                             userInfo:nil];
 }
 
@@ -6239,11 +8223,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 }
 
 - (void)presentSceneActivationError:(NSError *)error {
-    [self presentSceneActivationError:error title:@"Unable to open terminal"];
+    [self presentSceneActivationError:error title:NSLocalizedString(@"Unable to open terminal", @"error alert title")];
 }
 
 - (void)presentSceneActivationError:(NSError *)error title:(NSString *)title {
-    NSString *message = @"This device cannot open a separate terminal scene right now.";
+    NSString *message = NSLocalizedString(@"This device cannot open a separate terminal scene right now.", @"error alert message");
     if (error.localizedDescription.length > 0) {
         message = error.localizedDescription;
     }
@@ -6251,7 +8235,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         [UIAlertController alertControllerWithTitle:title
                                             message:message
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -6371,6 +8355,233 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 @end
 
+// ---- text size for the navigation-controller applets -------------------------
+//
+// Settings, Diagnostics and Filesystems: UIKit screens shared with the rest of
+// iSH-AOK, in a window whose content view controller is a navigation
+// controller. WorkspaceTextScaledPage in the header says how their pages follow
+// the window.
+//
+// Not a preferredContentSizeCategory trait override, though that would reach
+// every page and cell without the pages taking part. Their fonts are fixed
+// sizes (the storyboards' system 17, Menlo 14), which a trait does not move.
+// Making them Dynamic Type fonts would move Settings outside the Workspace too,
+// for anyone whose system text size is not the default. And the categories are
+// not the Workspace's steps -- body text has none below 0.82 -- and they resize
+// the navigation bar as well.
+
+// An associated object rather than an ivar, so that the two classes, whose
+// superclasses differ, share one implementation.
+static char ISHWorkspaceNavigationTextScaleKey;
+
+static CGFloat ISHWorkspaceNavigationControllerTextScale(UINavigationController *navigationController) {
+    NSNumber *scale = objc_getAssociatedObject(navigationController, &ISHWorkspaceNavigationTextScaleKey);
+    return scale != nil ? scale.doubleValue : 1.0;
+}
+
+static void ISHWorkspaceSetNavigationControllerTextScale(UINavigationController *navigationController, CGFloat scale) {
+    CGFloat clamped = ISHWorkspaceClampedTextScale(scale);
+    if (fabs(clamped - ISHWorkspaceNavigationControllerTextScale(navigationController)) < 0.001)
+        return;
+    objc_setAssociatedObject(navigationController, &ISHWorkspaceNavigationTextScaleKey, @(clamped),
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    // A page whose view is not loaded reads the scale when it loads, and a page
+    // pushed later reads it when it makes its rows.
+    for (UIViewController *page in navigationController.viewControllers) {
+        if (page.isViewLoaded && [page conformsToProtocol:@protocol(WorkspaceTextScaledPage)])
+            [(id<WorkspaceTextScaledPage>) page workspaceTextScaleDidChange];
+    }
+}
+
+@implementation WorkspaceToolNavigationController
+
+- (CGFloat)workspaceTextScale {
+    return ISHWorkspaceNavigationControllerTextScale(self);
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    ISHWorkspaceSetNavigationControllerTextScale(self, workspaceTextScale);
+}
+
+@end
+
+@implementation WorkspaceSettingsNavigationController
+
+- (CGFloat)workspaceTextScale {
+    return ISHWorkspaceNavigationControllerTextScale(self);
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    ISHWorkspaceSetNavigationControllerTextScale(self, workspaceTextScale);
+}
+
+@end
+
+CGFloat ISHWorkspaceTextScaleForViewController(UIViewController *viewController) {
+    for (UIViewController *ancestor = viewController; ancestor != nil; ancestor = ancestor.parentViewController) {
+        if ([ancestor conformsToProtocol:@protocol(WorkspaceTextScalable)])
+            return ((id<WorkspaceTextScalable>) ancestor).workspaceTextScale;
+    }
+    return 1.0;
+}
+
+CGFloat ISHWorkspaceScaledPointSize(CGFloat size, CGFloat scale) {
+    return round(size * scale * 2.0) / 2.0;
+}
+
+CGFloat ISHWorkspaceTextScaledRowHeight(CGFloat height, CGFloat scale) {
+    if (scale <= 1.001)
+        return height;
+    CGFloat scaled = round(44.0 * scale);
+    // UITableViewAutomaticDimension is negative. Rows like these resolve it to
+    // 44 however large their text, since nothing in them pushes on the height.
+    return height > 0 ? MAX(height, scaled) : scaled;
+}
+
+// ISHWorkspaceScaleTextFont's bookkeeping, kept on the view itself: the font its
+// owner gave it, the font set here (to notice when the owner sets another), and
+// the two properties scaling changes, to put back at 1.0.
+static char ISHWorkspaceUnscaledFontKey;
+static char ISHWorkspaceScaledFontKey;
+static char ISHWorkspaceUnscaledMinimumFontSizeKey;
+static char ISHWorkspaceAdjustsForContentSizeKey;
+static char ISHWorkspaceScaledCellKey;
+
+static UIFont *ISHWorkspaceFontOfTextView(UIView *view) {
+    if ([view isKindOfClass:UILabel.class])
+        return ((UILabel *) view).font;
+    if ([view isKindOfClass:UITextField.class])
+        return ((UITextField *) view).font;
+    return nil;
+}
+
+static void ISHWorkspaceSetFontOfTextView(UIView *view, UIFont *font) {
+    if ([view isKindOfClass:UILabel.class])
+        ((UILabel *) view).font = font;
+    else if ([view isKindOfClass:UITextField.class])
+        ((UITextField *) view).font = font;
+}
+
+static void ISHWorkspaceForgetTextScale(UIView *view) {
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledFontKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceScaledFontKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledMinimumFontSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceAdjustsForContentSizeKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+UIFont *ISHWorkspaceUnscaledFont(UIView *view) {
+    UIFont *font = ISHWorkspaceFontOfTextView(view);
+    UIFont *unscaled = objc_getAssociatedObject(view, &ISHWorkspaceUnscaledFontKey);
+    UIFont *scaled = objc_getAssociatedObject(view, &ISHWorkspaceScaledFontKey);
+    if (unscaled != nil && [font isEqual:scaled])
+        return unscaled;
+    return font;
+}
+
+void ISHWorkspaceScaleTextFont(UIView *view, CGFloat scale) {
+    UIFont *font = ISHWorkspaceFontOfTextView(view);
+    if (font == nil)
+        return;
+    BOOL actualSize = fabs(scale - 1.0) < 0.001;
+    UIFont *unscaled = objc_getAssociatedObject(view, &ISHWorkspaceUnscaledFontKey);
+    UIFont *scaled = objc_getAssociatedObject(view, &ISHWorkspaceScaledFontKey);
+    if (unscaled == nil && actualSize)
+        return;
+    // Not the font set here, so the view's owner has set one since -- a
+    // dequeued cell being configured, a row choosing its own face -- and that
+    // is the unscaled font now.
+    if (unscaled == nil || ![font isEqual:scaled])
+        unscaled = font;
+
+    // UILabel and UITextField both adopt it.
+    id<UIContentSizeCategoryAdjusting> adjusting = (id<UIContentSizeCategoryAdjusting>) view;
+    UITextField *field = [view isKindOfClass:UITextField.class] ? (UITextField *) view : nil;
+    NSNumber *adjusts = objc_getAssociatedObject(view, &ISHWorkspaceAdjustsForContentSizeKey)
+        ?: @(adjusting.adjustsFontForContentSizeCategory);
+    NSNumber *minimumFontSize = objc_getAssociatedObject(view, &ISHWorkspaceUnscaledMinimumFontSizeKey)
+        ?: @(field.minimumFontSize);
+
+    if (actualSize) {
+        ISHWorkspaceSetFontOfTextView(view, unscaled);
+        adjusting.adjustsFontForContentSizeCategory = adjusts.boolValue;
+        field.minimumFontSize = minimumFontSize.doubleValue;
+        ISHWorkspaceForgetTextScale(view);
+        return;
+    }
+    // Off while scaled. A view following Dynamic Type sets its own size again
+    // whenever its traits change, and a cell moving into the window is such a
+    // change, so the scale would be gone by the time the row is seen.
+    adjusting.adjustsFontForContentSizeCategory = NO;
+    UIFont *target = [unscaled fontWithSize:ISHWorkspaceScaledPointSize(unscaled.pointSize, scale)];
+    ISHWorkspaceSetFontOfTextView(view, target);
+    // A field that shrinks its text to fit would otherwise shrink it back as far
+    // as its old minimum.
+    field.minimumFontSize = ISHWorkspaceScaledPointSize(minimumFontSize.doubleValue, scale);
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledFontKey, unscaled, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceScaledFontKey, target, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceUnscaledMinimumFontSizeKey, minimumFontSize, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, &ISHWorkspaceAdjustsForContentSizeKey, adjusts, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// The labels and text fields under `view`, returning whether there were any.
+// Not inside any other control: a segmented control's or a button's titles are
+// chrome, and the labels inside them are UIKit's.
+static BOOL ISHWorkspaceScaleTextFontsInView(UIView *view, CGFloat scale) {
+    if ([view isKindOfClass:UILabel.class] || [view isKindOfClass:UITextField.class]) {
+        ISHWorkspaceScaleTextFont(view, scale);
+        return YES;
+    }
+    if ([view isKindOfClass:UIControl.class])
+        return NO;
+    BOOL found = NO;
+    for (UIView *subview in view.subviews) {
+        if (ISHWorkspaceScaleTextFontsInView(subview, scale))
+            found = YES;
+    }
+    return found;
+}
+
+void ISHWorkspaceScaleTableViewCell(UITableViewCell *cell, CGFloat scale) {
+    if (cell == nil)
+        return;
+    BOOL actualSize = fabs(scale - 1.0) < 0.001;
+    // Walked even at 1.0 in a cell never scaled. Whether a view needs putting
+    // back is recorded on the view, not the cell, and the two part company when
+    // a page keeps a view and moves it into whichever cell shows its row, as the
+    // Theme editor does with its name and colour fields: one scaled in another
+    // row can land in a cell already put back. A view never scaled costs a font
+    // read and is left alone, so outside the Workspace nothing changes.
+    BOOL found = ISHWorkspaceScaleTextFontsInView(cell.contentView, scale);
+    // UIKit may add a built-in style's labels to the content view only when it
+    // lays the cell out, after this has run. The row has set its text by then,
+    // so the labels it uses exist and can be asked for -- but only when the walk
+    // found nothing, so a storyboard cell of the custom style does not grow one,
+    // and at 1.0 only in a cell that was scaled, since those labels are the
+    // cell's own and could not have been scaled anywhere else.
+    BOOL cellWasScaled = objc_getAssociatedObject(cell, &ISHWorkspaceScaledCellKey) != nil;
+    if (!found && (!actualSize || cellWasScaled)) {
+        ISHWorkspaceScaleTextFont(cell.textLabel, scale);
+        ISHWorkspaceScaleTextFont(cell.detailTextLabel, scale);
+    }
+    objc_setAssociatedObject(cell, &ISHWorkspaceScaledCellKey, actualSize ? nil : @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+void ISHWorkspaceRescaleTableView(UITableView *tableView, CGFloat scale) {
+    // A reload can take a row out of the window, and a text field that loses
+    // first responder that way ends editing, which commits it: a half-typed
+    // launch command, a filesystem rename. With something being typed, the rows
+    // on screen are re-fonted where they are and only re-measured.
+    if (ISHWorkspaceFindFirstResponder(tableView) != nil) {
+        for (UITableViewCell *cell in tableView.visibleCells)
+            ISHWorkspaceScaleTableViewCell(cell, scale);
+        [UIView performWithoutAnimation:^{
+            [tableView performBatchUpdates:nil completion:nil];
+        }];
+        return;
+    }
+    [tableView reloadData];
+}
+
 @implementation WorkspaceThemedToolViewController {
     CAGradientLayer *_backgroundGradientLayer;
     UIView *_toolContentView;
@@ -6382,6 +8593,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     NSMutableArray<UILabel *> *_trackedAccentLabels;
     NSMutableArray<UITextView *> *_trackedTextViews;
     NSMutableArray<UIProgressView *> *_trackedProgressViews;
+    CGFloat _workspaceTextScale;   // 0 until set, which reads as 1.0
+    // -workspaceScaleLabel: bookkeeping: the unscaled font each label was given,
+    // and the font this class last set, to notice when the applet sets another.
+    NSMapTable<UILabel *, UIFont *> *_textScaleBaseFonts;
+    NSMapTable<UILabel *, UIFont *> *_textScaleAppliedFonts;
 }
 
 - (void)viewDidLoad {
@@ -6430,6 +8646,62 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     // UILabel's default color until a theme-change notification happens to fire (the bug that
     // left the Clock readout invisible on dark themes).
     [self workspaceApplyTheme];
+    // The same for a text size set before the subclass had built its views --
+    // a restore can set it that early.
+    if (fabs(self.workspaceTextScale - 1.0) > 0.001)
+        [self workspaceApplyTextScale];
+}
+
+- (CGFloat)workspaceTextScale {
+    return _workspaceTextScale > 0 ? _workspaceTextScale : 1.0;
+}
+
+- (void)setWorkspaceTextScale:(CGFloat)workspaceTextScale {
+    CGFloat clamped = ISHWorkspaceClampedTextScale(workspaceTextScale);
+    if (fabs(clamped - self.workspaceTextScale) < 0.001)
+        return;
+    _workspaceTextScale = clamped;
+    if (self.isViewLoaded)
+        [self workspaceApplyTextScale];
+}
+
+- (CGFloat)workspaceScaledFontSize:(CGFloat)size {
+    return round(size * self.workspaceTextScale * 2.0) / 2.0;
+}
+
+- (void)workspaceApplyTextScale {
+    [self workspaceApplyTrackedTextViewFonts];
+}
+
+- (void)workspaceScaleLabel:(UILabel *)label {
+    if (label.font == nil)
+        return;
+    if (_textScaleBaseFonts == nil) {
+        _textScaleBaseFonts = [NSMapTable weakToStrongObjectsMapTable];
+        _textScaleAppliedFonts = [NSMapTable weakToStrongObjectsMapTable];
+    }
+    UIFont *base = [_textScaleBaseFonts objectForKey:label];
+    UIFont *applied = [_textScaleAppliedFonts objectForKey:label];
+    if (base == nil || applied == nil || ![label.font isEqual:applied])
+        base = label.font;
+    UIFont *scaled = [base fontWithSize:[self workspaceScaledFontSize:base.pointSize]];
+    label.font = scaled;
+    [_textScaleBaseFonts setObject:base forKey:label];
+    [_textScaleAppliedFonts setObject:scaled forKey:label];
+}
+
+// The monospaced text views -workspaceThemeTextView makes. One place for their
+// size, shared by the factory, the theme and the text scale -- the theme used
+// to reset it without the scale (and without the factory's phone sizes).
+- (void)workspaceApplyTrackedTextViewFonts {
+    CGFloat pointSize = [self workspaceScaledFontSize:ISHWorkspaceThemeTextViewFontSize()];
+    for (UITextView *textView in _trackedTextViews) {
+        if (@available(iOS 13.0, *)) {
+            textView.font = [UIFont monospacedSystemFontOfSize:pointSize weight:UIFontWeightRegular];
+        } else {
+            textView.font = [UIFont fontWithName:@"Menlo-Regular" size:pointSize] ?: [UIFont systemFontOfSize:pointSize];
+        }
+    }
 }
 
 - (void)dealloc {
@@ -6511,14 +8783,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     textView.editable = NO;
     textView.alwaysBounceVertical = YES;
     textView.backgroundColor = UIColor.clearColor;
-    CGFloat pointSize = ISHWorkspaceDensityValue(ISHWorkspaceUsesPhoneLayout() ? 8.5 : 9.5,
-                                                 ISHWorkspaceUsesPhoneLayout() ? 11.0 : 12.0);
-    if (@available(iOS 13.0, *)) {
-        textView.font = [UIFont monospacedSystemFontOfSize:pointSize weight:UIFontWeightRegular];
-    } else {
-        textView.font = [UIFont fontWithName:@"Menlo-Regular" size:pointSize] ?: [UIFont systemFontOfSize:pointSize];
-    }
     [_trackedTextViews addObject:textView];
+    [self workspaceApplyTrackedTextViewFonts];
     return textView;
 }
 
@@ -6715,13 +8981,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     for (UILabel *label in _trackedAccentLabels) {
         label.textColor = theme[@"accent"];
     }
+    [self workspaceApplyTrackedTextViewFonts];
     for (UITextView *textView in _trackedTextViews) {
-        CGFloat pointSize = ISHWorkspaceDensityValue(9.5, 12.0);
-        if (@available(iOS 13.0, *)) {
-            textView.font = [UIFont monospacedSystemFontOfSize:pointSize weight:UIFontWeightRegular];
-        } else {
-            textView.font = [UIFont fontWithName:@"Menlo-Regular" size:pointSize] ?: [UIFont systemFontOfSize:pointSize];
-        }
         textView.textColor = theme[@"primary"];
         textView.tintColor = theme[@"accent"];
     }
@@ -6741,6 +9002,29 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     }
 }
 
+@end
+
+// A font size at a tool window's text scale (WorkspaceTextScalable), for the
+// applets below whose sizes come from ISHWorkspaceThemeFontSize. At 1.0 the size
+// comes back untouched: -workspaceScaledFontSize: rounds to half a point, and the
+// density and phone factors give sizes in between (11 * 0.92 on a phone), so the
+// rounding alone would move text nobody had scaled -- or had scaled and put back.
+static CGFloat ISHWorkspaceToolScaledFontSize(WorkspaceThemedToolViewController *tool, CGFloat size) {
+    if (fabs(tool.workspaceTextScale - 1.0) < 0.001)
+        return size;
+    return [tool workspaceScaledFontSize:size];
+}
+
+// Theme names, their descriptions, the panel's prose (the preview card's sample
+// text included), the colour names with their R/G/B readouts and the editor's
+// buttons follow Cmd+= / Cmd+- / Cmd+0. The theme thumbnails, the wallpaper
+// image, the swatches, the sliders and the Rings/Bars control are pictures and
+// controls, and stay as they are.
+//
+// This applet posts ISHWorkspaceToolThemeDidChangeNotification, which every
+// applet observes. The text scale is this window's alone, so nothing here goes
+// near that notification: the scale is re-applied to this view controller only.
+@interface WorkspaceThemesToolViewController () <WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceThemesToolViewController {
@@ -6767,23 +9051,64 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     NSMutableArray<UIButton *> *_themeSelectionButtons;
     NSMutableArray<UIButton *> *_editorActionButtons;
     NSString *_editingThemeIdentifier;
+    // The labels built once, each with the font it was finally given (the
+    // factory's size, or the literal that replaced it), and the fixed widths of
+    // the slider rows' R/G/B and value columns. Every re-apply starts from these.
+    NSMapTable<UILabel *, UIFont *> *_unscaledLabelFonts;
+    NSMapTable<NSLayoutConstraint *, NSNumber *> *_unscaledColumnWidths;
+}
+
+#pragma mark WorkspaceTextScalable
+
+- (void)recordUnscaledLabel:(UILabel *)label {
+    if (label.font != nil)
+        [_unscaledLabelFonts setObject:label.font forKey:label];
+}
+
+- (void)recordUnscaledColumnWidth:(NSLayoutConstraint *)constraint {
+    [_unscaledColumnWidths setObject:@(constraint.constant) forKey:constraint];
+}
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_contentStack == nil)
+        return;
+    for (UILabel *label in _unscaledLabelFonts) {
+        UIFont *unscaled = [_unscaledLabelFonts objectForKey:label];
+        CGFloat size = ISHWorkspaceToolScaledFontSize(self, unscaled.pointSize);
+        label.font = size == unscaled.pointSize ? unscaled : [unscaled fontWithSize:size];
+    }
+    // The columns line the sliders up across the cards; they widen with their
+    // digits so "255" is not clipped.
+    for (NSLayoutConstraint *constraint in _unscaledColumnWidths)
+        constraint.constant = ceil([_unscaledColumnWidths objectForKey:constraint].doubleValue * self.workspaceTextScale);
+    for (UIButton *button in _editorActionButtons)
+        button.titleLabel.font = [self themeUtilityButtonFont];
+    // The library is rebuilt rather than re-fonted: its rows build their fonts at
+    // the current scale, and this is the same rebuild a theme change runs.
+    [self refreshThemeSelectionButtons];
+}
+
+- (UIFont *)themeUtilityButtonFont {
+    return [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1))
+                             weight:UIFontWeightSemibold];
 }
 
 - (NSString *)themeEditorTitleForKey:(NSString *)key {
     if ([key isEqualToString:@"backgroundTop"])
-        return @"Background Top";
+        return NSLocalizedString(@"Background Top", @"theme palette colour name");
     if ([key isEqualToString:@"backgroundBottom"])
-        return @"Background Bottom";
+        return NSLocalizedString(@"Background Bottom", @"theme palette colour name");
     if ([key isEqualToString:@"card"])
-        return @"Card Surface";
+        return NSLocalizedString(@"Card Surface", @"theme palette colour name");
     if ([key isEqualToString:@"primary"])
-        return @"Primary Text";
+        return NSLocalizedString(@"Primary Text", @"theme palette colour name");
     if ([key isEqualToString:@"secondary"])
-        return @"Secondary Text";
+        return NSLocalizedString(@"Secondary Text", @"theme palette colour name");
     if ([key isEqualToString:@"accent"])
-        return @"Accent";
+        return NSLocalizedString(@"Accent", @"theme palette colour name");
     if ([key isEqualToString:@"accentAlt"])
-        return @"Accent Alt";
+        return NSLocalizedString(@"Accent Alt", @"theme palette colour name");
     return key;
 }
 
@@ -6793,7 +9118,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     for (NSString *key in ISHWorkspaceThemeEditableColorKeys()) {
         NSDictionary<NSString *, NSNumber *> *descriptor = palette[key];
         if (![descriptor isKindOfClass:NSDictionary.class]) {
-            descriptor = ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeAuroraIdentifier)[key];
+            descriptor = ISHWorkspaceBuiltInThemePalette(ISHWorkspaceToolThemeDefaultIdentifier)[key];
         }
         if (descriptor != nil)
             palette[key] = [descriptor copy];
@@ -6822,7 +9147,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     button.layer.cornerRadius = 10;
     button.layer.borderWidth = 1;
     button.contentEdgeInsets = UIEdgeInsetsMake(7, 10, 7, 10);
-    button.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1) weight:UIFontWeightSemibold];
+    button.titleLabel.font = [self themeUtilityButtonFont];
     [button setTitle:title forState:UIControlStateNormal];
     [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
     [_editorActionButtons addObject:button];
@@ -6837,6 +9162,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     button.clipsToBounds = NO;
     [button.heightAnchor constraintGreaterThanOrEqualToConstant:68].active = YES;
     button.accessibilityIdentifier = identifier;
+    // A custom button has no title for VoiceOver to read, and the labels drawn
+    // inside it are not its own: without this the row was announced as
+    // "button" and nothing else. -refreshThemeSelectionButtons gives it the
+    // row's second line as its value.
+    button.accessibilityLabel = title;
     [button addTarget:self action:@selector(selectThemeFromButton:) forControlEvents:UIControlEventTouchUpInside];
 
     UIStackView *contentRow = [UIStackView new];
@@ -6867,10 +9197,14 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     textStack.alignment = UIStackViewAlignmentLeading;
     textStack.userInteractionEnabled = NO;
     UILabel *titleLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleBody monospaced:NO];
-    titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightSemibold];
+    // Built at the window's text scale: -refreshThemeSelectionButtons rebuilds
+    // these rows, so this is where their size is decided every time.
+    titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                        weight:UIFontWeightSemibold];
     titleLabel.numberOfLines = 1;
     titleLabel.text = title;
     UILabel *detailLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
+    detailLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
     detailLabel.numberOfLines = 2;
     [textStack addArrangedSubview:titleLabel];
     [textStack addArrangedSubview:detailLabel];
@@ -6907,6 +9241,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
     UILabel *titleLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
     titleLabel.text = title;
+    [self recordUnscaledLabel:titleLabel];
     UIView *swatch = [UIView new];
     swatch.translatesAutoresizingMaskIntoConstraints = NO;
     swatch.layer.cornerRadius = 8;
@@ -6936,7 +9271,10 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         UILabel *channelLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:YES];
         channelLabel.text = channelDescriptor[@"name"];
         channelLabel.textAlignment = NSTextAlignmentCenter;
-        [channelLabel.widthAnchor constraintEqualToConstant:16].active = YES;
+        NSLayoutConstraint *channelWidth = [channelLabel.widthAnchor constraintEqualToConstant:16];
+        channelWidth.active = YES;
+        [self recordUnscaledLabel:channelLabel];
+        [self recordUnscaledColumnWidth:channelWidth];
 
         UISlider *slider = [UISlider new];
         slider.minimumValue = 0.0f;
@@ -6946,7 +9284,10 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
         UILabel *valueLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:YES];
         valueLabel.textAlignment = NSTextAlignmentRight;
-        [valueLabel.widthAnchor constraintEqualToConstant:28].active = YES;
+        NSLayoutConstraint *valueWidth = [valueLabel.widthAnchor constraintEqualToConstant:28];
+        valueWidth.active = YES;
+        [self recordUnscaledLabel:valueLabel];
+        [self recordUnscaledColumnWidth:valueWidth];
 
         [row addArrangedSubview:channelLabel];
         [row addArrangedSubview:slider];
@@ -7014,12 +9355,19 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     for (NSDictionary<NSString *, id> *choice in ISHWorkspaceThemeChoices()) {
         NSString *identifier = choice[@"identifier"];
         NSString *title = choice[@"title"];
-        NSString *detail = [choice[@"builtIn"] boolValue] ? @"Built-in theme" : @"Saved custom theme";
+        NSString *detail = [choice[@"builtIn"] boolValue] ? NSLocalizedString(@"Built-in theme", @"theme library row detail") : NSLocalizedString(@"Saved custom theme", @"theme library row detail");
         UIButton *button = [self themeSelectionButtonWithTitle:title identifier:identifier];
         UILabel *detailLabel = _themeDetailLabelsByIdentifier[identifier];
         detailLabel.text = [identifier isEqualToString:currentIdentifier]
-            ? [NSString stringWithFormat:@"Applied • %@", detail]
+            ? [NSString stringWithFormat:NSLocalizedString(@"Applied • %@", @"theme library row detail for the applied theme; %@ is Built-in theme or Saved custom theme"), detail]
             : detail;
+        // What the row shows, said: the kind of theme, and whether it is the
+        // one applied (as the selected trait, which VoiceOver announces).
+        button.accessibilityValue = detail;
+        if ([identifier isEqualToString:currentIdentifier])
+            button.accessibilityTraits |= UIAccessibilityTraitSelected;
+        else
+            button.accessibilityTraits &= ~UIAccessibilityTraitSelected;
         [_themeListStack addArrangedSubview:button];
     }
     [self workspaceApplyTheme];
@@ -7056,8 +9404,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(_editingThemeIdentifier);
     NSString *title = record[@"title"];
     if (title.length == 0)
-        title = @"Draft Theme";
-    _editorThemeLabel.text = [NSString stringWithFormat:@"Editing: %@", title];
+        title = NSLocalizedString(@"Draft Theme", @"theme editor name for an unsaved theme");
+    _editorThemeLabel.text = [NSString stringWithFormat:NSLocalizedString(@"Editing: %@", @"theme editor label; %@ is a theme name"), title];
 }
 
 - (void)themeSliderChanged:(UISlider *)sender {
@@ -7077,23 +9425,23 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 - (void)saveThemeAsNew:(id)sender {
     (void) sender;
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Save Theme"
-                                            message:@"Save the current editor palette as a custom Workspace theme."
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Save Theme", @"alert title")
+                                            message:NSLocalizedString(@"Save the current editor palette as a custom Workspace theme.", @"save theme alert message")
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.placeholder = @"Theme name";
-        textField.text = @"Custom Theme";
+        textField.placeholder = NSLocalizedString(@"Theme name", @"theme name placeholder");
+        textField.text = NSLocalizedString(@"Custom Theme", @"default name for a new custom theme");
     }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         NSString *title = alert.textFields.firstObject.text ?: @"";
         title = [title stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         if (title.length == 0)
-            title = @"Custom Theme";
+            title = NSLocalizedString(@"Custom Theme", @"default name for a new custom theme");
         NSString *identifier = ISHWorkspaceCreateCustomThemeIdentifier();
         ISHWorkspaceSaveCustomThemeRecord(identifier, title, [self draftPalette]);
         ISHWorkspaceSetCurrentThemeIdentifier(identifier);
@@ -7108,7 +9456,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if (ISHWorkspaceThemeIdentifierIsBuiltIn(_editingThemeIdentifier))
         return;
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(_editingThemeIdentifier);
-    NSString *title = record[@"title"] ?: @"Custom Theme";
+    NSString *title = record[@"title"] ?: NSLocalizedString(@"Custom Theme", @"default name for a custom theme");
     ISHWorkspaceSaveCustomThemeRecord(_editingThemeIdentifier, title, [self draftPalette]);
     ISHWorkspaceSetCurrentThemeIdentifier(_editingThemeIdentifier);
     [self refreshThemeSelectionButtons];
@@ -7120,19 +9468,19 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     if (ISHWorkspaceThemeIdentifierIsBuiltIn(_editingThemeIdentifier))
         return;
     NSDictionary<NSString *, id> *record = ISHWorkspaceThemeRecordForIdentifier(_editingThemeIdentifier);
-    NSString *title = record[@"title"] ?: @"this theme";
+    NSString *title = record[@"title"] ?: NSLocalizedString(@"this theme", @"stands in for a theme name in the delete theme message");
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Delete Theme?"
-                                            message:[NSString stringWithFormat:@"Remove %@ from saved custom themes.", title]
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Delete Theme?", @"alert title")
+                                            message:[NSString stringWithFormat:NSLocalizedString(@"Remove %@ from saved custom themes.", @"delete theme alert message; %@ is a theme name"), title]
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button")
                                               style:UIAlertActionStyleCancel
                                             handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Delete"
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Delete", @"alert button")
                                               style:UIAlertActionStyleDestructive
                                             handler:^(__unused UIAlertAction *action) {
         ISHWorkspaceDeleteCustomThemeRecord(self->_editingThemeIdentifier);
-        ISHWorkspaceSetCurrentThemeIdentifier(ISHWorkspaceToolThemeAuroraIdentifier);
+        ISHWorkspaceSetCurrentThemeIdentifier(ISHWorkspaceToolThemeDefaultIdentifier);
         [self loadThemeIntoEditorWithIdentifier:ISHWorkspaceCurrentThemeIdentifier()];
         [self refreshThemeSelectionButtons];
     }]];
@@ -7171,7 +9519,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Themes";
+    self.title = NSLocalizedString(@"Themes", @"Themes tool title");
 
     _swatchViewsByKey = [NSMutableDictionary dictionary];
     _channelSlidersByKey = [NSMutableDictionary dictionary];
@@ -7181,6 +9529,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     _themeDetailLabelsByIdentifier = [NSMutableDictionary dictionary];
     _themeSelectionButtons = [NSMutableArray array];
     _editorActionButtons = [NSMutableArray array];
+    _unscaledLabelFonts = [NSMapTable weakToStrongObjectsMapTable];
+    _unscaledColumnWidths = [NSMapTable strongToStrongObjectsMapTable];
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -7200,12 +9550,12 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     headerStack.spacing = 6;
     [headerCard addSubview:headerStack];
     UILabel *headerEyebrow = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    headerEyebrow.text = @"WORKSPACE THEMES";
+    headerEyebrow.text = NSLocalizedString(@"WORKSPACE THEMES", @"Themes tool header eyebrow");
     headerEyebrow.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
     _activeThemeLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleTitle2 monospaced:NO];
     _activeThemeLabel.numberOfLines = 0;
     UILabel *headerBody = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleBody monospaced:NO];
-    headerBody.text = @"Change themes from one native utility, then fine-tune and save custom palettes for every Workspace app.";
+    headerBody.text = NSLocalizedString(@"Change themes from one native utility, then fine-tune and save custom palettes for every Workspace app.", @"Themes tool header text");
     [headerStack addArrangedSubview:headerEyebrow];
     [headerStack addArrangedSubview:_activeThemeLabel];
     [headerStack addArrangedSubview:headerBody];
@@ -7223,9 +9573,9 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     libraryStack.spacing = 8;
     [libraryCard addSubview:libraryStack];
     UILabel *libraryTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
-    libraryTitle.text = @"Theme Library";
+    libraryTitle.text = NSLocalizedString(@"Theme Library", @"Themes tool section title");
     UILabel *librarySubtitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
-    librarySubtitle.text = @"Tap any theme to apply it everywhere and load it into the editor below.";
+    librarySubtitle.text = NSLocalizedString(@"Tap any theme to apply it everywhere and load it into the editor below.", @"Themes tool section subtitle");
     _themeListStack = [UIStackView new];
     _themeListStack.axis = UILayoutConstraintAxisVertical;
     _themeListStack.spacing = 6;
@@ -7246,7 +9596,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     editorStack.spacing = 10;
     [editorCard addSubview:editorStack];
     UILabel *editorTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
-    editorTitle.text = @"Palette Editor";
+    editorTitle.text = NSLocalizedString(@"Palette Editor", @"Themes tool section title");
     _editorThemeLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
 
     _previewSurfaceView = [UIView new];
@@ -7266,11 +9616,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     [_previewSurfaceView addSubview:previewStack];
     _previewTitleLabel = [UILabel new];
     _previewTitleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleTitle3];
-    _previewTitleLabel.text = @"Preview";
+    _previewTitleLabel.text = NSLocalizedString(@"Preview", @"Themes tool preview title");
     _previewBodyLabel = [UILabel new];
     _previewBodyLabel.numberOfLines = 0;
     _previewBodyLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
-    _previewBodyLabel.text = @"Buttons, cards, text, and monitor bars will all update when you apply this theme.";
+    _previewBodyLabel.text = NSLocalizedString(@"Buttons, cards, text, and monitor bars will all update when you apply this theme.", @"Themes tool preview text");
     _previewProgressView = [[UIProgressView alloc] initWithProgressViewStyle:UIProgressViewStyleDefault];
     _previewProgressView.translatesAutoresizingMaskIntoConstraints = NO;
     _previewProgressView.transform = CGAffineTransformMakeScale(1.0, 1.4);
@@ -7292,9 +9642,9 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     backgroundStack.spacing = 6;
     [backgroundCard addSubview:backgroundStack];
     UILabel *backgroundTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
-    backgroundTitle.text = @"Wallpaper Preview";
+    backgroundTitle.text = NSLocalizedString(@"Wallpaper Preview", @"Themes tool section title");
     UILabel *backgroundSubtitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    backgroundSubtitle.text = @"Generated from the current palette and sized for the current screen.";
+    backgroundSubtitle.text = NSLocalizedString(@"Generated from the current palette and sized for the current screen.", @"Themes tool section subtitle");
     _backgroundPreviewImageView = [UIImageView new];
     _backgroundPreviewImageView.translatesAutoresizingMaskIntoConstraints = NO;
     _backgroundPreviewImageView.contentMode = UIViewContentModeScaleAspectFill;
@@ -7319,7 +9669,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     densityStack.spacing = 6;
     [densityCard addSubview:densityStack];
     UILabel *densityTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
-    densityTitle.text = @"Utility Density";
+    densityTitle.text = NSLocalizedString(@"Utility Density", @"Themes tool section title");
     _densityValueLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
     _densitySlider = [UISlider new];
     _densitySlider.minimumValue = 0.0f;
@@ -7327,7 +9677,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     _densitySlider.value = (float) ISHWorkspaceCurrentDensity();
     [_densitySlider addTarget:self action:@selector(densitySliderChanged:) forControlEvents:UIControlEventValueChanged];
     UILabel *densitySubtitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    densitySubtitle.text = @"Lower values pack the utility cards tighter for smaller screens.";
+    densitySubtitle.text = NSLocalizedString(@"Lower values pack the utility cards tighter for smaller screens.", @"Themes tool section subtitle");
     [densityStack addArrangedSubview:densityTitle];
     [densityStack addArrangedSubview:_densityValueLabel];
     [densityStack addArrangedSubview:_densitySlider];
@@ -7346,12 +9696,12 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     gaugeStack.spacing = 6;
     [gaugeCard addSubview:gaugeStack];
     UILabel *gaugeTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
-    gaugeTitle.text = @"Gauge Style";
-    _gaugeStyleControl = [[UISegmentedControl alloc] initWithItems:@[@"Rings", @"Bars"]];
+    gaugeTitle.text = NSLocalizedString(@"Gauge Style", @"Themes tool section title");
+    _gaugeStyleControl = [[UISegmentedControl alloc] initWithItems:@[NSLocalizedString(@"Rings", @"gauge style option"), NSLocalizedString(@"Bars", @"gauge style option")]];
     _gaugeStyleControl.selectedSegmentIndex = ISHWorkspaceUsesRingGauges() ? 0 : 1;
     [_gaugeStyleControl addTarget:self action:@selector(gaugeStyleControlChanged:) forControlEvents:UIControlEventValueChanged];
     UILabel *gaugeSubtitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    gaugeSubtitle.text = @"How the status applets draw CPU, memory, battery, and storage.";
+    gaugeSubtitle.text = NSLocalizedString(@"How the status applets draw CPU, memory, battery, and storage.", @"Themes tool section subtitle");
     [gaugeStack addArrangedSubview:gaugeTitle];
     [gaugeStack addArrangedSubview:_gaugeStyleControl];
     [gaugeStack addArrangedSubview:gaugeSubtitle];
@@ -7370,18 +9720,18 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     actionRowTop.axis = UILayoutConstraintAxisHorizontal;
     actionRowTop.spacing = 8;
     actionRowTop.distribution = UIStackViewDistributionFillEqually;
-    [actionRowTop addArrangedSubview:[self themeUtilityButtonWithTitle:@"Save As New"
+    [actionRowTop addArrangedSubview:[self themeUtilityButtonWithTitle:NSLocalizedString(@"Save As New", @"Themes tool button")
                                                               selector:@selector(saveThemeAsNew:)]];
-    [actionRowTop addArrangedSubview:[self themeUtilityButtonWithTitle:@"Update Selected"
+    [actionRowTop addArrangedSubview:[self themeUtilityButtonWithTitle:NSLocalizedString(@"Update Selected", @"Themes tool button")
                                                               selector:@selector(updateSelectedCustomTheme:)]];
 
     UIStackView *actionRowBottom = [UIStackView new];
     actionRowBottom.axis = UILayoutConstraintAxisHorizontal;
     actionRowBottom.spacing = 8;
     actionRowBottom.distribution = UIStackViewDistributionFillEqually;
-    [actionRowBottom addArrangedSubview:[self themeUtilityButtonWithTitle:@"Delete Selected"
+    [actionRowBottom addArrangedSubview:[self themeUtilityButtonWithTitle:NSLocalizedString(@"Delete Selected", @"Themes tool button")
                                                                  selector:@selector(deleteSelectedCustomTheme:)]];
-    [actionRowBottom addArrangedSubview:[self themeUtilityButtonWithTitle:@"Apply Wallpaper"
+    [actionRowBottom addArrangedSubview:[self themeUtilityButtonWithTitle:NSLocalizedString(@"Apply Wallpaper", @"Themes tool button")
                                                                  selector:@selector(generateThemeBackgroundImage:)]];
 
     [actionStack addArrangedSubview:actionRowTop];
@@ -7421,6 +9771,17 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         [_contentStack.widthAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.widthAnchor constant:-28],
     ]];
 
+    // Recorded here, after every literal that replaced a factory font (the
+    // eyebrow's 11pt) has run, so the text scale multiplies the font each label
+    // really has.
+    for (UILabel *label in @[headerEyebrow, _activeThemeLabel, headerBody,
+                             libraryTitle, librarySubtitle,
+                             editorTitle, _editorThemeLabel, _previewTitleLabel, _previewBodyLabel,
+                             backgroundTitle, backgroundSubtitle,
+                             densityTitle, _densityValueLabel, densitySubtitle,
+                             gaugeTitle, gaugeSubtitle])
+        [self recordUnscaledLabel:label];
+
     [self refreshThemeSelectionButtons];
     [self loadThemeIntoEditorWithIdentifier:ISHWorkspaceCurrentThemeIdentifier()];
 }
@@ -7432,7 +9793,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)workspaceThemeDidChange:(NSNotification *)notification {
     [super workspaceThemeDidChange:notification];
-    _activeThemeLabel.text = [NSString stringWithFormat:@"Active Theme: %@", ISHWorkspaceCurrentThemeTitle()];
+    _activeThemeLabel.text = [NSString stringWithFormat:NSLocalizedString(@"Active Theme: %@", @"Themes tool label; %@ is a theme name"), ISHWorkspaceCurrentThemeTitle()];
     [self refreshThemeSelectionButtons];
     if (_editingThemeIdentifier.length == 0 || ISHWorkspaceThemeRecordForIdentifier(_editingThemeIdentifier) == nil) {
         [self loadThemeIntoEditorWithIdentifier:ISHWorkspaceCurrentThemeIdentifier()];
@@ -7442,7 +9803,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 - (void)workspaceApplyTheme {
     [super workspaceApplyTheme];
     NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
-    _activeThemeLabel.text = [NSString stringWithFormat:@"Active Theme: %@", ISHWorkspaceCurrentThemeTitle()];
+    _activeThemeLabel.text = [NSString stringWithFormat:NSLocalizedString(@"Active Theme: %@", @"Themes tool label; %@ is a theme name"), ISHWorkspaceCurrentThemeTitle()];
 
     for (UIButton *button in _themeSelectionButtons) {
         NSString *identifier = button.accessibilityIdentifier;
@@ -7463,8 +9824,15 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         button.layer.shadowOffset = CGSizeMake(0, 0);
         _themePreviewImageViewsByIdentifier[identifier].layer.borderColor =
             (selected ? theme[@"accentAlt"] : theme[@"stroke"]).CGColor;
-        _themeTitleLabelsByIdentifier[identifier].textColor = selected ? theme[@"card"] : theme[@"primary"];
-        _themeDetailLabelsByIdentifier[identifier].textColor = selected ? theme[@"cardAlt"] : theme[@"secondary"];
+        // The selected row is an accent wash over the card, so its text is measured
+        // against that composite. Using the card colour as the text assumed the
+        // wash was darker than the card, which is true for no built-in theme.
+        UIColor *selectedFill = ISHWorkspaceThemeWashOverColor(theme[@"accent"], 0.34, theme[@"card"]);
+        UIColor *selectedInk = ISHWorkspaceThemeOnSurfaceColor(selectedFill, 4.5);
+        _themeTitleLabelsByIdentifier[identifier].textColor = selected ? selectedInk : theme[@"primary"];
+        _themeDetailLabelsByIdentifier[identifier].textColor =
+            selected ? ISHWorkspaceThemeMutedOnSurfaceColor(selectedInk, selectedFill, 4.5)
+                     : theme[@"secondary"];
     }
     BOOL editingCustom = !ISHWorkspaceThemeIdentifierIsBuiltIn(_editingThemeIdentifier);
     for (UIButton *button in _editorActionButtons) {
@@ -7493,13 +9861,64 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 @end
 
+// Terminal names, the summary, the suspend status and the button captions all
+// follow Cmd+= / Cmd+- / Cmd+0; there is no chrome here beyond the cards.
+@interface WorkspaceSessionsToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceSessionsToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UILabel *_summaryLabel;
     UIStackView *_quickActionsStack;
     UIStackView *_sessionButtonsStack;
+    // Its first four are the quick actions, but only by the trim in
+    // -refreshSessions, which also drops the suspend button. The text scale
+    // keeps its own list of the quick actions rather than lean on that.
     NSMutableArray<UIButton *> *_trackedButtons;
+    NSArray<UIButton *> *_quickActionButtons;
+    UILabel *_summaryEyebrowLabel;
+    UILabel *_sessionsTitleLabel;
+    UILabel *_suspendEyebrowLabel;
+    // Suspend to disk (kernel/checkpoint.c). The automatic half needs no UI --
+    // it happens on backgrounding -- so what is here is the state of it and
+    // the one thing a user cannot do any other way from a GUI: take one NOW.
+    UILabel *_suspendLabel;
+    UIButton *_suspendButton;
+    BOOL _suspendInProgress;
+}
+
+// The two-line title these buttons wear, split out because the suspend button
+// changes both halves as its state changes ("Save Session Now" / "Open
+// Settings" / "Saving...").
+//
+// Every button's fonts are decided here, at the window's text scale, so a
+// terminal row rebuilt by -refreshSessions comes out at the current size.
+- (void)restyleSessionButton:(UIButton *)button title:(NSString *)title subtitle:(NSString *)subtitle {
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = NSTextAlignmentLeft;
+    CGFloat titleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline));
+    CGFloat subtitleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1));
+    NSMutableAttributedString *titleString =
+        [[NSMutableAttributedString alloc] initWithString:title
+                                               attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:titleSize
+                                               weight:UIFontWeightSemibold],
+        NSParagraphStyleAttributeName: style,
+    }];
+    [titleString appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
+                                                                        attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
+                                               weight:UIFontWeightMedium],
+        NSParagraphStyleAttributeName: style,
+    }]];
+    [titleString appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
+                                                                        attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
+                                               weight:UIFontWeightMedium],
+        NSParagraphStyleAttributeName: style,
+    }]];
+    [button setAttributedTitle:titleString forState:UIControlStateNormal];
 }
 
 - (UIButton *)sessionButtonWithTitle:(NSString *)title subtitle:(NSString *)subtitle selector:(SEL)selector {
@@ -7510,29 +9929,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     button.titleLabel.numberOfLines = 0;
     button.layer.cornerRadius = 12;
     button.layer.borderWidth = 1;
-
-    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
-    style.alignment = NSTextAlignmentLeft;
-    NSMutableAttributedString *titleString =
-        [[NSMutableAttributedString alloc] initWithString:title
-                                               attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
-                                               weight:UIFontWeightSemibold],
-        NSParagraphStyleAttributeName: style,
-    }];
-    [titleString appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                        attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
-                                               weight:UIFontWeightMedium],
-        NSParagraphStyleAttributeName: style,
-    }]];
-    [titleString appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
-                                                                        attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
-                                               weight:UIFontWeightMedium],
-        NSParagraphStyleAttributeName: style,
-    }]];
-    [button setAttributedTitle:titleString forState:UIControlStateNormal];
+    [self restyleSessionButton:button title:title subtitle:subtitle];
     [button addTarget:self action:selector forControlEvents:UIControlEventTouchUpInside];
     [_trackedButtons addObject:button];
     return button;
@@ -7540,7 +9937,7 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Sessions";
+    self.title = NSLocalizedString(@"Sessions", @"Sessions tool title");
     _trackedButtons = [NSMutableArray array];
 
     _scrollView = [UIScrollView new];
@@ -7561,8 +9958,9 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     summaryStack.spacing = 6;
     [summaryCard addSubview:summaryStack];
     UILabel *summaryTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    summaryTitle.text = @"ACTIVE SESSIONS";
+    summaryTitle.text = NSLocalizedString(@"ACTIVE SESSIONS", @"Sessions tool section eyebrow");
     summaryTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    _summaryEyebrowLabel = summaryTitle;
     _summaryLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
     _summaryLabel.numberOfLines = 0;
     [summaryStack addArrangedSubview:summaryTitle];
@@ -7585,11 +9983,11 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     rowOne.axis = UILayoutConstraintAxisHorizontal;
     rowOne.spacing = 6;
     rowOne.distribution = UIStackViewDistributionFillEqually;
-    UIButton *shellButton = [self sessionButtonWithTitle:@"Session Shell"
-                                                subtitle:@"Open or focus the primary shell"
+    UIButton *shellButton = [self sessionButtonWithTitle:NSLocalizedString(@"Session Shell", @"Sessions tool button")
+                                                subtitle:NSLocalizedString(@"Open or focus the primary shell", @"Sessions tool button subtitle")
                                                 selector:@selector(openShellShortcut:)];
-    UIButton *consoleButton = [self sessionButtonWithTitle:@"System Console"
-                                                  subtitle:@"Open or focus the console"
+    UIButton *consoleButton = [self sessionButtonWithTitle:NSLocalizedString(@"System Console", @"Sessions tool button")
+                                                  subtitle:NSLocalizedString(@"Open or focus the console", @"Sessions tool button subtitle")
                                                   selector:@selector(openConsoleShortcut:)];
     [rowOne addArrangedSubview:shellButton];
     [rowOne addArrangedSubview:consoleButton];
@@ -7598,23 +9996,24 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     rowTwo.axis = UILayoutConstraintAxisHorizontal;
     rowTwo.spacing = 6;
     rowTwo.distribution = UIStackViewDistributionFillEqually;
-    UIButton *dashboardButton = [self sessionButtonWithTitle:@"Layout Manager"
-                                                    subtitle:@"Save or restore this workspace"
+    UIButton *dashboardButton = [self sessionButtonWithTitle:NSLocalizedString(@"Layout Manager", @"Sessions tool button")
+                                                    subtitle:NSLocalizedString(@"Save or restore this workspace", @"Sessions tool button subtitle")
                                                     selector:@selector(openDashboardShortcut:)];
     [rowTwo addArrangedSubview:dashboardButton];
     if (ISHWorkspaceSupportsSceneWindows()) {
-        UIButton *workspaceButton = [self sessionButtonWithTitle:@"New Workspace"
-                                                        subtitle:@"Open another workspace window"
+        UIButton *workspaceButton = [self sessionButtonWithTitle:NSLocalizedString(@"New Workspace", @"Sessions tool button")
+                                                        subtitle:NSLocalizedString(@"Open another workspace window", @"Sessions tool button subtitle")
                                                         selector:@selector(openWorkspaceShortcut:)];
         [rowTwo addArrangedSubview:workspaceButton];
     } else {
-        UIButton *themesButton = [self sessionButtonWithTitle:@"Themes"
-                                                     subtitle:@"Adjust colors and density"
+        UIButton *themesButton = [self sessionButtonWithTitle:NSLocalizedString(@"Themes", @"Sessions tool button")
+                                                     subtitle:NSLocalizedString(@"Adjust colors and density", @"Sessions tool button subtitle")
                                                      selector:@selector(openThemesShortcut:)];
         [rowTwo addArrangedSubview:themesButton];
     }
     [_quickActionsStack addArrangedSubview:rowOne];
     [_quickActionsStack addArrangedSubview:rowTwo];
+    _quickActionButtons = (NSArray<UIButton *> *) [rowOne.arrangedSubviews arrayByAddingObjectsFromArray:rowTwo.arrangedSubviews];
     [NSLayoutConstraint activateConstraints:@[
         [_quickActionsStack.topAnchor constraintEqualToAnchor:quickActionsCard.topAnchor constant:8],
         [_quickActionsStack.leadingAnchor constraintEqualToAnchor:quickActionsCard.leadingAnchor constant:8],
@@ -7629,7 +10028,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     sessionsStack.spacing = 6;
     [sessionsCard addSubview:sessionsStack];
     UILabel *sessionsTitle = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
-    sessionsTitle.text = @"Live terminals";
+    sessionsTitle.text = NSLocalizedString(@"Live terminals", @"Sessions tool section title");
+    _sessionsTitleLabel = sessionsTitle;
     _sessionButtonsStack = [UIStackView new];
     _sessionButtonsStack.axis = UILayoutConstraintAxisVertical;
     _sessionButtonsStack.spacing = 6;
@@ -7642,8 +10042,35 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         [sessionsStack.bottomAnchor constraintEqualToAnchor:sessionsCard.bottomAnchor constant:-10],
     ]];
 
+    // ---- suspend to disk --------------------------------------------------
+    UIView *suspendCard = [self workspaceThemeCardView];
+    UIStackView *suspendStack = [UIStackView new];
+    suspendStack.translatesAutoresizingMaskIntoConstraints = NO;
+    suspendStack.axis = UILayoutConstraintAxisVertical;
+    suspendStack.spacing = 6;
+    [suspendCard addSubview:suspendStack];
+    UILabel *suspendTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
+    suspendTitle.text = NSLocalizedString(@"SESSION SUSPEND", @"Sessions tool section eyebrow");
+    suspendTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    _suspendEyebrowLabel = suspendTitle;
+    _suspendLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
+    _suspendLabel.numberOfLines = 0;
+    _suspendButton = [self sessionButtonWithTitle:NSLocalizedString(@"Save Session Now", @"Sessions tool button")
+                                         subtitle:NSLocalizedString(@"Write this session to disk", @"Sessions tool button subtitle")
+                                         selector:@selector(suspendSessionShortcut:)];
+    [suspendStack addArrangedSubview:suspendTitle];
+    [suspendStack addArrangedSubview:_suspendLabel];
+    [suspendStack addArrangedSubview:_suspendButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [suspendStack.topAnchor constraintEqualToAnchor:suspendCard.topAnchor constant:10],
+        [suspendStack.leadingAnchor constraintEqualToAnchor:suspendCard.leadingAnchor constant:10],
+        [suspendStack.trailingAnchor constraintEqualToAnchor:suspendCard.trailingAnchor constant:-10],
+        [suspendStack.bottomAnchor constraintEqualToAnchor:suspendCard.bottomAnchor constant:-10],
+    ]];
+
     [_contentStack addArrangedSubview:summaryCard];
     [_contentStack addArrangedSubview:quickActionsCard];
+    [_contentStack addArrangedSubview:suspendCard];
     [_contentStack addArrangedSubview:sessionsCard];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -7702,12 +10129,99 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     [self refreshSessions];
 }
 
+// What the card says, which is the state of the feature rather than a label.
+//
+// Four things a user can act on: whether it is on at all, what the last
+// attempt did, why it refused if it did, and how big the session is. The
+// refusal is the one worth showing verbatim -- it names the process, and the
+// answer ("quit that program, or use zsh rather than native dash") is only
+// obvious once you know which one it is.
+- (void)refreshSuspendCard {
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    BOOL on = UserPreferences.shared.shouldSuspendToDisk;
+
+    NSString *text;
+    if (_suspendInProgress) {
+        text = NSLocalizedString(@"Saving…", @"session suspend status while saving");
+    } else if (!on) {
+        text = NSLocalizedString(@"Off. Turn on Suspend to Disk in Settings to keep this session when iSH-AOK is closed or ends.", @"session suspend status when off");
+    } else if (ck.last_refusal[0] != '\0') {
+        text = [NSString stringWithFormat:NSLocalizedString(@"On. The last attempt was refused: %s", @"session suspend status; %s is the reason"),
+                ck.last_refusal];
+    } else if (ck.saves > 0) {
+        text = [NSString stringWithFormat:
+                ck.tasks == 1
+                    ? NSLocalizedString(@"On. Last saved %lu process, %.1f MB. Saved again whenever iSH-AOK goes to the background.", @"session suspend status: one process, size in MB")
+                    : NSLocalizedString(@"On. Last saved %lu processes, %.1f MB. Saved again whenever iSH-AOK goes to the background.", @"session suspend status: process count, size in MB"),
+                ck.tasks,
+                (double) ck.bytes / (1024.0 * 1024.0)];
+    } else {
+        text = NSLocalizedString(@"On. This session is saved whenever iSH-AOK goes to the background, and comes back on the next launch.", @"session suspend status when on and nothing saved yet");
+    }
+    _suspendLabel.text = text;
+
+    // The button turns into the way to switch it on, because a "Save Session
+    // Now" that quietly does nothing is worse than no button.
+    NSString *title = on ? NSLocalizedString(@"Save Session Now", @"Sessions tool button") : NSLocalizedString(@"Open Settings", @"Sessions tool button");
+    NSString *subtitle = on ? NSLocalizedString(@"Write this session to disk", @"Sessions tool button subtitle")
+                            : NSLocalizedString(@"Turn on Suspend to Disk", @"Sessions tool button subtitle");
+    if (_suspendInProgress) {
+        title = NSLocalizedString(@"Saving…", @"Sessions tool button while saving");
+        subtitle = NSLocalizedString(@"Every process is stopped while this is written", @"Sessions tool button subtitle while saving");
+    }
+    [self restyleSessionButton:_suspendButton title:title subtitle:subtitle];
+    _suspendButton.enabled = !_suspendInProgress;
+    _suspendButton.alpha = _suspendInProgress ? 0.5 : 1.0;
+}
+
+- (void)suspendSessionShortcut:(__unused id)sender {
+    if (!UserPreferences.shared.shouldSuspendToDisk) {
+        [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        return;
+    }
+    if (_suspendInProgress)
+        return;
+    // The Wayland desktop and GPU programs cannot be saved: ask first.
+    ISHSuspendSessionConfirmGPUThen(self, @"Save", ^(BOOL leaveOutGPU) {
+        _suspendInProgress = YES;
+        [self refreshSuspendCard];
+
+        // OFF the main thread: the save freezes every guest task, writes the image
+        // and thaws before it returns, and on a large session that is long enough
+        // to be a visible stall. The guest is stopped for that time either way --
+        // it is the UI that must not be.
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            int err = ISHSuspendSessionSaveNow(leaveOutGPU);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                self->_suspendInProgress = NO;
+                [self refreshSuspendCard];
+                if (err != 0) {
+                    struct checkpoint_status ck;
+                    checkpoint_get_status(&ck);
+                    UIAlertController *alert = [UIAlertController
+                        alertControllerWithTitle:NSLocalizedString(@"Session not saved", @"alert title")
+                                         message:ck.last_refusal[0] != '\0'
+                                                 ? @(ck.last_refusal)
+                                                 : NSLocalizedString(@"iSH-AOK could not write the session.", @"alert message when saving the session failed")
+                                  preferredStyle:UIAlertControllerStyleAlert];
+                    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button")
+                                                              style:UIAlertActionStyleDefault
+                                                            handler:nil]];
+                    [self presentViewController:alert animated:YES completion:nil];
+                }
+            });
+        });
+    });
+}
+
 - (void)refreshSessions {
+    [self refreshSuspendCard];
     NSUInteger sceneCount = 0;
     if (@available(iOS 13.0, *)) {
         sceneCount = UIApplication.sharedApplication.connectedScenes.count;
     }
-    _summaryLabel.text = [NSString stringWithFormat:@"%lu terminals  •  %lu roots  •  %lu scenes",
+    _summaryLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%lu terminals  •  %lu roots  •  %lu scenes", @"Sessions tool summary counts"),
                           (unsigned long) Terminal.activeTerminals.count,
                           (unsigned long) Roots.instance.roots.count,
                           (unsigned long) sceneCount];
@@ -7723,7 +10237,8 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
     if (Terminal.activeTerminals.count == 0) {
         UILabel *emptyLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
-        emptyLabel.text = @"No active terminals. Use the quick actions above to start a shell or console.";
+        emptyLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
+        emptyLabel.text = NSLocalizedString(@"No active terminals. Use the quick actions above to start a shell or console.", @"Sessions tool empty state");
         [_sessionButtonsStack addArrangedSubview:emptyLabel];
         return;
     }
@@ -7732,14 +10247,46 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
         NSString *uuidString = terminal.uuid.UUIDString ?: @"";
         ISHWorkspaceContainedWindowView *existingWindow = [self.workspaceHostViewController desktopWindowHostingTerminalUUID:terminal.uuid];
         NSString *subtitle = existingWindow != nil
-            ? @"Focus current workspace window"
-            : (terminal.webView.superview != nil ? @"Focus another window" : @"Reconnect in this workspace");
+            ? NSLocalizedString(@"Focus current workspace window", @"Sessions tool terminal button subtitle")
+            : (terminal.webView.superview != nil ? NSLocalizedString(@"Focus another window", @"Sessions tool terminal button subtitle") : NSLocalizedString(@"Reconnect in this workspace", @"Sessions tool terminal button subtitle"));
         UIButton *button = [self sessionButtonWithTitle:ISHWorkspaceTerminalDisplayName(terminal)
                                                subtitle:subtitle
                                                selector:@selector(openSessionTerminal:)];
         button.accessibilityIdentifier = uuidString;
         [_sessionButtonsStack addArrangedSubview:button];
     }
+    [self workspaceApplyTheme];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Each size is rebuilt from its unscaled value: the labels from the sizes
+// -viewDidLoad gave them, the buttons through -restyleSessionButton:.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_contentStack == nil)
+        return;
+    UIFont *eyebrowFont = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, 9) weight:UIFontWeightSemibold];
+    _summaryEyebrowLabel.font = eyebrowFont;
+    _suspendEyebrowLabel.font = eyebrowFont;
+    _summaryLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleHeadline))];
+    _sessionsTitleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))];
+    _suspendLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1))];
+    // The quick actions are built once, and their title and subtitle are not
+    // kept; they are read back out of the "Title\nSubtitle" the button wears.
+    for (UIButton *button in _quickActionButtons) {
+        NSString *text = [button attributedTitleForState:UIControlStateNormal].string;
+        NSRange newline = [text rangeOfString:@"\n"];
+        if (newline.location == NSNotFound)
+            continue;
+        [self restyleSessionButton:button
+                             title:[text substringToIndex:newline.location]
+                          subtitle:[text substringFromIndex:NSMaxRange(newline)]];
+    }
+    // Rebuilds the terminal rows and the suspend button at the new size.
+    [self refreshSessions];
+    // A restyled title has lost its colours, and -refreshSessions only puts
+    // them back when there is a terminal to list.
     [self workspaceApplyTheme];
 }
 
@@ -7804,13 +10351,287 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
 
 @end
 
+// ---- Storage (GH #640) -----------------------------------------------------
+//
+// Where the app's disk has gone, ncdu-style: every place the app keeps data,
+// largest first, and inside each the directories and files that make it up.
+// The tool used to print one total per filesystem and stop there, which says
+// that 5 GB is gone and not where.
+//
+// A place is scanned once, on a background queue, into a table of what every
+// directory under it holds; going into a directory after that only lists it.
+// Sizes are what the files occupy on the device (allocated blocks, a hard
+// link counted once), which is what "storage used" means, and can differ from
+// the lengths `ls -l` shows in the guest.
+
+typedef struct {
+    uint64_t bytes;
+    uint64_t files;
+} ISHStorageUsage;
+
+@interface ISHStorageEntry : NSObject
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy, nullable) NSString *detail;
+// Where it is on the device; nil for something with no files to list (swap).
+@property (nonatomic, copy, nullable) NSString *hostPath;
+@property (nonatomic) uint64_t bytes;
+@property (nonatomic) uint64_t files;
+@property (nonatomic) BOOL isDirectory;
+@property (nonatomic) BOOL scanning;
+// A filesystem: its files are under data/, and are shown by their guest paths.
+@property (nonatomic) BOOL isRoot;
+// Relative directory path ("" for the place itself) -> ISHStorageUsage, once scanned.
+@property (nonatomic, strong, nullable) NSDictionary<NSString *, NSValue *> *tree;
+@end
+
+@implementation ISHStorageEntry
+@end
+
+static NSValue *ISHStorageUsageValue(ISHStorageUsage usage) {
+    return [NSValue valueWithBytes:&usage objCType:@encode(ISHStorageUsage)];
+}
+
+static ISHStorageUsage ISHStorageUsageFromValue(NSValue *_Nullable value) {
+    ISHStorageUsage usage = {0, 0};
+    if (value != nil)
+        [value getValue:&usage size:sizeof(usage)];
+    return usage;
+}
+
+// Walks everything under `path` and returns what each directory holds, keyed
+// by its path relative to `path`. `*total` is the whole of it, and is all
+// there is when `path` is a file.
+static NSDictionary<NSString *, NSValue *> *ISHStorageScan(NSString *path, ISHStorageUsage *total, BOOL (^cancelled)(void)) {
+    NSMutableDictionary<NSString *, NSValue *> *tree = [NSMutableDictionary dictionary];
+    *total = (ISHStorageUsage) {0, 0};
+    char *const roots[] = {(char *) path.fileSystemRepresentation, NULL};
+    FTS *fts = fts_open(roots, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, NULL);
+    if (fts == NULL)
+        return tree;
+    size_t rootLength = strlen(roots[0]);
+    size_t depthCapacity = 64;
+    ISHStorageUsage *stack = calloc(depthCapacity, sizeof(*stack));
+    // A file with several names is one file's worth of disk.
+    NSMutableSet<NSNumber *> *linked = [NSMutableSet set];
+    FTSENT *entry;
+    unsigned sinceCheck = 0;
+    while (stack != NULL && (entry = fts_read(fts)) != NULL) {
+        if (++sinceCheck >= 512) {
+            sinceCheck = 0;
+            if (cancelled != nil && cancelled())
+                break;
+        }
+        size_t level = entry->fts_level < 0 ? 0 : (size_t) entry->fts_level;
+        if (level + 1 >= depthCapacity) {
+            size_t newCapacity = depthCapacity * 2;
+            ISHStorageUsage *grown = realloc(stack, newCapacity * sizeof(*stack));
+            if (grown == NULL)
+                break;
+            memset(grown + depthCapacity, 0, (newCapacity - depthCapacity) * sizeof(*stack));
+            stack = grown;
+            depthCapacity = newCapacity;
+        }
+        const struct stat *st = entry->fts_statp;
+        switch (entry->fts_info) {
+            case FTS_D:
+                stack[level] = (ISHStorageUsage) {st != NULL ? (uint64_t) st->st_blocks * 512 : 0, 0};
+                break;
+            case FTS_DP: {
+                ISHStorageUsage usage = stack[level];
+                const char *relative = entry->fts_path + rootLength;
+                while (*relative == '/')
+                    relative++;
+                NSString *key = [NSFileManager.defaultManager stringWithFileSystemRepresentation:relative length:strlen(relative)];
+                if (key != nil)
+                    tree[key] = ISHStorageUsageValue(usage);
+                if (level > 0) {
+                    stack[level - 1].bytes += usage.bytes;
+                    stack[level - 1].files += usage.files;
+                } else {
+                    *total = usage;
+                }
+                break;
+            }
+            case FTS_F:
+            case FTS_SL:
+            case FTS_SLNONE:
+            case FTS_DEFAULT: {
+                uint64_t bytes = st != NULL ? (uint64_t) st->st_blocks * 512 : 0;
+                if (st != NULL && st->st_nlink > 1) {
+                    NSNumber *inode = @((unsigned long long) st->st_ino);
+                    if ([linked containsObject:inode])
+                        bytes = 0;
+                    else
+                        [linked addObject:inode];
+                }
+                if (level > 0) {
+                    stack[level - 1].bytes += bytes;
+                    stack[level - 1].files += 1;
+                } else {
+                    *total = (ISHStorageUsage) {bytes, 1};
+                }
+                break;
+            }
+            default:
+                break; // unreadable, or a directory that could not be entered: counted as nothing
+        }
+    }
+    free(stack);
+    fts_close(fts);
+    return tree;
+}
+
+// The rows of one directory of a scanned place, largest first.
+static NSArray<ISHStorageEntry *> *ISHStorageChildren(NSString *hostDirectory, NSString *relativePath,
+                                                      NSDictionary<NSString *, NSValue *> *tree) {
+    NSMutableArray<ISHStorageEntry *> *children = [NSMutableArray array];
+    NSArray<NSString *> *names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:hostDirectory error:nil];
+    for (NSString *name in names) {
+        NSString *childPath = [hostDirectory stringByAppendingPathComponent:name];
+        struct stat st;
+        if (lstat(childPath.fileSystemRepresentation, &st) != 0)
+            continue;
+        ISHStorageEntry *child = [ISHStorageEntry new];
+        child.name = name;
+        child.hostPath = childPath;
+        if (S_ISDIR(st.st_mode)) {
+            NSString *key = relativePath.length > 0 ? [relativePath stringByAppendingPathComponent:name] : name;
+            ISHStorageUsage usage = ISHStorageUsageFromValue(tree[key]);
+            child.isDirectory = YES;
+            child.bytes = usage.bytes;
+            child.files = usage.files;
+        } else {
+            child.bytes = (uint64_t) st.st_blocks * 512;
+            child.files = 1;
+        }
+        [children addObject:child];
+    }
+    [children sortUsingComparator:^NSComparisonResult(ISHStorageEntry *a, ISHStorageEntry *b) {
+        if (a.bytes != b.bytes)
+            return a.bytes > b.bytes ? NSOrderedAscending : NSOrderedDescending;
+        return [a.name localizedStandardCompare:b.name];
+    }];
+    return children;
+}
+
+// Every place the app keeps data. Built on the main thread (Roots is), with
+// nothing measured yet.
+static NSArray<ISHStorageEntry *> *ISHStoragePlaces(void) {
+    NSMutableArray<ISHStorageEntry *> *places = [NSMutableArray array];
+    NSFileManager *files = NSFileManager.defaultManager;
+    ISHStorageEntry *(^place)(NSString *, NSString *_Nullable, NSString *_Nullable) =
+            ^ISHStorageEntry *(NSString *name, NSString *detail, NSString *hostPath) {
+        ISHStorageEntry *entry = [ISHStorageEntry new];
+        entry.name = name;
+        entry.detail = detail;
+        entry.hostPath = hostPath;
+        BOOL isDirectory = NO;
+        if (hostPath != nil && [files fileExistsAtPath:hostPath isDirectory:&isDirectory])
+            entry.isDirectory = isDirectory;
+        entry.scanning = hostPath != nil;
+        [places addObject:entry];
+        return entry;
+    };
+
+    NSString *defaultRoot = Roots.instance.defaultRoot;
+    NSMutableSet<NSString *> *listed = [NSMutableSet set];
+    for (NSString *rootName in Roots.instance.roots) {
+        NSString *abi = [Roots.instance guestABIForRootNamed:rootName] ?: NSLocalizedString(@"Unknown ABI", @"root filesystem ABI when unknown");
+        NSString *marker = [rootName isEqualToString:defaultRoot]
+            ? NSLocalizedString(@"default", @"Storage tool marker for the default root")
+            : NSLocalizedString(@"root", @"Storage tool marker for a non-default root");
+        NSString *path = [Roots.instance rootUrl:rootName].path;
+        ISHStorageEntry *entry = place(rootName, [NSString stringWithFormat:@"%@  •  %@", abi, marker], path);
+        entry.isRoot = YES;
+        if (path != nil)
+            [listed addObject:path.stringByStandardizingPath];
+    }
+
+    // The rest of the container, by what each thing is for where that is
+    // known and by its own name where it is not: nothing in it goes uncounted.
+    NSString *container = ContainerURL().path.stringByStandardizingPath;
+    NSDictionary<NSString *, NSString *> *known = @{
+        @"AOK/fakefs": NSLocalizedString(@"Shared files", @"Storage tool row: the shared /AOK/fakefs filesystem"),
+        @"AOK/persist": NSLocalizedString(@"Persistent storage", @"Storage tool row: /AOK/persist"),
+        @"sessions": NSLocalizedString(@"Saved sessions", @"Storage tool row: suspended session images"),
+        @"suspend.img": NSLocalizedString(@"Saved sessions", @"Storage tool row: suspended session images"),
+        @"Diagnostics": NSLocalizedString(@"Diagnostics", @"Storage tool row: diagnostic logs"),
+        @"MetricKitDiagnostics": NSLocalizedString(@"Diagnostics", @"Storage tool row: diagnostic logs"),
+    };
+    NSDictionary<NSString *, NSString *> *guestNames = @{@"AOK/fakefs": @"/AOK/fakefs", @"AOK/persist": @"/AOK/persist"};
+    if (container != nil) {
+        NSMutableArray<NSString *> *relativeNames = [NSMutableArray array];
+        for (NSString *name in [files contentsOfDirectoryAtPath:container error:nil] ?: @[]) {
+            if ([name isEqualToString:@"roots"])
+                continue; // each root is a row of its own, above
+            if ([name isEqualToString:@"AOK"]) {
+                for (NSString *inner in [files contentsOfDirectoryAtPath:[container stringByAppendingPathComponent:name] error:nil] ?: @[]) {
+                    if (![inner isEqualToString:@"roots"]) // mount points for the other roots: empty directories
+                        [relativeNames addObject:[name stringByAppendingPathComponent:inner]];
+                }
+                continue;
+            }
+            [relativeNames addObject:name];
+        }
+        for (NSString *relative in relativeNames) {
+            NSString *path = [container stringByAppendingPathComponent:relative];
+            place(known[relative] ?: relative.lastPathComponent, guestNames[relative], path);
+            [listed addObject:path.stringByStandardizingPath];
+        }
+    }
+
+    // The app's own sandbox, unless the container above is inside it (an
+    // install with no app group keeps the container under Application Support).
+    void (^sandbox)(NSString *, NSString *_Nullable) = ^(NSString *name, NSString *path) {
+        NSString *standard = path.stringByStandardizingPath;
+        if (standard.length == 0 || ![files fileExistsAtPath:standard])
+            return;
+        for (NSString *other in listed) {
+            if ([other isEqualToString:standard] || [other hasPrefix:[standard stringByAppendingString:@"/"]] ||
+                    [standard hasPrefix:[other stringByAppendingString:@"/"]])
+                return;
+        }
+        if (container != nil && ([container isEqualToString:standard] || [container hasPrefix:[standard stringByAppendingString:@"/"]]))
+            return;
+        place(name, nil, standard);
+        [listed addObject:standard];
+    };
+    sandbox(NSLocalizedString(@"Temporary files", @"Storage tool row: the app's temporary directory"), NSTemporaryDirectory());
+    sandbox(NSLocalizedString(@"Caches", @"Storage tool row: the app's cache directory"),
+            [files URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask].firstObject.path);
+    sandbox(NSLocalizedString(@"Documents", @"Storage tool row: the app's Documents directory"),
+            [files URLsForDirectory:NSDocumentDirectory inDomains:NSUserDomainMask].firstObject.path);
+
+    // Swap is a file with no name (it is unlinked as soon as it is made), so
+    // no walk finds it; it holds its whole size for as long as the app runs.
+    if (swap_enabled() && swap_area_bytes() > 0) {
+        ISHStorageEntry *swap = place(NSLocalizedString(@"Swap", @"Storage tool row: the swap file"), nil, nil);
+        swap.bytes = swap_area_bytes();
+    }
+    return places;
+}
+
+static NSString *const ISHWorkspaceStorageRowReuseIdentifier = @"ISHWorkspaceStorageRow";
+
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable): the rows, the path above them and the summary
+// scale. The ROOT STORAGE heading and the Refresh button stay, as card furniture does elsewhere.
+@interface WorkspaceStorageToolViewController () <WorkspaceTextScalable, WorkspaceStatefulTool, UITableViewDataSource, UITableViewDelegate>
+@end
+
 @implementation WorkspaceStorageToolViewController {
-    UIScrollView *_scrollView;
-    UIStackView *_contentStack;
     UILabel *_summaryLabel;
-    UITextView *_detailsTextView;
+    UILabel *_pathLabel;
     UIButton *_refreshButton;
+    UITableView *_tableView;
     NSUInteger _refreshGeneration;
+    NSArray<ISHStorageEntry *> *_places;
+    // Where the list is: nil at the top, else the place and the directory under it.
+    ISHStorageEntry *_Nullable _currentPlace;
+    NSString *_currentRelativePath;
+    NSArray<ISHStorageEntry *> *_rows;
+    // A place and path to go back to once its scan finishes (a restored window).
+    NSString *_Nullable _pendingPlaceName;
+    NSString *_Nullable _pendingRelativePath;
 }
 
 - (UIButton *)storageActionButton {
@@ -7821,166 +10642,409 @@ static NSRange ISHWorkspaceLineRangeContainingIndex(NSString *text, NSUInteger i
     button.contentEdgeInsets = UIEdgeInsetsMake(5, 10, 5, 10);
     button.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
                                                weight:UIFontWeightSemibold];
-    [button setTitle:@"Refresh" forState:UIControlStateNormal];
+    [button setTitle:NSLocalizedString(@"Refresh", @"Storage tool button") forState:UIControlStateNormal];
     [button addTarget:self action:@selector(refreshStorage:) forControlEvents:UIControlEventTouchUpInside];
     return button;
 }
 
+- (CGFloat)storageRowHeight {
+    return 46.0 * MAX(0.8, self.workspaceTextScale);
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Storage";
-
-    _scrollView = [UIScrollView new];
-    _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
-    _scrollView.alwaysBounceVertical = YES;
-    [self.toolContentView addSubview:_scrollView];
-
-    _contentStack = [UIStackView new];
-    _contentStack.translatesAutoresizingMaskIntoConstraints = NO;
-    _contentStack.axis = UILayoutConstraintAxisVertical;
-    _contentStack.spacing = 8;
-    [_scrollView addSubview:_contentStack];
+    self.title = NSLocalizedString(@"Storage", @"Storage tool title");
+    _currentRelativePath = @"";
+    _rows = @[];
 
     UIView *summaryCard = [self workspaceThemeCardView];
-    UIStackView *summaryStack = [UIStackView new];
-    summaryStack.translatesAutoresizingMaskIntoConstraints = NO;
-    summaryStack.axis = UILayoutConstraintAxisVertical;
-    summaryStack.spacing = 6;
-    [summaryCard addSubview:summaryStack];
+    summaryCard.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.toolContentView addSubview:summaryCard];
     UILabel *summaryTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    summaryTitle.text = @"ROOT STORAGE";
+    summaryTitle.text = NSLocalizedString(@"ROOT STORAGE", @"Storage tool section eyebrow");
     summaryTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
     _summaryLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
     _summaryLabel.numberOfLines = 0;
-    [summaryStack addArrangedSubview:summaryTitle];
-    [summaryStack addArrangedSubview:_summaryLabel];
-    [NSLayoutConstraint activateConstraints:@[
-        [summaryStack.topAnchor constraintEqualToAnchor:summaryCard.topAnchor constant:12],
-        [summaryStack.leadingAnchor constraintEqualToAnchor:summaryCard.leadingAnchor constant:12],
-        [summaryStack.trailingAnchor constraintEqualToAnchor:summaryCard.trailingAnchor constant:-12],
-        [summaryStack.bottomAnchor constraintEqualToAnchor:summaryCard.bottomAnchor constant:-12],
-    ]];
-
-    UIView *actionsCard = [self workspaceThemeCardView];
-    UIStackView *actionsStack = [UIStackView new];
-    actionsStack.translatesAutoresizingMaskIntoConstraints = NO;
-    actionsStack.axis = UILayoutConstraintAxisHorizontal;
-    actionsStack.alignment = UIStackViewAlignmentCenter;
-    actionsStack.spacing = 8;
-    [actionsCard addSubview:actionsStack];
-    UILabel *actionsLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
-    actionsLabel.text = @"Rescan roots and container directories.";
+    UIStackView *summaryText = [[UIStackView alloc] initWithArrangedSubviews:@[summaryTitle, _summaryLabel]];
+    summaryText.axis = UILayoutConstraintAxisVertical;
+    summaryText.spacing = 4;
     _refreshButton = [self storageActionButton];
-    [actionsStack addArrangedSubview:actionsLabel];
-    [actionsStack addArrangedSubview:_refreshButton];
-    [actionsLabel setContentCompressionResistancePriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+    [_refreshButton setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [_refreshButton setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    UIStackView *summaryRow = [[UIStackView alloc] initWithArrangedSubviews:@[summaryText, _refreshButton]];
+    summaryRow.translatesAutoresizingMaskIntoConstraints = NO;
+    summaryRow.axis = UILayoutConstraintAxisHorizontal;
+    summaryRow.alignment = UIStackViewAlignmentCenter;
+    summaryRow.spacing = 8;
+    [summaryCard addSubview:summaryRow];
+
+    UIView *listCard = [self workspaceThemeCardView];
+    listCard.translatesAutoresizingMaskIntoConstraints = NO;
+    listCard.clipsToBounds = YES;
+    [self.toolContentView addSubview:listCard];
+    _pathLabel = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:YES];
+    _pathLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _pathLabel.lineBreakMode = NSLineBreakByTruncatingHead;
+    [listCard addSubview:_pathLabel];
+
+    _tableView = [[UITableView alloc] initWithFrame:CGRectZero style:UITableViewStylePlain];
+    _tableView.translatesAutoresizingMaskIntoConstraints = NO;
+    _tableView.dataSource = self;
+    _tableView.delegate = self;
+    _tableView.backgroundColor = UIColor.clearColor;
+    _tableView.separatorInset = UIEdgeInsetsZero;
+    _tableView.rowHeight = [self storageRowHeight];
+    _tableView.tableFooterView = [UIView new];
+    [listCard addSubview:_tableView];
+
     [NSLayoutConstraint activateConstraints:@[
-        [actionsStack.topAnchor constraintEqualToAnchor:actionsCard.topAnchor constant:8],
-        [actionsStack.leadingAnchor constraintEqualToAnchor:actionsCard.leadingAnchor constant:10],
-        [actionsStack.trailingAnchor constraintEqualToAnchor:actionsCard.trailingAnchor constant:-10],
-        [actionsStack.bottomAnchor constraintEqualToAnchor:actionsCard.bottomAnchor constant:-8],
+        [summaryCard.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor constant:6],
+        [summaryCard.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor constant:6],
+        [summaryCard.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor constant:-6],
+        [summaryRow.topAnchor constraintEqualToAnchor:summaryCard.topAnchor constant:10],
+        [summaryRow.leadingAnchor constraintEqualToAnchor:summaryCard.leadingAnchor constant:12],
+        [summaryRow.trailingAnchor constraintEqualToAnchor:summaryCard.trailingAnchor constant:-10],
+        [summaryRow.bottomAnchor constraintEqualToAnchor:summaryCard.bottomAnchor constant:-10],
+
+        [listCard.topAnchor constraintEqualToAnchor:summaryCard.bottomAnchor constant:6],
+        [listCard.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor constant:6],
+        [listCard.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor constant:-6],
+        [listCard.bottomAnchor constraintEqualToAnchor:self.toolContentView.bottomAnchor constant:-6],
+        [_pathLabel.topAnchor constraintEqualToAnchor:listCard.topAnchor constant:8],
+        [_pathLabel.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor constant:12],
+        [_pathLabel.trailingAnchor constraintEqualToAnchor:listCard.trailingAnchor constant:-12],
+        [_tableView.topAnchor constraintEqualToAnchor:_pathLabel.bottomAnchor constant:6],
+        [_tableView.leadingAnchor constraintEqualToAnchor:listCard.leadingAnchor],
+        [_tableView.trailingAnchor constraintEqualToAnchor:listCard.trailingAnchor],
+        [_tableView.bottomAnchor constraintEqualToAnchor:listCard.bottomAnchor],
     ]];
 
-    UIView *detailsCard = [self workspaceThemeCardView];
-    _detailsTextView = [self workspaceThemeTextView];
-    [detailsCard addSubview:_detailsTextView];
-    [NSLayoutConstraint activateConstraints:@[
-        [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:(ISHWorkspaceUsesPhoneLayout() ? 132.0 : 168.0)],
-        [_detailsTextView.topAnchor constraintEqualToAnchor:detailsCard.topAnchor constant:8],
-        [_detailsTextView.leadingAnchor constraintEqualToAnchor:detailsCard.leadingAnchor constant:8],
-        [_detailsTextView.trailingAnchor constraintEqualToAnchor:detailsCard.trailingAnchor constant:-8],
-        [_detailsTextView.bottomAnchor constraintEqualToAnchor:detailsCard.bottomAnchor constant:-8],
-    ]];
-
-    [_contentStack addArrangedSubview:summaryCard];
-    [_contentStack addArrangedSubview:actionsCard];
-    [_contentStack addArrangedSubview:detailsCard];
-
-    [NSLayoutConstraint activateConstraints:@[
-        [_scrollView.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor],
-        [_scrollView.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor],
-        [_scrollView.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor],
-        [_scrollView.bottomAnchor constraintEqualToAnchor:self.toolContentView.bottomAnchor],
-
-        [_contentStack.topAnchor constraintEqualToAnchor:_scrollView.contentLayoutGuide.topAnchor constant:6],
-        [_contentStack.leadingAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.leadingAnchor constant:6],
-        [_contentStack.trailingAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.trailingAnchor constant:-6],
-        [_contentStack.bottomAnchor constraintEqualToAnchor:_scrollView.contentLayoutGuide.bottomAnchor constant:-6],
-        [_contentStack.widthAnchor constraintEqualToAnchor:_scrollView.frameLayoutGuide.widthAnchor constant:-12],
-    ]];
-
+    [self workspaceApplyTheme];
     [self refreshStorage:nil];
 }
 
-- (void)viewWillAppear:(BOOL)animated {
-    [super viewWillAppear:animated];
-    [self refreshStorage:nil];
-}
-
-- (void)viewDidLayoutSubviews {
-    [super viewDidLayoutSubviews];
-    _contentStack.spacing = ISHWorkspaceDensityValue(4, 8);
-}
+#pragma mark Scanning
 
 - (void)refreshStorage:(id)sender {
     (void) sender;
     NSUInteger generation = ++_refreshGeneration;
-    _detailsTextView.text = @"Scanning roots and container directories…";
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSArray<NSDictionary<NSString *, id> *> *rootRecords = ISHWorkspaceRootUsageRecords();
-        NSDictionary<NSString *, NSNumber *> *tmpUsage = ISHWorkspaceDirectoryUsage([NSURL fileURLWithPath:NSTemporaryDirectory()]);
-        NSArray<NSURL *> *cacheDirectories =
-            [NSFileManager.defaultManager URLsForDirectory:NSCachesDirectory inDomains:NSUserDomainMask];
-        NSDictionary<NSString *, NSNumber *> *cacheUsage =
-            ISHWorkspaceDirectoryUsage(cacheDirectories.firstObject ?: [NSURL fileURLWithPath:NSHomeDirectory()]);
-        uint64_t totalRootBytes = 0;
-        NSMutableArray<NSString *> *lines = [NSMutableArray array];
-        [lines addObject:@"Workspace roots:"];
-        for (NSDictionary<NSString *, id> *record in rootRecords) {
-            totalRootBytes += [record[@"bytes"] unsignedLongLongValue];
-            NSString *marker = [record[@"isDefault"] boolValue] ? @"default" : @"root";
-            [lines addObject:[NSString stringWithFormat:@"%@  •  %@  •  %@",
-                              record[@"name"],
-                              record[@"abi"],
-                              marker]];
-            [lines addObject:[NSString stringWithFormat:@"  %@  •  %@ files  •  %@ dirs",
-                              ISHWorkspaceByteCountString([record[@"bytes"] unsignedLongLongValue]),
-                              record[@"files"],
-                              record[@"directories"]]];
-        }
-        if (rootRecords.count == 0) {
-            [lines addObject:@"No installed roots."];
-        }
-        [lines addObject:@""];
-        [lines addObject:@"Container directories:"];
-        [lines addObject:[NSString stringWithFormat:@"tmp  •  %@", ISHWorkspaceByteCountString([tmpUsage[@"bytes"] unsignedLongLongValue])]];
-        [lines addObject:[NSString stringWithFormat:@"cache  •  %@", ISHWorkspaceByteCountString([cacheUsage[@"bytes"] unsignedLongLongValue])]];
+    // A rescan lands back where the list was, once that place has been read again.
+    if (_currentPlace != nil) {
+        _pendingPlaceName = _currentPlace.name;
+        _pendingRelativePath = _currentRelativePath;
+    }
+    _currentPlace = nil;
+    _currentRelativePath = @"";
+    _places = ISHStoragePlaces();
+    _summaryLabel.text = NSLocalizedString(@"Scanning…", @"Storage tool status while scanning");
+    [self rebuildRows];
 
-        NSDictionary<NSFileAttributeKey, id> *attributes =
-            [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
-        uint64_t freeBytes = [attributes[NSFileSystemFreeSize] unsignedLongLongValue];
-        NSString *summary = [NSString stringWithFormat:@"%@ free  •  %@ across %lu roots",
-                                                       ISHWorkspaceByteCountString(freeBytes),
-                                                       ISHWorkspaceByteCountString(totalRootBytes),
-                                                       (unsigned long) rootRecords.count];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (generation != self->_refreshGeneration)
-                return;
-            self->_summaryLabel.text = summary;
-            self->_detailsTextView.text = [lines componentsJoinedByString:@"\n"];
+    __weak typeof(self) weakSelf = self;
+    BOOL (^cancelled)(void) = ^BOOL {
+        typeof(self) strongSelf = weakSelf;
+        return strongSelf == nil || strongSelf->_refreshGeneration != generation;
+    };
+    for (ISHStorageEntry *place in _places) {
+        if (place.hostPath == nil)
+            continue;
+        NSString *path = place.hostPath;
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            ISHStorageUsage total;
+            NSDictionary<NSString *, NSValue *> *tree = ISHStorageScan(path, &total, cancelled);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                typeof(self) strongSelf = weakSelf;
+                if (strongSelf == nil || strongSelf->_refreshGeneration != generation)
+                    return;
+                place.tree = tree;
+                place.bytes = total.bytes;
+                place.files = total.files;
+                place.scanning = NO;
+                [strongSelf storagePlaceDidFinish:place];
+            });
         });
-    });
+    }
+    [self updateSummary];
+}
+
+- (void)storagePlaceDidFinish:(ISHStorageEntry *)place {
+    if (_pendingPlaceName != nil && [place.name isEqualToString:_pendingPlaceName]) {
+        NSString *relative = _pendingRelativePath ?: @"";
+        _pendingPlaceName = nil;
+        _pendingRelativePath = nil;
+        // Only if it is still there: the directory may be what was deleted.
+        if (relative.length == 0 || place.tree[relative] != nil) {
+            _currentPlace = place;
+            _currentRelativePath = relative;
+        }
+    }
+    [self updateSummary];
+    if (_currentPlace == nil || _currentPlace == place)
+        [self rebuildRows];
+}
+
+- (void)updateSummary {
+    uint64_t rootBytes = 0, allBytes = 0;
+    NSUInteger roots = 0;
+    BOOL scanning = NO;
+    for (ISHStorageEntry *place in _places) {
+        scanning = scanning || place.scanning;
+        allBytes += place.bytes;
+        if (place.isRoot) {
+            roots++;
+            rootBytes += place.bytes;
+        }
+    }
+    if (scanning) {
+        _summaryLabel.text = NSLocalizedString(@"Scanning…", @"Storage tool status while scanning");
+        return;
+    }
+    NSDictionary<NSFileAttributeKey, id> *attributes =
+        [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
+    uint64_t freeBytes = [attributes[NSFileSystemFreeSize] unsignedLongLongValue];
+    _summaryLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%@ free  •  %@ across %lu roots", @"Storage tool summary: free space, total root size, root count"),
+                          ISHWorkspaceByteCountString(freeBytes),
+                          ISHWorkspaceByteCountString(rootBytes),
+                          (unsigned long) roots];
+    (void) allBytes;
+}
+
+#pragma mark The list
+
+// The directory on the device that the list is showing, for a place being browsed.
+- (NSString *)currentHostDirectory {
+    NSString *base = _currentPlace.hostPath;
+    if (_currentPlace.isRoot)
+        base = [base stringByAppendingPathComponent:@"data"];
+    return _currentRelativePath.length > 0 ? [base stringByAppendingPathComponent:_currentRelativePath] : base;
+}
+
+// ...and the key its directories have in the place's table.
+- (NSString *)currentTreePath {
+    if (!_currentPlace.isRoot)
+        return _currentRelativePath;
+    return _currentRelativePath.length > 0 ? [@"data" stringByAppendingPathComponent:_currentRelativePath] : @"data";
+}
+
+- (void)rebuildRows {
+    if (_currentPlace == nil) {
+        _rows = [_places sortedArrayUsingComparator:^NSComparisonResult(ISHStorageEntry *a, ISHStorageEntry *b) {
+            if (a.scanning != b.scanning)
+                return a.scanning ? NSOrderedDescending : NSOrderedAscending;
+            if (a.bytes != b.bytes)
+                return a.bytes > b.bytes ? NSOrderedAscending : NSOrderedDescending;
+            return [a.name localizedStandardCompare:b.name];
+        }];
+        _pathLabel.text = NSLocalizedString(@"All storage", @"Storage tool: the top of the list, every place the app keeps data");
+    } else {
+        NSMutableArray<ISHStorageEntry *> *rows =
+            [ISHStorageChildren([self currentHostDirectory], [self currentTreePath], _currentPlace.tree ?: @{}) mutableCopy];
+        if (_currentPlace.isRoot && _currentRelativePath.length == 0) {
+            // What a filesystem costs beside its files: the database that
+            // holds every owner, mode and device number.
+            ISHStorageUsage data = ISHStorageUsageFromValue(_currentPlace.tree[@"data"]);
+            if (_currentPlace.bytes > data.bytes) {
+                ISHStorageEntry *metadata = [ISHStorageEntry new];
+                metadata.name = NSLocalizedString(@"Filesystem metadata", @"Storage tool row: a root's metadata database");
+                metadata.bytes = _currentPlace.bytes - data.bytes;
+                [rows addObject:metadata];
+                [rows sortUsingComparator:^NSComparisonResult(ISHStorageEntry *a, ISHStorageEntry *b) {
+                    if (a.bytes != b.bytes)
+                        return a.bytes > b.bytes ? NSOrderedAscending : NSOrderedDescending;
+                    return [a.name localizedStandardCompare:b.name];
+                }];
+            }
+        }
+        _rows = rows;
+        NSString *shown = _currentPlace.isRoot || _currentRelativePath.length > 0
+            ? [@"/" stringByAppendingString:_currentRelativePath]
+            : @"";
+        _pathLabel.text = shown.length > 0 ? [NSString stringWithFormat:@"%@: %@", _currentPlace.name, shown] : _currentPlace.name;
+    }
+    [_tableView reloadData];
+}
+
+- (BOOL)storageShowsBackRow {
+    return _currentPlace != nil;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+    NSUInteger count = _rows.count + ([self storageShowsBackRow] ? 1 : 0);
+    // A directory with nothing in it still says so.
+    if (_rows.count == 0 && _currentPlace != nil)
+        count += 1;
+    return (NSInteger) count;
+}
+
+- (UIColor *)storageColorForKey:(NSString *)key fallback:(UIColor *)fallback {
+    UIColor *color = self.workspaceTheme[key];
+    return color != nil ? color : fallback;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:ISHWorkspaceStorageRowReuseIdentifier];
+    if (cell == nil) {
+        cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:ISHWorkspaceStorageRowReuseIdentifier];
+        UILabel *size = [UILabel new];
+        size.textAlignment = NSTextAlignmentRight;
+        cell.accessoryView = size;
+    }
+    UIColor *primary = [self storageColorForKey:@"primary" fallback:UIColor.labelColor];
+    UIColor *secondary = [self storageColorForKey:@"secondary" fallback:UIColor.secondaryLabelColor];
+    UIColor *accent = [self storageColorForKey:@"accent" fallback:UIColor.systemBlueColor];
+    // Set on every dequeue, from the unscaled size: a reused cell carries the
+    // font of whatever row it last showed.
+    cell.backgroundColor = UIColor.clearColor;
+    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                            weight:UIFontWeightMedium];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1))];
+    cell.textLabel.textColor = primary;
+    cell.detailTextLabel.textColor = secondary;
+    cell.textLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    UILabel *size = (UILabel *) cell.accessoryView;
+    size.font = [UIFont monospacedDigitSystemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                                 weight:UIFontWeightRegular];
+    size.textColor = accent;
+    cell.imageView.tintColor = accent;
+    cell.accessibilityTraits = UIAccessibilityTraitNone;
+
+    NSInteger row = indexPath.row;
+    BOOL back = [self storageShowsBackRow] && row == 0;
+    if ([self storageShowsBackRow])
+        row -= 1;
+    UIImageSymbolConfiguration *symbol = [UIImageSymbolConfiguration configurationWithPointSize:14 weight:UIImageSymbolWeightMedium];
+    if (back) {
+        cell.textLabel.text = NSLocalizedString(@"‹ Back", @"launcher back button");
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
+        size.text = nil;
+        cell.selectionStyle = UITableViewCellSelectionStyleDefault;
+        cell.accessibilityTraits = UIAccessibilityTraitButton;
+    } else if (row >= (NSInteger) _rows.count) {
+        cell.textLabel.text = NSLocalizedString(@"Empty", @"Storage tool: a directory with nothing in it");
+        cell.textLabel.textColor = secondary;
+        cell.detailTextLabel.text = nil;
+        cell.imageView.image = nil;
+        size.text = nil;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+    } else {
+        ISHStorageEntry *entry = _rows[(NSUInteger) row];
+        BOOL opens = [self storageEntryOpens:entry];
+        cell.textLabel.text = entry.name;
+        if (entry.scanning)
+            cell.detailTextLabel.text = NSLocalizedString(@"Scanning…", @"Storage tool status while scanning");
+        else if (entry.detail.length > 0)
+            cell.detailTextLabel.text = entry.detail;
+        else if (entry.isDirectory)
+            cell.detailTextLabel.text = [NSString localizedStringWithFormat:NSLocalizedString(@"%lu items", @"file manager folder item count"), (unsigned long) entry.files];
+        else
+            cell.detailTextLabel.text = nil;
+        size.text = entry.scanning ? @"…" : ISHWorkspaceByteCountString(entry.bytes);
+        NSString *symbolName = entry.isRoot ? @"internaldrive" : (entry.isDirectory ? @"folder.fill" : @"doc");
+        cell.imageView.image = [[UIImage systemImageNamed:symbolName] imageByApplyingSymbolConfiguration:symbol];
+        cell.selectionStyle = opens ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+        if (opens)
+            cell.accessibilityTraits = UIAccessibilityTraitButton;
+    }
+    [size sizeToFit];
+    return cell;
+}
+
+// A directory that has been measured can be gone into; a file, swap and a
+// place still being read cannot.
+- (BOOL)storageEntryOpens:(ISHStorageEntry *)entry {
+    return entry.isDirectory && entry.hostPath != nil && !entry.scanning;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+    NSInteger row = indexPath.row;
+    if ([self storageShowsBackRow]) {
+        if (row == 0) {
+            if (_currentRelativePath.length > 0)
+                _currentRelativePath = _currentRelativePath.stringByDeletingLastPathComponent;
+            else
+                _currentPlace = nil;
+            [self rebuildRows];
+            return;
+        }
+        row -= 1;
+    }
+    if (row < 0 || row >= (NSInteger) _rows.count)
+        return;
+    ISHStorageEntry *entry = _rows[(NSUInteger) row];
+    if (![self storageEntryOpens:entry])
+        return;
+    if (_currentPlace == nil) {
+        _currentPlace = entry;
+        _currentRelativePath = @"";
+    } else {
+        _currentRelativePath = _currentRelativePath.length > 0
+            ? [_currentRelativePath stringByAppendingPathComponent:entry.name]
+            : entry.name;
+    }
+    [self rebuildRows];
+    if (_rows.count > 0 || [self storageShowsBackRow])
+        [_tableView scrollToRowAtIndexPath:[NSIndexPath indexPathForRow:0 inSection:0] atScrollPosition:UITableViewScrollPositionTop animated:NO];
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// Which directory the list was in: a restored window that is back at the top
+// has forgotten what was being looked at.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    NSString *placeName = _currentPlace != nil ? _currentPlace.name : _pendingPlaceName;
+    NSString *relative = _currentPlace != nil ? _currentRelativePath : _pendingRelativePath;
+    if (placeName.length == 0)
+        return nil;
+    return @{@"place": placeName, @"path": relative ?: @""};
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSString *placeName = [state[@"place"] isKindOfClass:NSString.class] ? state[@"place"] : nil;
+    NSString *relative = [state[@"path"] isKindOfClass:NSString.class] ? state[@"path"] : @"";
+    if (placeName.length == 0)
+        return;
+    // Applied when that place's scan finishes; until then the list is the top.
+    _pendingPlaceName = placeName;
+    _pendingRelativePath = relative;
+    for (ISHStorageEntry *place in _places) {
+        if (!place.scanning && place.tree != nil && [place.name isEqualToString:placeName]) {
+            [self storagePlaceDidFinish:place];
+            break;
+        }
+    }
+}
+
+#pragma mark Text scale and theme
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_summaryLabel];
+    [self workspaceScaleLabel:_pathLabel];
+    _tableView.rowHeight = [self storageRowHeight];
+    [_tableView reloadData];
 }
 
 - (void)workspaceApplyTheme {
     [super workspaceApplyTheme];
+    if (_tableView == nil)
+        return; // the base class calls this before viewDidLoad has built anything
     NSDictionary<NSString *, UIColor *> *theme = self.workspaceTheme;
     _summaryLabel.textColor = theme[@"accent"];
     _refreshButton.backgroundColor = [theme[@"cardAlt"] colorWithAlphaComponent:0.96];
     _refreshButton.layer.borderColor = theme[@"stroke"].CGColor;
     [_refreshButton setTitleColor:theme[@"accentAlt"] forState:UIControlStateNormal];
+    _tableView.separatorColor = [self storageColorForKey:@"stroke" fallback:[UIColor colorWithWhite:0.5 alpha:0.35]];
+    [_tableView reloadData];
 }
 
+@end
+
+// The shortcut names (written by the user), the "‹ Back" row and the empty-list
+// text follow Cmd+= / Cmd+- / Cmd+0. The + Add and Edit pills are the list's
+// controls, deliberately muted beside it, and stay as they are; so do the
+// folder and reorder glyphs.
+@interface WorkspaceLauncherToolViewController () <WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceLauncherToolViewController {
@@ -8019,7 +11083,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Launcher";
+    self.title = NSLocalizedString(@"Launcher", @"Launcher tool title");
     _currentPath = [NSMutableArray new];
 
     _scrollView = [UIScrollView new];
@@ -8065,7 +11129,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     // so it never needs to scroll on its own — this also avoids a repeat of the earlier bug
     // where an ancestor scroll view's pan gesture competed with a drag inside this list.
     _tableView.scrollEnabled = NO;
-    _tableView.rowHeight = ISHWorkspaceUsesPhoneLayout() ? 34.0 : 38.0;
+    _tableView.rowHeight = ISHWorkspaceLauncherRowHeight(self.workspaceTextScale);
     _tableView.separatorColor = [self launcherColorForKey:@"stroke" fallback:[UIColor colorWithWhite:0.5 alpha:0.35]];
     [_tableView registerClass:UITableViewCell.class forCellReuseIdentifier:ISHWorkspaceLauncherRowReuseIdentifier];
     _tableViewHeightConstraint = [_tableView.heightAnchor constraintEqualToConstant:_tableView.rowHeight];
@@ -8122,13 +11186,68 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     // its persisted frame (like the dock) so it returns to exactly where the user left it.
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [(id)weakSelf.workspaceHostViewController restoreLauncherWindowPlacement];
+        typeof(self) strongSelf = weakSelf;
+        [(id)strongSelf.workspaceHostViewController restoreLauncherWindowPlacement];
+        // The persisted frame is saved only when the user moves or resizes the
+        // window, so its size is from before any text-size change. Size the
+        // window to the scaled rows again, keeping the place just restored.
+        if (strongSelf != nil && fabs(strongSelf.workspaceTextScale - 1.0) > 0.001)
+            [(id)strongSelf.workspaceHostViewController autosizeLauncherWindowForItemCount:strongSelf->_rowShortcuts.count
+                                                                              showsBackRow:strongSelf->_currentPath.count > 0];
     });
+}
+
+// The size the window is autosized to for the level on screen, at the list's own
+// text size. The Workspace's compaction pass shrinks the Launcher to this rather
+// than to its preferred size, so the two cannot disagree.
+- (CGSize)launcherContentSizeForDisplayedLevel {
+    // No list has been built before -viewDidLoad; when it is, it opens at the root.
+    if (_rowShortcuts == nil)
+        return ISHWorkspaceLauncherContentSizeAtTextScale(ISHWorkspaceLauncherShortcuts().count, NO, self.workspaceTextScale);
+    return ISHWorkspaceLauncherContentSizeAtTextScale(_rowShortcuts.count, _currentPath.count > 0, self.workspaceTextScale);
+}
+
+#pragma mark WorkspaceTextScalable
+
+// The row height, the cells' font and the Back row are all decided where the
+// list is built, so a rebuild is the whole of it -- and the rebuild autosizes
+// the window, which is what keeps the last row on screen.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_tableView == nil)
+        return;
+    _tableView.rowHeight = ISHWorkspaceLauncherRowHeight(self.workspaceTextScale);
+    [self rebuildLauncherList];
 }
 
 - (UIColor *)launcherColorForKey:(NSString *)key fallback:(UIColor *)fallback {
     UIColor *color = self.workspaceTheme[key];
     return color != nil ? color : fallback;
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// Which group the list was drilled into. Cheap to carry and jarring to lose:
+// a resumed Launcher that jumps back to the top level looks like it forgot
+// where you were, because it has.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    return _currentPath.count > 0 ? @{@"path": [_currentPath copy]} : nil;
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSArray *path = [state[@"path"] isKindOfClass:NSArray.class] ? state[@"path"] : nil;
+    if (path == nil)
+        return;
+    [_currentPath removeAllObjects];
+    for (id index in path) {
+        if ([index isKindOfClass:NSNumber.class])
+            [_currentPath addObject:index];
+    }
+    // The shortcut list is editable and may have changed since the suspend, so
+    // the saved indices are not assumed to still point anywhere -- this is the
+    // same clamp the applet already uses when a group is deleted underneath it.
+    [self clampCurrentPathToValidLevel];
+    [self rebuildLauncherList];
 }
 
 - (void)rebuildLauncherList {
@@ -8145,8 +11264,9 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
 
     if (shortcuts.count == 0) {
         UILabel *empty = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
+        empty.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
         empty.numberOfLines = 0;
-        empty.text = _currentPath.count > 0 ? @"No shortcuts in this group yet." : @"No shortcuts yet.";
+        empty.text = _currentPath.count > 0 ? NSLocalizedString(@"No shortcuts in this group yet.", @"Launcher empty state inside a group") : NSLocalizedString(@"No shortcuts yet.", @"Launcher empty state");
         [_contentStack addArrangedSubview:empty];
     } else {
         [_contentStack addArrangedSubview:_tableView];
@@ -8181,11 +11301,14 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     BOOL isGroup = ISHWorkspaceShortcutIsGroup(shortcut);
     NSString *command = shortcut[@"command"];
     NSString *shortcutName = shortcut[@"name"];
-    NSString *name = shortcutName.length > 0 ? shortcutName : (command.length > 0 ? command : @"Terminal");
+    NSString *name = shortcutName.length > 0 ? shortcutName : (command.length > 0 ? command : NSLocalizedString(@"Terminal", @"launcher shortcut name fallback"));
 
     cell.backgroundColor = UIColor.clearColor;
     cell.textLabel.text = name;
-    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightMedium];
+    // Set on every dequeue, from the unscaled size: a reused cell carries the
+    // font of whatever row it last showed, at whatever scale that was.
+    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                            weight:UIFontWeightMedium];
     cell.textLabel.textColor = [self launcherColorForKey:@"primary" fallback:UIColor.darkTextColor];
     cell.accessoryType = (isGroup && !_isEditing) ? UITableViewCellAccessoryDisclosureIndicator : UITableViewCellAccessoryNone;
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
@@ -8253,7 +11376,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     return [UIContextMenuConfiguration configurationWithIdentifier:nil
                                                     previewProvider:nil
                                                      actionProvider:^UIMenu *(NSArray<UIMenuElement *> *suggestedActions) {
-        UIAction *editAction = [UIAction actionWithTitle:isGroup ? @"Edit Group…" : @"Edit Shortcut…"
+        UIAction *editAction = [UIAction actionWithTitle:isGroup ? NSLocalizedString(@"Edit Group…", @"launcher context menu action") : NSLocalizedString(@"Edit Shortcut…", @"launcher context menu action")
                                                     image:[UIImage systemImageNamed:@"pencil"]
                                                identifier:nil
                                                   handler:^(__unused UIAction *action) {
@@ -8264,7 +11387,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
         // A group can be added to without drilling into it first — the destination path is the
         // group's own path (path + its index), not the level it's sitting at.
         NSArray<NSNumber *> *groupPath = [path arrayByAddingObject:@(index)];
-        UIAction *addAction = [UIAction actionWithTitle:@"Add…"
+        UIAction *addAction = [UIAction actionWithTitle:NSLocalizedString(@"Add…", @"launcher context menu action")
                                                    image:[UIImage systemImageNamed:@"plus"]
                                               identifier:nil
                                                  handler:^(__unused UIAction *action) {
@@ -8295,16 +11418,18 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
         return;
     }
     UIAlertController *confirm =
-        [UIAlertController alertControllerWithTitle:@"Delete Group?"
-                                            message:[NSString stringWithFormat:@"This deletes \"%@\" and %lu item%@ inside it.",
-                                                     shortcut[@"name"], (unsigned long)children.count, children.count == 1 ? @"" : @"s"]
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Delete Group?", @"alert title")
+                                            message:[NSString stringWithFormat:children.count == 1
+                                                         ? NSLocalizedString(@"This deletes \"%@\" and %lu item inside it.", @"delete launcher group message: group name, one item")
+                                                         : NSLocalizedString(@"This deletes \"%@\" and %lu items inside it.", @"delete launcher group message: group name, item count"),
+                                                     shortcut[@"name"], (unsigned long)children.count]
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"Delete"
+    [confirm addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Delete", @"alert button")
                                                 style:UIAlertActionStyleDestructive
                                               handler:^(__unused UIAlertAction *action) {
         [self deleteRowAtIndex:index indexPath:indexPath];
     }]];
-    [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [confirm addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
@@ -8423,11 +11548,12 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     UIButton *back = [UIButton buttonWithType:UIButtonTypeSystem];
     back.translatesAutoresizingMaskIntoConstraints = NO;
     UIColor *primary = [self launcherColorForKey:@"primary" fallback:UIColor.darkTextColor];
-    [back setTitle:@"‹ Back" forState:UIControlStateNormal];
+    [back setTitle:NSLocalizedString(@"‹ Back", @"Launcher back button") forState:UIControlStateNormal];
     [back setTitleColor:primary forState:UIControlStateNormal];
-    back.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline) weight:UIFontWeightSemibold];
+    back.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline))
+                                             weight:UIFontWeightSemibold];
     back.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-    CGFloat minHeight = ISHWorkspaceUsesPhoneLayout() ? 28.0 : 30.0;
+    CGFloat minHeight = ISHWorkspaceLauncherBackRowHeight(self.workspaceTextScale);
     [back.heightAnchor constraintGreaterThanOrEqualToConstant:minHeight].active = YES;
     [back addTarget:self action:@selector(backButtonTapped:) forControlEvents:UIControlEventTouchUpInside];
     if (_isEditing) {
@@ -8506,7 +11632,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     UIButton *add = [UIButton buttonWithType:UIButtonTypeSystem];
     add.translatesAutoresizingMaskIntoConstraints = NO;
     UIColor *secondary = [self launcherColorForKey:@"secondary" fallback:UIColor.secondaryLabelColor];
-    [add setTitle:@"+ Add" forState:UIControlStateNormal];
+    [add setTitle:NSLocalizedString(@"+ Add", @"Launcher add button") forState:UIControlStateNormal];
     [add setTitleColor:secondary forState:UIControlStateNormal];
     add.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote) weight:UIFontWeightMedium];
     add.backgroundColor = [[self launcherColorForKey:@"cardAlt" fallback:[UIColor colorWithWhite:0.5 alpha:0.12]] colorWithAlphaComponent:0.25];
@@ -8528,7 +11654,7 @@ static NSString *const ISHWorkspaceLauncherRowReuseIdentifier = @"launcher.row";
     UIButton *toggle = [UIButton buttonWithType:UIButtonTypeSystem];
     toggle.translatesAutoresizingMaskIntoConstraints = NO;
     UIColor *secondary = [self launcherColorForKey:@"secondary" fallback:UIColor.secondaryLabelColor];
-    [toggle setTitle:_isEditing ? @"Done" : @"Edit" forState:UIControlStateNormal];
+    [toggle setTitle:_isEditing ? NSLocalizedString(@"Done", @"Launcher edit toggle button") : NSLocalizedString(@"Edit", @"Launcher edit toggle button") forState:UIControlStateNormal];
     [toggle setTitleColor:secondary forState:UIControlStateNormal];
     toggle.titleLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote) weight:UIFontWeightMedium];
     toggle.backgroundColor = [[self launcherColorForKey:@"cardAlt" fallback:[UIColor colorWithWhite:0.5 alpha:0.12]] colorWithAlphaComponent:0.25];
@@ -8605,7 +11731,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
                                                       target:self action:@selector(cancel)];
     if (_mode == MotePadBrowserModeSave) {
         self.navigationItem.rightBarButtonItem =
-            [[UIBarButtonItem alloc] initWithTitle:@"Save Here" style:UIBarButtonItemStyleDone
+            [[UIBarButtonItem alloc] initWithTitle:NSLocalizedString(@"Save Here", @"MotePad file browser save button") style:UIBarButtonItemStyleDone
                                             target:self action:@selector(saveHere)];
     }
     [self reload];
@@ -8683,7 +11809,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 
 - (void)promptForFilename:(NSString *)initialName message:(NSString *)message {
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Save As"
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Save As", @"MotePad save alert title")
                                             message:message.length ? message : _directory
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
@@ -8694,7 +11820,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
         textField.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button") style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         typeof(self) strongSelf = weakSelf;
         if (strongSelf == nil) return;
@@ -8706,7 +11832,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
             // inline explanation once the alert's own dismissal has finished.
             dispatch_async(dispatch_get_main_queue(), ^{
                 [strongSelf promptForFilename:name
-                                      message:@"Enter a file name without “/” (and not “.” or “..”)."];
+                                      message:NSLocalizedString(@"Enter a file name without “/” (and not “.” or “..”).", @"MotePad save alert message for an invalid name")];
             });
             return;
         }
@@ -8717,7 +11843,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
             [strongSelf finishWithPath:path];
         });
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -8785,6 +11911,9 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 // logical line (paragraph), aligned to that line's first laid-out fragment, and the editor
 // asks it to redraw on scroll/edit/wrap/font changes. Word-wrapped continuation fragments
 // get no number, matching a desktop editor.
+// The editor's size at text scale 1.0 (WorkspaceTextScalable).
+static const CGFloat kMotePadDefaultFontSize = 14.0;
+
 @interface MotePadLineNumberGutterView : UIView
 @property (nonatomic, weak) UITextView *textView;
 @property (nonatomic, strong) UIColor *numberColor;
@@ -9067,7 +12196,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 @end
 
 
-@interface WorkspaceMotePadToolViewController () <UITextViewDelegate, UIFontPickerViewControllerDelegate, WorkspaceFileOpenable, WorkspaceFocusable>
+@interface WorkspaceMotePadToolViewController () <UITextViewDelegate, UIFontPickerViewControllerDelegate, WorkspaceFileOpenable, WorkspaceFocusable, WorkspaceStatefulTool, WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceMotePadToolViewController {
@@ -9114,6 +12243,35 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 // inside it again (viewDidAppear's initial grab only fires once).
 - (void)workspaceToolDidBecomeFrontmost {
     [_textView becomeFirstResponder];
+}
+
+// WorkspaceTextScalable: Cmd+= / Cmd+- / Cmd+0 and the View menu's
+// Bigger / Smaller / Actual Size. Only the document text scales; the menu bar,
+// title and status bar are chrome. -fontWithSize: keeps the face, so a font
+// picked with Show Fonts survives, and the picker in turn keeps the size.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_textView == nil)
+        return;
+    CGFloat size = [self workspaceScaledFontSize:kMotePadDefaultFontSize];
+    UIFont *font = _textView.font ?: [UIFont monospacedSystemFontOfSize:size weight:UIFontWeightRegular];
+    // Setting the font is not an edit: no dirty flag, no draft, no undo.
+    _textView.font = [font fontWithSize:size];
+    [self updateGutterWidth];
+    [_gutter setNeedsDisplay];
+    [_textView scrollRangeToVisible:_textView.selectedRange];
+}
+
+- (void)mpBiggerText {
+    [self.workspaceHostViewController adjustTextSizeForToolViewController:self step:1];
+}
+
+- (void)mpSmallerText {
+    [self.workspaceHostViewController adjustTextSizeForToolViewController:self step:-1];
+}
+
+- (void)mpActualSizeText {
+    [self.workspaceHostViewController adjustTextSizeForToolViewController:self step:0];
 }
 
 - (void)viewDidLoad {
@@ -9168,7 +12326,8 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
     _textView.translatesAutoresizingMaskIntoConstraints = NO;
     _textView.delegate = self;
     _textView.editable = YES;
-    _textView.font = [UIFont fontWithName:@"Courier" size:14] ?: [UIFont monospacedSystemFontOfSize:14 weight:UIFontWeightRegular];
+    _textView.font = [UIFont fontWithName:@"Courier" size:kMotePadDefaultFontSize]
+        ?: [UIFont monospacedSystemFontOfSize:kMotePadDefaultFontSize weight:UIFontWeightRegular];
     _textView.autocapitalizationType = UITextAutocapitalizationTypeNone;
     _textView.autocorrectionType = UITextAutocorrectionTypeNo;
     _textView.smartQuotesType = UITextSmartQuotesTypeNo;
@@ -9318,54 +12477,58 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 - (NSArray<NSArray<MotePadMenuRow *> *> *)fileMenuSections {
     __weak typeof(self) ws = self;
     return @[
-        @[ [self row:@"New" shortcut:@"⌘N" handler:^{ [ws mpNew]; }],
-           [self row:@"Open…" shortcut:@"⌘O" handler:^{ [ws mpOpen]; }],
-           [self row:@"Save" shortcut:@"⌘S" handler:^{ [ws mpSave]; }],
-           [self row:@"Save As…" shortcut:@"⇧⌘S" handler:^{ [ws mpSaveAs]; }] ],
-        @[ [self row:@"Page Setup…" shortcut:@"⇧⌘P" handler:^{ [ws mpPageSetup]; }],
-           [self row:@"Print…" shortcut:@"⌘P" handler:^{ [ws mpPrint]; }] ],
-        @[ [self row:@"Close" shortcut:@"⌘W" handler:^{ [ws mpClose]; }],
-           [self row:@"Quit MotePad" shortcut:@"⌘Q" handler:^{ [ws mpQuit]; }] ],
+        @[ [self row:NSLocalizedString(@"New", @"MotePad File menu item") shortcut:@"⌘N" handler:^{ [ws mpNew]; }],
+           [self row:NSLocalizedString(@"Open…", @"MotePad File menu item") shortcut:@"⌘O" handler:^{ [ws mpOpen]; }],
+           [self row:NSLocalizedString(@"Save", @"MotePad File menu item") shortcut:@"⌘S" handler:^{ [ws mpSave]; }],
+           [self row:NSLocalizedString(@"Save As…", @"MotePad File menu item") shortcut:@"⇧⌘S" handler:^{ [ws mpSaveAs]; }] ],
+        @[ [self row:NSLocalizedString(@"Page Setup…", @"MotePad File menu item") shortcut:@"⇧⌘P" handler:^{ [ws mpPageSetup]; }],
+           [self row:NSLocalizedString(@"Print…", @"MotePad File menu item") shortcut:@"⌘P" handler:^{ [ws mpPrint]; }] ],
+        @[ [self row:NSLocalizedString(@"Close", @"MotePad File menu item") shortcut:@"⌘W" handler:^{ [ws mpClose]; }],
+           [self row:NSLocalizedString(@"Quit MotePad", @"MotePad File menu item") shortcut:@"⌘Q" handler:^{ [ws mpQuit]; }] ],
     ];
 }
 
 - (NSArray<NSArray<MotePadMenuRow *> *> *)editMenuSections {
     __weak typeof(self) ws = self;
     return @[
-        @[ [self row:@"Undo" shortcut:@"⌘Z" handler:^{ [ws editUndo]; }],
-           [self row:@"Redo" shortcut:@"⇧⌘Z" handler:^{ [ws editRedo]; }] ],
-        @[ [self row:@"Cut" shortcut:@"⌘X" handler:^{ [ws editCut]; }],
-           [self row:@"Copy" shortcut:@"⌘C" handler:^{ [ws editCopy]; }],
-           [self row:@"Paste" shortcut:@"⌘V" handler:^{ [ws editPaste]; }],
-           [self row:@"Delete" shortcut:nil handler:^{ [ws editDelete]; }],
-           [self row:@"Select All" shortcut:@"⌘A" handler:^{ [ws editSelectAll]; }] ],
-        @[ [self row:@"Find…" shortcut:@"⌘F" handler:^{ [ws mpFind]; }],
-           [self row:@"Find Next" shortcut:@"⌘G" handler:^{ [ws mpFindNext]; }],
-           [self row:@"Replace…" shortcut:@"⇧⌘F" handler:^{ [ws mpReplace]; }],
-           [self row:@"Go to Line…" shortcut:@"⌘L" handler:^{ [ws mpGoToLine]; }],
-           [self row:@"Insert Date and Time" shortcut:@"⌘D" handler:^{ [ws mpInsertDateTime]; }] ],
+        @[ [self row:NSLocalizedString(@"Undo", @"MotePad Edit menu item") shortcut:@"⌘Z" handler:^{ [ws editUndo]; }],
+           [self row:NSLocalizedString(@"Redo", @"MotePad Edit menu item") shortcut:@"⇧⌘Z" handler:^{ [ws editRedo]; }] ],
+        @[ [self row:NSLocalizedString(@"Cut", @"MotePad Edit menu item") shortcut:@"⌘X" handler:^{ [ws editCut]; }],
+           [self row:NSLocalizedString(@"Copy", @"MotePad Edit menu item") shortcut:@"⌘C" handler:^{ [ws editCopy]; }],
+           [self row:NSLocalizedString(@"Paste", @"MotePad Edit menu item") shortcut:@"⌘V" handler:^{ [ws editPaste]; }],
+           [self row:NSLocalizedString(@"Delete", @"MotePad Edit menu item") shortcut:nil handler:^{ [ws editDelete]; }],
+           [self row:NSLocalizedString(@"Select All", @"MotePad Edit menu item") shortcut:@"⌘A" handler:^{ [ws editSelectAll]; }] ],
+        @[ [self row:NSLocalizedString(@"Find…", @"MotePad Edit menu item") shortcut:@"⌘F" handler:^{ [ws mpFind]; }],
+           [self row:NSLocalizedString(@"Find Next", @"MotePad Edit menu item") shortcut:@"⌘G" handler:^{ [ws mpFindNext]; }],
+           [self row:NSLocalizedString(@"Replace…", @"MotePad Edit menu item") shortcut:@"⇧⌘F" handler:^{ [ws mpReplace]; }],
+           [self row:NSLocalizedString(@"Go to Line…", @"MotePad Edit menu item") shortcut:@"⌘L" handler:^{ [ws mpGoToLine]; }],
+           [self row:NSLocalizedString(@"Insert Date and Time", @"MotePad Edit menu item") shortcut:@"⌘D" handler:^{ [ws mpInsertDateTime]; }] ],
     ];
 }
 
 - (NSArray<NSArray<MotePadMenuRow *> *> *)formatMenuSections {
     __weak typeof(self) ws = self;
     return @[ @[
-        [self toggle:@"Word Wrap" shortcut:@"⌥⌘W" checked:_wordWrap handler:^{ [ws mpToggleWordWrap]; }],
-        [self row:@"Show Fonts" shortcut:@"⌘T" handler:^{ [ws mpShowFonts]; }],
+        [self toggle:NSLocalizedString(@"Word Wrap", @"MotePad Format menu item") shortcut:@"⌥⌘W" checked:_wordWrap handler:^{ [ws mpToggleWordWrap]; }],
+        [self row:NSLocalizedString(@"Show Fonts", @"MotePad Format menu item") shortcut:@"⌘T" handler:^{ [ws mpShowFonts]; }],
     ] ];
 }
 
 - (NSArray<NSArray<MotePadMenuRow *> *> *)viewMenuSections {
     __weak typeof(self) ws = self;
     return @[ @[
-        [self toggle:@"Status Bar" shortcut:@"⌥⌘S" checked:_statusBarVisible handler:^{ [ws mpToggleStatusBar]; }],
-        [self toggle:@"Line Numbers" shortcut:@"⌥⌘L" checked:_lineNumbersVisible handler:^{ [ws mpToggleLineNumbers]; }],
+        [self toggle:NSLocalizedString(@"Status Bar", @"MotePad View menu item") shortcut:@"⌥⌘S" checked:_statusBarVisible handler:^{ [ws mpToggleStatusBar]; }],
+        [self toggle:NSLocalizedString(@"Line Numbers", @"MotePad View menu item") shortcut:@"⌥⌘L" checked:_lineNumbersVisible handler:^{ [ws mpToggleLineNumbers]; }],
+    ], @[
+        [self row:NSLocalizedString(@"Bigger", @"MotePad View menu item (text size)") shortcut:@"⌘+" handler:^{ [ws mpBiggerText]; }],
+        [self row:NSLocalizedString(@"Smaller", @"MotePad View menu item (text size)") shortcut:@"⌘−" handler:^{ [ws mpSmallerText]; }],
+        [self row:NSLocalizedString(@"Actual Size", @"MotePad View menu item (text size)") shortcut:@"⌘0" handler:^{ [ws mpActualSizeText]; }],
     ] ];
 }
 
 - (NSArray<NSArray<MotePadMenuRow *> *> *)helpMenuSections {
     __weak typeof(self) ws = self;
-    return @[ @[ [self row:@"MotePad Help" shortcut:@"⌘?" handler:^{ [ws mpAbout]; }] ] ];
+    return @[ @[ [self row:NSLocalizedString(@"MotePad Help", @"MotePad Help menu item") shortcut:@"⌘?" handler:^{ [ws mpAbout]; }] ] ];
 }
 
 - (NSArray<NSArray<MotePadMenuRow *> *> *)menuSectionsForTitle:(NSString *)title {
@@ -9426,37 +12589,37 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
     UIKeyModifierFlags optCmd = UIKeyModifierCommand | UIKeyModifierAlternate;
     NSMutableArray<UIKeyCommand *> *commands = [@[
         // File
-        [self key:@"n" flags:cmd action:@selector(mpNew) title:@"New"],
-        [self key:@"o" flags:cmd action:@selector(mpOpen) title:@"Open…"],
-        [self key:@"s" flags:cmd action:@selector(mpSave) title:@"Save"],
-        [self key:@"s" flags:shiftCmd action:@selector(mpSaveAs) title:@"Save As…"],
-        [self key:@"p" flags:cmd action:@selector(mpPrint) title:@"Print…"],
-        [self key:@"p" flags:shiftCmd action:@selector(mpPageSetup) title:@"Page Setup…"],
-        [self key:@"w" flags:cmd action:@selector(mpClose) title:@"Close"],
-        [self key:@"q" flags:cmd action:@selector(mpQuit) title:@"Quit MotePad"],
+        [self key:@"n" flags:cmd action:@selector(mpNew) title:NSLocalizedString(@"New", @"MotePad keyboard shortcut title")],
+        [self key:@"o" flags:cmd action:@selector(mpOpen) title:NSLocalizedString(@"Open…", @"MotePad keyboard shortcut title")],
+        [self key:@"s" flags:cmd action:@selector(mpSave) title:NSLocalizedString(@"Save", @"MotePad keyboard shortcut title")],
+        [self key:@"s" flags:shiftCmd action:@selector(mpSaveAs) title:NSLocalizedString(@"Save As…", @"MotePad keyboard shortcut title")],
+        [self key:@"p" flags:cmd action:@selector(mpPrint) title:NSLocalizedString(@"Print…", @"MotePad keyboard shortcut title")],
+        [self key:@"p" flags:shiftCmd action:@selector(mpPageSetup) title:NSLocalizedString(@"Page Setup…", @"MotePad keyboard shortcut title")],
+        [self key:@"w" flags:cmd action:@selector(mpClose) title:NSLocalizedString(@"Close", @"MotePad keyboard shortcut title")],
+        [self key:@"q" flags:cmd action:@selector(mpQuit) title:NSLocalizedString(@"Quit MotePad", @"MotePad keyboard shortcut title")],
         // Edit — Undo/Redo/Cut/Copy/Paste/Select All are provided natively by UITextView.
-        [self key:@"f" flags:cmd action:@selector(mpFind) title:@"Find…"],
-        [self key:@"g" flags:cmd action:@selector(mpFindNext) title:@"Find Next"],
-        [self key:@"f" flags:shiftCmd action:@selector(mpReplace) title:@"Replace…"],
-        [self key:@"l" flags:cmd action:@selector(mpGoToLine) title:@"Go to Line…"],
-        [self key:@"d" flags:cmd action:@selector(mpInsertDateTime) title:@"Insert Date and Time"],
+        [self key:@"f" flags:cmd action:@selector(mpFind) title:NSLocalizedString(@"Find…", @"MotePad keyboard shortcut title")],
+        [self key:@"g" flags:cmd action:@selector(mpFindNext) title:NSLocalizedString(@"Find Next", @"MotePad keyboard shortcut title")],
+        [self key:@"f" flags:shiftCmd action:@selector(mpReplace) title:NSLocalizedString(@"Replace…", @"MotePad keyboard shortcut title")],
+        [self key:@"l" flags:cmd action:@selector(mpGoToLine) title:NSLocalizedString(@"Go to Line…", @"MotePad keyboard shortcut title")],
+        [self key:@"d" flags:cmd action:@selector(mpInsertDateTime) title:NSLocalizedString(@"Insert Date and Time", @"MotePad keyboard shortcut title")],
         // Format
-        [self key:@"w" flags:optCmd action:@selector(mpToggleWordWrap) title:@"Word Wrap"],
-        [self key:@"t" flags:cmd action:@selector(mpShowFonts) title:@"Show Fonts"],
+        [self key:@"w" flags:optCmd action:@selector(mpToggleWordWrap) title:NSLocalizedString(@"Word Wrap", @"MotePad keyboard shortcut title")],
+        [self key:@"t" flags:cmd action:@selector(mpShowFonts) title:NSLocalizedString(@"Show Fonts", @"MotePad keyboard shortcut title")],
         // View
-        [self key:@"s" flags:optCmd action:@selector(mpToggleStatusBar) title:@"Status Bar"],
-        [self key:@"l" flags:optCmd action:@selector(mpToggleLineNumbers) title:@"Line Numbers"],
+        [self key:@"s" flags:optCmd action:@selector(mpToggleStatusBar) title:NSLocalizedString(@"Status Bar", @"MotePad keyboard shortcut title")],
+        [self key:@"l" flags:optCmd action:@selector(mpToggleLineNumbers) title:NSLocalizedString(@"Line Numbers", @"MotePad keyboard shortcut title")],
         // Help
-        [self key:@"?" flags:cmd action:@selector(mpAbout) title:@"MotePad Help"],
+        [self key:@"?" flags:cmd action:@selector(mpAbout) title:NSLocalizedString(@"MotePad Help", @"MotePad keyboard shortcut title")],
     ] mutableCopy];
     // Open each in-window menu from the keyboard (Control-Option-letter).
     UIKeyModifierFlags ctrlOpt = UIKeyModifierControl | UIKeyModifierAlternate;
     [commands addObjectsFromArray:@[
-        [self key:@"f" flags:ctrlOpt action:@selector(openFileMenu) title:@"File Menu"],
-        [self key:@"e" flags:ctrlOpt action:@selector(openEditMenu) title:@"Edit Menu"],
-        [self key:@"o" flags:ctrlOpt action:@selector(openFormatMenu) title:@"Format Menu"],
-        [self key:@"v" flags:ctrlOpt action:@selector(openViewMenu) title:@"View Menu"],
-        [self key:@"h" flags:ctrlOpt action:@selector(openHelpMenu) title:@"Help Menu"],
+        [self key:@"f" flags:ctrlOpt action:@selector(openFileMenu) title:NSLocalizedString(@"File Menu", @"MotePad keyboard shortcut title")],
+        [self key:@"e" flags:ctrlOpt action:@selector(openEditMenu) title:NSLocalizedString(@"Edit Menu", @"MotePad keyboard shortcut title")],
+        [self key:@"o" flags:ctrlOpt action:@selector(openFormatMenu) title:NSLocalizedString(@"Format Menu", @"MotePad keyboard shortcut title")],
+        [self key:@"v" flags:ctrlOpt action:@selector(openViewMenu) title:NSLocalizedString(@"View Menu", @"MotePad keyboard shortcut title")],
+        [self key:@"h" flags:ctrlOpt action:@selector(openHelpMenu) title:NSLocalizedString(@"Help Menu", @"MotePad keyboard shortcut title")],
     ]];
     return commands;
 }
@@ -9464,7 +12627,7 @@ typedef NS_ENUM(NSInteger, MotePadBrowserMode) {
 #pragma mark Document state
 
 - (NSString *)documentDisplayName {
-    return _currentGuestPath.lastPathComponent.length ? _currentGuestPath.lastPathComponent : @"Untitled";
+    return _currentGuestPath.lastPathComponent.length ? _currentGuestPath.lastPathComponent : NSLocalizedString(@"Untitled", @"MotePad name for an unsaved document");
 }
 
 - (void)updateDocTitle {
@@ -9529,6 +12692,66 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
         [MotePadClaimedDraftSlots() removeObject:name];
     else
         dispatch_async(dispatch_get_main_queue(), ^{ [MotePadClaimedDraftSlots() removeObject:name]; });
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// What this editor needs in order to come back as itself.
+//
+// The draft machinery above already survives a jetsam kill: text is mirrored to
+// a numbered slot, debounced ~2s, and reclaimed on window creation "in creation
+// order, so the slots line back up". A checkpoint breaks both halves of that.
+//
+// The debounce loses outright. Suspend and Exit ends in exit(0) -- no
+// background notification, and autosaveDraftNow's write is queued on the IO
+// queue, so a process that exits immediately never performs it. Text typed
+// seconds before a suspend was simply gone, which is what was reported.
+// So this writes the draft HERE, synchronously, before returning.
+//
+// And creation order is not a safe key across a restore: it holds only if the
+// layout recreates every MotePad in the same order with nothing else opening
+// one in between. The slot NAME is recorded instead, so a window reclaims the
+// draft it actually wrote.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    NSMutableDictionary<NSString *, id> *state = [NSMutableDictionary dictionary];
+    NSURL *url = [self draftFileURL];
+    if (url != nil) {
+        if (_dirty) {
+            // Synchronous on purpose -- see above. The snapshot is taken on the
+            // main thread either way; only the write moves.
+            [_draftTimer invalidate];
+            _draftTimer = nil;
+            [[self draftDataSnapshot] writeToURL:url options:NSDataWritingAtomic error:NULL];
+        }
+        state[@"draftSlot"] = _draftSlotName;
+    }
+    if (_currentGuestPath.length > 0)
+        state[@"path"] = _currentGuestPath;
+    state[@"dirty"] = @(_dirty);
+    return state;
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    if (![state isKindOfClass:NSDictionary.class])
+        return;
+    NSString *slot = state[@"draftSlot"];
+    if ([slot isKindOfClass:NSString.class] && slot.length > 0 &&
+            ![slot isEqualToString:_draftSlotName]) {
+        // viewDidLoad has already claimed a slot by number. Swap to the one
+        // this window actually wrote, if nothing else holds it -- and give the
+        // guessed one back so the next window can have it.
+        NSMutableSet<NSString *> *claimed = MotePadClaimedDraftSlots();
+        if (![claimed containsObject:slot]) {
+            [WorkspaceMotePadToolViewController releaseDraftSlotNamed:_draftSlotName];
+            [claimed addObject:slot];
+            _draftSlotName = slot;
+        }
+    }
+    // Re-run the normal restore against the slot we now hold. It refuses to
+    // stomp a window the user has already typed into, and it compares the
+    // draft's date against the file's, so a document saved since is not
+    // overwritten by a stale draft.
+    [self restoreDraftIfNewer];
 }
 
 - (void)claimDraftSlot {
@@ -9684,14 +12907,14 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
             if (path == nil) return;
             typeof(self) ss = ws;
             if (ss == nil) return;
-            [ss beginFileOperation:@"Opening…"];
+            [ss beginFileOperation:NSLocalizedString(@"Opening…", @"MotePad status while opening a file")];
             [[MotePadDocumentStore sharedStore] readTextFileAtGuestPath:path
                                                              completion:^(NSString *text, NSError *error) {
                 typeof(self) s2 = ws;
                 if (s2 == nil) return;
                 [s2 endFileOperation];
                 if (text == nil) {
-                    [s2 presentError:error title:@"Couldn’t Open"];
+                    [s2 presentError:error title:NSLocalizedString(@"Couldn’t Open", @"MotePad error alert title")];
                     return;
                 }
                 [s2 loadText:text guestPath:path];
@@ -9708,14 +12931,14 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
     [self promptToSaveIfDirtyThen:^{
         typeof(self) ss = ws;
         if (ss == nil) return;
-        [ss beginFileOperation:@"Opening…"];
+        [ss beginFileOperation:NSLocalizedString(@"Opening…", @"MotePad status while opening a file")];
         [[MotePadDocumentStore sharedStore] readTextFileAtGuestPath:guestPath
                                                          completion:^(NSString *text, NSError *error) {
             typeof(self) s2 = ws;
             if (s2 == nil) return;
             [s2 endFileOperation];
             if (text == nil) {
-                [s2 presentError:error title:@"Couldn’t Open"];
+                [s2 presentError:error title:NSLocalizedString(@"Couldn’t Open", @"MotePad error alert title")];
                 return;
             }
             [s2 loadText:text guestPath:guestPath];
@@ -9793,7 +13016,7 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
 // is locked while it's in flight, and the completion (main thread) reports success.
 - (void)writeToGuestPath:(NSString *)path completion:(void (^)(BOOL ok))completion {
     __weak typeof(self) ws = self;
-    [self beginFileOperation:@"Saving…"];
+    [self beginFileOperation:NSLocalizedString(@"Saving…", @"MotePad status while saving a file")];
     [[MotePadDocumentStore sharedStore] writeText:_textView.text toGuestPath:path
                                        completion:^(BOOL ok, NSError *error) {
         typeof(self) ss = ws;
@@ -9803,7 +13026,7 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
         }
         [ss endFileOperation];
         if (!ok) {
-            [ss presentError:error title:@"Couldn’t Save"];
+            [ss presentError:error title:NSLocalizedString(@"Couldn’t Save", @"MotePad error alert title")];
         } else {
             ss->_currentGuestPath = path;
             [ss setDirty:NO];
@@ -9850,11 +13073,11 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
         return;
     }
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Unsaved Changes"
-                                            message:[NSString stringWithFormat:@"Save changes to %@?", [self documentDisplayName]]
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Unsaved Changes", @"MotePad alert title")
+                                            message:[NSString stringWithFormat:NSLocalizedString(@"Save changes to %@?", @"MotePad unsaved changes message; %@ is the document name"), [self documentDisplayName]]
                                      preferredStyle:UIAlertControllerStyleAlert];
     __weak typeof(self) ws = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button") style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *a) {
         typeof(self) ss = ws;
         if (ss == nil) return;
@@ -9873,9 +13096,9 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
             [ss writeToGuestPath:ss->_currentGuestPath completion:proceedIfSaved];
         }
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Don’t Save" style:UIAlertActionStyleDestructive
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Don’t Save", @"alert button") style:UIAlertActionStyleDestructive
                                             handler:^(__unused UIAlertAction *a) { if (proceed) proceed(); }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -9905,18 +13128,18 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
     }
     // Pre-iOS 16 fallback: a one-shot forward find from the caret.
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Find" message:nil
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Find", @"MotePad find alert title") message:nil
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Search";
+        tf.placeholder = NSLocalizedString(@"Search", @"MotePad find field placeholder");
         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
     __weak typeof(self) ws = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Find Next" style:UIAlertActionStyleDefault
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Find Next", @"MotePad find alert button") style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *a) {
         [ws findNext:alert.textFields.firstObject.text];
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -9953,18 +13176,18 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
 
 - (void)mpGoToLine {
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Go to Line" message:nil
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Go to Line", @"MotePad alert title") message:nil
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Line number";
+        tf.placeholder = NSLocalizedString(@"Line number", @"MotePad go to line placeholder");
         tf.keyboardType = UIKeyboardTypeNumberPad;
     }];
     __weak typeof(self) ws = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Go" style:UIAlertActionStyleDefault
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Go", @"MotePad go to line button") style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *a) {
         [ws goToLine:alert.textFields.firstObject.text.integerValue];
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -10078,9 +13301,9 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
 - (void)mpAbout {
     UIAlertController *alert =
         [UIAlertController alertControllerWithTitle:@"MotePad"
-                                            message:@"A Notepad-style text editor for the iSH-AOK Workspace.\n\nInspired by MotePad / TinyRetroPad — reads and writes files on the guest filesystem."
+                                            message:NSLocalizedString(@"A Notepad-style text editor for the iSH-AOK Workspace.\n\nInspired by MotePad / TinyRetroPad — reads and writes files on the guest filesystem.", @"MotePad about message")
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -10089,9 +13312,9 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
 - (void)presentError:(NSError *)error title:(NSString *)title {
     UIAlertController *alert =
         [UIAlertController alertControllerWithTitle:title
-                                            message:error.localizedDescription ?: @"Unknown error"
+                                            message:error.localizedDescription ?: NSLocalizedString(@"Unknown error", @"error alert message fallback")
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -10106,7 +13329,7 @@ static NSMutableSet<NSString *> *MotePadClaimedDraftSlots(void) {
         if ([text characterAtIndex:i] == '\n') { line++; lineStart = i + 1; }
     }
     NSUInteger column = caret - lineStart + 1;
-    _statusLabel.text = [NSString stringWithFormat:@"Ln %lu, Col %lu", (unsigned long)line, (unsigned long)column];
+    _statusLabel.text = [NSString stringWithFormat:NSLocalizedString(@"Ln %lu, Col %lu", @"MotePad status bar: line, column"), (unsigned long)line, (unsigned long)column];
 }
 
 #pragma mark UITextViewDelegate
@@ -10218,7 +13441,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 
 @end
 
-@interface WorkspaceAudioPlayerToolViewController () <UITableViewDataSource, UITableViewDelegate, WorkspaceFileOpenable>
+@interface WorkspaceAudioPlayerToolViewController () <UITableViewDataSource, UITableViewDelegate, WorkspaceFileOpenable, WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceAudioPlayerToolViewController {
@@ -10259,7 +13482,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Music";
+    self.title = NSLocalizedString(@"Music", @"Music tool title");
 
     CGFloat bodyMaxWidth = ISHWorkspaceAudioDeviceWidth();
 
@@ -10299,7 +13522,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     _titleLabel.textColor = UIColor.whiteColor;
     _titleLabel.textAlignment = NSTextAlignmentCenter;
     _titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-    _titleLabel.text = @"Nothing playing";
+    _titleLabel.text = NSLocalizedString(@"Nothing playing", @"Music tool title when idle");
 
     _progressSlider = [UISlider new];
     _progressSlider.continuous = YES;
@@ -10410,7 +13633,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     _tableView.dataSource = self;
     _tableView.delegate = self;
     _tableView.backgroundColor = UIColor.clearColor;
-    _tableView.rowHeight = 38;
+    _tableView.rowHeight = [self trackRowHeight];
     _tableView.alwaysBounceVertical = YES;
     _tableView.showsVerticalScrollIndicator = YES;
     [self.toolContentView addSubview:_tableView];
@@ -10472,19 +13695,19 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 
     NSString *accessibilityLabel = text;
     if ([text isEqualToString:@"M"]) {
-        accessibilityLabel = @"Menu";
+        accessibilityLabel = NSLocalizedString(@"Menu", @"accessibility label for Music menu button");
     } else if ([text isEqualToString:@"|<"]) {
-        accessibilityLabel = @"Previous Track";
+        accessibilityLabel = NSLocalizedString(@"Previous Track", @"accessibility label for Music button");
     } else if ([text isEqualToString:@">|"]) {
-        accessibilityLabel = @"Next Track";
+        accessibilityLabel = NSLocalizedString(@"Next Track", @"accessibility label for Music button");
     } else if ([text isEqualToString:@"VOL"]) {
-        accessibilityLabel = @"Volume";
+        accessibilityLabel = NSLocalizedString(@"Volume", @"accessibility label for Music button");
     } else if ([text isEqualToString:@">"]) {
-        accessibilityLabel = @"Play/Pause";
+        accessibilityLabel = NSLocalizedString(@"Play/Pause", @"accessibility label for Music button");
     } else if ([text isEqualToString:@"S"]) {
-        accessibilityLabel = @"Shuffle";
+        accessibilityLabel = NSLocalizedString(@"Shuffle", @"accessibility label for Music button");
     } else if ([text isEqualToString:@"R"]) {
-        accessibilityLabel = @"Repeat";
+        accessibilityLabel = NSLocalizedString(@"Repeat", @"accessibility label for Music button");
     }
     button.accessibilityLabel = accessibilityLabel;
 
@@ -10530,7 +13753,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
         ? [NSString stringWithFormat:@"%ld / %ld", (long)(index + 1), (long)total]
         : [NSString stringWithFormat:@"0 / %ld", (long)total];
     if (track == nil) {
-        _titleLabel.text = @"Nothing playing";
+        _titleLabel.text = NSLocalizedString(@"Nothing playing", @"Music tool title when idle");
     } else {
         NSString *title = track.title.length ? track.title : track.guestPath.lastPathComponent;
         _titleLabel.text = track.artist.length ? [NSString stringWithFormat:@"%@ — %@", title, track.artist] : title;
@@ -10616,13 +13839,16 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 }
 
 - (void)menuTapped {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Music" message:nil
-                                                           preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Music…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self addMusicTapped:self->_mButton]; }); }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Playlists…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self playlistsTapped:self->_mButton]; }); }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Music", @"Music menu title") message:nil];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Music…", @"Music menu item") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self addMusicTapped:self->_mButton]; }); }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Playlists…", @"Music menu item") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { dispatch_async(dispatch_get_main_queue(), ^{ [self playlistsTapped:self->_mButton]; }); }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Equalizer…", @"Music menu item") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) {
+        [self.workspaceHostViewController openOrFocusWorkspaceToolIdentifier:ISHWorkspaceToolEqualizerIdentifier];
+    }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:_mButton];
 }
 
@@ -10677,28 +13903,27 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 #pragma mark Add Music / Playlists
 
 - (void)addMusicTapped:(UIButton *)sender {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Add Music"
-        message:@"Music lives in /AOK/persist/music by default, or add tracks from any path in the guest."
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Play Music Folder" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:YES]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add Music Folder to Queue" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:NO]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Add from Path…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self promptAddFromPath]; }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Add Music", @"action sheet title")
+        message:NSLocalizedString(@"Music lives in /AOK/persist/music by default, or add tracks from any path in the guest.", @"add music sheet message")];
+    [sheet addActionWithTitle:NSLocalizedString(@"Play Music Folder", @"add music action") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:YES]; }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add Music Folder to Queue", @"add music action") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self loadDefaultFolderReplacing:NO]; }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Add from Path…", @"add music action") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self promptAddFromPath]; }];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:sender];
 }
 
 - (void)loadDefaultFolderReplacing:(BOOL)replace {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSArray<ISHAudioTrack *> *tracks = [ISHAudioLibrary.sharedLibrary scanDefaultMusicDirectory];
-        dispatch_async(dispatch_get_main_queue(), ^{ [self applyScannedTracks:tracks replace:replace emptyMessage:@"No audio files in /AOK/persist/music."]; });
+        dispatch_async(dispatch_get_main_queue(), ^{ [self applyScannedTracks:tracks replace:replace emptyMessage:NSLocalizedString(@"No audio files in /AOK/persist/music.", @"Music message when the music folder is empty")]; });
     });
 }
 
 - (void)promptAddFromPath {
-    [self promptForTextWithTitle:@"Add from Path" message:@"A guest folder or audio file path."
+    [self promptForTextWithTitle:NSLocalizedString(@"Add from Path", @"alert title") message:NSLocalizedString(@"A guest folder or audio file path.", @"add from path alert message")
                      placeholder:@"/root/music" initial:nil handler:^(NSString *path) {
         NSString *trimmed = [path stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         if (trimmed.length == 0) return;
@@ -10708,7 +13933,7 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
                 tracks = @[[[ISHAudioTrack alloc] initWithGuestPath:trimmed]];
             else
                 tracks = [ISHAudioLibrary.sharedLibrary scanGuestDirectoryAtPath:trimmed];
-            dispatch_async(dispatch_get_main_queue(), ^{ [self applyScannedTracks:tracks replace:NO emptyMessage:@"No audio files found at that path."]; });
+            dispatch_async(dispatch_get_main_queue(), ^{ [self applyScannedTracks:tracks replace:NO emptyMessage:NSLocalizedString(@"No audio files found at that path.", @"Music message when a path has no audio")]; });
         });
     }];
 }
@@ -10723,26 +13948,25 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 }
 
 - (void)playlistsTapped:(UIButton *)sender {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Playlists" message:nil
-        preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Save Queue as Playlist…" style:UIAlertActionStyleDefault
-        handler:^(__unused UIAlertAction *a) { [self promptSavePlaylist]; }]];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Playlists", @"action sheet title") message:nil];
+    [sheet addActionWithTitle:NSLocalizedString(@"Save Queue as Playlist…", @"playlists action") style:UIAlertActionStyleDefault
+        handler:^(__unused UIAlertAction *a) { [self promptSavePlaylist]; }];
     NSArray<NSString *> *names = [ISHAudioLibrary.sharedLibrary playlistNames];
     for (NSString *name in names) {
-        [sheet addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Play “%@”", name]
-            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { [self loadPlaylistNamed:name]; }]];
+        [sheet addActionWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Play “%@”", @"playlists action; %@ is a playlist name"), name]
+            style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *a) { [self loadPlaylistNamed:name]; }];
     }
     if (names.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Delete Playlist…" style:UIAlertActionStyleDestructive
-            handler:^(__unused UIAlertAction *a) { [self promptDeletePlaylistFromView:sender]; }]];
+        [sheet addActionWithTitle:NSLocalizedString(@"Delete Playlist…", @"playlists action") style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *a) { [self promptDeletePlaylistFromView:sender]; }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:sender];
 }
 
 - (void)promptSavePlaylist {
-    if (self.engine.queue.count == 0) { [self showMessage:@"The queue is empty."]; return; }
-    [self promptForTextWithTitle:@"Save Playlist" message:nil placeholder:@"Playlist name" initial:nil
+    if (self.engine.queue.count == 0) { [self showMessage:NSLocalizedString(@"The queue is empty.", @"Music message")]; return; }
+    [self promptForTextWithTitle:NSLocalizedString(@"Save Playlist", @"alert title") message:nil placeholder:NSLocalizedString(@"Playlist name", @"playlist name placeholder") initial:nil
                          handler:^(NSString *name) {
         NSString *trimmed = [name stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
         if (trimmed.length == 0) return;
@@ -10752,17 +13976,16 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
 
 - (void)loadPlaylistNamed:(NSString *)name {
     NSArray<ISHAudioTrack *> *tracks = [ISHAudioLibrary.sharedLibrary tracksForPlaylistNamed:name];
-    [self applyScannedTracks:tracks replace:YES emptyMessage:@"That playlist is empty."];
+    [self applyScannedTracks:tracks replace:YES emptyMessage:NSLocalizedString(@"That playlist is empty.", @"Music message")];
 }
 
 - (void)promptDeletePlaylistFromView:(UIView *)sender {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Delete Playlist" message:nil
-        preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Delete Playlist", @"action sheet title") message:nil];
     for (NSString *name in [ISHAudioLibrary.sharedLibrary playlistNames]) {
-        [sheet addAction:[UIAlertAction actionWithTitle:name style:UIAlertActionStyleDestructive
-            handler:^(__unused UIAlertAction *a) { [ISHAudioLibrary.sharedLibrary deletePlaylistNamed:name]; }]];
+        [sheet addActionWithTitle:name style:UIAlertActionStyleDestructive
+            handler:^(__unused UIAlertAction *a) { [ISHAudioLibrary.sharedLibrary deletePlaylistNamed:name]; }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
     [self presentSheet:sheet fromView:sender];
 }
 
@@ -10779,27 +14002,51 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
         field.autocorrectionType = UITextAutocorrectionTypeNo;
         field.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault
         handler:^(__unused UIAlertAction *a) { handler(alert.textFields.firstObject.text ?: @""); }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)showMessage:(NSString *)message {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:nil message:message
                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)presentSheet:(UIAlertController *)sheet fromView:(UIView *)sourceView {
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView ?: self.toolContentView;
-        popover.sourceRect = sourceView ? sourceView.bounds : self.toolContentView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+- (void)presentSheet:(ISHActionSheet *)sheet fromView:(UIView *)sourceView {
+    UIView *anchor = sourceView ?: self.toolContentView;
+    [sheet presentFromViewController:self sourceView:anchor sourceRect:anchor.bounds];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0 scale the queue list: track titles and artists are what
+// a person reads here. The device (its screen's title, counter and times, the
+// wheel) is a drawing of a player in fixed-size boxes, and stays as it is.
+// cellForRow derives both fonts from the theme sizes each time, so a reload is
+// the whole re-apply and cell reuse cannot compound them.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_tableView == nil)
+        return;
+    _tableView.rowHeight = [self trackRowHeight];
+    [_tableView reloadData];
+}
+
+// 38pt at scale 1.0. The rows are a fixed height, so the height has to grow
+// with the fonts or a two-line row clips; rounded up so it is never a fraction
+// short.
+- (CGFloat)trackRowHeight {
+    return ceil(38.0 * self.workspaceTextScale);
+}
+
+// Not -workspaceScaledFontSize:, which rounds to half a point. The theme sizes
+// follow the density slider (and shrink on a phone), so they are rarely on one,
+// and rounding would change the list at scale 1.0.
+- (CGFloat)trackListFontSize:(UIFontTextStyle)textStyle {
+    return ISHWorkspaceThemeFontSize(textStyle) * self.workspaceTextScale;
 }
 
 #pragma mark Table
@@ -10823,10 +14070,10 @@ static UIColor *ISHAudioHexColor(uint32_t hex) {
     UIColor *accent = self.workspaceTheme[@"accent"] ?: UIColor.systemBlueColor;
     UIColor *primary = self.workspaceTheme[@"primary"] ?: UIColor.labelColor;
     cell.textLabel.textColor = isCurrent ? accent : primary;
-    cell.textLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
+    cell.textLabel.font = [UIFont systemFontOfSize:[self trackListFontSize:UIFontTextStyleSubheadline]
                                             weight:isCurrent ? UIFontWeightSemibold : UIFontWeightRegular];
     cell.detailTextLabel.textColor = self.workspaceTheme[@"secondary"] ?: UIColor.secondaryLabelColor;
-    cell.detailTextLabel.font = [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption2)];
+    cell.detailTextLabel.font = [UIFont systemFontOfSize:[self trackListFontSize:UIFontTextStyleCaption2]];
     return cell;
 }
 
@@ -10847,10 +14094,53 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 
 @end
 
+// The header, its description and every button's two-line caption follow
+// Cmd+= / Cmd+- / Cmd+0.
+@interface WorkspaceShortcutsToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceShortcutsToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     NSMutableArray<UIButton *> *_shortcutButtons;
+    // One per button, in the same order: the height a button keeps even when its
+    // caption is short, which grows and shrinks with the caption's text.
+    NSMutableArray<NSLayoutConstraint *> *_shortcutMinimumHeightConstraints;
+    UILabel *_headerLabel;
+    UILabel *_detailLabel;
+}
+
+- (CGFloat)shortcutButtonMinimumHeight {
+    return ceil((ISHWorkspaceUsesPhoneLayout() ? 52.0 : 58.0) * self.workspaceTextScale);
+}
+
+// The caption's fonts at the window's text scale. Colours are left to
+// -workspaceApplyTheme, which adds them to whatever title this sets.
+- (void)styleShortcutButton:(UIButton *)button title:(NSString *)title subtitle:(NSString *)subtitle {
+    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
+    style.alignment = NSTextAlignmentLeft;
+    CGFloat titleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline));
+    CGFloat subtitleSize = ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1));
+    NSMutableAttributedString *label =
+        [[NSMutableAttributedString alloc] initWithString:title
+                                               attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:titleSize
+                                               weight:UIFontWeightSemibold],
+        NSParagraphStyleAttributeName: style,
+    }];
+    [label appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
+                                                                  attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
+                                               weight:UIFontWeightMedium],
+        NSParagraphStyleAttributeName: style,
+    }]];
+    [label appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
+                                                                  attributes:@{
+        NSFontAttributeName: [UIFont systemFontOfSize:subtitleSize
+                                               weight:UIFontWeightMedium],
+        NSParagraphStyleAttributeName: style,
+    }]];
+    [button setAttributedTitle:label forState:UIControlStateNormal];
 }
 
 - (UIButton *)shortcutButtonWithTitle:(NSString *)title subtitle:(NSString *)subtitle identifier:(NSString *)identifier {
@@ -10864,31 +14154,11 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     button.layer.borderWidth = 1;
     [button setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisVertical];
     [button setContentHuggingPriority:UILayoutPriorityDefaultHigh forAxis:UILayoutConstraintAxisVertical];
-    CGFloat minimumHeight = ISHWorkspaceUsesPhoneLayout() ? 52.0 : 58.0;
-    [button.heightAnchor constraintGreaterThanOrEqualToConstant:minimumHeight].active = YES;
+    NSLayoutConstraint *minimumHeight = [button.heightAnchor constraintGreaterThanOrEqualToConstant:[self shortcutButtonMinimumHeight]];
+    minimumHeight.active = YES;
+    [_shortcutMinimumHeightConstraints addObject:minimumHeight];
 
-    NSMutableParagraphStyle *style = [NSMutableParagraphStyle new];
-    style.alignment = NSTextAlignmentLeft;
-    NSMutableAttributedString *label =
-        [[NSMutableAttributedString alloc] initWithString:title
-                                               attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleSubheadline)
-                                               weight:UIFontWeightSemibold],
-        NSParagraphStyleAttributeName: style,
-    }];
-    [label appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"
-                                                                  attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
-                                               weight:UIFontWeightMedium],
-        NSParagraphStyleAttributeName: style,
-    }]];
-    [label appendAttributedString:[[NSAttributedString alloc] initWithString:subtitle
-                                                                  attributes:@{
-        NSFontAttributeName: [UIFont systemFontOfSize:ISHWorkspaceThemeFontSize(UIFontTextStyleCaption1)
-                                               weight:UIFontWeightMedium],
-        NSParagraphStyleAttributeName: style,
-    }]];
-    [button setAttributedTitle:label forState:UIControlStateNormal];
+    [self styleShortcutButton:button title:title subtitle:subtitle];
     [button addTarget:self action:@selector(runShortcut:) forControlEvents:UIControlEventTouchUpInside];
     [_shortcutButtons addObject:button];
     return button;
@@ -10896,8 +14166,9 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Quick Actions";
+    self.title = NSLocalizedString(@"Quick Actions", @"Quick Actions tool title");
     _shortcutButtons = [NSMutableArray array];
+    _shortcutMinimumHeightConstraints = [NSMutableArray array];
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -10910,9 +14181,11 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     [_scrollView addSubview:_contentStack];
 
     UILabel *header = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
-    header.text = @"Quick workspace actions";
+    header.text = NSLocalizedString(@"Quick workspace actions", @"Quick Actions tool header");
     UILabel *detail = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleFootnote monospaced:NO];
-    detail.text = @"Open the most common tools and terminal actions without leaving the workspace.";
+    detail.text = NSLocalizedString(@"Open the most common tools and terminal actions without leaving the workspace.", @"Quick Actions tool description");
+    _headerLabel = header;
+    _detailLabel = detail;
     [_contentStack addArrangedSubview:header];
     [_contentStack addArrangedSubview:detail];
 
@@ -10921,30 +14194,30 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
     // multi-window); elsewhere the last row is just the Clock quick action.
     NSMutableArray<NSArray<NSDictionary<NSString *, NSString *> *> *> *rows = [NSMutableArray arrayWithArray:@[
         @[
-            @{@"title": @"Layout Manager", @"subtitle": @"Save or restore this workspace", @"identifier": @"dashboard"},
-            @{@"title": @"Desktops", @"subtitle": @"Manage in-app Desktops", @"identifier": ISHWorkspaceToolWorkspacesIdentifier},
+            @{@"title": NSLocalizedString(@"Layout Manager", @"quick action title"), @"subtitle": NSLocalizedString(@"Save or restore this workspace", @"quick action subtitle"), @"identifier": @"dashboard"},
+            @{@"title": NSLocalizedString(@"Desktops", @"quick action title"), @"subtitle": NSLocalizedString(@"Manage in-app Desktops", @"quick action subtitle"), @"identifier": ISHWorkspaceToolWorkspacesIdentifier},
         ],
         @[
-            @{@"title": @"Session Shell", @"subtitle": @"Open or focus the shell", @"identifier": @"shell"},
-            @{@"title": @"System Console", @"subtitle": @"Open or focus the console", @"identifier": @"console"},
+            @{@"title": NSLocalizedString(@"Session Shell", @"quick action title"), @"subtitle": NSLocalizedString(@"Open or focus the shell", @"quick action subtitle"), @"identifier": @"shell"},
+            @{@"title": NSLocalizedString(@"System Console", @"quick action title"), @"subtitle": NSLocalizedString(@"Open or focus the console", @"quick action subtitle"), @"identifier": @"console"},
         ],
         @[
-            @{@"title": @"Sessions", @"subtitle": @"Inspect live terminals", @"identifier": ISHWorkspaceToolSessionsIdentifier},
-            @{@"title": @"Storage", @"subtitle": @"Root and container usage", @"identifier": ISHWorkspaceToolStorageIdentifier},
+            @{@"title": NSLocalizedString(@"Sessions", @"quick action title"), @"subtitle": NSLocalizedString(@"Inspect live terminals", @"quick action subtitle"), @"identifier": ISHWorkspaceToolSessionsIdentifier},
+            @{@"title": NSLocalizedString(@"Storage", @"quick action title"), @"subtitle": NSLocalizedString(@"Root and container usage", @"quick action subtitle"), @"identifier": ISHWorkspaceToolStorageIdentifier},
         ],
         @[
-            @{@"title": @"Themes", @"subtitle": @"Colors, density, wallpaper", @"identifier": ISHWorkspaceToolThemesIdentifier},
-            @{@"title": @"Boot Images", @"subtitle": @"Manage installed roots", @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
+            @{@"title": NSLocalizedString(@"Themes", @"quick action title"), @"subtitle": NSLocalizedString(@"Colors, density, wallpaper", @"quick action subtitle"), @"identifier": ISHWorkspaceToolThemesIdentifier},
+            @{@"title": NSLocalizedString(@"Boot Images", @"quick action title"), @"subtitle": NSLocalizedString(@"Manage installed roots", @"quick action subtitle"), @"identifier": ISHWorkspaceToolFilesystemsIdentifier},
         ],
     ]];
     if (ISHWorkspaceSupportsSceneWindows()) {
         [rows addObject:@[
-            @{@"title": @"New Workspace", @"subtitle": @"Open another workspace window", @"identifier": @"new-workspace"},
-            @{@"title": @"Clock", @"subtitle": @"Quick local time", @"identifier": ISHWorkspaceToolClockIdentifier},
+            @{@"title": NSLocalizedString(@"New Workspace", @"quick action title"), @"subtitle": NSLocalizedString(@"Open another workspace window", @"quick action subtitle"), @"identifier": @"new-workspace"},
+            @{@"title": NSLocalizedString(@"Clock", @"quick action title"), @"subtitle": NSLocalizedString(@"Quick local time", @"quick action subtitle"), @"identifier": ISHWorkspaceToolClockIdentifier},
         ]];
     } else {
         [rows addObject:@[
-            @{@"title": @"Clock", @"subtitle": @"Quick local time", @"identifier": ISHWorkspaceToolClockIdentifier},
+            @{@"title": NSLocalizedString(@"Clock", @"quick action title"), @"subtitle": NSLocalizedString(@"Quick local time", @"quick action subtitle"), @"identifier": ISHWorkspaceToolClockIdentifier},
         ]];
     }
 
@@ -10980,6 +14253,32 @@ forRowAtIndexPath:(NSIndexPath *)indexPath {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     _contentStack.spacing = ISHWorkspaceDensityValue(4, 6);
+}
+
+#pragma mark WorkspaceTextScalable
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    if (_contentStack == nil)
+        return;
+    _headerLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleHeadline))];
+    _detailLabel.font = [UIFont systemFontOfSize:ISHWorkspaceToolScaledFontSize(self, ISHWorkspaceThemeFontSize(UIFontTextStyleFootnote))];
+    // The captions are rebuilt, not re-fonted: a font set over the whole string
+    // would flatten the title and subtitle to one size. Their text is not kept
+    // anywhere else, so it is read back out of the "Title\nSubtitle" itself.
+    for (NSUInteger index = 0; index < _shortcutButtons.count; index++) {
+        UIButton *button = _shortcutButtons[index];
+        NSString *text = [button attributedTitleForState:UIControlStateNormal].string;
+        NSRange newline = [text rangeOfString:@"\n"];
+        if (newline.location != NSNotFound)
+            [self styleShortcutButton:button
+                                title:[text substringToIndex:newline.location]
+                             subtitle:[text substringFromIndex:NSMaxRange(newline)]];
+        if (index < _shortcutMinimumHeightConstraints.count)
+            _shortcutMinimumHeightConstraints[index].constant = [self shortcutButtonMinimumHeight];
+    }
+    // The rebuilt captions have no colours yet.
+    [self workspaceApplyTheme];
 }
 
 - (void)runShortcut:(UIButton *)sender {
@@ -11156,6 +14455,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 }
 
 @implementation WorkspaceWorkspacesToolViewController {
+    UIButton *_sessionButton;
+    UIButton *_saveDesktopsButton;   // tinted to say whether this arrangement is saved
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UIStackView *_rowsStack;
@@ -11206,12 +14507,199 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)saveLayoutFromApplet:(id)sender {
     (void) sender;
-    [(id)self.workspaceHostViewController saveWorkspaceLayout:nil];
+    [(id)self.workspaceHostViewController saveWorkspaceDesktops];
+    [self refreshSaveDesktopsIndicator];
 }
 
 - (void)restoreLayoutFromApplet:(id)sender {
     (void) sender;
-    [(id)self.workspaceHostViewController restoreWorkspaceLayout:nil];
+    [(id)self.workspaceHostViewController restoreWorkspaceDesktops];
+    [self refreshSaveDesktopsIndicator];
+}
+
+// Green means "what is on screen is what is saved".
+//
+// Asked for because a Save that works looks exactly like a Save that does
+// nothing -- which it was. The comparison is structural (how many Desktops,
+// which applet on which), so moving a window does not flip it; adding a Desktop,
+// opening an applet, or dragging one to another Desktop does.
+- (void)refreshSaveDesktopsIndicator {
+    if (_saveDesktopsButton == nil)
+        return;
+    BOOL saved = [(id)self.workspaceHostViewController workspaceDesktopsArrangementIsSaved];
+    if (@available(iOS 13.0, *)) {
+        _saveDesktopsButton.tintColor = saved ? UIColor.systemGreenColor : nil;
+    }
+    _saveDesktopsButton.accessibilityLabel = saved ? NSLocalizedString(@"Desktops saved", @"accessibility label for save desktops button") : NSLocalizedString(@"Save Desktops", @"accessibility label for save desktops button");
+}
+
+// Suspend/checkpoint, reachable from Workspace mode.
+//
+// The same menu the terminal's bar button offers on a long press, but it does
+// NOT go through TerminalViewController: the session is the whole machine, not
+// one window, and Workspace mode may have no terminal window open at all.
+// Everything here is the public C surface in AppDelegate.h plus
+// checkpoint_get_status, so this works whatever is (or is not) on screen.
+- (void)sessionActionsFromApplet:(id)sender {
+    UIView *sourceView = [sender isKindOfClass:UIView.class] ? (UIView *) sender : _sessionButton;
+    UIViewController *presenter = (UIViewController *) self.workspaceHostViewController ?: self;
+    if (presenter.presentedViewController != nil)
+        return;
+
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    BOOL enabled = UserPreferences.shared.shouldSuspendToDisk;
+
+    NSString *subtitle;
+    if (!enabled) {
+        subtitle = NSLocalizedString(@"Suspend to Disk is off, so nothing is being saved.", @"session sheet message");
+    } else if (ck.last_refusal[0] != '\0') {
+        subtitle = NSLocalizedString(@"The last attempt was refused.", @"session sheet message");
+    } else if (ck.saves > 0 && ck.natives_restarted != 0) {
+        subtitle = [NSString stringWithFormat:
+                    NSLocalizedString(@"%lu saved so far; %lu process(es) will start again rather than resume.", @"session sheet message: save count, restarted process count"),
+                    ck.saves, ck.natives_restarted];
+    } else if (ck.saves > 0) {
+        subtitle = [NSString stringWithFormat:NSLocalizedString(@"%lu saved so far; the last held %lu processes.", @"session sheet message: save count, process count"),
+                    ck.saves, ck.tasks];
+    } else {
+        subtitle = NSLocalizedString(@"Nothing saved yet this run.", @"session sheet message");
+    }
+
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Session", @"session action sheet title")
+                                                         message:subtitle];
+
+    if (enabled) {
+        [sheet addActionWithTitle:NSLocalizedString(@"Save Session Now", @"session sheet action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
+            // The Wayland desktop and GPU programs cannot be saved: ask first.
+            ISHSuspendSessionConfirmGPUThen(self, @"Save", ^(BOOL leaveOutGPU) {
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    int err = ISHSuspendSessionSaveNow(leaveOutGPU);
+                    struct checkpoint_status after;
+                    checkpoint_get_status(&after);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        if (err == 0)
+                            return;   // the confirmation is the absence of a complaint
+                        UIAlertController *alert =
+                            [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Session not saved", @"alert title")
+                                                                message:after.last_refusal[0] != '\0'
+                                                                        ? @(after.last_refusal)
+                                                                        : NSLocalizedString(@"iSH-AOK could not write the session.", @"alert message when saving the session failed")
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button")
+                                                                  style:UIAlertActionStyleCancel
+                                                                handler:nil]];
+                        if (presenter.presentedViewController == nil)
+                            [presenter presentViewController:alert animated:YES completion:nil];
+                    });
+                });
+            });
+        }];
+    } else {
+        [sheet addActionWithTitle:NSLocalizedString(@"Turn On Suspend to Disk…", @"session sheet action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
+            [UIApplication openURL:UIApplicationOpenSettingsURLString];
+        }];
+    }
+
+    // Only when there is one -- an empty "why it refused" implies something
+    // went wrong when nothing did.
+    if (ck.last_refusal[0] != '\0') {
+        NSString *why = @(ck.last_refusal);
+        [sheet addActionWithTitle:NSLocalizedString(@"Why It Was Not Saved", @"session sheet action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
+            UIAlertController *alert =
+                [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Session not saved", @"alert title")
+                                                    message:why
+                                             preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button")
+                                                      style:UIAlertActionStyleCancel
+                                                    handler:nil]];
+            if (presenter.presentedViewController == nil)
+                [presenter presentViewController:alert animated:YES completion:nil];
+        }];
+    }
+
+    // Confirmed rather than immediate: this one quits the app, and it sits
+    // next to one that does not.
+    if (enabled) {
+        [sheet addActionWithTitle:NSLocalizedString(@"Suspend and Exit", @"session sheet action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *a) {
+            UIAlertController *confirm = [UIAlertController
+                alertControllerWithTitle:NSLocalizedString(@"Suspend and exit?", @"alert title")
+                                 message:NSLocalizedString(@"iSH-AOK writes this session to disk and quits. The next launch picks it up where you left it.", @"suspend and exit confirmation message")
+                          preferredStyle:UIAlertControllerStyleAlert];
+            [confirm addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Suspend and Exit", @"alert button")
+                                                        style:UIAlertActionStyleDefault
+                                                      handler:^(__unused UIAlertAction *go) {
+                // The Wayland desktop and GPU programs cannot be saved: ask first.
+                ISHSuspendSessionConfirmGPUThen(self, @"Suspend", ^(BOOL leaveOutGPU) {
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        // Returns only on FAILURE: on success the process is gone.
+                        int err = ISHSuspendSessionSuspendAndExit(leaveOutGPU);
+                        (void) err;
+                        struct checkpoint_status after;
+                        checkpoint_get_status(&after);
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            UIAlertController *alert =
+                                [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Session not suspended", @"alert title")
+                                                                    message:after.last_refusal[0] != '\0'
+                                                                            ? @(after.last_refusal)
+                                                                            : NSLocalizedString(@"iSH-AOK could not write the session.", @"alert message when suspending the session failed")
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+                            [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button")
+                                                                      style:UIAlertActionStyleCancel
+                                                                    handler:nil]];
+                            if (presenter.presentedViewController == nil)
+                                [presenter presentViewController:alert animated:YES completion:nil];
+                        });
+                    });
+                });
+            }]];
+            [confirm addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button")
+                                                        style:UIAlertActionStyleCancel
+                                                      handler:nil]];
+            if (presenter.presentedViewController == nil)
+                [presenter presentViewController:confirm animated:YES completion:nil];
+        }];
+    }
+
+    [sheet addActionWithTitle:NSLocalizedString(@"What Would Be Saved", @"session sheet action")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *a) {
+        struct checkpoint_status now;
+        checkpoint_get_status(&now);
+        NSMutableString *body = [NSMutableString string];
+        [body appendFormat:NSLocalizedString(@"Saves this run: %lu\n", @"session details line"), now.saves];
+        if (now.saves > 0) {
+            [body appendFormat:NSLocalizedString(@"Last image: %lu processes, %lu descriptors, %lu pages\n", @"session details line"),
+                               now.tasks, now.fds, now.pages];
+        }
+        if (now.natives_restarted != 0)
+            [body appendFormat:NSLocalizedString(@"Started again rather than resumed: %s\n", @"session details line"), now.natives_note];
+        [body appendFormat:NSLocalizedString(@"This launch resumed a saved session: %@", @"session details line; %@ is yes or no"), now.restored ? NSLocalizedString(@"yes", @"session details value") : NSLocalizedString(@"no", @"session details value")];
+        UIAlertController *alert =
+            [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Session", @"alert title")
+                                                message:body
+                                         preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button")
+                                                  style:UIAlertActionStyleCancel
+                                                handler:nil]];
+        if (presenter.presentedViewController == nil)
+            [presenter presentViewController:alert animated:YES completion:nil];
+    }];
+
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button")
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
+
+    // An action sheet on iPad is a popover and needs somewhere to point.
+    [sheet presentFromViewController:presenter sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (UIImage *)scenePreviewImageForDescriptor:(NSDictionary<NSString *, id> *)descriptor size:(CGSize)size {
@@ -11295,7 +14783,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     button.layer.borderWidth = 1;
     [button.heightAnchor constraintEqualToConstant:(ISHWorkspaceUsesPhoneLayout() ? 54.0 : 62.0)].active = YES;
     [button addTarget:self action:@selector(focusWorkspaceSceneButton:) forControlEvents:UIControlEventTouchUpInside];
-    button.accessibilityHint = @"Touch and hold for workspace options.";
+    button.accessibilityHint = NSLocalizedString(@"Touch and hold for workspace options.", @"accessibility hint for a workspace scene button");
     UILongPressGestureRecognizer *longPressRecognizer =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleWorkspaceSceneButtonLongPress:)];
     longPressRecognizer.minimumPressDuration = 0.35;
@@ -11340,7 +14828,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     for (NSInteger i = 0; i < count; i++) {
         [_rowsStack addArrangedSubview:[self desktopRowForIndex:i active:(i == active) removable:(count > 1)]];
     }
-    [_rowsStack addArrangedSubview:[self workspacesActionButtonWithTitle:@"New Desktop" action:@selector(addDesktopFromApplet:)]];
+    [_rowsStack addArrangedSubview:[self workspacesActionButtonWithTitle:NSLocalizedString(@"New Desktop", @"Desktops tool button") action:@selector(addDesktopFromApplet:)]];
 
     // Size the window to the Desktop count. Deferred so it runs after the host's initial
     // placement, which would otherwise restore a stale frame.
@@ -11355,6 +14843,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UIColor *accent = theme[@"accent"] ?: UIColor.systemBlueColor;
     UIColor *muted = [(theme[@"primary"] ?: UIColor.grayColor) colorWithAlphaComponent:0.5];
     BOOL locked = [self.workspaceHostViewController isDesktopLockedAtIndex:index];
+    NSString *name = [self.workspaceHostViewController nameForDesktopAtIndex:index];
 
     UIStackView *row = [UIStackView new];
     row.axis = UILayoutConstraintAxisHorizontal;
@@ -11378,8 +14867,9 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     // The first Desktop is permanently protected, so its lock shows closed and isn't toggleable.
     lock.enabled = (index != 0);
     lock.accessibilityLabel = (index == 0)
-        ? @"Desktop 1 is protected"
-        : [NSString stringWithFormat:@"%@ Desktop %ld", locked ? @"Unlock" : @"Lock", (long)(index + 1)];
+        ? [NSString stringWithFormat:NSLocalizedString(@"%@ is protected", @"accessibility label for the lock of the first desktop; %@ is the desktop name"), name]
+        : [NSString stringWithFormat:locked ? NSLocalizedString(@"Unlock %@", @"accessibility label to unlock a desktop; %@ is the desktop name")
+                                            : NSLocalizedString(@"Lock %@", @"accessibility label to lock a desktop; %@ is the desktop name"), name];
     [lock setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
     [lock.widthAnchor constraintEqualToConstant:28.0].active = YES;
     [lock addTarget:self action:@selector(toggleLockFromApplet:) forControlEvents:UIControlEventTouchUpInside];
@@ -11394,10 +14884,20 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                              weight:active ? UIFontWeightSemibold : UIFontWeightRegular];
     jump.layer.cornerRadius = 10;
     jump.layer.borderWidth = 1;
-    jump.layer.borderColor = (theme[@"stroke"] ?: [UIColor colorWithWhite:0.5 alpha:0.35]).CGColor;
-    jump.backgroundColor = active ? [accent colorWithAlphaComponent:0.22] : nil;
-    [jump setTitle:[NSString stringWithFormat:@"Desktop %ld", (long)(index + 1)] forState:UIControlStateNormal];
-    [jump setTitleColor:active ? accent : (theme[@"primary"] ?: UIColor.darkTextColor) forState:UIControlStateNormal];
+    // The active Desktop reads by its accent BORDER and its fill; its label is
+    // measured against that fill. Drawing the label in the accent over a paler
+    // wash of the same accent was 3.69:1 on Aurora -- the same hue twice, which
+    // is the one pairing that cannot work whatever the palette.
+    UIColor *activeFill = ISHWorkspaceThemeWashOverColor(accent, 0.22,
+                                                         theme[@"card"] ?: UIColor.whiteColor);
+    jump.layer.borderColor = (active ? accent
+                                     : (theme[@"stroke"] ?: [UIColor colorWithWhite:0.5 alpha:0.35])).CGColor;
+    jump.backgroundColor = active ? activeFill : nil;
+    [jump setTitle:name forState:UIControlStateNormal];
+    jump.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    [jump setTitleColor:(active ? ISHWorkspaceThemeOnSurfaceColor(activeFill, 4.5)
+                                : (theme[@"primary"] ?: UIColor.darkTextColor))
+               forState:UIControlStateNormal];
     if (active) {
         jump.accessibilityTraits |= UIAccessibilityTraitSelected;
     } else {
@@ -11405,6 +14905,17 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     }
     [jump.heightAnchor constraintEqualToConstant:ISHWorkspaceUsesPhoneLayout() ? 30.0 : 38.0].active = YES;
     [jump addTarget:self action:@selector(jumpToDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
+    // Touch and hold (click and hold on a Mac) to rename it. The press only begins
+    // the gesture; a plain tap still jumps.
+    [jump addGestureRecognizer:[[UILongPressGestureRecognizer alloc] initWithTarget:self
+                                                                            action:@selector(renameDesktopFromApplet:)]];
+    __weak typeof(self) weakSelf = self;
+    jump.accessibilityCustomActions = @[
+        [[UIAccessibilityCustomAction alloc] initWithName:NSLocalizedString(@"Rename", @"accessibility action to rename a desktop")
+                                            actionHandler:^BOOL(__unused UIAccessibilityCustomAction *action) {
+            [weakSelf presentRenameForDesktopAtIndex:index];
+            return YES;
+        }]];
     [row addArrangedSubview:jump];
 
     // The delete x is hidden entirely while the Desktop is locked; unlock to remove it.
@@ -11421,7 +14932,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
             [remove setTitle:@"x" forState:UIControlStateNormal];
         }
         remove.tintColor = UIColor.systemRedColor;
-        remove.accessibilityLabel = [NSString stringWithFormat:@"Remove Desktop %ld", (long)(index + 1)];
+        remove.accessibilityLabel = [NSString stringWithFormat:NSLocalizedString(@"Remove %@", @"accessibility label for removing a desktop; %@ is the desktop name"), name];
         [remove setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
         [remove.widthAnchor constraintEqualToConstant:28.0].active = YES;
         [remove addTarget:self action:@selector(removeDesktopFromApplet:) forControlEvents:UIControlEventTouchUpInside];
@@ -11432,6 +14943,40 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)jumpToDesktopFromApplet:(UIButton *)sender {
     [self.workspaceHostViewController switchToDesktopIndex:sender.tag];
+}
+
+- (void)renameDesktopFromApplet:(UILongPressGestureRecognizer *)recognizer {
+    if (recognizer.state != UIGestureRecognizerStateBegan)
+        return;
+    [self presentRenameForDesktopAtIndex:recognizer.view.tag];
+}
+
+- (void)presentRenameForDesktopAtIndex:(NSInteger)index {
+    WorkspaceViewController *host = self.workspaceHostViewController;
+    if (host == nil || index < 0 || index >= host.desktopCount)
+        return;
+    NSString *positional = [NSString stringWithFormat:NSLocalizedString(@"Desktop %ld", @"default desktop name with number"), (long)(index + 1)];
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Rename Desktop", @"alert title")
+                                            message:[NSString stringWithFormat:NSLocalizedString(@"Leave it empty to go back to \"%@\".", @"rename desktop alert message; %@ is the default desktop name"), positional]
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        textField.text = [host customNameForDesktopAtIndex:index];
+        textField.placeholder = positional;
+        textField.autocapitalizationType = UITextAutocapitalizationTypeWords;
+        textField.clearButtonMode = UITextFieldViewModeWhileEditing;
+        textField.returnKeyType = UIReturnKeyDone;
+    }];
+    __weak UIAlertController *weakAlert = alert;
+    UIAlertAction *save = [UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button")
+                                                   style:UIAlertActionStyleDefault
+                                                 handler:^(__unused UIAlertAction *action) {
+        [host setName:weakAlert.textFields.firstObject.text ?: @"" forDesktopAtIndex:index];
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:save];
+    alert.preferredAction = save;
+    [host presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)addDesktopFromApplet:(id)sender {
@@ -11449,7 +14994,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Desktops";
+    self.title = NSLocalizedString(@"Desktops", @"Desktops tool title");
     _trackedButtons = [NSMutableArray array];
     _previewImageViewsByIdentifier = [NSMutableDictionary dictionary];
 
@@ -11472,18 +15017,38 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [listCard addSubview:_rowsStack];
 
     if (!ISHWorkspaceUsesModernStyle()) {
-        _newWorkspaceButton = [self workspacesActionButtonWithTitle:@"New Workspace" action:@selector(openNewWorkspaceFromApplet:)];
+        _newWorkspaceButton = [self workspacesActionButtonWithTitle:NSLocalizedString(@"New Workspace", @"Desktops tool button") action:@selector(openNewWorkspaceFromApplet:)];
         [_contentStack addArrangedSubview:_newWorkspaceButton];
-        _closeHiddenButton = [self workspacesActionButtonWithTitle:@"Close Hidden Windows" action:@selector(confirmCloseHiddenWindows:)];
+        _closeHiddenButton = [self workspacesActionButtonWithTitle:NSLocalizedString(@"Close Hidden Windows", @"Desktops tool button") action:@selector(confirmCloseHiddenWindows:)];
         [_contentStack addArrangedSubview:_closeHiddenButton];
+        _sessionButton = [self workspacesIconButtonWithSymbol:@"arrow.down.doc"
+                                                     fallback:NSLocalizedString(@"Session", @"Desktops tool session button label")
+                                                       action:@selector(sessionActionsFromApplet:)];
+        [_contentStack addArrangedSubview:_sessionButton];
     } else {
         // Modern folds the Layout Manager into this applet as two icons.
         UIStackView *layoutRow = [UIStackView new];
         layoutRow.axis = UILayoutConstraintAxisHorizontal;
         layoutRow.distribution = UIStackViewDistributionFillEqually;
         layoutRow.spacing = 6;
-        [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"square.and.arrow.down" fallback:@"Save" action:@selector(saveLayoutFromApplet:)]];
-        [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"arrow.clockwise" fallback:@"Restore" action:@selector(restoreLayoutFromApplet:)]];
+        _saveDesktopsButton = [self workspacesIconButtonWithSymbol:@"square.and.arrow.down"
+                                                          fallback:NSLocalizedString(@"Save", @"Desktops tool save button label")
+                                                            action:@selector(saveLayoutFromApplet:)];
+        [layoutRow addArrangedSubview:_saveDesktopsButton];
+        [layoutRow addArrangedSubview:[self workspacesIconButtonWithSymbol:@"arrow.clockwise" fallback:NSLocalizedString(@"Restore", @"Desktops tool restore button label") action:@selector(restoreLayoutFromApplet:)]];
+        // In the row, as asked. The SAME symbol the shell-mode terminal uses for
+        // its session control (arrow.down.doc, TerminalViewController's save
+        // button), so the two modes say "session" the same way.
+        //
+        // I had kept it on its own row on the argument that this row's "Save"
+        // means the window arrangement while this one writes the running machine
+        // to disk, and that sitting them together would blur it. Overruled: the
+        // three are what you reach for in the same breath, and a control you
+        // have to hunt for is worse than one you might misread once.
+        _sessionButton = [self workspacesIconButtonWithSymbol:@"arrow.down.doc"
+                                                     fallback:NSLocalizedString(@"Session", @"Desktops tool session button label")
+                                                       action:@selector(sessionActionsFromApplet:)];
+        [layoutRow addArrangedSubview:_sessionButton];
         [_contentStack addArrangedSubview:layoutRow];
     }
     CGFloat listInset = ISHWorkspaceUsesPhoneLayout() ? 6.0 : 8.0;
@@ -11527,11 +15092,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
                                                  object:nil];
     }
     [NSNotificationCenter.defaultCenter addObserver:self
-                                           selector:@selector(rebuildSceneButtons)
+                                           selector:@selector(desktopsDidChangeNotification:)
                                                name:ISHWorkspaceDesktopsDidChangeNotification
                                              object:nil];
 
     [self refreshWorkspaceScenes];
+    [self refreshSaveDesktopsIndicator];
 }
 
 - (void)dealloc {
@@ -11546,6 +15112,11 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     _rowsStack.spacing = ISHWorkspaceDensityValue(4, 6);
+}
+
+- (void)desktopsDidChangeNotification:(__unused NSNotification *)notification {
+    [self rebuildSceneButtons];
+    [self refreshSaveDesktopsIndicator];
 }
 
 - (void)refreshWorkspaceScenesNotification:(__unused NSNotification *)notification {
@@ -11582,19 +15153,19 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         return;
     }
     NSDictionary<NSString *, id> *descriptor = [self sceneDescriptorWithIdentifier:sender.accessibilityIdentifier];
-    NSString *title = descriptor[@"title"] ?: @"Workspace";
+    NSString *title = descriptor[@"title"] ?: NSLocalizedString(@"Workspace", @"workspace scene sheet title fallback");
     UIAlertController *sheet = [UIAlertController alertControllerWithTitle:title
                                                                    message:descriptor[@"detail"]
                                                             preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Focus Workspace" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Focus Workspace", @"workspace scene sheet action") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         [self.workspaceHostViewController focusSceneWithPersistentIdentifier:sender.accessibilityIdentifier];
     }]];
-    UIAlertAction *closeAction = [UIAlertAction actionWithTitle:@"Close Workspace" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+    UIAlertAction *closeAction = [UIAlertAction actionWithTitle:NSLocalizedString(@"Close Workspace", @"workspace scene sheet action") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
             [self confirmCloseWorkspaceWithIdentifier:sender.accessibilityIdentifier title:title];
     }];
     closeAction.enabled = ![title isEqualToString:@"Workspace One"];
     [sheet addAction:closeAction];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil]];
     UIPopoverPresentationController *popover = sheet.popoverPresentationController;
     if (popover != nil) {
         popover.sourceView = sender;
@@ -11613,18 +15184,18 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     if (@available(iOS 13.0, *)) {
         NSArray<UISceneSession *> *sessions = [self.workspaceHostViewController hiddenWorkspaceSceneSessions];
         if (sessions.count == 0) {
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"No Hidden Windows"
-                                                                           message:@"There are no hidden Workspace windows to close."
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"No Hidden Windows", @"alert title")
+                                                                           message:NSLocalizedString(@"There are no hidden Workspace windows to close.", @"alert message")
                                                                     preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
             [self presentViewController:alert animated:YES completion:nil];
             return;
         }
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Close Hidden Windows?"
-                                                                       message:[NSString stringWithFormat:@"This will close %lu hidden Workspace window%@.", (unsigned long) sessions.count, sessions.count == 1 ? @"" : @"s"]
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Close Hidden Windows?", @"alert title")
+                                                                       message:[NSString stringWithFormat:sessions.count == 1 ? NSLocalizedString(@"This will close %lu hidden Workspace window.", @"close hidden windows message, one window") : NSLocalizedString(@"This will close %lu hidden Workspace windows.", @"close hidden windows message, window count"), (unsigned long) sessions.count]
                                                                 preferredStyle:UIAlertControllerStyleAlert];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-        [alert addAction:[UIAlertAction actionWithTitle:@"Close Hidden" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Close Hidden", @"alert button") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
             [self.workspaceHostViewController closeHiddenWorkspaceWindows:nil];
             [self refreshWorkspaceScenes];
         }]];
@@ -11634,12 +15205,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 }
 
 - (void)confirmCloseWorkspaceWithIdentifier:(NSString *)identifier title:(NSString *)title {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:@"Close %@?", title ?: @"Workspace"]
-                                                                   message:@"This closes that Workspace window. Running terminals in that Workspace may be detached or closed with the scene."
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Close %@?", @"alert title; %@ is a workspace name"), title ?: NSLocalizedString(@"Workspace", @"workspace name fallback")]
+                                                                   message:NSLocalizedString(@"This closes that Workspace window. Running terminals in that Workspace may be detached or closed with the scene.", @"close workspace alert message")
                                                             preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Close Workspace" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
-        [self.workspaceHostViewController closeSceneWithPersistentIdentifier:identifier title:@"Unable to close workspace"];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Close Workspace", @"alert button") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+        [self.workspaceHostViewController closeSceneWithPersistentIdentifier:identifier title:NSLocalizedString(@"Unable to close workspace", @"error alert title")];
         [self refreshWorkspaceScenes];
     }]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -11684,6 +15255,73 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         previewView.layer.borderColor =
             (current ? theme[@"accentAlt"] : theme[@"stroke"]).CGColor;
     }
+}
+
+@end
+
+// Serves aokfile:///<guest path> to the Browser from the guest's filesystem.
+@interface ISHBrowserGuestFileSchemeHandler : NSObject <WKURLSchemeHandler>
++ (instancetype)shared;
+@end
+
+@implementation ISHBrowserGuestFileSchemeHandler {
+    NSHashTable *_stoppedTasks; // main thread
+}
+
++ (instancetype)shared {
+    static ISHBrowserGuestFileSchemeHandler *shared;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        shared = [ISHBrowserGuestFileSchemeHandler new];
+    });
+    return shared;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self != nil)
+        _stoppedTasks = [NSHashTable weakObjectsHashTable];
+    return self;
+}
+
+static NSString *ISHBrowserMIMETypeForPath(NSString *path) {
+    NSString *ext = path.pathExtension.lowercaseString;
+    if ([ext isEqualToString:@"html"] || [ext isEqualToString:@"htm"])
+        return @"text/html";
+    if (@available(iOS 14.0, *)) {
+        UTType *type = ext.length > 0 ? [UTType typeWithFilenameExtension:ext] : nil;
+        if (type.preferredMIMEType != nil)
+            return type.preferredMIMEType;
+    }
+    return @"application/octet-stream";
+}
+
+- (void)webView:(WKWebView *)webView startURLSchemeTask:(id<WKURLSchemeTask>)task {
+    NSURL *url = task.request.URL;
+    NSString *path = url.path.length > 0 ? url.path : @"/";
+    [ISHGuestFileBridge.sharedBridge readFileAtGuestPath:path maxBytes:64u << 20
+                                              completion:^(NSData *data, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if ([self->_stoppedTasks containsObject:task])
+                return;
+            if (data == nil) {
+                [task didFailWithError:error ?: [NSError errorWithDomain:NSURLErrorDomain
+                                                                    code:NSURLErrorFileDoesNotExist userInfo:nil]];
+                return;
+            }
+            NSString *mime = ISHBrowserMIMETypeForPath(path);
+            NSURLResponse *response = [[NSURLResponse alloc] initWithURL:url MIMEType:mime
+                                                   expectedContentLength:(NSInteger) data.length
+                                                        textEncodingName:[mime hasPrefix:@"text/"] ? @"utf-8" : nil];
+            [task didReceiveResponse:response];
+            [task didReceiveData:data];
+            [task didFinish];
+        });
+    }];
+}
+
+- (void)webView:(WKWebView *)webView stopURLSchemeTask:(id<WKURLSchemeTask>)task {
+    [_stoppedTasks addObject:task];
 }
 
 @end
@@ -11767,11 +15405,11 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
              forState:UIControlStateNormal];
     if (pinned) {
         NSString *pinnedTitle = ISHWorkspaceBrowserPinnedTitleForTabIndex(index);
-        button.accessibilityLabel = [NSString stringWithFormat:@"Tab %ld, pinned to %@", (long) (index + 1), pinnedTitle];
-        button.accessibilityHint = @"Touch and hold to unpin.";
+        button.accessibilityLabel = [NSString stringWithFormat:NSLocalizedString(@"Tab %ld, pinned to %@", @"accessibility label for a pinned browser tab: number, page"), (long) (index + 1), pinnedTitle];
+        button.accessibilityHint = NSLocalizedString(@"Touch and hold to unpin.", @"accessibility hint for a pinned browser tab");
     } else {
-        button.accessibilityLabel = [NSString stringWithFormat:@"Tab %ld", (long) (index + 1)];
-        button.accessibilityHint = @"Touch and hold to pin this tab's current page.";
+        button.accessibilityLabel = [NSString stringWithFormat:NSLocalizedString(@"Tab %ld", @"accessibility label for a browser tab"), (long) (index + 1)];
+        button.accessibilityHint = NSLocalizedString(@"Touch and hold to pin this tab's current page.", @"accessibility hint for a browser tab");
     }
 }
 
@@ -11783,6 +15421,9 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (WKWebView *)buildBrowserWebView {
     WKWebViewConfiguration *configuration = [WKWebViewConfiguration new];
+    // aokfile:///path reads the guest's files, so a local page's relative
+    // links (its CSS, images, other pages) resolve to guest files too.
+    [configuration setURLSchemeHandler:ISHBrowserGuestFileSchemeHandler.shared forURLScheme:@"aokfile"];
     WKWebView *webView = [[WKWebView alloc] initWithFrame:CGRectZero configuration:configuration];
     webView.translatesAutoresizingMaskIntoConstraints = NO;
     webView.navigationDelegate = self;
@@ -11791,6 +15432,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     webView.layer.cornerRadius = ISHWorkspaceUsesPhoneLayout() ? 12.0 : 16.0;
     webView.layer.masksToBounds = YES;
     webView.scrollView.keyboardDismissMode = UIScrollViewKeyboardDismissModeInteractive;
+    // A tab opened after Cmd+= starts at its window's size, not at 100%.
+    webView.pageZoom = self.workspaceTextScale;
     [webView addObserver:self forKeyPath:@"estimatedProgress" options:NSKeyValueObservingOptionNew context:nil];
     return webView;
 }
@@ -11799,6 +15442,53 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     if (_selectedTabIndex < 0 || _selectedTabIndex >= (NSInteger) _tabWebViews.count)
         return nil;
     return _tabWebViews[_selectedTabIndex];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0 zoom the pages, as Safari's do. pageZoom rather than
+// re-fonting: a page sets its own sizes in CSS, and pageZoom reflows it like the
+// CSS zoom property, where pinch zoom only magnifies. Every tab follows, so
+// switching tabs does not change the size. The address field and the toolbar
+// and tab buttons are chrome in fixed-size boxes, and stay as they are.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    for (WKWebView *webView in _tabWebViews)
+        webView.pageZoom = self.workspaceTextScale;
+}
+
+#pragma mark WorkspaceStatefulTool
+
+// The pages that were open.
+//
+// Every tab's address is recorded, but only the SELECTED one is reopened: the
+// applet builds its tabs through its own creation path and re-driving that from
+// a restore is a separate piece of work. Saving them all now means the rest can
+// be brought back later without a second format change, and costs a few strings
+// in the meantime.
+- (nullable NSDictionary<NSString *, id> *)workspaceToolStateForSaving {
+    NSMutableArray<NSString *> *addresses = [NSMutableArray array];
+    for (WKWebView *tab in _tabWebViews) {
+        NSString *address = tab.URL.absoluteString;
+        [addresses addObject:address.length > 0 ? address : @""];
+    }
+    if (addresses.count == 0)
+        return nil;
+    return @{@"tabs": addresses, @"selected": @(_selectedTabIndex)};
+}
+
+- (void)workspaceRestoreToolState:(NSDictionary<NSString *, id> *)state {
+    NSArray *tabs = [state[@"tabs"] isKindOfClass:NSArray.class] ? state[@"tabs"] : nil;
+    if (tabs.count == 0)
+        return;
+    NSInteger selected = [state[@"selected"] isKindOfClass:NSNumber.class]
+            ? [state[@"selected"] integerValue] : 0;
+    if (selected < 0 || selected >= (NSInteger) tabs.count)
+        selected = 0;
+    NSString *address = tabs[(NSUInteger) selected];
+    if (![address isKindOfClass:NSString.class] || address.length == 0)
+        return;
+    [self loadAddressString:address inWebView:[self currentBrowserWebView]];
 }
 
 - (void)loadAddressString:(NSString *)addressString inWebView:(WKWebView *)webView {
@@ -11852,6 +15542,31 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [self refreshBrowserChrome];
 }
 
+// A file from the File Manager, or a path or web address from ws-browser: in a
+// new tab while the RAM-based tab limit leaves room, else in the current tab.
+// A Browser that has only its first tab, never navigated, uses that one.
+- (void)workspaceOpenFileAtGuestPath:(NSString *)guestPath {
+    [self loadViewIfNeeded];
+    NSString *address = guestPath;
+    if ([guestPath hasPrefix:@"/"]) {
+        NSURLComponents *components = [NSURLComponents new];
+        components.scheme = @"aokfile";
+        components.host = @"";
+        components.path = guestPath;
+        address = components.URL.absoluteString ?: guestPath;
+    }
+    WKWebView *current = [self currentBrowserWebView];
+    BOOL currentUnused = _tabWebViews.count == 1 && current.backForwardList.backList.count == 0;
+    if (!currentUnused && _tabWebViews.count < _maximumTabCount) {
+        [self addBrowserTabLoadingAddress:address activate:YES];
+        // A pinned address for the new tab's slot must not win over this one.
+        if (ISHWorkspaceBrowserPinnedURLForTabIndex((NSInteger) _tabWebViews.count - 1).length > 0)
+            [self loadAddressString:address inWebView:_tabWebViews.lastObject];
+        return;
+    }
+    [self loadAddressString:address inWebView:current];
+}
+
 - (void)addBrowserTabLoadingAddress:(NSString *)addressString activate:(BOOL)activate {
     if (_tabWebViews.count >= _maximumTabCount)
         return;
@@ -11872,25 +15587,25 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _maximumTabCount = ISHWorkspaceBrowserMaximumTabCount();
     NSString *message;
     if (ISHWorkspaceDeviceHasLowMemoryForWorkspace()) {
-        message = [NSString stringWithFormat:@"This device is limited to %lu browser tabs in Workspace because it has less than 4 GB of RAM.",
+        message = [NSString stringWithFormat:NSLocalizedString(@"This device is limited to %lu browser tabs in Workspace because it has less than 4 GB of RAM.", @"browser tab limit alert message"),
                    (unsigned long) _maximumTabCount];
     } else {
         CGFloat ramGB = (CGFloat) ISHWorkspacePhysicalMemoryBytes() / (CGFloat) ISHWorkspaceOneGB;
-        message = [NSString stringWithFormat:@"This device is limited to %lu browser tabs in Workspace based on its available RAM (%.0f GB).",
+        message = [NSString stringWithFormat:NSLocalizedString(@"This device is limited to %lu browser tabs in Workspace based on its available RAM (%.0f GB).", @"browser tab limit alert message"),
                    (unsigned long) _maximumTabCount,
                    floor(ramGB)];
     }
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Tab Limit Reached"
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Tab Limit Reached", @"alert title")
                                             message:message
                                      preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"alert button") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Browser";
+    self.title = NSLocalizedString(@"Browser", @"Browser tool title");
     _selectedTabIndex = NSNotFound;
     _maximumTabCount = ISHWorkspaceBrowserMaximumTabCount();
     _actionButtons = [NSMutableArray array];
@@ -11907,24 +15622,29 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [_toolbarCard addSubview:controlsRow];
 
     _backButton = [self browserButtonWithTitle:@"<" action:@selector(goBack:)];
-    _backButton.accessibilityLabel = @"Back";
+    _backButton.accessibilityLabel = NSLocalizedString(@"Back", @"accessibility label for browser back button");
+    _backButton.accessibilityHint = NSLocalizedString(@"Navigates back to the previous page.", @"accessibility hint for browser back button");
     _forwardButton = [self browserButtonWithTitle:@">" action:@selector(goForward:)];
-    _forwardButton.accessibilityLabel = @"Forward";
+    _forwardButton.accessibilityLabel = NSLocalizedString(@"Forward", @"accessibility label for browser forward button");
+    _forwardButton.accessibilityHint = NSLocalizedString(@"Navigates forward to the next page.", @"accessibility hint for browser forward button");
     _reloadButton = [self browserButtonWithTitle:@"R" action:@selector(reloadOrStop:)];
-    _reloadButton.accessibilityLabel = @"Reload";
-    _reloadButton.accessibilityHint = @"Touch and hold to open the current page in Safari.";
+    _reloadButton.accessibilityLabel = NSLocalizedString(@"Reload", @"accessibility label for browser reload button");
+    _reloadButton.accessibilityHint = NSLocalizedString(@"Touch and hold to open the current page in Safari.", @"accessibility hint for browser reload button");
     _homeButton = [self browserButtonWithTitle:@"Home" action:@selector(goHome:)];
-    _homeButton.accessibilityLabel = @"Home";
-    _homeButton.accessibilityHint = @"Touch and hold to set the home page.";
+    _homeButton.accessibilityLabel = NSLocalizedString(@"Home", @"accessibility label for browser home button");
+    _homeButton.accessibilityHint = NSLocalizedString(@"Touch and hold to set the home page.", @"accessibility hint for browser home button");
     _bookmarkButton = [self browserButtonWithTitle:@"☆" action:@selector(toggleBookmark:)];
-    _bookmarkButton.accessibilityLabel = @"Bookmark";
-    _bookmarkButton.accessibilityHint = @"Toggles a bookmark for the current page. Touch and hold to view bookmarks.";
+    _bookmarkButton.accessibilityLabel = NSLocalizedString(@"Bookmark", @"accessibility label for browser bookmark button");
+    _bookmarkButton.accessibilityHint = NSLocalizedString(@"Toggles a bookmark for the current page. Touch and hold to view bookmarks.", @"accessibility hint for browser bookmark button");
     _goButton = [self browserButtonWithTitle:@"Go" action:@selector(commitAddress:)];
-    _goButton.accessibilityLabel = @"Go";
+    _goButton.accessibilityLabel = NSLocalizedString(@"Go", @"accessibility label for browser go button");
+    _goButton.accessibilityHint = NSLocalizedString(@"Loads the entered address.", @"accessibility hint for browser go button");
     _addTabButton = [self browserButtonWithTitle:@"+" action:@selector(addTab:)];
-    _addTabButton.accessibilityLabel = @"Add Tab";
+    _addTabButton.accessibilityLabel = NSLocalizedString(@"Add Tab", @"accessibility label for browser add tab button");
+    _addTabButton.accessibilityHint = NSLocalizedString(@"Opens a new browser tab.", @"accessibility hint for browser add tab button");
     _closeTabButton = [self browserButtonWithTitle:@"×" action:@selector(closeCurrentTab:)];
-    _closeTabButton.accessibilityLabel = @"Close Tab";
+    _closeTabButton.accessibilityLabel = NSLocalizedString(@"Close Tab", @"accessibility label for browser close tab button");
+    _closeTabButton.accessibilityHint = NSLocalizedString(@"Closes the current browser tab.", @"accessibility hint for browser close tab button");
     UILongPressGestureRecognizer *homeLongPressRecognizer =
         [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(handleHomeButtonLongPress:)];
     homeLongPressRecognizer.minimumPressDuration = 0.35;
@@ -11954,7 +15674,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
     _addressField = [UITextField new];
     _addressField.translatesAutoresizingMaskIntoConstraints = NO;
-    _addressField.accessibilityLabel = @"Address bar";
+    _addressField.accessibilityLabel = NSLocalizedString(@"Address bar", @"accessibility label for browser address field");
     _addressField.delegate = self;
     _addressField.clearButtonMode = UITextFieldViewModeWhileEditing;
     _addressField.returnKeyType = UIReturnKeyGo;
@@ -12090,7 +15810,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _closeTabButton.enabled = _tabWebViews.count > 1;
     _closeTabButton.alpha = _closeTabButton.enabled ? 1.0 : 0.42;
     [_reloadButton setTitle:(currentWebView.loading ? @"X" : @"R") forState:UIControlStateNormal];
-    NSString *reloadLabel = currentWebView.loading ? @"Stop loading" : @"Reload";
+    NSString *reloadLabel = currentWebView.loading ? NSLocalizedString(@"Stop loading", @"accessibility label for browser stop button") : NSLocalizedString(@"Reload", @"accessibility label for browser reload button");
     _reloadButton.accessibilityLabel = reloadLabel;
     _progressView.hidden = !currentWebView.loading && currentWebView.estimatedProgress >= 0.999;
     _progressView.alpha = _progressView.hidden ? 0.0 : 1.0;
@@ -12128,8 +15848,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)presentHomePagePrompt {
     UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Browser Home"
-                                            message:@"Set the page opened by the Home button."
+        [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Browser Home", @"alert title")
+                                            message:NSLocalizedString(@"Set the page opened by the Home button.", @"browser home alert message")
                                      preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.text = ISHWorkspaceBrowserHomeAddress();
@@ -12145,12 +15865,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         }
     }];
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Use Default" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"alert button") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Use Default", @"alert button") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         ISHWorkspaceSetBrowserHomeAddress(nil);
         [weakSelf goHome:nil];
     }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Save", @"alert button") style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
         UITextField *textField = alert.textFields.firstObject;
         ISHWorkspaceSetBrowserHomeAddress(textField.text);
         [weakSelf goHome:nil];
@@ -12172,12 +15892,12 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         [UIAlertController alertControllerWithTitle:nil
                                             message:url.absoluteString
                                      preferredStyle:UIAlertControllerStyleActionSheet];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Open in Safari"
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Open in Safari", @"browser action")
                                               style:UIAlertActionStyleDefault
                                             handler:^(__unused UIAlertAction *action) {
         [UIApplication openURL:url.absoluteString];
     }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil]];
     UIPopoverPresentationController *popover = sheet.popoverPresentationController;
     if (popover != nil) {
         popover.sourceView = sourceView;
@@ -12219,7 +15939,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         _bookmarkButton.accessibilityValue = nil;
     } else {
         _bookmarkButton.accessibilityTraits &= ~UIAccessibilityTraitSelected;
-        _bookmarkButton.accessibilityValue = @"Not bookmarked";
+        _bookmarkButton.accessibilityValue = NSLocalizedString(@"Not bookmarked", @"accessibility value for browser bookmark button");
     }
 }
 
@@ -12232,19 +15952,17 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)presentBookmarksListFromView:(UIView *)sourceView editing:(BOOL)editing {
     NSArray<NSDictionary<NSString *, NSString *> *> *bookmarks = ISHWorkspaceBrowserBookmarkRecords();
     NSString *message = bookmarks.count == 0
-        ? @"No bookmarks yet. Tap the star to bookmark the current page."
-        : (editing ? @"Tap a bookmark to remove it." : nil);
-    UIAlertController *sheet =
-        [UIAlertController alertControllerWithTitle:@"Bookmarks"
-                                            message:message
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+        ? NSLocalizedString(@"No bookmarks yet. Tap the star to bookmark the current page.", @"bookmarks sheet message")
+        : (editing ? NSLocalizedString(@"Tap a bookmark to remove it.", @"bookmarks sheet message while editing") : nil);
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Bookmarks", @"bookmarks sheet title")
+                                                         message:message];
     __weak typeof(self) weakSelf = self;
     for (NSDictionary<NSString *, NSString *> *bookmark in bookmarks) {
         NSString *title = bookmark[@"title"];
         NSString *url = bookmark[@"url"];
-        [sheet addAction:[UIAlertAction actionWithTitle:title.length > 0 ? title : url
-                                                  style:editing ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:title.length > 0 ? title : url
+                            style:editing ? UIAlertActionStyleDestructive : UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             if (editing) {
                 ISHWorkspaceRemoveBrowserBookmarkForURL(url);
                 [weakSelf updateBookmarkButtonState];
@@ -12257,25 +15975,19 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
             } else {
                 [weakSelf loadAddressString:url inWebView:[weakSelf currentBrowserWebView]];
             }
-        }]];
+        }];
     }
     if (bookmarks.count > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:editing ? @"Done" : @"Edit Bookmarks…"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [sheet addActionWithTitle:editing ? NSLocalizedString(@"Done", @"bookmarks sheet action") : NSLocalizedString(@"Edit Bookmarks…", @"bookmarks sheet action")
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             dispatch_async(dispatch_get_main_queue(), ^{
                 [weakSelf presentBookmarksListFromView:sourceView editing:!editing];
             });
-        }]];
+        }];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    UIPopoverPresentationController *popover = sheet.popoverPresentationController;
-    if (popover != nil) {
-        popover.sourceView = sourceView;
-        popover.sourceRect = sourceView.bounds;
-        popover.permittedArrowDirections = UIPopoverArrowDirectionAny;
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:sourceView sourceRect:sourceView.bounds];
 }
 
 - (void)handleTabButtonLongPress:(UILongPressGestureRecognizer *)recognizer {
@@ -12290,17 +16002,17 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         return;
     NSString *currentURL = _tabWebViews[index].URL.absoluteString;
     NSString *pinnedURL = ISHWorkspaceBrowserPinnedURLForTabIndex(index);
-    NSString *title = [NSString stringWithFormat:@"Tab %ld", (long) (index + 1)];
+    NSString *title = [NSString stringWithFormat:NSLocalizedString(@"Tab %ld", @"browser tab sheet title"), (long) (index + 1)];
     NSString *message = pinnedURL.length > 0
-        ? [NSString stringWithFormat:@"Pinned to %@. New tabs opened in this slot load that page instead of Home.", pinnedURL]
-        : @"Pin this tab so new tabs opened in this slot load its current page instead of Home.";
+        ? [NSString stringWithFormat:NSLocalizedString(@"Pinned to %@. New tabs opened in this slot load that page instead of Home.", @"browser tab pin message; %@ is a URL"), pinnedURL]
+        : NSLocalizedString(@"Pin this tab so new tabs opened in this slot load its current page instead of Home.", @"browser tab pin message");
     UIAlertController *sheet =
         [UIAlertController alertControllerWithTitle:title
                                             message:message
                                      preferredStyle:UIAlertControllerStyleActionSheet];
     __weak typeof(self) weakSelf = self;
     if (pinnedURL.length > 0) {
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Unpin Tab"
+        [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Unpin Tab", @"browser tab action")
                                                   style:UIAlertActionStyleDestructive
                                                 handler:^(__unused UIAlertAction *action) {
             ISHWorkspaceRemoveBrowserPinnedTabForIndex(index);
@@ -12308,14 +16020,14 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         }]];
     } else if (currentURL.length > 0) {
         NSString *currentTitle = _tabWebViews[index].title;
-        [sheet addAction:[UIAlertAction actionWithTitle:@"Pin Tab to Current Page"
+        [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Pin Tab to Current Page", @"browser tab action")
                                                   style:UIAlertActionStyleDefault
                                                 handler:^(__unused UIAlertAction *action) {
             ISHWorkspaceSetBrowserPinnedTabForIndex(index, currentTitle, currentURL);
             [weakSelf refreshTabButtonPinIndicators];
         }]];
     }
-    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [sheet addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil]];
     UIPopoverPresentationController *popover = sheet.popoverPresentationController;
     if (popover != nil) {
         popover.sourceView = sourceView;
@@ -12382,6 +16094,15 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     (void) navigation;
     if (webView == [self currentBrowserWebView])
         [self refreshBrowserChrome];
+}
+
+// The zoom belongs to the web view, and WebKit carries it from page to page.
+// Setting it again as each page commits is a guard rather than the mechanism:
+// a page in any tab, background ones included, shows at its window's size even
+// if some navigation path brings it up at the default.
+- (void)webView:(WKWebView *)webView didCommitNavigation:(WKNavigation *)navigation {
+    (void) navigation;
+    webView.pageZoom = self.workspaceTextScale;
 }
 
 - (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation {
@@ -12465,10 +16186,146 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _addressField.textColor = theme[@"primary"];
     _addressField.tintColor = theme[@"accent"];
     _addressField.attributedPlaceholder =
-        [[NSAttributedString alloc] initWithString:@"Enter URL or search"
+        [[NSAttributedString alloc] initWithString:NSLocalizedString(@"Enter URL or search", @"browser address field placeholder")
                                         attributes:@{NSForegroundColorAttributeName: theme[@"secondary"]}];
     _progressView.trackTintColor = [theme[@"backgroundTop"] colorWithAlphaComponent:0.24];
     _progressView.progressTintColor = theme[@"accent"];
+}
+
+@end
+
+// The Music player's 10-band equalizer (ISHAudioEqualizer): an on switch, a
+// preset menu and a vertical slider per band, +/-12 dB. Changes apply as the
+// sliders move.
+@implementation WorkspaceEqualizerToolViewController {
+    UISwitch *_enabledSwitch;
+    UIButton *_presetButton;
+    NSMutableArray<UISlider *> *_sliders;
+    NSMutableArray<UILabel *> *_gainLabels;
+}
+
+static NSString *ISHEqualizerFrequencyTitle(float hz) {
+    return hz >= 1000 ? [NSString stringWithFormat:@"%gk", hz / 1000] : [NSString stringWithFormat:@"%g", hz];
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = NSLocalizedString(@"Equalizer", @"Equalizer tool title");
+    ISHAudioEqualizer *eq = ISHAudioEqualizer.shared;
+
+    UIView *card = [self workspaceThemeCardView];
+    [self.toolContentView addSubview:card];
+
+    UILabel *onLabel = [self workspaceThemePrimaryLabelWithTextStyle:UIFontTextStyleSubheadline monospaced:NO];
+    onLabel.text = NSLocalizedString(@"Equalizer", @"Equalizer on/off label");
+    _enabledSwitch = [UISwitch new];
+    [_enabledSwitch addTarget:self action:@selector(enabledChanged) forControlEvents:UIControlEventValueChanged];
+    _presetButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    _presetButton.titleLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
+    [_presetButton addTarget:self action:@selector(presetTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIView *spacer = [UIView new];
+    UIStackView *topRow = [[UIStackView alloc] initWithArrangedSubviews:@[onLabel, _enabledSwitch, spacer, _presetButton]];
+    topRow.axis = UILayoutConstraintAxisHorizontal;
+    topRow.spacing = 10;
+    topRow.alignment = UIStackViewAlignmentCenter;
+
+    UIStackView *bands = [UIStackView new];
+    bands.axis = UILayoutConstraintAxisHorizontal;
+    bands.distribution = UIStackViewDistributionFillEqually;
+    bands.spacing = 2;
+    _sliders = [NSMutableArray array];
+    _gainLabels = [NSMutableArray array];
+    NSArray<NSNumber *> *frequencies = eq.frequencies;
+    for (NSUInteger i = 0; i < frequencies.count; i++) {
+        UILabel *gain = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption2 monospaced:YES];
+        gain.textAlignment = NSTextAlignmentCenter;
+        UILabel *freq = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption2 monospaced:NO];
+        freq.textAlignment = NSTextAlignmentCenter;
+        freq.text = ISHEqualizerFrequencyTitle(frequencies[i].floatValue);
+        // A slider turned upright: laid out across its container's height.
+        UIView *track = [UIView new];
+        UISlider *slider = [UISlider new];
+        slider.minimumValue = -12;
+        slider.maximumValue = 12;
+        slider.tag = (NSInteger) i;
+        slider.translatesAutoresizingMaskIntoConstraints = NO;
+        slider.transform = CGAffineTransformMakeRotation(-M_PI_2);
+        [slider addTarget:self action:@selector(sliderChanged:) forControlEvents:UIControlEventValueChanged];
+        [track addSubview:slider];
+        [NSLayoutConstraint activateConstraints:@[
+            [slider.centerXAnchor constraintEqualToAnchor:track.centerXAnchor],
+            [slider.centerYAnchor constraintEqualToAnchor:track.centerYAnchor],
+            [slider.widthAnchor constraintEqualToAnchor:track.heightAnchor],
+        ]];
+        UIStackView *column = [[UIStackView alloc] initWithArrangedSubviews:@[gain, track, freq]];
+        column.axis = UILayoutConstraintAxisVertical;
+        column.spacing = 4;
+        [bands addArrangedSubview:column];
+        [_sliders addObject:slider];
+        [_gainLabels addObject:gain];
+    }
+
+    UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[topRow, bands]];
+    stack.axis = UILayoutConstraintAxisVertical;
+    stack.spacing = 10;
+    stack.translatesAutoresizingMaskIntoConstraints = NO;
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    [card addSubview:stack];
+    [NSLayoutConstraint activateConstraints:@[
+        [card.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor constant:8],
+        [card.leadingAnchor constraintEqualToAnchor:self.toolContentView.leadingAnchor constant:8],
+        [card.trailingAnchor constraintEqualToAnchor:self.toolContentView.trailingAnchor constant:-8],
+        [card.bottomAnchor constraintEqualToAnchor:self.toolContentView.bottomAnchor constant:-8],
+        [stack.topAnchor constraintEqualToAnchor:card.topAnchor constant:10],
+        [stack.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [stack.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [stack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-10],
+    ]];
+
+    [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(refresh)
+                                               name:ISHAudioEqualizerDidChangeNotification object:nil];
+    [self workspaceApplyTheme];
+    [self refresh];
+}
+
+- (void)dealloc {
+    [NSNotificationCenter.defaultCenter removeObserver:self];
+}
+
+- (void)refresh {
+    ISHAudioEqualizer *eq = ISHAudioEqualizer.shared;
+    _enabledSwitch.on = eq.enabled;
+    [_presetButton setTitle:[eq.currentPresetName stringByAppendingString:@" \u25BE"] forState:UIControlStateNormal];
+    for (NSUInteger i = 0; i < _sliders.count; i++) {
+        float gain = [eq gainForBand:i];
+        if (!_sliders[i].isTracking)
+            _sliders[i].value = gain;
+        _gainLabels[i].text = [NSString stringWithFormat:@"%+.0f", gain];
+        _sliders[i].enabled = eq.enabled;
+    }
+}
+
+- (void)enabledChanged {
+    ISHAudioEqualizer.shared.enabled = _enabledSwitch.on;
+}
+
+- (void)sliderChanged:(UISlider *)slider {
+    // Whole decibels: finer than a listener can place by thumb, and the labels
+    // stay honest.
+    [ISHAudioEqualizer.shared setGain:roundf(slider.value) forBand:(NSUInteger) slider.tag];
+}
+
+- (void)presetTapped {
+    ISHActionSheet *sheet = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Preset", @"equalizer preset sheet title") message:nil];
+    for (NSString *name in ISHAudioEqualizer.shared.presetNames) {
+        [sheet addActionWithTitle:name style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction *action) {
+            [ISHAudioEqualizer.shared applyPreset:name];
+            if (!ISHAudioEqualizer.shared.enabled)
+                ISHAudioEqualizer.shared.enabled = YES;
+        }];
+    }
+    [sheet addActionWithTitle:NSLocalizedString(@"Cancel", @"action sheet cancel button") style:UIAlertActionStyleCancel handler:nil];
+    [sheet presentFromViewController:self sourceView:_presetButton sourceRect:_presetButton.bounds];
 }
 
 @end
@@ -12486,7 +16343,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Clock";
+    self.title = NSLocalizedString(@"Clock", @"Clock tool title");
 
     _timeFormatter = [NSDateFormatter new];
     _timeFormatter.timeStyle = NSDateFormatterMediumStyle;
@@ -12581,8 +16438,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     NSDate *now = NSDate.date;
     _timeLabel.text = [_timeFormatter stringFromDate:now];
     _dateLabel.text = [_dateFormatter stringFromDate:now];
-    NSString *abbreviation = NSTimeZone.localTimeZone.abbreviation ?: @"Local";
-    _zoneLabel.text = [NSString stringWithFormat:@"%@  •  %@", abbreviation, NSTimeZone.localTimeZone.name ?: @"Time Zone"];
+    NSString *abbreviation = NSTimeZone.localTimeZone.abbreviation ?: NSLocalizedString(@"Local", @"time zone abbreviation fallback");
+    _zoneLabel.text = [NSString stringWithFormat:@"%@  •  %@", abbreviation, NSTimeZone.localTimeZone.name ?: NSLocalizedString(@"Time Zone", @"time zone name fallback")];
 }
 
 - (void)workspaceApplyTheme {
@@ -12603,6 +16460,34 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 @end
 
+// Info's and Monitor's window follows the text size only while it still has a size the applet
+// gave it -- its size at the previous scale, or its 1.0 size. A window someone has resized keeps
+// their frame, and so does a restored one: the Workspace applies the saved frame before the saved
+// scale, and that frame already has the size it had at that scale. The scroll view shows whatever
+// no longer fits. The 1.0 size counts because it is the size the window opens at, and the one a
+// window from before its text grew was saved at; a window found there grows on the next step.
+// `autosizedSize` is the frame the last resize produced, because the Desktop clamps a size larger
+// than its room and the clamped frame then matches none of the computed sizes.
+static BOOL ISHWorkspaceSizesMatch(CGSize a, CGSize b) {
+    return fabs(a.width - b.width) < 1.0 && fabs(a.height - b.height) < 1.0;
+}
+
+static void ISHWorkspaceResizeWindowForTextScale(WorkspaceThemedToolViewController *viewController, CGSize defaultSize,
+                                                 CGSize previousSize, CGSize size, CGSize *autosizedSize) {
+    ISHWorkspaceContainedWindowView *windowView = ISHWorkspaceWindowContainingResponder(viewController);
+    if (windowView == nil)
+        return;
+    CGSize current = windowView.frame.size;
+    if (!ISHWorkspaceSizesMatch(current, previousSize) && !ISHWorkspaceSizesMatch(current, *autosizedSize) &&
+        !ISHWorkspaceSizesMatch(current, defaultSize))
+        return;
+    [(id) viewController.workspaceHostViewController resizeDesktopWindow:windowView toSize:size animated:YES];
+    *autosizedSize = windowView.frame.size;
+}
+
+@interface WorkspaceInfoToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceInfoToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
@@ -12615,6 +16500,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UILabel *_rootValueLabel;
     UILabel *_startupValueLabel;
     NSTimer *_timer;
+    CGFloat _appliedTextScale;      // the scale the labels and window were last sized for; 0 is 1.0
+    CGSize _autosizedWindowSize;
 }
 
 - (UIView *)infoMetricCardWithTitle:(NSString *)title valueLabel:(UILabel * __strong *)valueLabel {
@@ -12658,7 +16545,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Info";
+    self.title = NSLocalizedString(@"Info", @"Info tool title");
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -12675,15 +16562,15 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _topRow.axis = UILayoutConstraintAxisHorizontal;
     _topRow.spacing = 6;
     _topRow.distribution = UIStackViewDistributionFillEqually;
-    [_topRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"battery.100" caption:@"Battery" subtitleLabel:&_batterySubtitle gauge:&_batteryGauge]];
-    [_topRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"internaldrive" caption:@"Storage" subtitleLabel:&_storageSubtitle gauge:&_storageGauge]];
+    [_topRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"battery.100" caption:NSLocalizedString(@"Battery", @"Info tool tile caption") subtitleLabel:&_batterySubtitle gauge:&_batteryGauge]];
+    [_topRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"internaldrive" caption:NSLocalizedString(@"Storage", @"Info tool tile caption") subtitleLabel:&_storageSubtitle gauge:&_storageGauge]];
 
     _bottomRow = [UIStackView new];
     _bottomRow.axis = UILayoutConstraintAxisHorizontal;
     _bottomRow.spacing = 6;
     _bottomRow.distribution = UIStackViewDistributionFillEqually;
-    [_bottomRow addArrangedSubview:[self workspaceStatTileWithIcon:@"folder" caption:@"Root" valueLabel:&_rootValueLabel]];
-    [_bottomRow addArrangedSubview:[self workspaceStatTileWithIcon:@"bolt" caption:@"Startup" valueLabel:&_startupValueLabel]];
+    [_bottomRow addArrangedSubview:[self workspaceStatTileWithIcon:@"folder" caption:NSLocalizedString(@"Root", @"Info tool tile caption") valueLabel:&_rootValueLabel]];
+    [_bottomRow addArrangedSubview:[self workspaceStatTileWithIcon:@"bolt" caption:NSLocalizedString(@"Startup", @"Info tool tile caption") valueLabel:&_startupValueLabel]];
 
     [_contentStack addArrangedSubview:_topRow];
     [_contentStack addArrangedSubview:_bottomRow];
@@ -12733,20 +16620,23 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [super viewDidDisappear:animated];
     [_timer invalidate];
     _timer = nil;
-    UIDevice.currentDevice.batteryMonitoringEnabled = NO;
+    // Battery monitoring stays on. It is one process-wide switch, and the
+    // kernel turned it on at launch for /proc/ish/BAT0 and
+    // /sys/class/power_supply (kernel/BatteryStatus.m): turning it off here
+    // took the battery away from every guest as soon as this applet closed.
 }
 
 - (void)refreshInfo:(id)sender {
     if (UIDevice.currentDevice.batteryState == UIDeviceBatteryStateUnknown || UIDevice.currentDevice.batteryLevel < 0) {
         _batteryGauge.progress = 0.0;
         _batteryGauge.valueText = @"--";
-        _batterySubtitle.text = @"Unavailable";
+        _batterySubtitle.text = NSLocalizedString(@"Unavailable", @"battery status unavailable");
     } else {
-        NSString *stateDescription = @"On battery";
+        NSString *stateDescription = NSLocalizedString(@"On battery", @"battery state");
         switch (UIDevice.currentDevice.batteryState) {
-            case UIDeviceBatteryStateCharging: stateDescription = @"Charging"; break;
-            case UIDeviceBatteryStateFull: stateDescription = @"Full"; break;
-            case UIDeviceBatteryStateUnplugged: stateDescription = @"On battery"; break;
+            case UIDeviceBatteryStateCharging: stateDescription = NSLocalizedString(@"Charging", @"battery state"); break;
+            case UIDeviceBatteryStateFull: stateDescription = NSLocalizedString(@"Full", @"battery state"); break;
+            case UIDeviceBatteryStateUnplugged: stateDescription = NSLocalizedString(@"On battery", @"battery state"); break;
             case UIDeviceBatteryStateUnknown: break;
         }
         double level = MAX(0.0, MIN(1.0, (double) UIDevice.currentDevice.batteryLevel));
@@ -12755,8 +16645,8 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         _batterySubtitle.text = stateDescription;
     }
 
-    NSString *defaultRoot = Roots.instance.defaultRoot;
-    _rootValueLabel.text = defaultRoot.length > 0 ? defaultRoot : @"Unavailable";
+    NSString *currentRoot = Roots.instance.bootedRoot ?: Roots.instance.rootToBoot;
+    _rootValueLabel.text = currentRoot.length > 0 ? currentRoot : NSLocalizedString(@"Unavailable", @"no current root");
 
     NSDictionary<NSFileAttributeKey, id> *attributes =
         [NSFileManager.defaultManager attributesOfFileSystemForPath:NSHomeDirectory() error:nil];
@@ -12766,15 +16656,35 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         double used = (double) (totalSize.longLongValue - freeSize.longLongValue) / (double) totalSize.longLongValue;
         _storageGauge.progress = MAX(0.0, MIN(1.0, used));
         _storageGauge.valueText = [NSString stringWithFormat:@"%ld%%", (long) llround(used * 100.0)];
-        _storageSubtitle.text = [NSString stringWithFormat:@"%@ free",
+        _storageSubtitle.text = [NSString stringWithFormat:NSLocalizedString(@"%@ free", @"free storage; %@ is a size"),
                                  [NSByteCountFormatter stringFromByteCount:freeSize.longLongValue countStyle:NSByteCountFormatterCountStyleFile]];
     } else {
         _storageGauge.progress = 0.0;
         _storageGauge.valueText = @"--";
-        _storageSubtitle.text = @"Unavailable";
+        _storageSubtitle.text = NSLocalizedString(@"Unavailable", @"storage status unavailable");
     }
 
     _startupValueLabel.text = ISHInitialWindowTitle();
+}
+
+// WorkspaceTextScalable. The readings scale: the Battery and Storage subtitles and the Root and
+// Startup values. The tile captions and icons stay, and so do the gauges: WorkspaceGaugeView draws
+// its percentage to fit the ring, and the ring's height is the tile's. The window grows with the
+// text while it still has the size Info gave it (ISHWorkspaceResizeWindowForTextScale).
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_batterySubtitle];
+    [self workspaceScaleLabel:_storageSubtitle];
+    [self workspaceScaleLabel:_rootValueLabel];
+    [self workspaceScaleLabel:_startupValueLabel];
+    CGFloat previousScale = _appliedTextScale > 0 ? _appliedTextScale : 1.0;
+    _appliedTextScale = self.workspaceTextScale;
+    if (fabs(_appliedTextScale - previousScale) < 0.001)
+        return;
+    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolInfoIdentifier),
+                                         ISHWorkspaceInfoContentSizeForTextScale(previousScale),
+                                         ISHWorkspaceInfoContentSizeForTextScale(_appliedTextScale),
+                                         &_autosizedWindowSize);
 }
 
 - (void)workspaceApplyTheme {
@@ -12782,6 +16692,9 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _storageGauge.fillColor = self.workspaceTheme[@"accentAlt"];
 }
 
+@end
+
+@interface WorkspaceMonitorToolViewController () <WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceMonitorToolViewController {
@@ -12802,14 +16715,17 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UILabel *_networkValueLabel;
     UILabel *_startupValueLabel;
     UILabel *_liveValueLabel;
+    NSMutableArray<UILabel *> *_detailRowLabels;   // title and value of each detail row
     NSTimer *_timer;
     natural_t _previousCPUTicks[CPU_STATE_MAX];
     BOOL _hasPreviousCPUSample;
+    CGFloat _appliedTextScale;      // the scale the labels and window were last sized for; 0 is 1.0
+    CGSize _autosizedWindowSize;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Monitor";
+    self.title = NSLocalizedString(@"Monitor", @"Monitor tool title");
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -12826,25 +16742,37 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     _gaugeRow.axis = UILayoutConstraintAxisHorizontal;
     _gaugeRow.spacing = 8;
     _gaugeRow.distribution = UIStackViewDistributionFillEqually;
-    [_gaugeRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"cpu" caption:@"CPU" subtitleLabel:&_cpuSubtitle gauge:&_cpuGauge]];
-    [_gaugeRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"memorychip" caption:@"Memory" subtitleLabel:&_memorySubtitle gauge:&_memoryGauge]];
+    [_gaugeRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"cpu" caption:NSLocalizedString(@"CPU", @"Monitor tool gauge caption") subtitleLabel:&_cpuSubtitle gauge:&_cpuGauge]];
+    [_gaugeRow addArrangedSubview:[self workspaceGaugeTileWithIcon:@"memorychip" caption:NSLocalizedString(@"Memory", @"Monitor tool gauge caption") subtitleLabel:&_memorySubtitle gauge:&_memoryGauge]];
     [_contentStack addArrangedSubview:_gaugeRow];
 
     _gaugeRow2 = [UIStackView new];
     _gaugeRow2.axis = UILayoutConstraintAxisHorizontal;
     _gaugeRow2.spacing = 8;
     _gaugeRow2.distribution = UIStackViewDistributionFillEqually;
-    [_gaugeRow2 addArrangedSubview:[self workspaceGaugeTileWithIcon:@"battery.100" caption:@"Battery" subtitleLabel:&_batterySubtitle gauge:&_batteryGauge]];
-    [_gaugeRow2 addArrangedSubview:[self workspaceGaugeTileWithIcon:@"internaldrive" caption:@"Storage" subtitleLabel:&_storageSubtitle gauge:&_storageGauge]];
+    [_gaugeRow2 addArrangedSubview:[self workspaceGaugeTileWithIcon:@"battery.100" caption:NSLocalizedString(@"Battery", @"Monitor tool gauge caption") subtitleLabel:&_batterySubtitle gauge:&_batteryGauge]];
+    [_gaugeRow2 addArrangedSubview:[self workspaceGaugeTileWithIcon:@"internaldrive" caption:NSLocalizedString(@"Storage", @"Monitor tool gauge caption") subtitleLabel:&_storageSubtitle gauge:&_storageGauge]];
     [_contentStack addArrangedSubview:_gaugeRow2];
 
-    [_contentStack addArrangedSubview:[self workspaceRowsCardWithRows:@[
-        [self workspaceIconRowWithIcon:@"clock" title:@"Uptime" valueLabel:&_uptimeValueLabel],
-        [self workspaceIconRowWithIcon:@"folder" title:@"Root" valueLabel:&_rootValueLabel],
-        [self workspaceIconRowWithIcon:@"network" title:@"Network" valueLabel:&_networkValueLabel],
-        [self workspaceIconRowWithIcon:@"bolt" title:@"Startup" valueLabel:&_startupValueLabel],
-        [self workspaceIconRowWithIcon:@"square.grid.2x2" title:@"Live" valueLabel:&_liveValueLabel],
-    ]]];
+    NSArray<UIView *> *detailRows = @[
+        [self workspaceIconRowWithIcon:@"clock" title:NSLocalizedString(@"Uptime", @"Monitor tool row title") valueLabel:&_uptimeValueLabel],
+        [self workspaceIconRowWithIcon:@"folder" title:NSLocalizedString(@"Root", @"Monitor tool row title") valueLabel:&_rootValueLabel],
+        [self workspaceIconRowWithIcon:@"network" title:NSLocalizedString(@"Network", @"Monitor tool row title") valueLabel:&_networkValueLabel],
+        [self workspaceIconRowWithIcon:@"bolt" title:NSLocalizedString(@"Startup", @"Monitor tool row title") valueLabel:&_startupValueLabel],
+        [self workspaceIconRowWithIcon:@"square.grid.2x2" title:NSLocalizedString(@"Live", @"Monitor tool row title (live scenes and terminals)") valueLabel:&_liveValueLabel],
+    ];
+    [_contentStack addArrangedSubview:[self workspaceRowsCardWithRows:detailRows]];
+    // The text scale needs each row's title as well as its value, and the row helper hands back
+    // only the value.
+    _detailRowLabels = [NSMutableArray array];
+    for (UIView *row in detailRows) {
+        if (![row isKindOfClass:UIStackView.class])
+            continue;
+        for (UIView *view in ((UIStackView *) row).arrangedSubviews) {
+            if ([view isKindOfClass:UILabel.class])
+                [_detailRowLabels addObject:(UILabel *) view];
+        }
+    }
 
     [NSLayoutConstraint activateConstraints:@[
         [_scrollView.topAnchor constraintEqualToAnchor:self.toolContentView.topAnchor],
@@ -12870,9 +16798,18 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)monitorGaugeStyleDidChange {
     // Ring vs bar gauges differ in height, so resize the window to the new style (deferred so the
     // gauges re-lay-out first) — keeps both gauge rows visible instead of clipping or floating.
+    // At the window's text size, or a larger detail card is clipped. And this Monitor's own window:
+    // looking one up by tool identifier found the frontmost Monitor, whichever that was.
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        [(id)weakSelf.workspaceHostViewController autosizeMonitorWindow];
+        WorkspaceMonitorToolViewController *strongSelf = weakSelf;
+        ISHWorkspaceContainedWindowView *windowView = ISHWorkspaceWindowContainingResponder(strongSelf);
+        if (windowView == nil)
+            return;
+        [(id) strongSelf.workspaceHostViewController resizeDesktopWindow:windowView
+                                                                   toSize:ISHWorkspaceMonitorContentSizeForTextScale(strongSelf.workspaceTextScale)
+                                                                 animated:YES];
+        strongSelf->_autosizedWindowSize = windowView.frame.size;
     });
 }
 
@@ -12892,7 +16829,10 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     [super viewDidDisappear:animated];
     [_timer invalidate];
     _timer = nil;
-    UIDevice.currentDevice.batteryMonitoringEnabled = NO;
+    // Battery monitoring stays on. It is one process-wide switch, and the
+    // kernel turned it on at launch for /proc/ish/BAT0 and
+    // /sys/class/power_supply (kernel/BatteryStatus.m): turning it off here
+    // took the battery away from every guest as soon as this applet closed.
 }
 
 - (UILabel *)monitorValueLabelWithMonospaced:(BOOL)monospaced {
@@ -13020,11 +16960,11 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     if (cpuRatio >= 0.0) {
         _cpuGauge.progress = cpuRatio;
         _cpuGauge.valueText = [NSString stringWithFormat:@"%ld%%", (long) llround(cpuRatio * 100.0)];
-        _cpuSubtitle.text = @"load";
+        _cpuSubtitle.text = NSLocalizedString(@"load", @"Monitor CPU gauge subtitle");
     } else {
         _cpuGauge.progress = 0.0;
         _cpuGauge.valueText = @"--";
-        _cpuSubtitle.text = @"n/a";
+        _cpuSubtitle.text = NSLocalizedString(@"n/a", @"Monitor gauge subtitle when unavailable");
     }
 
     uint64_t footprint = 0;
@@ -13034,23 +16974,23 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         double memoryRatio = (double) footprint / (double) physical;
         _memoryGauge.progress = memoryRatio;
         _memoryGauge.valueText = [NSString stringWithFormat:@"%ld%%", (long) llround(memoryRatio * 100.0)];
-        _memorySubtitle.text = @"in use";
+        _memorySubtitle.text = NSLocalizedString(@"in use", @"Monitor memory gauge subtitle");
     } else {
         _memoryGauge.progress = 0.0;
         _memoryGauge.valueText = @"--";
-        _memorySubtitle.text = @"n/a";
+        _memorySubtitle.text = NSLocalizedString(@"n/a", @"Monitor gauge subtitle when unavailable");
     }
 
     if (UIDevice.currentDevice.batteryState == UIDeviceBatteryStateUnknown || UIDevice.currentDevice.batteryLevel < 0) {
         _batteryGauge.progress = 0.0;
         _batteryGauge.valueText = @"--";
-        _batterySubtitle.text = @"n/a";
+        _batterySubtitle.text = NSLocalizedString(@"n/a", @"Monitor gauge subtitle when unavailable");
     } else {
-        NSString *batteryState = @"on battery";
+        NSString *batteryState = NSLocalizedString(@"on battery", @"Monitor battery state");
         switch (UIDevice.currentDevice.batteryState) {
-            case UIDeviceBatteryStateCharging: batteryState = @"charging"; break;
-            case UIDeviceBatteryStateFull: batteryState = @"full"; break;
-            case UIDeviceBatteryStateUnplugged: batteryState = @"on battery"; break;
+            case UIDeviceBatteryStateCharging: batteryState = NSLocalizedString(@"charging", @"Monitor battery state"); break;
+            case UIDeviceBatteryStateFull: batteryState = NSLocalizedString(@"full", @"Monitor battery state"); break;
+            case UIDeviceBatteryStateUnplugged: batteryState = NSLocalizedString(@"on battery", @"Monitor battery state"); break;
             case UIDeviceBatteryStateUnknown: break;
         }
         double level = MAX(0.0, MIN(1.0, (double) UIDevice.currentDevice.batteryLevel));
@@ -13067,26 +17007,48 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
         double used = (double) (totalSize.longLongValue - freeSize.longLongValue) / (double) totalSize.longLongValue;
         _storageGauge.progress = MAX(0.0, MIN(1.0, used));
         _storageGauge.valueText = [NSString stringWithFormat:@"%ld%%", (long) llround(used * 100.0)];
-        _storageSubtitle.text = [NSString stringWithFormat:@"%@ free",
+        _storageSubtitle.text = [NSString stringWithFormat:NSLocalizedString(@"%@ free", @"free storage; %@ is a size"),
                                  [NSByteCountFormatter stringFromByteCount:freeSize.longLongValue countStyle:NSByteCountFormatterCountStyleFile]];
     } else {
         _storageGauge.progress = 0.0;
         _storageGauge.valueText = @"--";
-        _storageSubtitle.text = @"n/a";
+        _storageSubtitle.text = NSLocalizedString(@"n/a", @"Monitor gauge subtitle when unavailable");
     }
 
     NSUInteger sceneCount = 0;
     if (@available(iOS 13.0, *)) {
         sceneCount = UIApplication.sharedApplication.connectedScenes.count;
     }
-    NSString *defaultRoot = Roots.instance.defaultRoot;
+    NSString *currentRoot = Roots.instance.bootedRoot ?: Roots.instance.rootToBoot;
     _uptimeValueLabel.text = ISHWorkspaceDurationString(NSProcessInfo.processInfo.systemUptime);
-    _rootValueLabel.text = defaultRoot.length > 0 ? defaultRoot : @"unavailable";
+    _rootValueLabel.text = currentRoot.length > 0 ? currentRoot : NSLocalizedString(@"unavailable", @"Monitor: no current root");
     _networkValueLabel.text = ISHWorkspacePrimaryNetworkLine();
     _startupValueLabel.text = ISHInitialWindowTitle();
-    _liveValueLabel.text = [NSString stringWithFormat:@"%lu scenes · %lu terminals",
+    _liveValueLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%lu scenes · %lu terminals", @"Monitor live counts"),
                             (unsigned long) sceneCount,
                             (unsigned long) [Terminal activeTerminals].count];
+}
+
+// WorkspaceTextScalable. The readings scale: the four tile subtitles and both columns of the
+// detail rows. The tile captions, icons and gauges stay, as in Info. The window grows with the
+// text while it still has the size Monitor gave it; a gauge style change sizes it for the text
+// either way (-monitorGaugeStyleDidChange).
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_cpuSubtitle];
+    [self workspaceScaleLabel:_memorySubtitle];
+    [self workspaceScaleLabel:_batterySubtitle];
+    [self workspaceScaleLabel:_storageSubtitle];
+    for (UILabel *label in _detailRowLabels)
+        [self workspaceScaleLabel:label];
+    CGFloat previousScale = _appliedTextScale > 0 ? _appliedTextScale : 1.0;
+    _appliedTextScale = self.workspaceTextScale;
+    if (fabs(_appliedTextScale - previousScale) < 0.001)
+        return;
+    ISHWorkspaceResizeWindowForTextScale(self, ISHWorkspacePreferredToolContentSize(ISHWorkspaceToolMonitorIdentifier),
+                                         ISHWorkspaceMonitorContentSizeForTextScale(previousScale),
+                                         ISHWorkspaceMonitorContentSizeForTextScale(_appliedTextScale),
+                                         &_autosizedWindowSize);
 }
 
 - (void)workspaceApplyTheme {
@@ -13097,17 +17059,24 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 
 @end
 
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable). The interface lines are a
+// -workspaceThemeTextView, which the base class re-fonts, and the summary line above them is a
+// reading too. The CONNECTIVITY heading stays, as the card's title.
+@interface WorkspaceNetworksToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceNetworksToolViewController {
     UIScrollView *_scrollView;
     UIStackView *_contentStack;
     UILabel *_summaryLabel;
     UITextView *_textView;
+    NSLayoutConstraint *_detailsMinimumHeightConstraint;
     NSTimer *_timer;
 }
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Networks";
+    self.title = NSLocalizedString(@"Networks", @"Networks tool title");
 
     _scrollView = [UIScrollView new];
     _scrollView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -13127,7 +17096,7 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     summaryStack.spacing = 6;
     [summaryCard addSubview:summaryStack];
     UILabel *summaryTitle = [self workspaceThemeSecondaryLabelWithTextStyle:UIFontTextStyleCaption1 monospaced:NO];
-    summaryTitle.text = @"CONNECTIVITY";
+    summaryTitle.text = NSLocalizedString(@"CONNECTIVITY", @"Networks tool section eyebrow");
     summaryTitle.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
     _summaryLabel = [self workspaceThemeAccentLabelWithTextStyle:UIFontTextStyleHeadline monospaced:NO];
     _summaryLabel.numberOfLines = 0;
@@ -13143,8 +17112,9 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
     UIView *detailsCard = [self workspaceThemeCardView];
     _textView = [self workspaceThemeTextView];
     [detailsCard addSubview:_textView];
+    _detailsMinimumHeightConstraint = [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:[self networksDetailsMinimumHeight]];
     [NSLayoutConstraint activateConstraints:@[
-        [detailsCard.heightAnchor constraintGreaterThanOrEqualToConstant:(ISHWorkspaceUsesPhoneLayout() ? 92.0 : 110.0)],
+        _detailsMinimumHeightConstraint,
         [_textView.topAnchor constraintEqualToAnchor:detailsCard.topAnchor constant:8],
         [_textView.leadingAnchor constraintEqualToAnchor:detailsCard.leadingAnchor constant:8],
         [_textView.trailingAnchor constraintEqualToAnchor:detailsCard.trailingAnchor constant:-8],
@@ -13189,11 +17159,11 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)refreshNetworks:(id)sender {
     NSString *summary = ISHWorkspaceNetworkSummaryText();
     NSArray<NSString *> *lines = [summary componentsSeparatedByString:@"\n"];
-    _summaryLabel.text = lines.firstObject ?: @"Network unavailable";
+    _summaryLabel.text = lines.firstObject ?: NSLocalizedString(@"Network unavailable", @"Networks tool summary fallback");
     if (lines.count > 1) {
         _textView.text = [[lines subarrayWithRange:NSMakeRange(1, lines.count - 1)] componentsJoinedByString:@"\n"];
     } else {
-        _textView.text = @"No active interfaces to display.";
+        _textView.text = NSLocalizedString(@"No active interfaces to display.", @"Networks tool empty state");
     }
 }
 
@@ -13205,6 +17175,18 @@ static NSURL *ISHWorkspaceBrowserURLFromInput(NSString *input) {
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
     _contentStack.spacing = ISHWorkspaceDensityValue(4, 8);
+}
+
+// As Storage's details card (-storageDetailsMinimumHeight): the scrolling text view gives the card
+// no height, so the minimum is its height, and it follows the text size from 1.0 up.
+- (CGFloat)networksDetailsMinimumHeight {
+    return (ISHWorkspaceUsesPhoneLayout() ? 92.0 : 110.0) * MAX(1.0, self.workspaceTextScale);
+}
+
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    [self workspaceScaleLabel:_summaryLabel];
+    _detailsMinimumHeightConstraint.constant = [self networksDetailsMinimumHeight];
 }
 
 @end
@@ -13221,6 +17203,12 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
     return queue;
 }
 
+// Cmd+= / Cmd+- / Cmd+0 (WorkspaceTextScalable). The log is a -workspaceThemeTextView, which the
+// base class re-fonts, in a card that fills the window and scrolls it, so nothing here needs an
+// override. The header stays: the RECENT LOGS caption and the log file's path title the card.
+@interface WorkspaceStatusToolViewController () <WorkspaceTextScalable>
+@end
+
 @implementation WorkspaceStatusToolViewController {
     UILabel *_sourceLabel;
     UITextView *_logTextView;
@@ -13230,7 +17218,7 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Logs";
+    self.title = NSLocalizedString(@"Logs", @"Logs tool title");
 
     UIView *card = [self workspaceThemeCardView];
     card.translatesAutoresizingMaskIntoConstraints = NO;
@@ -13242,7 +17230,7 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
     cardStack.spacing = 6;
     [card addSubview:cardStack];
 
-    [cardStack addArrangedSubview:[self workspaceTileHeaderRowWithIcon:@"doc.text" caption:@"RECENT LOGS" trailingLabel:&_sourceLabel]];
+    [cardStack addArrangedSubview:[self workspaceTileHeaderRowWithIcon:@"doc.text" caption:NSLocalizedString(@"RECENT LOGS", @"Logs tool section caption") trailingLabel:&_sourceLabel]];
     _sourceLabel.textAlignment = NSTextAlignmentRight;
 
     // The log text view fills the (resizable) window below the fixed header and scrolls
@@ -13265,8 +17253,8 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
         [cardStack.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-10],
     ]];
 
-    _sourceLabel.text = @"reading…";
-    _logTextView.text = @"Loading recent log entries…";
+    _sourceLabel.text = NSLocalizedString(@"reading…", @"Logs tool source label while loading");
+    _logTextView.text = NSLocalizedString(@"Loading recent log entries…", @"Logs tool status while loading");
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -13317,14 +17305,14 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
 
 - (void)applyLogText:(NSString *)captured launched:(BOOL)launched {
     if (!launched) {
-        _sourceLabel.text = @"guest";
-        _logTextView.text = @"The guest system isn't running yet. Start a shell or console, then recent log lines will appear here.";
+        _sourceLabel.text = NSLocalizedString(@"guest", @"Logs tool source label");
+        _logTextView.text = NSLocalizedString(@"The guest system isn't running yet. Start a shell or console, then recent log lines will appear here.", @"Logs tool message");
         return;
     }
     NSString *trimmed = [(captured ?: @"") stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
     if (trimmed.length == 0 || [trimmed containsString:@"__NOLOGS__"]) {
         _sourceLabel.text = @"/var/log";
-        _logTextView.text = @"No populated log files under /var/log. Many minimal rootfs's don't run a syslog daemon by default.";
+        _logTextView.text = NSLocalizedString(@"No populated log files under /var/log. Many minimal rootfs's don't run a syslog daemon by default.", @"Logs tool message");
         return;
     }
     NSMutableArray<NSString *> *lines = [[trimmed componentsSeparatedByString:@"\n"] mutableCopy];
@@ -13336,7 +17324,7 @@ static dispatch_queue_t ISHWorkspaceLogReaderQueue(void) {
         [lines removeObjectAtIndex:0];
     }
     _sourceLabel.text = source;
-    _logTextView.text = lines.count > 0 ? [lines componentsJoinedByString:@"\n"] : @"(log file is empty)";
+    _logTextView.text = lines.count > 0 ? [lines componentsJoinedByString:@"\n"] : NSLocalizedString(@"(log file is empty)", @"Logs tool message");
 }
 
 @end
@@ -13410,8 +17398,11 @@ static int ISHWorkspaceOpenImpl(const char *request) {
         return _EINVAL;
     // A relative path has no meaning by the time this reaches the main queue:
     // the guest's cwd is not the app's, and it may have changed or the process
-    // exited. Make the caller resolve it.
-    if (path != nil && ![path hasPrefix:@"/"])
+    // exited. Make the caller resolve it. The one exception is a stream's web
+    // address for the video player (`ws-videoplayer https://.../live.m3u8`).
+    BOOL streamAddress = ([tool isEqualToString:@"videoplayer"] || [tool isEqualToString:@"browser"]) &&
+        ([path hasPrefix:@"http://"] || [path hasPrefix:@"https://"]);
+    if (path != nil && ![path hasPrefix:@"/"] && !streamAddress)
         return _EINVAL;
 
     if (ISHWorkspaceActiveController == nil)
@@ -13423,12 +17414,113 @@ static int ISHWorkspaceOpenImpl(const char *request) {
         WorkspaceViewController *workspace = ISHWorkspaceActiveController;
         if (workspace == nil)
             return;
+        // Wayland is one desktop session, not a document window:
+        // start-wayland.sh runs one session at a time and refuses a second,
+        // so a second window would only show that refusal. It is brought
+        // forward the way the dock and the Launcher bring it forward, and a
+        // path, which it has no use for, is ignored.
+        if ([tool isEqualToString:ISHWorkspaceToolDisplayIdentifier]) {
+            [workspace openOrFocusWorkspaceToolIdentifier:tool];
+            return;
+        }
         if (path != nil)
             [workspace openWorkspaceToolWithIdentifier:tool fileGuestPath:path];
         else
             [workspace openWorkspaceToolWithIdentifier:tool];
     });
     return 0;
+}
+
+#pragma mark - /proc/ish/applets bridge
+
+// The applets are app UI, not processes (fs/proc/ish.c says why they are not
+// given pids), so this is where a guest finds them. Every tool window counts.
+// Terminal windows do not: what runs in a terminal is a guest process, and ps
+// already shows it.
+//
+// Main thread only: it walks UIKit views.
+static NSString *ISHWorkspaceAppletsBody(void) {
+    WorkspaceViewController *workspace = ISHWorkspaceActiveController;
+    if (workspace == nil)
+        return @"";
+    ISHWorkspaceContainedWindowView *front = nil;
+    NSMutableArray<ISHWorkspaceContainedWindowView *> *applets = [NSMutableArray array];
+    for (UIView *view in workspace.desktopSurfaceView.subviews.reverseObjectEnumerator) {
+        if (![view isKindOfClass:ISHWorkspaceContainedWindowView.class])
+            continue;
+        ISHWorkspaceContainedWindowView *windowView = (ISHWorkspaceContainedWindowView *) view;
+        // Whatever window is on top, applet or terminal: an applet is only
+        // "front" if nothing covers it.
+        if (front == nil && !windowView.hidden && windowView != workspace.dockWindow)
+            front = windowView;
+        if (windowView.workspaceToolIdentifier.length == 0)
+            continue;
+        [applets addObject:windowView];
+    }
+    // Opening order, which stays put, rather than stacking order, which
+    // changes every time one is tapped.
+    [applets sortUsingComparator:^NSComparisonResult(ISHWorkspaceContainedWindowView *a,
+                                                     ISHWorkspaceContainedWindowView *b) {
+        if (a.workspaceWindowSerial == b.workspaceWindowSerial)
+            return NSOrderedSame;
+        return a.workspaceWindowSerial < b.workspaceWindowSerial ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    CFTimeInterval now = CACurrentMediaTime();
+    NSMutableString *body = [NSMutableString string];
+    for (ISHWorkspaceContainedWindowView *windowView in applets) {
+        // Desktops are numbered as the Desktops applet numbers them. The
+        // Launcher and the Desktops applet are shared by every Desktop.
+        NSString *desktop = [workspace isGlobalToolIdentifier:windowView.workspaceToolIdentifier]
+            ? @"*" : [NSString stringWithFormat:@"%ld", (long) windowView.workspaceDesktopIndex + 1];
+        // hidden: open, but on another Desktop.
+        NSString *state = windowView == front ? @"front" : windowView.hidden ? @"hidden" : @"shown";
+        NSString *title = [[(windowView.titleLabel.text ?: @"")
+            componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
+            componentsJoinedByString:@" "];
+        if (title.length == 0)
+            title = @"-";
+        long age = (long) MAX(0.0, now - windowView.workspaceOpenedAt);
+        [body appendFormat:@"%lu %@ %@ %@ %ld %@\n", (unsigned long) windowView.workspaceWindowSerial,
+            windowView.workspaceToolIdentifier, desktop, state, age, title];
+    }
+    return body;
+}
+
+// The last body the main thread built, for when it cannot answer in time.
+static NSString *ISHWorkspaceAppletsLastBody = @"";
+static os_unfair_lock ISHWorkspaceAppletsLastBodyLock = OS_UNFAIR_LOCK_INIT;
+
+static void ISHWorkspaceAppletsRemember(NSString *body) {
+    os_unfair_lock_lock(&ISHWorkspaceAppletsLastBodyLock);
+    ISHWorkspaceAppletsLastBody = body;
+    os_unfair_lock_unlock(&ISHWorkspaceAppletsLastBodyLock);
+}
+
+// Called from a guest read. The answer lives on the main thread, but a guest
+// thread must not block on the UI indefinitely: that is how a terminal hosted
+// by that same UI deadlocks (see ISHWorkspaceOpenImpl). So ask, wait a bounded
+// time, and if the main thread is busy, answer with the last list it built.
+static char *ISHAppletsStatusImpl(void) {
+    if (NSThread.isMainThread) {
+        NSString *body = ISHWorkspaceAppletsBody();
+        ISHWorkspaceAppletsRemember(body);
+        return strdup(body.UTF8String);
+    }
+    __block NSString *fresh = nil;
+    dispatch_semaphore_t built = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *body = ISHWorkspaceAppletsBody();
+        ISHWorkspaceAppletsRemember(body);
+        fresh = body;
+        dispatch_semaphore_signal(built);
+    });
+    if (dispatch_semaphore_wait(built, dispatch_time(DISPATCH_TIME_NOW, 500 * NSEC_PER_MSEC)) != 0) {
+        os_unfair_lock_lock(&ISHWorkspaceAppletsLastBodyLock);
+        NSString *last = ISHWorkspaceAppletsLastBody;
+        os_unfair_lock_unlock(&ISHWorkspaceAppletsLastBodyLock);
+        return strdup(last.UTF8String);
+    }
+    return strdup(fresh.UTF8String);
 }
 
 @interface ISHWorkspaceBridgeInstaller : NSObject
@@ -13440,5 +17532,87 @@ static int ISHWorkspaceOpenImpl(const char *request) {
 + (void)load {
     ish_workspace_status = ISHWorkspaceStatusImpl;
     ish_workspace_open = ISHWorkspaceOpenImpl;
+    ish_applets_status = ISHAppletsStatusImpl;
 }
 @end
+
+// Where an image's arrangement lives: beside the image, named after it.
+//
+// It used to live in NSUserDefaults under the scene, one blob for the whole app,
+// and the resume took the newest one it could find. With two saved sessions that
+// is simply wrong: pick the OLDER session and the newest layout is still the one
+// applied, so the windows came back painted with the NEWER session's scrollback
+// over the older session's shells. Reported as "I resumed the older of two
+// sessions and got the new session" -- the machine was right, the text on it was
+// a lie about which machine it was.
+//
+// An arrangement describes one suspended machine. It belongs with that machine.
+static NSString *ISHWorkspaceLayoutPathForSessionImage(NSString *imagePath) {
+    if (imagePath.length == 0)
+        return nil;
+    return [imagePath.stringByDeletingPathExtension stringByAppendingPathExtension:@"layout"];
+}
+
+NSArray<NSDictionary<NSString *, id> *> *ISHWorkspaceLayoutForSessionImage(NSString *imagePath) {
+    NSString *path = ISHWorkspaceLayoutPathForSessionImage(imagePath);
+    if (path == nil)
+        return nil;
+    NSArray *layout = [NSArray arrayWithContentsOfFile:path];
+    return [layout isKindOfClass:NSArray.class] && layout.count > 0 ? layout : nil;
+}
+
+void ISHWorkspaceForgetLayoutForSessionImage(NSString *imagePath) {
+    NSString *path = ISHWorkspaceLayoutPathForSessionImage(imagePath);
+    if (path != nil)
+        [NSFileManager.defaultManager removeItemAtPath:path error:nil];
+}
+
+static void ISHWorkspaceWriteLayoutBesideImage(WorkspaceViewController *workspace, NSString *imagePath) {
+    NSString *path = ISHWorkspaceLayoutPathForSessionImage(imagePath);
+    if (path == nil || workspace == nil)
+        return;
+    NSArray<NSDictionary<NSString *, id> *> *layout = [workspace workspaceSuspendLayoutDescriptors];
+    if (layout.count == 0)
+        return;
+    [layout writeToFile:path atomically:YES];
+}
+
+WorkspaceViewController *ISHWorkspaceCurrentController(void) {
+    return ISHWorkspaceActiveController;
+}
+
+void ISHWorkspaceCaptureLayoutForSuspend(NSString *imagePath) {
+    WorkspaceViewController *workspace = ISHWorkspaceActiveController;
+    if (workspace == nil)
+        return;   // shell mode: nothing on screen to describe
+    // Defined at the END of this file on purpose: it sends saveWorkspaceLayout:
+// and that selector is not visible until after @implementation.
+// UIKit, so main. Synchronous on purpose: this runs immediately BEFORE
+    // checkpoint_save_external, and a layout captured after the guest is
+    // frozen -- or after the app has exited -- describes a different machine
+    // than the image does. Nothing is holding the main thread at this point;
+    // the freeze has not started yet.
+    if (NSThread.isMainThread) {
+        // Cannot collect the terminals' history from here: evaluateJavaScript
+        // answers ON THIS THREAD, so waiting for it would deadlock. Geometry
+        // only -- every caller that can afford to wait comes in off-main.
+        // Beside the image FIRST: saveWorkspaceLayout: consumes the captured
+        // scrollback on its way out, so building the sidecar after it would file
+        // an arrangement with every terminal blank.
+        ISHWorkspaceWriteLayoutBesideImage(workspace, imagePath);
+        [workspace saveWorkspaceLayout:nil];
+        return;
+    }
+    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [workspace captureTerminalContentsThen:^{
+            ISHWorkspaceWriteLayoutBesideImage(workspace, imagePath);   // before the consume
+            [workspace saveWorkspaceLayout:nil];
+            dispatch_semaphore_signal(done);
+        }];
+    });
+    // Bounded: a web view that never answers must not hold up the checkpoint.
+    // The layout is then simply the one from before, which is worse than fresh
+    // and far better than no save.
+    dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t) (5 * NSEC_PER_SEC)));
+}

@@ -15,6 +15,12 @@ An unprivileged guest process — the UID 1000 user, an `ssh` login as a normal
 user — is refused a step earlier still, by the emulated kernel itself; see
 "What is *not* affected" below.
 
+**Not every host refuses.** Everything below happens only when the host bind
+fails; a recent iOS has been seen to let the app bind a privileged wildcard
+port outright (an M4 iPad Pro in August 2026), and then the listener is real and
+reachable like any other. Which one you got is not something to guess at, so a port ≥ 1024
+stays the advice: it works the same everywhere.
+
 When a guest daemon binds a privileged port on the IPv4 wildcard address
 (`0.0.0.0`), iSH-AOK doesn't fail the call. It quietly rebinds the socket to
 `127.0.0.1` on an ephemeral port and reports success. The daemon starts
@@ -84,3 +90,76 @@ process can no longer join a root daemon's group and take its connections.
 So a service you only talk to from inside the guest can use port 80 or 22
 quite happily, as long as it runs as root. The port ≥ 1024 rule only matters
 when you want the outside world to reach it.
+
+## When the screen locks: connections that drop
+
+iOS suspends the app when the screen locks or you switch away, and a locked
+device takes back a suspended app's network connections. An `ssh` session left
+idle across that comes back to a dead connection. Nothing in the guest can stop
+it; what keeps a session alive is keeping the app running, and the usual way is
+to keep it busy with location updates:
+
+```sh
+cat /dev/location > /dev/null &    # the first time, iOS asks for location permission
+```
+
+How long iOS honours that on a locked device has not been measured here.
+
+From build 559 such a connection reads as **reset** (`ECONNRESET`, "Connection
+reset by peer"), which is what Linux says of a connection the network took and
+what a client that reconnects is waiting for. Before, `ssh` and anything else
+that had been waiting in `poll` were told "Bad file descriptor".
+
+## Sandboxes: a network of their own
+
+A process in a private network namespace — `unshare -n`, a bubblewrap
+sandbox, Codex CLI's — reaches none of this: not the device's network, not the
+loopback NAT, not the DNS relay. It has its own `lo`, and links you make
+between sandboxes. See [namespaces.md](namespaces.md).
+
+## The DNS relay at `127.0.0.53`
+
+The `/etc/resolv.conf` iSH-AOK writes lists `127.0.0.53` first, ahead of the
+device's own nameservers — the address systemd-resolved's stub uses on Linux.
+Behind it is a small relay in the app that passes each query, unchanged, to
+the device's nameservers in turn and hands the reply straight back, whatever
+it says:
+
+```sh
+head -3 /etc/resolv.conf     # nameserver 127.0.0.53 first
+nslookup example.com         # answered from 127.0.0.53
+```
+
+Things worth knowing:
+
+- **It exists because iOS knows the network and the guest does not.** The
+  nameservers change as the device moves between Wi-Fi and cellular; the relay
+  always asks the current ones.
+- **A missing name is answered at once.** `NXDOMAIN` and empty answers come back
+  as such, so glibc on Devuan moves on immediately instead of sitting out a
+  five-second timeout per nameserver.
+- **Port 53 on `127.0.0.1` is yours.** The relay listens on an ephemeral host
+  port and the guest reaches it through the loopback NAT at `127.0.0.53:53`, so a
+  guest resolver such as `dnsmasq` or `unbound` can bind `127.0.0.1:53` without
+  colliding with it.
+
+## Letting the guest own `/etc/resolv.conf`
+
+By default iSH-AOK rewrites the guest's `/etc/resolv.conf` on every DNS
+refresh, which fires whenever the device's network path changes — on
+cellular, that can be constantly. A guest resolver that polls the file's
+modification time (some do) sees it change again and again, even though the
+content is identical each time.
+
+If that is causing trouble — a resolver logging repeated reopens, or you
+simply want to manage `/etc/resolv.conf` yourself, by hand or with a guest
+service like `dhclient` or `resolvconf` — **Settings → Custom DNS Servers**
+has a **Don't Manage** choice, alongside the usual field for a list of
+nameserver IPs. Choosing it shows "Off (guest manages)" and the periodic
+refresh returns without touching the file at all from then on; it also stops
+the DNS relay described above. Setting a custom server list and choosing
+Don't Manage are mutually exclusive — saving one clears the other.
+
+Both are also reachable from inside the guest through
+[`/proc/ish/defaults`](proc-ish.md#your-settings-from-the-guest), as
+`custom_dns_servers` and `disable_resolv_conf_rewrite`.

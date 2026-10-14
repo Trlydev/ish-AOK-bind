@@ -17,11 +17,19 @@
 // were namespaced.
 #define UTS_NAME_LENGTH 65 // must match UNAME_LENGTH in kernel/calls.h
 
+struct user_namespace;
+
 struct uts_namespace {
     lock_t lock;
     unsigned refcount; // guarded by lock
+    // Its identity in /proc/<pid>/ns/uts. Immutable.
+    unsigned long inode;
     char hostname[UTS_NAME_LENGTH];
     char domainname[UTS_NAME_LENGTH];
+    // The user namespace it was made in (kernel/user_ns.h), NULL for the
+    // initial one: CAP_SYS_ADMIN there is what naming this one takes. Owns a
+    // reference; set by whoever made the namespace, before anyone is in it.
+    struct user_namespace *user_ns;
 };
 
 // The namespace every task starts in, and the one the app-side hostname

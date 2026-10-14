@@ -26,6 +26,9 @@ struct fifo_file {
     size_t start;       // ring read position
     unsigned readers;   // currently-open read ends
     unsigned writers;   // currently-open write ends
+    // Writers ever attached, Linux's w_counter: a read end is hung up only
+    // once a writer that came after its open has gone (fd->fifo_version).
+    unsigned w_counter;
 
     // The fd list is iterated to wake pollers. It has its own lock so the wake
     // (which takes poll locks) never runs under ->lock; the two are never held
@@ -44,6 +47,7 @@ struct fifo_file *fifo_file_new(void) {
     fifo->buf = NULL;
     fifo->cap = fifo->size = fifo->start = 0;
     fifo->readers = fifo->writers = 0;
+    fifo->w_counter = 0;
     list_init(&fifo->fds);
     return fifo;
 }
@@ -85,10 +89,12 @@ int fifo_file_open(struct fifo_file *fifo, struct fd *fd) {
         unlock(&fifo->lock);
         return _ENXIO;
     }
+    // See fifo_version: pinned only when no writer is there yet.
+    fd->fifo_version = fifo->writers == 0 ? fifo->w_counter : fifo->w_counter - 1;
     if (reader)
         fifo->readers++;
     if (writer)
-        fifo->writers++;
+        fifo->writers++, fifo->w_counter++;
     notify(&fifo->cond); // a newly-arrived peer may complete a rendezvous
     unlock(&fifo->lock);
 
@@ -104,10 +110,10 @@ int fifo_file_open(struct fifo_file *fifo, struct fd *fd) {
         lock(&fifo->lock, 0);
         if (reader && !writer) {
             while (fifo->writers == 0)
-                if (wait_for(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
+                if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
         } else if (writer && !reader) {
             while (fifo->readers == 0)
-                if (wait_for(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
+                if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) { err = _EINTR; break; }
         }
         unlock(&fifo->lock);
     }
@@ -149,7 +155,7 @@ ssize_t fifo_file_read(struct fifo_file *fifo, struct fd *fd, void *buf, size_t 
             unlock(&fifo->lock);
             return _EAGAIN;
         }
-        if (wait_for(&fifo->cond, &fifo->lock, NULL)) {
+        if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) {
             unlock(&fifo->lock);
             return _EINTR;
         }
@@ -225,7 +231,7 @@ ssize_t fifo_file_write(struct fifo_file *fifo, struct fd *fd, const void *buf, 
             unlock(&fifo->lock);
             return written > 0 ? (ssize_t) written : _EAGAIN;
         }
-        if (wait_for(&fifo->cond, &fifo->lock, NULL)) {
+        if (wait_for_blocked(&fifo->cond, &fifo->lock, NULL)) {
             unlock(&fifo->lock);
             return written > 0 ? (ssize_t) written : _EINTR;
         }
@@ -238,8 +244,12 @@ int fifo_file_poll(struct fifo_file *fifo, struct fd *fd) {
     if (fifo_fd_is_reader(fd)) {
         if (fifo->size > 0)
             types |= POLL_READ;
-        if (fifo->writers == 0)
-            types |= POLL_READ | POLL_HUP; // EOF: a read would return 0
+        // End of file: POLLHUP, and POLLIN only with bytes left, as Linux
+        // has it -- and only once a writer this open did not precede has
+        // gone, so a reader opened O_NONBLOCK before any writer is not told
+        // of a hangup that never happened.
+        if (fifo->writers == 0 && fd->fifo_version != fifo->w_counter)
+            types |= POLL_HUP;
     }
     if (fifo_fd_is_writer(fd)) {
         if (fifo->buf == NULL || fifo->size < fifo->cap)
@@ -249,4 +259,51 @@ int fifo_file_poll(struct fifo_file *fifo, struct fd *fd) {
     }
     unlock(&fifo->lock);
     return types;
+}
+
+char *fifo_file_peek(struct fifo_file *fifo, size_t *len) {
+    *len = 0;
+    lock(&fifo->lock, 0);
+    size_t n = fifo->size;
+    char *out = NULL;
+    if (n > 0 && (out = malloc(n)) != NULL) {
+        size_t first = fifo->cap - fifo->start;
+        if (first > n)
+            first = n;
+        memcpy(out, fifo->buf + fifo->start, first);
+        memcpy(out + first, fifo->buf, n - first);
+        *len = n;
+    }
+    unlock(&fifo->lock);
+    return out;
+}
+
+int fifo_file_prime(struct fifo_file *fifo, const char *buf, size_t len) {
+    if (len == 0)
+        return 0;
+    lock(&fifo->lock, 0);
+    if (fifo->buf == NULL) {
+        fifo->buf = malloc(FIFO_FILE_CAPACITY);
+        if (fifo->buf == NULL) {
+            unlock(&fifo->lock);
+            return _ENOMEM;
+        }
+        fifo->cap = FIFO_FILE_CAPACITY;
+    }
+    // A saved buffer came out of one of these, so it fits one.
+    if (fifo->size + len > fifo->cap) {
+        unlock(&fifo->lock);
+        return _ENOSPC;
+    }
+    size_t end = (fifo->start + fifo->size) % fifo->cap;
+    size_t first = fifo->cap - end;
+    if (first > len)
+        first = len;
+    memcpy(fifo->buf + end, buf, first);
+    memcpy(fifo->buf, buf + first, len - first);
+    fifo->size += len;
+    notify(&fifo->cond);
+    unlock(&fifo->lock);
+    fifo_file_wake_pollers(fifo, POLL_READ);
+    return 0;
 }

@@ -1,10 +1,14 @@
-# Runtime tuning: CPU count and memory headroom
+# Runtime tuning, resource limits, and hardening
 
 A few environment variables let you tune how iSH-AOK presents itself
 to the guest. These apply when you can control the process environment —
 building and running the standalone CLI emulator, or launching the app
 from Xcode with a custom scheme environment — rather than something an
 App Store install lets you change day to day.
+
+The rest of this page is not variables: it is what the emulator enforces
+unconditionally — resource limits, and security hardening a guest program
+can rely on the same way it would on Linux.
 
 ## `ISH_GUEST_CPU_COUNT`
 
@@ -14,8 +18,12 @@ Overrides the CPU count iSH-AOK reports to the guest — `/proc/cpuinfo` and
 On iOS, and only on a device with more than two cores, iSH-AOK reserves roughly
 a third of them (at least one) back from the scheduler-sizing queries `nproc`
 and `sched_getaffinity`, so that `make -j$(nproc)` and programs that size
-themselves from the affinity mask leave the app some headroom; `/proc/cpuinfo`
-still shows every core. The standalone CLI on Apple silicon does **not** do
+themselves from the affinity mask leave the app some headroom. Every core is
+still online: `/proc/cpuinfo`, `/proc/stat` and `/sys/devices/system/cpu` list
+all of them, and the affinity mask and `Cpus_allowed` name the ones a program
+may run on, the way Linux looks under a cpuset or `taskset` (so glibc's
+`sysconf(_SC_NPROCESSORS_ONLN)` counts every core, as it does there). On a
+9-core M4 iPad that is 9 CPUs listed and `nproc` 6. The standalone CLI on Apple silicon does **not** do
 that — with no override it runs a fixed 4 emulated CPUs regardless of the host's
 core count. Set `ISH_GUEST_CPU_COUNT` to override either:
 
@@ -26,6 +34,130 @@ ISH_GUEST_CPU_COUNT=1 ./ish -f build/alpine /bin/sh   # force a serial (single-c
 
 Forcing `=1` is particularly useful when debugging a concurrency bug: it
 rules out cross-core races as the cause by construction.
+
+The reservation above is itself driven by an environment variable,
+`ISH_GUEST_CPU_RESERVE`: set it (to anything) on a non-iOS host to get the
+same "leave the app some headroom" behavior the app applies automatically on
+a device with more than two cores. It exists so a test can exercise the
+reservation logic without an iPhone.
+
+## `ISH_RANDOMIZE_VA_SPACE`
+
+Controls ASLR on `exec`, the same way `/proc/sys/kernel/randomize_va_space`
+does on Linux: `0` disables it, `1` randomizes the mmap base, PIE base and
+heap start, `2` (the default, whether or not the variable is set) is the
+same plus a randomized stack top. An invalid value falls back to `2`. It
+moves where the loader, shared libraries, the vDSO/sigpage, a dynamic
+`arm64`/`riscv64` PIE, and any mapping made without an address land — not
+just the stack.
+
+ASLR is off regardless for a process exec'd with `ADDR_NO_RANDOMIZE`
+(`setarch -R`; this is gdb's default, so a debugged program's addresses are
+reproducible), and a set-id exec clears that flag first so a privileged
+program cannot inherit a debugger's disabled-ASLR setting.
+
+```sh
+ISH_RANDOMIZE_VA_SPACE=0 ./ish -f build/alpine /bin/sh   # reproducible layouts, for A/B testing
+```
+
+In the app, **Settings → Translated Code → Cache Translated Code (arm64)** sets
+it to `0` and holds it there — a write of any other value is `EPERM` — for as
+long as the switch is on, and puts the old value back when it goes off. See
+[proc-ish.md](proc-ish.md#the-jit-from-the-guest) for why.
+
+## `ISH_VDSO`
+
+64-bit guests (`amd64`, `arm64`, `riscv64`) read the clock through a vDSO
+mapped into every process — `vdso/amd64`, `arm64` or `riscv64/vdso.S` — rather
+than making a system call for `clock_gettime` and friends. `ISH_VDSO=0` in
+the host environment leaves it out entirely: no page is mapped, no
+`AT_SYSINFO_EHDR` goes in the aux vector, and the C library falls back to the
+real system calls the vDSO replaces. It exists to A/B a problem against a
+build with the vDSO in the picture — with it set, `strace` sees
+`clock_gettime` calls again, which a vDSO read never generates.
+
+## `ISH_GUEST_PROFILE`
+
+A guest-PC sampling profiler, host-side and with no guest cooperation needed:
+it answers where a workload's wall time actually goes, split across the
+shared objects (libraries) it has mapped, plus how much of that time is
+kernel work or blocked rather than guest code at all. It exists to settle
+whether a native stand-in for a hot library function — the same idea behind
+`ISH_HLE` and the [crypto accelerator](crypto-accel.md) — would actually pay
+for a given workload, rather than guessing.
+
+```sh
+ISH_GUEST_PROFILE=1 ./ish -f build/alpine /bin/sh          # sample every 1000 us (the default)
+ISH_GUEST_PROFILE=200 ./ish -f build/alpine /bin/sh        # sample every 200 us
+ISH_GUEST_PROFILE_OUT=/tmp/prof.txt ./ish -f build/alpine /bin/sh   # write the report there instead of stderr
+```
+
+The report is written at process exit. It is a no-op unless set, so it costs
+nothing in ordinary use.
+
+## `ISH_JIT_PROFILE`
+
+Where `ISH_GUEST_PROFILE` says which library the time went to, this says which
+*instructions* it went to. Every guest instruction costs about the same under
+the gadget JIT, so a workload's cost is set by how many of each kind it runs,
+and that is what this records: each translated block counts how often it ran
+and keeps the guest code it was made from. It covers all four guests.
+
+```sh
+ISH_JIT_PROFILE=/tmp/mix.txt ./ish -f build/alpine-arm64 /bin/sh -c 'gzip -9 < big > /dev/null'
+python3 tools/jitprof-report.py /tmp/mix.txt     # the mix, vector runs, commonest pairs
+```
+
+The file is written at exit. The report disassembles x86 blocks with `llvm-mc`.
+
+## The JIT and HLE switches
+
+Each of these has a matching `/proc/ish` file that switches it live (see
+[proc-ish.md](proc-ish.md#the-jit-from-the-guest)); the variable only sets where
+it starts:
+
+| variable | default | what `0` does |
+| --- | --- | --- |
+| `ISH_HLE` | on | stops running hot libc functions (`memcpy`, `strlen`, …) in arm64 and riscv64 programs as host code |
+| `ISH_JIT_INHERIT` | on | a forked child translates everything again instead of copying its parent's blocks |
+| `ISH_MOPS` | on | arm64 programs are not told about FEAT_MOPS, so glibc uses its NEON `memcpy` |
+| `ISH_VIRTGPU` | on | no GPU render node: `/dev/dri/renderD128` is absent |
+
+`ISH_HLE` was opt-in until 557. It became the default once an intercepted call
+returned through the return cache rather than the dispatcher; nothing measured
+slower with it on, and musl and riscv64 programs gained up to 18%.
+`ISH_HLE_STATS=1` prints per-function call counts at exit. `ISH_JIT_TIMING=1`
+counts translation time from the start, as writing `1` to
+`/proc/ish/jit_timing` does later.
+
+## App settings, for the CLI
+
+The standalone CLI has no Settings screen, so these stand in for the switches
+the app has:
+
+| variable | the app's setting | what it does |
+| --- | --- | --- |
+| `ISH_CRYPTO_ACCEL=1` | **Crypto Accel** | host-native AEAD for arm64/riscv64 ssh — see [crypto-accel.md](crypto-accel.md); off by default |
+| `ISH_JIT_XCACHE=1` | **Cache Translated Code (arm64)** | keeps arm64 translations after a program exits, for the next one to reuse; off by default. Unlike the setting, it leaves ASLR as it finds it, so pair it with `ISH_RANDOMIZE_VA_SPACE=0` or it will rarely hit |
+| `ISH_PIX_ACCEL=1` | **Pixman Accel** | host-native fill/copy/composite for the guest's pixman shim; off by default, and on only once its self-test passes |
+| `ISH_FOREIGN_EXEC` | **Programs From Other Roots** | `root`, `libs` or `off`: how a program from another root runs when its loader is not here — see [roots.md](roots.md#running-another-roots-programs-by-path); the same as writing `/proc/ish/foreign_exec` at boot |
+| `ISH_NATIVE_ROOT=1` | a [native-mode](native-mode.md) root | treats the root as native mode, provisioning it as the app does at every boot of one |
+| `ISH_NATIVE_USER`, `ISH_NATIVE_PASSWORD` | the first-start prompt | with `ISH_NATIVE_ROOT=1`, the everyday account to create (password optional) on a root that has none yet |
+
+## `ISH_BOOT_ROOT`
+
+For the app rather than the CLI: boots the named root for **this launch only**,
+leaving the saved default alone, so a device driven from a Mac can boot each
+root in turn:
+
+```sh
+xcrun devicectl device process launch -e '{"ISH_BOOT_ROOT":"Alpine3.24.2-aarch64"}' \
+    --terminate-existing app.ish.iSH-AOK
+```
+
+A name that is not an installed root fails the boot by name, listing the ones
+there are, rather than quietly booting the default. `/proc/ish/roots` reports
+`booted name=` for the root at `/` — see [roots.md](roots.md).
 
 ## `ISH_GUEST_MEM_HEADROOM_MB`
 
@@ -148,15 +280,41 @@ manages its own memory and can page the app out regardless; iSH-AOK has no way
 to pin host pages and never has. So a locked page will not be written to the
 swap file, and that is all `mlock` can mean here.
 
-`RLIMIT_MEMLOCK` is enforced, and exceeding it returns `ENOMEM` as Linux has
-since 2.6.9. Note that the standalone CLI runs as **root**, which is exempt
-(Linux exempts `CAP_IPC_LOCK`), so testing the limit means dropping privilege
-first -- as root every `mlock` simply succeeds.
+The lock is visible where Linux shows it: `VmLck` in `/proc/<pid>/status`,
+`Locked` and the `lo` flag in `smaps`, and a separate `maps` line wherever a
+lock starts or ends. It belongs to the mapping, so it stays with a page that is
+copied after a `fork` or a debugger's write, and with a mapping that grows or
+moves -- the stack of a locked process, an `mremap` -- while a `fork`'s child
+starts with no locks at all.
 
-`mlockall(MCL_FUTURE)` is accepted and recorded but not yet acted on: it would
-have to reach the page-table layer, which knows nothing about a process's
-flags. `MCL_CURRENT` locks everything already mapped, which is the half that
-works today.
+`mlockall(MCL_CURRENT)` locks everything already mapped; `MCL_FUTURE`, and the
+`MAP_LOCKED` flag to `mmap`, lock new mappings too -- `mmap`, `brk` and
+`shmat` alike. As on Linux, what is locked is populated, readable or writable
+parts of large untouched mappings included; `PROT_NONE` mappings have each page
+locked when it is first touched.
+
+`mlock2(2)` is `mlock` with flags, and its one flag, `MLOCK_ONFAULT`, is the
+on-fault lock that `MCL_ONFAULT` gives `mlockall`: the mapping is locked and
+counted in `VmLck` at once, but nothing is brought in until it is touched --
+not by the call, and not later when `mremap` grows the mapping or `mprotect`
+makes it writable, both of which populate an ordinary locked mapping. `smaps`
+shows such a mapping as `lo lf`, and `maps` starts a new line where the `lf`
+starts or ends. A later plain `mlock` (or `mlockall(MCL_CURRENT)`) turns it
+back into an ordinary lock and populates it.
+
+`RLIMIT_MEMLOCK` is enforced the way Linux enforces it: with a limit of 0,
+`mlock`, `mlockall` and `MAP_LOCKED` fail with `EPERM`; past the limit `mlock`
+and `mlockall(MCL_CURRENT)` fail with `ENOMEM`, a locked `mmap` or `mremap` with
+`EAGAIN`, and a locked stack that would grow past it gets `SIGSEGV`. The
+standalone CLI runs as **root**, which is exempt (Linux exempts
+`CAP_IPC_LOCK`), so testing the limit means dropping privilege first -- as root
+every `mlock` simply succeeds.
+
+Not there yet: a process restored after iOS suspended the app comes back
+holding no locks. And locking does not copy a page the process still shares
+copy-on-write with its parent or child after a `fork`, as Linux does: `smaps`
+counts such a page at half in `Pss` and `Locked` until one of them writes to
+it.
 
 ## `ISH_GUEST_SWAP_FAIL_READS`
 
@@ -194,6 +352,87 @@ that a test cannot schedule against:
 echo quiesce > /proc/ish/swap   # hold it; eviction stops
 echo resume > /proc/ish/swap    # lift it
 ```
+
+## Resource limits
+
+Not an environment variable — an ordinary `setrlimit`/`ulimit`, enforced the
+way Linux enforces it:
+
+- **`RLIMIT_CPU`**: `SIGXCPU` at the soft limit and each further second of
+  CPU time, with the soft limit raised a second at a time (so `getrlimit`
+  shows the new value); `SIGKILL` at the hard limit; nothing else when soft
+  and hard are equal (`bash`'s `ulimit -t`).
+- **`RLIMIT_AS`** and **`RLIMIT_DATA`**: checked the way Linux's `mmap`,
+  `mremap`, `brk` and `shmat` check them, from a page-table walk of the
+  process. `mprotect` making private pages writable counts against
+  `RLIMIT_DATA` too, because that is how glibc's thread arenas grow.
+- **`RLIMIT_NPROC`** (`ulimit -u`): counted per real uid, with root exempt.
+  AOK counts processes where Linux counts threads, so a heavily threaded
+  program gets further here before `fork` fails with `EAGAIN`. A process in a [user namespace](namespaces.md) counts
+  at every level up to the machine, against the limit its namespace's creator
+  had, so raising the limit inside a sandbox does not raise it.
+- A soft limit above the hard one is refused (`EINVAL`); raising a hard limit
+  needs `CAP_SYS_RESOURCE`; changing another process's limits needs your
+  real, effective and saved ids to all match its.
+
+```sh
+sh -c 'ulimit -t 1; while :; do :; done'   # SIGXCPU after 1s of CPU, not wall time
+```
+
+**`tmpfs`'s `size=`/`nr_blocks=`** mount options are enforced too (bytes with
+`k`/`m`/`g`/`t`/`p`/`e` suffixes, or a percentage of `MemTotal`; `0` is
+unlimited; half of `MemTotal` when neither is given, as Linux defaults).
+Each file is charged its size in pages; a write, `truncate` or `fallocate`
+that would pass the limit is cut short and fails with `ENOSPC`. `statfs`
+reports the limit and the current charge, so `df` on a tmpfs mount is no
+longer fiction.
+
+## BSD process accounting
+
+`acct(2)` works now, so a guest can turn on BSD-style process accounting the
+normal way:
+
+```sh
+touch /var/log/pacct
+accton /var/log/pacct   # start writing a record for every process that exits
+accton off              # or: accton with no file
+```
+
+Debian's `acct_v3` record format is produced (64 bytes, what `atopacctd` and
+`sa`/`lastcomm` expect), written once per process from the same place Linux
+writes it. Two fields are worth knowing if you read the records by hand
+rather than through a tool: `ac_etime` is elapsed time in centisecond ticks,
+not seconds, and `ac_exitcode` is the wait-encoded status (so `false` records
+256, not 1). `ac_mem` is peak RSS rather than Linux's virtual size at exit —
+the same units, without walking the address space on every process exit for
+an advisory field. Off — which is every system that has never called
+`acct(2)` — costs one atomic read on process exit and nothing else.
+
+Accounting belongs to a [pid namespace](namespaces.md), as on Linux: a process
+that exits is written to its own namespace's file and to every one above it
+that has accounting on, with pids as each namespace numbers them.
+
+## Other hardening worth knowing about
+
+Not configurable, and not previously enforced at all:
+
+- **`seccomp(2)`** works: strict mode kills a thread that calls anything but
+  `read`, `write`, `exit` and `sigreturn`; classic-BPF filter mode is checked
+  and run the way Linux runs it, actions and all
+  (`SECCOMP_RET_KILL_PROCESS`/`KILL_THREAD`/`TRAP`/`ERRNO`/`TRACE`/`LOG`/`ALLOW`).
+  A sandbox built on it — OpenSSH's pre-authentication child, `systemd`'s
+  `SystemCallFilter=`, `apt` and `man-db`'s helpers — is now actually confined
+  rather than merely believing it is.
+- **`PROT_EXEC` is enforced.** Code in a page mapped without it — the stack,
+  the heap, an overflowed buffer — faults with `SIGSEGV`/`SEGV_ACCERR` instead
+  of running.
+- **Another user's process is not yours to inspect.** See
+  [proc-ish.md](proc-ish.md#every-processs-architecture-and-who-may-ask) for
+  the `ptrace`/`/proc` access gate.
+- **`chgrp` is restricted to a group you are in.** An owner may move a file to
+  their own `fsgid` or a supplementary group, or leave it where it is;
+  anything else needs `CAP_CHOWN` — closing a path to running a program as an
+  arbitrary group via `chgrp` + `chmod g+s`.
 
 ## Logging
 

@@ -110,13 +110,16 @@ Stage Manager, so multi-window is available on a device the platform does not
 give multiple windows to.
 
 The applet list is longer than a book chapter should enumerate — a file manager,
-MotePad, a markdown viewer, an image viewer, a video player, a music player, a
-browser, clock and monitor and network and log panels, storage, the Filesystems
-screen of Chapter 30, settings, diagnostics, an LLM chat (Chapter 32), and a
-Wayland display (Chapter 42).
+MotePad, a markdown viewer, an image viewer, a video player, a music player and
+its equalizer, a browser, clock and monitor and network and log panels, storage,
+the Filesystems screen of Chapter 30, settings, diagnostics, an LLM chat
+(Chapter 32), and a Wayland display (Chapter 32). 557 gave Terminal windows
+tabs, kept by saved layouts and by suspend; let the video player open web
+streams, HLS and `.m3u` playlists with a channel list; and let the browser open
+guest pages from the File Manager and `ws-browser`, in tabs.
 
 The design question from the top of this chapter applies hardest here, and
-`docs/native_workspace_design.md` answers it directly: the goal "is not to build
+`docs/historical/native_workspace_design.md` answers it directly: the goal "is not to build
 a Linux desktop stack", but to let the guest keep providing shell and process
 semantics while the visible workspace, layout and widgets are owned by the app.
 A clock applet does not need a Linux process behind it, and one drawn in UIKit
@@ -173,14 +176,29 @@ Its reason to exist is one column:
 
 > iSH-AOK can run i386, amd64, arm64, and riscv64 binaries side by side in one
 > booted session … Stock `top`/`htop` have no way to show that architecture mix.
-> `ktop`'s one real differentiator is an **ARCH** column, read directly from each
-> process's ELF header via `/proc/<pid>/exe`.
+> `ktop`'s one real differentiator is an **ARCH** column.
+
+That column used to be read straight from each process's ELF header via
+`/proc/<pid>/exe`. Chapter 12's `/proc`/`ptrace` credential gate broke it: a
+normal user's `open` of a root process's `exe` is now `EACCES`, as on Linux, so
+`init`, `sshd`, `login` and every other root-owned process showed `?` in the one
+column that is the entire point of running `ktop`. The check was right; the
+column's source was the wrong one. `/proc/ish/arch` now lists `<pid> <machine>`
+for every process, a zombie with what it ran before it died — readable by anyone, because which of iSH-AOK's
+architectures a process runs is not a secret even when the process itself is —
+and `ktop` reads the whole table once per refresh, falling back to the ELF
+header only for a pid the table missed. Native programs (`zsh`, SmallCLUE's
+applets) have no guest ELF image to read anyway; the table lists those as the
+host's machine marked `(n)`, and `ktop` shows `arm64(n)` on every Apple Silicon
+device, because that is what the code actually is, and the `(n)` says it runs
+natively.
 
 That column is only meaningful because of two facts established much earlier in
-this book: a task's guest ABI is a field on the task (Chapter 7), and there are
-no PID namespaces, so one process viewer sees every process in every root
-(Chapter 21). A tool that shows what this system uniquely is could not exist on
-a system that had isolation.
+this book: a task's guest ABI is a field on the task (Chapter 7), and a root is
+not a PID namespace — there are PID namespaces since 559, but only for a sandbox
+that asks for one (Chapter 10) — so one process viewer sees every process in
+every root (Chapter 21). A tool that shows what this system uniquely is could
+not exist on a system that had isolation.
 
 Two practical notes come with it. `/AOK` is read-only, so `ktop` cannot be built
 in place — `build.sh` copies the source out first, for whichever guest
@@ -229,7 +247,7 @@ system underneath, and the surfaces are views onto it.
 [opt/AOK/tools/ktop/ktop.c](../../opt/AOK/tools/ktop/ktop.c),
 [docs/guest_file_bridge_lanes.md](../../docs/guest_file_bridge_lanes.md),
 [docs/workspace_file_manager_plan.md](../../docs/workspace_file_manager_plan.md),
-[docs/native_workspace_design.md](../../docs/native_workspace_design.md),
+[docs/historical/native_workspace_design.md](../../docs/historical/native_workspace_design.md),
 [opt/AOK/docs/workspace.md](../../opt/AOK/docs/workspace.md),
 [opt/AOK/docs/files-app-integration.md](../../opt/AOK/docs/files-app-integration.md),
 [opt/AOK/docs/ktop.md](../../opt/AOK/docs/ktop.md),

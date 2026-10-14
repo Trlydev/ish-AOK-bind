@@ -4,6 +4,7 @@
 // bits by gen_step_riscv64.
 
 #include "gadgets.h"
+#include "frag.h"
 
 // Exit-to-kernel with an interrupt code and a 64-bit guest pc.
 // Code stream: [gadget][code][pc][addr]
@@ -19,8 +20,8 @@
 
 // HLE "giant gadget" -- riscv64 twin of guest-arm64 control.S's hle_call
 // (see that gadget's comment for the full contract). Bridges to
-// hle_call(cpu, tlb, fn, entry_ip); INT_NONE -> jit_ret with the pc the C
-// side stored, any real interrupt code -> jit_exit. x27 carries the result
+// hle_call(cpu, tlb, fn, entry_ip); INT_NONE -> the pc the C side stored,
+// through the jalr cache (else jit_ret), any real interrupt code -> jit_exit. x27 carries the result
 // across restore_c. Code stream: [fn | abi<<8][entry_ip].
 .gadget hle_call
     ldr x8, [_ip]
@@ -36,7 +37,24 @@
     tbnz w27, #31, 1f          // INT_NONE (-1): success, pc updated
     mov w0, w27
     b jit_exit
-1:  b jit_ret
+    // Success: enter the return address through the jalr cache (alu.S's
+    // jalr_cached, same hash and checks) rather than always exiting to the
+    // dispatcher, which was most of an intercepted call's cost.
+1:  ldr x10, [_cpu, #CPU_riscv64_pc]
+    eor x13, x10, x10, lsr #12
+    ubfx x13, x13, #1, #12
+    mov x14, LOCAL_ret_cache
+    add x14, _cpu, x14
+    ldr x14, [x14, x13, lsl #3]
+    cbz x14, 2f
+    ldur x15, [x14, #(JIT_BLOCK_addr - JIT_BLOCK_code)]
+    cmp x15, x10
+    b.ne 2f
+    ldurb w15, [x14, #(JIT_BLOCK_is_jetsam - JIT_BLOCK_code)]
+    cbnz w15, 2f
+    mov _ip, x14
+    b riscv64_chain
+2:  b jit_ret
 
 .extern hle_call
 
@@ -73,35 +91,24 @@
 
 // rd = constant (LUI, AUIPC, li-style folds; also jal/jalr link writes).
 // Code stream: [gadget][rd_off][value]
-.gadget mov_const
-    ldr x9, [_ip]
-    ldr x10, [_ip, #8]
-    str x10, [_cpu, x9]
-    gret 2
+f_gadget mov_const
 
 // rd = rs1 + imm (ADDI; covers mv and li-with-base).
 // Code stream: [gadget][rd_off][rs1_off][imm]
-.gadget addi
-    ldr x9, [_ip]           // rd_off
-    ldr x10, [_ip, #8]      // rs1_off
-    ldr x11, [_ip, #16]     // imm
-    ldr x10, [_cpu, x10]
-    add x10, x10, x11
-    str x10, [_cpu, x9]
-    gret 3
+f_gadget addi
 
 // Unconditional compile-time branch (JAL after its link write; also
 // gen_exit's block-size-cap continuation). Code stream: [gadget][target],
 // target tagged with bit 63 when unchained — same tagged-word chaining
 // scheme as guest-arm64 control.S; riscv64_branch_dispatch below is that
 // design with this guest's pc field.
-.gadget b
-    ldr _ip, [_ip]
-    b riscv64_branch_dispatch
+f_gadget b
 
 .global riscv64_branch_dispatch
 riscv64_branch_dispatch:
     tbz _ip, #63, riscv64_chain
+.global riscv64_branch_unchained
+riscv64_branch_unchained:
     and x8, _ip, #0x7fffffffffffffff
     str x8, [_cpu, #CPU_riscv64_pc]
     b jit_ret
@@ -125,7 +132,13 @@ riscv64_chain:
     b.le riscv64_chain_poked
     sub x8, _ip, #JIT_BLOCK_code
     str x8, [_cpu, #LOCAL_last_block]
+#if !defined(ISH_ARM64_GRET_LDAR)
+    // The one barrier of the default build; see guest-arm64 control.S's
+    // arm64_chain (gadgets.h's gret carries none).
+    dmb ishld
+#endif
     gret
+.global riscv64_chain_poked
 riscv64_chain_poked:
     ldur x8, [_ip, #(JIT_BLOCK_addr - JIT_BLOCK_code)]
     str x8, [_cpu, #CPU_riscv64_pc]

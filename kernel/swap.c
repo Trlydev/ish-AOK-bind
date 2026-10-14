@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 
 #include "kernel/swap.h"
+#include "kernel/zswap.h"
 #include "fs/devices.h"
 #include "fs/dev.h"
 #include "kernel/fs.h"
@@ -67,10 +68,30 @@ static lock_t swap_config_lock = LOCK_INITIALIZER;
 static _Atomic bool swap_on;
 
 static int swap_fd = -1;
+// RAM-ONLY MODE. The area has slots but no file: every eviction must be taken
+// by the compressed tier or refused, and nothing is ever written to storage.
+//
+// This is zram rather than zswap, and it exists because the two answer different
+// worries. zswap needs a swap area, and creating one costs flash IMMEDIATELY --
+// the file is F_PREALLOCATE'd and ftruncate'd to its full size before a single
+// page is written. A user whose concern is wear or free space should not have to
+// hand over a gigabyte of storage to enable the feature whose entire point is
+// not writing to storage.
+static bool swap_ram_only;
+
 static uint64_t swap_slot_size;        // one host frame
 static uint32_t swap_slot_count;       // slots in the area, INCLUDING slot 0
 static uint32_t swap_slots_used;       // allocated, i.e. out on disk
 static uint64_t *swap_free_bitmap;     // 1 = free
+// "An area exists to allocate slots from", which is NOT the same as "a file is
+// open" once RAM-only mode exists. The bitmap is allocated with the area and
+// freed with it, in both modes, so it is the honest test. Every site that used
+// to ask `swap_fd >= 0` to mean this now asks here; the sites that genuinely
+// need a descriptor to do I/O still check the fd, and in RAM-only mode they are
+// unreachable because the tier takes every slot.
+static bool swap_area_live_locked(void) {
+    return swap_free_bitmap != NULL;
+}
 static uint32_t swap_alloc_rover;      // where the last search stopped
 
 static _Atomic uint64_t swap_stat_alloc_fail;
@@ -206,11 +227,13 @@ static int swap_reserve(int fd, uint64_t bytes) {
 // lock story is that swap_lock is a leaf that is never held across I/O -- a
 // claim that was not actually true while the close path did both under it.
 static int swap_file_detach_locked(uint64_t **bitmap_out) {
-    int fd = swap_fd;
+    int fd = swap_fd;           // -1 in RAM-only mode; the caller must not close it
     *bitmap_out = swap_free_bitmap;
     swap_fd = -1;
     swap_free_bitmap = NULL;
+    swap_ram_only = false;
     swap_slot_count = 0;
+    zswap_set_slot_geometry(0, 0);      // drops the pool with the area
     swap_slots_used = 0;
     swap_alloc_rover = 0;
     swap_slot_size = 0;
@@ -219,9 +242,11 @@ static int swap_file_detach_locked(uint64_t **bitmap_out) {
 
 static void swap_file_dispose(int fd, uint64_t *bitmap) {
     if (fd >= 0) {
-        // Truncate before closing: the file is already unlinked, so this is
-        // what actually hands the blocks back rather than waiting for the
-        // process to exit. A clean exit should leave nothing behind.
+        // Truncate before closing. The container's file is already unlinked,
+        // so this is what hands its blocks back rather than waiting for the
+        // process to exit. A file on external storage (swap_enable_fd) is not
+        // unlinked and stays where the user put it, so truncating is also what
+        // empties it of guest memory -- keys and passwords included.
         if (ftruncate(fd, 0) != 0)
             /* nothing useful to do; the unlink still frees it at exit */;
         close(fd);
@@ -237,7 +262,7 @@ static void swap_disable_locked(void);
 static void swap_kswapd_start_locked(void);
 static void swap_kswapd_stop_locked(void);
 
-static int swap_enable_locked(uint64_t bytes) {
+static int swap_enable_locked(uint64_t bytes, bool ram_only, int host_fd) {
     uint64_t frame = mem_frame_size();
     if (frame == 0)
         return _EINVAL;
@@ -254,7 +279,7 @@ static int swap_enable_locked(uint64_t bytes) {
     uint32_t slots = (uint32_t) usable_slots + 1;
 
     lock(&swap_lock, 0);
-    if (swap_fd >= 0) {
+    if (swap_area_live_locked()) {
         bool same_size = swap_slot_count == slots && swap_slot_size == frame;
         bool draining = !atomic_load_explicit(&swap_on, memory_order_relaxed);
         unlock(&swap_lock);
@@ -272,7 +297,7 @@ static int swap_enable_locked(uint64_t bytes) {
         // the gap.
         swap_disable_locked();
         lock(&swap_lock, 0);
-        if (swap_fd >= 0) {
+        if (swap_area_live_locked()) {
             unlock(&swap_lock);
             return _EBUSY;          // still draining after the disable
         }
@@ -292,24 +317,54 @@ static int swap_enable_locked(uint64_t bytes) {
     if (bitmap == NULL)
         return _ENOMEM;
 
-    int fd = host_unlinked_tmpfd();
-    if (fd < 0) {
+    // RAM-only: no file at all. Not a zero-length one, not a sparse one -- the
+    // point is that nothing is reserved and nothing can be written. Slots are
+    // pure addressing here; the compressed pool is the only storage.
+    //
+    // External: host_fd >= 0 is a file the app opened on storage the user chose
+    // (a USB drive, through a security-scoped URL), used instead of an unlinked
+    // temp file in the container. Ownership passes to this module only on
+    // SUCCESS -- from then on it is closed with the area (swap_file_dispose).
+    // On failure it is still the caller's to close. The container's temp file
+    // is this module's either way, so a failure closes that one here.
+    int fd = -1;
+    if (!ram_only) {
+        if (host_fd >= 0)
+            fd = host_fd;
+        else
+            fd = host_unlinked_tmpfd();
+    }
+    if (!ram_only && fd < 0) {
         free(bitmap);
         return fd;
     }
-    int err = swap_reserve(fd, total);
-    if (err == 0 && ftruncate(fd, (off_t) total) != 0)
-        err = errno == ENOSPC ? _ENOSPC : _EIO;
+    int err = 0;
+    // A file on external storage is not unlinked, so it can still hold a
+    // previous run's pages -- a run that was killed never reached
+    // swap_file_dispose's truncate. Empty it before the area is laid out, so
+    // this run neither reads nor leaves behind anything it did not write.
+    if (!ram_only && host_fd >= 0 && ftruncate(fd, 0) != 0)
+        err = _EIO;
+    if (!ram_only && err == 0) {
+        err = swap_reserve(fd, total);
+        if (err == 0 && ftruncate(fd, (off_t) total) != 0)
+            err = errno == ENOSPC ? _ENOSPC : _EIO;
+    }
     if (err != 0) {
-        close(fd);
+        if (fd >= 0 && host_fd < 0)
+            close(fd);              // ours; an external fd stays the caller's
         free(bitmap);
         return err;                 // never a smaller area than was asked for
     }
 
     lock(&swap_lock, 0);
     swap_fd = fd;
+    swap_ram_only = ram_only;
     swap_slot_size = frame;
     swap_slot_count = slots;
+    // Tell the compressed tier the shape of the area it is fronting. It drops
+    // anything it held: those handles describe slots of the old geometry.
+    zswap_set_slot_geometry(slots, frame);
     swap_slots_used = 0;
     swap_free_bitmap = bitmap;
     // Every slot free except 0, which is SWAP_SLOT_NONE and must never be
@@ -342,7 +397,7 @@ static void swap_disable_locked(void) {
     swap_kswapd_stop_locked();
 
     lock(&swap_lock, 0);
-    bool anything_to_do = swap_fd >= 0;
+    bool anything_to_do = swap_area_live_locked();
     unlock(&swap_lock);
     if (!anything_to_do)
         return;
@@ -420,9 +475,50 @@ static void swap_disable_locked(void) {
     printk("swap: disabled\n");
 }
 
+// The last enable attempt, so a refusal can say WHY. Without this the only
+// guest-visible evidence that a user asked for swap and did not get it is
+// `enabled no`, which is indistinguishable from never having asked -- and the
+// most likely reason is the one the Settings picker cannot prevent: it offers
+// sizes up to 16 GB on a device that may not have 16 GB free, and swap_reserve
+// deliberately refuses rather than quietly handing back a smaller area.
+// Relaxed atomics: written once per enable attempt under swap_config_lock,
+// read by the status text with no lock, and a torn read here would only
+// mis-describe an already-failed enable.
+static _Atomic int swap_last_enable_err;
+static _Atomic uint64_t swap_last_enable_bytes;
+
 int swap_enable(uint64_t bytes) {
     lock(&swap_config_lock, 0);
-    int err = swap_enable_locked(bytes);
+    int err = swap_enable_locked(bytes, false, -1);
+    atomic_store_explicit(&swap_last_enable_err, err, memory_order_relaxed);
+    atomic_store_explicit(&swap_last_enable_bytes, bytes, memory_order_relaxed);
+    unlock(&swap_config_lock);
+    return err;
+}
+
+// Same, but with no backing file: every eviction must be taken by the
+// compressed tier or refused. `bytes` is the ADDRESSABLE size -- how much guest
+// memory may be evicted -- not the memory this will use, which is the
+// compressed pool's own cap. See swap_ram_only.
+int swap_enable_ram_only(uint64_t bytes) {
+
+    lock(&swap_config_lock, 0);
+    int err = swap_enable_locked(bytes, true, -1);
+    atomic_store_explicit(&swap_last_enable_err, err, memory_order_relaxed);
+    atomic_store_explicit(&swap_last_enable_bytes, bytes, memory_order_relaxed);
+    unlock(&swap_config_lock);
+    return err;
+}
+
+// swap_enable with the area in a file the caller opened (swap.h has the
+// ownership rule: this module's on success, the caller's on failure).
+int swap_enable_fd(int host_fd, uint64_t bytes) {
+    if (host_fd < 0)
+        return _EINVAL;
+    lock(&swap_config_lock, 0);
+    int err = swap_enable_locked(bytes, false, host_fd);
+    atomic_store_explicit(&swap_last_enable_err, err, memory_order_relaxed);
+    atomic_store_explicit(&swap_last_enable_bytes, bytes, memory_order_relaxed);
     unlock(&swap_config_lock);
     return err;
 }
@@ -461,7 +557,7 @@ int swap_slot_alloc(uint32_t *slot_out) {
         return _ENOSPC;
     }
     if (!atomic_load_explicit(&swap_on, memory_order_acquire) ||
-            swap_fd < 0 || swap_free_bitmap == NULL) {
+            !swap_area_live_locked()) {
         unlock(&swap_lock);
         // Counted, because "there was no area to evict into" and "the area the
         // user chose is full" are different things the /proc report should not
@@ -498,6 +594,11 @@ int swap_slot_alloc(uint32_t *slot_out) {
 void swap_slot_free(uint32_t slot) {
     if (slot == SWAP_SLOT_NONE)
         return;
+    // Unconditional, and outside swap_lock: the tier is a no-op for a slot it
+    // never held, and holding two locks across it would be an ordering rule
+    // nobody needs. Missing this would leak the compressed object permanently,
+    // because the slot number is the only thing that knows its handle.
+    zswap_forget(slot);
     lock(&swap_lock, 0);
     if (swap_free_bitmap == NULL || slot >= swap_slot_count) {
         unlock(&swap_lock);
@@ -512,7 +613,7 @@ void swap_slot_free(uint32_t slot) {
         swap_alloc_rover = slot;
     }
     bool drained = swap_slots_used == 0 &&
-        !atomic_load_explicit(&swap_on, memory_order_relaxed) && swap_fd >= 0;
+        !atomic_load_explicit(&swap_on, memory_order_relaxed) && swap_area_live_locked();
     int fd = -1;
     uint64_t *bitmap = NULL;
     if (drained) {
@@ -548,6 +649,31 @@ static int swap_fd_for_slot(uint32_t slot, off_t *at_out, size_t len) {
 }
 
 int swap_slot_write(uint32_t slot, const void *buf, size_t len) {
+    // The compressed tier gets first refusal. A frame it keeps costs no flash
+    // write at all -- not against the 24-hour budget, not against the device's
+    // wear -- and comes back roughly two orders of magnitude faster than one
+    // read from the file. It declines for an incompressible frame or a full
+    // pool, and then this proceeds exactly as it always did.
+    //
+    // Before the quiesce gate deliberately: that gate exists so the app is
+    // never mid-WRITE when iOS freezes it, and this path does no I/O.
+    if (zswap_store(slot, buf, len)) {
+        atomic_fetch_add_explicit(&swap_stat_pswpout, len / PAGE_SIZE,
+                                  memory_order_relaxed);
+        return 0;
+    }
+    // RAM-only: there is nowhere else for this frame to go. Refusing is the
+    // correct and safe answer -- the caller frees the slot and leaves the frame
+    // resident (emu/memory.c), so an incompressible frame or a full pool simply
+    // stops being evictable rather than being lost or silently written
+    // somewhere. This is the branch that makes a file-less area sound.
+    lock(&swap_lock, 0);
+    bool ram_only = swap_ram_only;
+    unlock(&swap_lock);
+    if (ram_only) {
+        atomic_fetch_add_explicit(&swap_stat_io_errors, 0, memory_order_relaxed);
+        return _ENOSPC;
+    }
     off_t at;
     int fd = swap_fd_for_slot(slot, &at, len);
     if (fd < 0)
@@ -813,6 +939,28 @@ int swap_slot_read(uint32_t slot, void *buf, size_t len) {
         atomic_fetch_add_explicit(&swap_stat_io_errors, 1, memory_order_relaxed);
         return _EIO;
     }
+    // Served from RAM if the tier took it on the way out. After the
+    // fault-injection knob above, so "every slot read will fail" keeps meaning
+    // exactly that.
+    if (zswap_load(slot, buf, len)) {
+        atomic_fetch_add_explicit(&swap_stat_pswpin, len / PAGE_SIZE,
+                                  memory_order_relaxed);
+        return 0;
+    }
+    // RAM-only: the pool is the ONLY place this frame's bytes ever were. If the
+    // tier does not have it, they are gone -- there is no file to fall through
+    // to, and reading one would hand the guest whatever those blocks contained.
+    // That is a bug in the tier or in slot accounting, not a recoverable state,
+    // so say so as loudly as possible rather than returning plausible garbage.
+    lock(&swap_lock, 0);
+    bool ram_only = swap_ram_only;
+    unlock(&swap_lock);
+    if (ram_only) {
+        printk("swap: BUG -- RAM-only slot %u is not in the compressed pool; "
+               "its contents are gone and there is no file to read\n", slot);
+        atomic_fetch_add_explicit(&swap_stat_io_errors, 1, memory_order_relaxed);
+        return _EIO;
+    }
     off_t at;
     int fd = swap_fd_for_slot(slot, &at, len);
     if (fd < 0)
@@ -882,6 +1030,10 @@ static bool swap_kswapd_started;                  // swap_config_lock
 static _Atomic bool swap_kswapd_stop;
 static _Atomic bool swap_kswapd_alive;
 static _Atomic uint64_t swap_stat_kswapd_passes;
+// Wake-ups and actual sweeps are different numbers now that unpressured reclaim
+// runs on a housekeeping cadence, and the gap between them IS the policy. Both
+// are reported so it can be seen rather than inferred.
+static _Atomic uint64_t swap_stat_kswapd_sweeps;
 static _Atomic uint64_t swap_stat_kswapd_bytes;
 static _Atomic uint64_t swap_stat_thrash_backoffs;
 static _Atomic uint64_t swap_stat_ledger_backoffs;
@@ -889,11 +1041,48 @@ static _Atomic bool swap_thrashing;
 
 // Should background reclaim be running right now?
 //
-// The watermark is DELIBERATELY ABOVE the one that refuses allocations. The
-// guard fires when the app is within host_mem_headroom_floor() of its ceiling,
-// and by then the guest is already being told no; a background reclaimer that
-// waited for the same point would be no earlier than direct reclaim and would
-// have no reason to exist. Two floors gives a band to work in.
+// FILE-BACKED: the watermark is DELIBERATELY ABOVE the one that refuses
+// allocations. The guard fires when the app is within host_mem_headroom_floor()
+// of its ceiling, and by then the guest is already being told no; a background
+// reclaimer that waited for the same point would be no earlier than direct
+// reclaim and would have no reason to exist. Two floors gives a band to work in.
+//
+// RAM-ONLY (zram) HAS NO WATERMARK AT ALL, and that is the point rather than an
+// oversight.
+//
+// Every gate around eviction was built for a swap FILE: reclaim writes to the
+// user's flash, which is metered against a 24-hour budget and wears out, so
+// waiting until the app is nearly dead is the right trade. In RAM-only mode
+// none of that is true. swap_write_frame takes the ram_only branch and returns
+// _ENOSPC before it ever reaches a file descriptor, so nothing is written and
+// the write window is never touched -- measured on a device: 864 kswapd passes,
+// 0 bytes reclaimed, `write_window 0 of 4294967296 bytes used`, with a 494 MB
+// pool completely empty and 931 MB of headroom to spare.
+//
+// A watermark was the wrong SHAPE here, not merely the wrong number, and two
+// tries at one failed the same way. Any threshold expressed against remaining
+// headroom says "wait until enough is gone", and there is nothing to wait for:
+// the host's own compressor does not wait, and this has no flash to protect.
+// The first attempt (half the budget) still left the device above the line; the
+// second added hysteresis and only made the hovering less frequent.
+//
+// So RAM-only reclaim runs whenever the POOL HAS ROOM and stops when it is
+// full. The cap is a size the user chose in Settings, and filling it with cold
+// frames is what choosing it asked for. What keeps that honest is not a
+// headroom test but three mechanisms that already exist:
+//
+//   * the aging clock, which offers only frames that have read cold across
+//     several sweeps, so hot memory is never a candidate;
+//   * the thrash guard, which pauses reclaim outright when evicted pages come
+//     straight back, whatever the headroom says;
+//   * the empty-sweep backoff in the kswapd loop, so a guest with nothing cold
+//     costs one sweep every ten seconds rather than two a second.
+//
+// The cost of being wrong is small, and was measured on that device: lz4 runs
+// at 2.46 us per 4 KiB page, so a 16 KiB frame costs ~10 us to compress and the
+// whole 494 MB pool well under a second of CPU, once. A frame faulted back
+// costs a decompress, ~39 us. Compressing is close to free; choosing hot frames
+// is what would cost, and the clock and the thrash guard are what prevent it.
 static bool swap_kswapd_should_reclaim(void) {
     uint64_t floor = host_mem_headroom_floor();
     if (floor == 0)
@@ -901,6 +1090,41 @@ static bool swap_kswapd_should_reclaim(void) {
     struct mem_budget budget = get_mem_budget();
     if (!budget.known || !budget.available_known)
         return false;                  // a reading nobody could take is not pressure
+
+    lock(&swap_lock, 0);
+    bool ram_only = swap_ram_only;
+    unlock(&swap_lock);
+    if (!ram_only)
+        return budget.available < floor * 2;
+
+    // A full pool ends it. In RAM-only mode the pool is the only destination,
+    // so once it is at capacity every further eviction compresses the frame,
+    // is declined for want of room, and leaves it resident -- the CPU is spent
+    // and nothing moves. Cheap to check, and essential now that there is no
+    // watermark keeping kswapd asleep.
+    //
+    // Read outside swap_lock: zswap has its own lock, and the pool figures are
+    // a hint either way -- a pass that races a free simply tries again in
+    // 500 ms.
+    struct zswap_stats z;
+    zswap_get_stats(&z);
+    if (z.enabled && z.max_bytes > 0 && z.pool_bytes >= z.max_bytes)
+        return false;
+    return true;
+}
+
+// True when the app is close enough to its ceiling that reclaim is a rescue
+// rather than housekeeping. The idle backoff must never apply here: a guest
+// that is genuinely running out cannot afford to wait ten seconds for the next
+// sweep, and in that state a pass that reclaims nothing means there was nothing
+// to reclaim, not that there is no hurry.
+static bool swap_kswapd_under_pressure(void) {
+    uint64_t floor = host_mem_headroom_floor();
+    if (floor == 0)
+        return false;
+    struct mem_budget budget = get_mem_budget();
+    if (!budget.known || !budget.available_known)
+        return false;
     return budget.available < floor * 2;
 }
 
@@ -927,6 +1151,43 @@ static bool swap_kswapd_should_reclaim(void) {
 // moved on gets reclaimed again promptly.
 #define SWAP_THRASH_COOLDOWN_PASSES 20
 static unsigned swap_thrash_cooldown;   // kswapd thread only
+
+// The empty-sweep backoff, which is what makes "no watermark" affordable.
+//
+// RAM-only reclaim no longer waits for pressure, so kswapd can find itself
+// sweeping a guest that simply has nothing cold. A sweep is not free even when
+// it evicts nothing: it takes a task snapshot and an address-space barrier per
+// mm, and those cost the guest's own threads. Twice a second, forever, for no
+// result, would be a real tax.
+//
+// So a pass that reclaims nothing doubles a skip count, up to ten seconds, and
+// any pass that reclaims something clears it. A guest with cold memory is swept
+// at the full rate; a guest without is sampled occasionally to find out whether
+// that has changed. Never applied under real pressure -- see
+// swap_kswapd_under_pressure.
+#define SWAP_IDLE_BACKOFF_MAX_PASSES 20
+static unsigned swap_idle_skip;         // kswapd thread only
+static unsigned swap_idle_backoff;      // kswapd thread only
+
+// Housekeeping cadence: how many 500 ms passes to skip between sweeps when
+// there is no pressure.
+//
+// The backoff above only helps when reclaim finds NOTHING, and that is not the
+// common case -- a guest usually has a trickle of newly-cold memory, so a
+// productive pass every few seconds resets the counter and the sweep rate stays
+// pinned at two a second. Measured: 60 passes in 30 s for 12 frames.
+//
+// A sweep is not free even when it is productive. It takes a task snapshot and
+// an address-space barrier per mm, and that barrier is paid by the guest's own
+// threads -- the same mechanism that makes mallocng's mmap/munmap churn
+// expensive (see mem_quiesce). Filling a pool is housekeeping, not a rescue, so
+// it runs at a quarter of the rate: 4 MB per slice every two seconds still
+// fills a 494 MB pool in a few minutes, which is far faster than the memory
+// goes cold in the first place.
+//
+// Under real pressure this does not apply and every pass sweeps.
+#define SWAP_HOUSEKEEPING_SKIP_PASSES 3
+static unsigned swap_housekeeping_skip; // kswapd thread only
 
 // The latch now carries its own deadline (emu/memory.c), so nothing here has to
 // clear it. This is only the transition LOGGER: it tells the user once when
@@ -977,6 +1238,11 @@ static void swap_thrash_check(uint64_t in_delta, uint64_t out_delta) {
 
 static void *swap_kswapd_main(void *UNUSED_ARG) {
     (void) UNUSED_ARG;
+    // Darwin's pthread_setname_np names the CALLING thread and takes only the
+    // name; every other platform takes the thread as well. Unguarded, this
+    // built on the Mac and broke the Linux CI job on both gcc and clang -- the
+    // second compiler that exists precisely to catch what the Mac build cannot
+    // (see kernel/task.c's update_thread_name, which already does this).
 #if __APPLE__
     pthread_setname_np("kswapd0");
 #else
@@ -1016,14 +1282,56 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
         pthread_mutex_unlock(&swap_quiesce_lock);
         if (gated)
             continue;
+        bool pressured = swap_kswapd_under_pressure();
+        if (!pressured) {
+            if (swap_idle_skip > 0) {
+                swap_idle_skip--;
+                continue;
+            }
+            if (swap_housekeeping_skip > 0) {
+                swap_housekeeping_skip--;
+                continue;
+            }
+            swap_housekeeping_skip = SWAP_HOUSEKEEPING_SKIP_PASSES;
+        } else {
+            swap_housekeeping_skip = 0;
+        }
         if (!swap_kswapd_should_reclaim())
             continue;
 
-        // NO mm_retain ANYWHERE IN HERE. The task reference from the snapshot
-        // is what keeps task->mm alive: do_exit waits on exactly those
-        // references (exit_wait_needed) before it calls mm_release, so the mm
-        // cannot be torn down while we hold one -- and kswapd never becomes the
-        // thread that runs mem_destroy, which it must not, having no `current`.
+        // NO mm_retain ANYWHERE IN HERE: kswapd must never become the thread
+        // that runs mem_destroy, having no `current` (swap.h). What keeps an
+        // address space alive across its sweep is the mem PIN instead --
+        // mem_ref_cnt_mod, which mm_release waits on before it tears the mem
+        // down -- taken under the task's general_lock, so it is in place
+        // before anyone can publish a different mm for that task.
+        //
+        // The task reference from the snapshot is NOT enough on its own, and
+        // believing it was killed the app on an iPad. do_exit does wait for
+        // those references before it releases the mm; EXEC does not. elf_exec
+        // and the native exec both swap task->mm and mm_release the old one
+        // with the task alive and referenced (kernel/exec.c), so an mm read
+        // from a snapshot task can be a freed one by the time the sweep
+        // reaches it. MEASURED 2026-09-06 on the A9 iPad, under a swap soak
+        // whose logger forked date/grep/cut every 30 seconds:
+        //
+        //   kswapd0: EXC_BAD_ACCESS address 0, mem_pgdir_chunk_get <- mem_pt
+        //   <- swap_frame_eligible <- swap_evict_common <- swap_evict_bytes
+        //   <- swap_kswapd_main, with mem->pgdir_root NULL -- exactly what
+        //   mem_destroy leaves behind.
+        //
+        // trylock, and skip the task on failure, for the reason fs/proc/root.c's
+        // collect_mem_page_stats documents: do_exit spins in exit_wait_backoff()
+        // with general_lock held, waiting for references that include the one
+        // this snapshot holds, so a blocking lock here is a deadlock. A task
+        // that cannot be locked is mid-exit and its address space is about to
+        // go anyway.
+        //
+        // What the pin costs: an exec that races the sweep spins in mm_release
+        // until the sweep of its OLD address space finishes, at most one slice,
+        // and that slice's writes go to an address space nothing will fault
+        // back in. Rare and bounded; the alternative was the crash above.
+        atomic_fetch_add_explicit(&swap_stat_kswapd_sweeps, 1, memory_order_relaxed);
         struct task_snapshot snapshot = {0};
         if (task_snapshot_collect(&snapshot, false) != 0)
             continue;
@@ -1035,22 +1343,45 @@ static void *swap_kswapd_main(void *UNUSED_ARG) {
                 break;
             if (atomic_load_explicit(&swap_kswapd_stop, memory_order_acquire))
                 break;
-            struct mm *mm = snapshot.tasks[i]->mm;
+            struct task *task = snapshot.tasks[i];
+            if (trylock(&task->general_lock) != 0)
+                continue;
+            struct mm *mm = task->mm;
+            if (mm != NULL)
+                mem_ref_cnt_mod(&mm->mem, 1);
+            unlock(&task->general_lock);
             if (mm == NULL)
                 continue;
+            // Every thread of a group names the same mm; sweep it once. (A
+            // pointer in seen[] may by now name a freed mm whose address was
+            // reused -- that only skips the newcomer for this pass.)
             bool already = false;
             for (unsigned j = 0; j < seen_count && !already; j++)
                 already = seen[j] == mm;
-            if (already)
+            if (already) {
+                mem_ref_cnt_mod(&mm->mem, -1);
                 continue;
+            }
             seen[seen_count++] = mm;
             long released = swap_evict_bytes(&mm->mem, SWAP_KSWAPD_SLICE_BYTES);
+            mem_ref_cnt_mod(&mm->mem, -1);
             if (released > 0)
                 got += (uint64_t) released;
         }
         task_snapshot_release(&snapshot);
         if (got != 0)
             atomic_fetch_add_explicit(&swap_stat_kswapd_bytes, got, memory_order_relaxed);
+        // Back off from a sweep that found nothing, so an idle guest is cheap;
+        // reset the moment one finds something, so a busy one is not slowed.
+        if (got == 0 && !pressured) {
+            swap_idle_backoff = swap_idle_backoff ? swap_idle_backoff * 2 : 1;
+            if (swap_idle_backoff > SWAP_IDLE_BACKOFF_MAX_PASSES)
+                swap_idle_backoff = SWAP_IDLE_BACKOFF_MAX_PASSES;
+            swap_idle_skip = swap_idle_backoff;
+        } else if (got != 0) {
+            swap_idle_backoff = 0;
+            swap_idle_skip = 0;
+        }
     }
     atomic_store_explicit(&swap_kswapd_alive, false, memory_order_release);
     return NULL;
@@ -1106,10 +1437,74 @@ void swap_set_preference(bool enabled, unsigned size_mb) {
     atomic_store_explicit(&swap_pref_seen, true, memory_order_release);
 }
 
+// A file on external storage for swap_startup to use instead of the container,
+// opened by the app from a security-scoped bookmark. -1 means none. Recorded,
+// like the preference, before swap_startup() acts on it.
+static int swap_external_fd = -1;
+
+void swap_set_external_fd(int fd) {
+    swap_external_fd = fd;
+}
+
+int swap_take_unused_external_fd(void) {
+    int fd = swap_external_fd;
+    swap_external_fd = -1;
+    return fd;
+}
+
+// Compressed memory with no swap area behind it.
+//
+// The addressable size is derived from the pool's cap rather than asked for
+// separately, and the MULTIPLIER IS USER-VISIBLE, which is the thing to get
+// right. Two constraints pull against each other:
+//
+//   - Too small and slots become the binding constraint. Eviction stops dead
+//     when they run out however much pool is left, which is the mistake the
+//     device runs caught: a 256 MB area capped eviction at 256 MB regardless of
+//     the pool.
+//   - Too large and it lies. This is what /proc/meminfo reports as SwapTotal
+//     and what /proc/swaps advertises, so ktop and free(1) print it. The first
+//     version used 8x, and a 128 MB pool showed up on an iPad as "Swp
+//     2.0M/1.00G" -- a gigabyte of swap the user does not have, on a device
+//     where the whole point is that nothing is on storage at all.
+//
+// 4x. Above the 2.2-2.8x measured on real workloads, so the pool still fills
+// before slots run out on anything typical, and close enough to reality that
+// the reported total means something: a 128 MB pool advertises 512 MB, which is
+// roughly what it can hold if the data compresses about as well as everything
+// measured so far. Data that compresses BETTER than 4x will run out of slots
+// first, and that is a real limit rather than a hidden one -- it shows up as
+// SwapFree reaching zero, which is exactly where a user would look.
+#define SWAP_RAM_ONLY_ADDRESSABLE_RATIO 4
+
+static void swap_start_ram_only(unsigned pool_mb) {
+    uint64_t addressable = (uint64_t) pool_mb *
+        SWAP_RAM_ONLY_ADDRESSABLE_RATIO * 1024 * 1024;
+    int err = swap_enable_ram_only(addressable);
+    if (err < 0) {
+        printk("zram: could not create a %u MB file-less area (%d)\n", pool_mb, err);
+        return;
+    }
+    zswap_startup();
+    if (!zswap_enabled()) {
+        // The area exists but nothing can use it: every eviction would be
+        // refused. Take it back down rather than leave a pager that cannot page.
+        printk("zram: the compressed tier did not come up; disabling the area\n");
+        swap_disable();
+    }
+}
+
 void swap_startup(void) {
     if (atomic_load_explicit(&swap_pref_seen, memory_order_acquire)) {
-        if (!atomic_load_explicit(&swap_pref_enabled, memory_order_relaxed))
+        if (!atomic_load_explicit(&swap_pref_enabled, memory_order_relaxed)) {
+            // Swap off. Compressed memory can still run on its own, with no
+            // file and nothing ever written to storage -- which is the
+            // configuration for a user whose worry is flash rather than RAM.
+            unsigned pool_mb = zswap_requested_mb();
+            if (pool_mb > 0)
+                swap_start_ram_only(pool_mb);
             return;
+        }
         unsigned mb = atomic_load_explicit(&swap_pref_size_mb, memory_order_relaxed);
         if (mb == 0) {
             // Refused rather than guessed, and said out loud. The UI is
@@ -1121,9 +1516,26 @@ void swap_startup(void) {
             printk("swap: enabled in Settings but no size chosen; staying off\n");
             return;
         }
-        int err = swap_enable((uint64_t) mb * 1024 * 1024);
+        // External fd: the iOS app restored a security-scoped bookmark and
+        // opened the swap file on a USB drive. Use it instead of creating an
+        // anonymous temp file in the container.
+        int ext_fd = swap_external_fd;
+        int err;
+        if (ext_fd >= 0) {
+            err = swap_enable_fd(ext_fd, (uint64_t) mb * 1024 * 1024);
+            if (err == 0) {
+                swap_external_fd = -1;  // ours now; see swap_enable_fd
+                printk("swap: enabled on external storage (fd %d)\n", ext_fd);
+            }
+            // On failure it stays recorded, and the app takes it back with
+            // swap_take_unused_external_fd() and closes it.
+        } else {
+            err = swap_enable((uint64_t) mb * 1024 * 1024);
+        }
         if (err < 0)
             printk("swap: enable failed (%d)\n", err);
+        else
+            zswap_startup();    // only once there is an area for it to front
         return;
     }
     // The CLI and Xcode-scheme path. Nothing on this branch is reachable from
@@ -1144,6 +1556,19 @@ void swap_startup(void) {
         atomic_store_explicit(&swap_fail_reads, true, memory_order_relaxed);
         printk("swap: FAULT INJECTION -- every slot read will fail\n");
     }
+    // The compressed tier's launch override. Settings is the shipping route
+    // (zswap_startup, called from the boot path); this is the CLI and Xcode one,
+    // and it wins because a developer who set it meant it.
+    const char *zmb = getenv("ISH_GUEST_ZSWAP_MB");
+    if (zmb != NULL && zmb[0] != '\0') {
+        long z = strtol(zmb, NULL, 10);
+        // Recorded rather than applied, so there is exactly one place the tier
+        // is brought up -- and it is after swap_enable below, because a pool
+        // with no area in front of it has nothing to front. Same reason the
+        // size is recorded as a preference just below.
+        if (z > 0)
+            zswap_set_preference(true, (unsigned) z);
+    }
     const char *budget = getenv("ISH_GUEST_SWAP_WRITE_BUDGET_MB");
     if (budget != NULL && budget[0] != '\0') {
         long mb_budget = strtol(budget, NULL, 10);
@@ -1154,17 +1579,40 @@ void swap_startup(void) {
         }
     }
     long want = strtol(mb, NULL, 10);
+    // ISH_GUEST_SWAP_MB=0 with a tier size asks for RAM-only, the same shape
+    // Settings gets when the swap switch is off and the compressed one is on.
+    if (want <= 0) {
+        unsigned pool_mb = zswap_requested_mb();
+        if (pool_mb > 0)
+            swap_start_ram_only(pool_mb);
+        return;
+    }
     // Record it as the preference as well. swapon(2) restores the area at the
     // size that was chosen for it, and on this branch the env knob IS that
     // choice -- without this, swapoff then swapon on the CLI could not come
     // back, which is the only place the pair can be exercised at all.
     if (want > 0)
         atomic_store_explicit(&swap_pref_size_mb, (unsigned) want, memory_order_relaxed);
-    if (want <= 0)
-        return;
-    int err = swap_enable((uint64_t) want * 1024 * 1024);
+    // ISH_GUEST_SWAP_FILE=<host path> puts the area in that file through
+    // swap_enable_fd, the path the app takes for a USB drive -- so the CLI can
+    // run it against a real exFAT or FAT32 volume (an hdiutil image) rather
+    // than only against the container's unlinked APFS temp file.
+    const char *file = getenv("ISH_GUEST_SWAP_FILE");
+    int err;
+    if (file != NULL && file[0] != '\0') {
+        int fd = open(file, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        err = fd < 0 ? _EIO : swap_enable_fd(fd, (uint64_t) want * 1024 * 1024);
+        if (fd >= 0 && err != 0)
+            close(fd);
+        if (err == 0)
+            printk("swap: ISH_GUEST_SWAP_FILE=%s\n", file);
+    } else {
+        err = swap_enable((uint64_t) want * 1024 * 1024);
+    }
     if (err < 0)
         printk("swap: ISH_GUEST_SWAP_MB=%s refused (%d)\n", mb, err);
+    else
+        zswap_startup();
 }
 
 // ---------------------------------------------------------------------------
@@ -1186,7 +1634,8 @@ void swap_get_stats(struct swap_stats *out) {
     // never true at once -- "on" beside a slot count from before an enable, or
     // "off, draining" beside the totals of an area that had just been created.
     out->enabled = atomic_load_explicit(&swap_on, memory_order_relaxed);
-    out->draining = swap_fd >= 0 && !out->enabled;
+    out->draining = swap_area_live_locked() && !out->enabled;
+    out->ram_only = swap_ram_only;
     out->write_budget_bytes = swap_write_budget;
     out->written_window_bytes = swap_written_window;
     unlock(&swap_lock);
@@ -1200,6 +1649,7 @@ void swap_get_stats(struct swap_stats *out) {
     out->kswapd_running = atomic_load_explicit(&swap_kswapd_alive, memory_order_relaxed);
     out->thrashing = atomic_load_explicit(&swap_thrashing, memory_order_relaxed);
     out->kswapd_passes = atomic_load_explicit(&swap_stat_kswapd_passes, memory_order_relaxed);
+    out->kswapd_sweeps = atomic_load_explicit(&swap_stat_kswapd_sweeps, memory_order_relaxed);
     out->kswapd_reclaimed_bytes = atomic_load_explicit(&swap_stat_kswapd_bytes, memory_order_relaxed);
     out->thrash_backoffs = atomic_load_explicit(&swap_stat_thrash_backoffs, memory_order_relaxed);
     out->release_ineffective = swap_release_ineffective();
@@ -1218,9 +1668,31 @@ size_t swap_status_text(char *buf, size_t size) {
         return 0;
     struct swap_stats s;
     swap_get_stats(&s);
+
+    // Only says anything when an enable was actually attempted AND refused.
+    // A refusal with no explanation reads exactly like "swap was never turned
+    // on", and the most likely cause is invisible from in here: the Settings
+    // picker offers up to 16 GB whatever the device has free, and swap_reserve
+    // refuses rather than handing back a smaller area than was asked for.
+    char failure[160] = "";
+    int last_err = atomic_load_explicit(&swap_last_enable_err, memory_order_relaxed);
+    if (!s.enabled && last_err != 0) {
+        unsigned long long mb =
+            (unsigned long long) (atomic_load_explicit(&swap_last_enable_bytes,
+                    memory_order_relaxed) / (1024 * 1024));
+        const char *why = last_err == _ENOSPC ? "not enough free space for an area that size"
+            : last_err == _EINVAL ? "size not usable"
+            : last_err == _EBUSY  ? "the previous area is still draining"
+            : last_err == _ENOMEM ? "out of memory"
+            : "refused";
+        snprintf(failure, sizeof(failure),
+                 "last_enable      %llu MB requested, refused: %s\n", mb, why);
+    }
+
     int n = snprintf(buf, size,
         "enabled          %s\n"
         "state            %s\n"
+        "backing          %s\n"
         "slot_size        %llu\n"
         "slots_total      %llu\n"
         "slots_free       %llu\n"
@@ -1230,15 +1702,22 @@ size_t swap_status_text(char *buf, size_t size) {
         "quiesced         %s  (suspension gate: no new eviction I/O)\n"
         "write_window     %llu of %llu bytes used in the last 24h\n"
         "budget_refusals  %llu  (evictions refused, the window is spent)\n"
-        "kswapd           %s, %llu passes, %llu bytes reclaimed\n"
+        "kswapd           %s, %llu passes, %llu sweeps, %llu bytes reclaimed\n"
         "thrashing        %s  (%llu backoffs)\n"
         "release_works    %s  (%llu sweeps moved no footprint, %llu backoffs)\n"
         "direct_reclaim   %llu  (bytes freed for an allocation that would have failed)\n"
         "alloc_failures   %llu  (evictions refused, the area is full)\n"
         "no_area          %llu  (evictions refused, there is no area)\n"
-        "io_errors        %llu\n",
+        "io_errors        %llu\n"
+        "%s",
         s.enabled ? "yes" : "no",
         s.enabled ? "on" : (s.draining ? "off, draining" : "off"),
+        // Say which one this is. "state on" with no file behind it would read
+        // as "writing to flash" to anyone who did not know RAM-only mode
+        // existed, which is the opposite of what it is doing.
+        !s.enabled ? "none" :
+            (s.ram_only ? "compressed memory only -- NO file, nothing is ever written to storage"
+                        : "a swap file"),
         (unsigned long long) s.slot_size,
         (unsigned long long) s.slots_total,
         (unsigned long long) s.slots_free,
@@ -1251,6 +1730,7 @@ size_t swap_status_text(char *buf, size_t size) {
         (unsigned long long) s.budget_refusals,
         s.kswapd_running ? "running" : "stopped",
         (unsigned long long) s.kswapd_passes,
+        (unsigned long long) s.kswapd_sweeps,
         (unsigned long long) s.kswapd_reclaimed_bytes,
         s.thrashing ? "yes" : "no",
         (unsigned long long) s.thrash_backoffs,
@@ -1262,7 +1742,8 @@ size_t swap_status_text(char *buf, size_t size) {
         (unsigned long long) s.direct_reclaim_bytes,
         (unsigned long long) s.alloc_failures,
         (unsigned long long) s.no_area,
-        (unsigned long long) s.io_errors);
+        (unsigned long long) s.io_errors,
+        failure);
     if (n < 0)
         return 0;
     return (size_t) n >= size ? size - 1 : (size_t) n;

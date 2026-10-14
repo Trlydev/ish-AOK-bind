@@ -2,6 +2,7 @@
 #define TASK_H
 
 #include <pthread.h>
+#include <stdint.h>
 #include <stdatomic.h>
 #include "emu/cpu.h"
 #include "kernel/abi.h"
@@ -14,6 +15,32 @@
 #include "util/list.h"
 #include "util/timer.h"
 #include "util/sync.h"
+#include "kernel/guestprof.h"
+
+struct ipc_namespace;
+
+// The highest capability number this kernel defines. /proc/sys/kernel/cap_last_cap
+// reports it, and it is chosen to match the 5.10 release AOK advertises
+// (kernel/uname.c): CAP_CHECKPOINT_RESTORE, 40, arrived in 5.9, after
+// CAP_PERFMON (38) and CAP_BPF (39) in 5.8.
+//
+// The "full" set is bits 0..CAP_LAST_CAP_ and deliberately NOT all ones. Linux
+// never reports a mask wider than the capabilities it actually has -- a 6.12 box
+// with cap_last_cap 40 reports CapBnd 000001ffffffffff -- and systemd uses an
+// all-ones mask as its own CAP_MASK_UNSET sentinel. pidref_get_capability()
+// rejects the WHOLE of /proc/PID/status with EBADMSG the moment a field parses
+// to it, so with all-ones AOK every ConditionCapability= in the unit set came
+// back "Couldn't determine result for ConditionCapability=CAP_SYS_ADMIN,
+// assuming failed: Bad message" and the unit was skipped -- systemd-sysext.socket,
+// dev-hugepages.mount, dev-mqueue.mount, sys-kernel-debug.mount and
+// sys-kernel-tracing.mount, every boot, in an openSUSE guest.
+//
+// Nothing gains or loses a capability by this: every capability AOK checks is
+// well below 38, so the three newest are held and dropped like any other but
+// never asked about.
+#define CAP_LAST_CAP_ 40
+#define CAP_FULL_LOW_ 0xffffffffu
+#define CAP_FULL_HIGH_ ((1u << (CAP_LAST_CAP_ - 31)) - 1)
 
 extern void task_ref_cnt_mod(struct task *task, int value);
 
@@ -64,6 +91,7 @@ static inline void task_io_counters_add(struct task_io_counters *dst,
 }
 struct futex; // opaque; defined in kernel/futex.c (see futex_restart_futex below)
 struct native_exec_pending; // opaque; defined in kernel/native.c
+struct native_program;   // kernel/native.h
 
 // The SELinux context every task carries when no policy has ever been loaded.
 // A real kernel reports u:r:kernel:s0 in that state, but only until init
@@ -96,6 +124,10 @@ struct task_security {
     char sockcreate[TASK_SECURITY_CONTEXT_MAX] __strncpy_safe;
 };
 
+struct mnt_namespace;
+struct user_namespace;
+struct pid_namespace;
+struct net_namespace;
 struct task {
     enum guest_abi abi;
     // Ticks since boot when this task was created -- /proc/<pid>/stat field 22
@@ -141,6 +173,13 @@ struct task {
     // storage because a native program's THREADS share one task, and the
     // thread that installs a handler is not always the one that delivers it.
     void *native_sigtable;
+    // The native program entry this task is running, or NULL. Read by
+    // kernel/checkpoint.c to find its ckpt_dump; see struct native_program.
+    const struct native_program *native_running;
+    // What that program said about itself when the checkpoint froze it,
+    // produced on its own thread and consumed by the writer on another. Owned
+    // by the task until the writer takes it.
+    char *ckpt_native_state;
 
     // Signals a native program has a handler for that the SHIM is blocking on
     // its behalf, and which the program itself has not asked to block.
@@ -192,6 +231,26 @@ struct task {
     
     int stuck_count;
 
+    // ---- the checkpoint freezer (kernel/checkpoint.c) --------------------
+    //
+    // `wanted` says this task must reach a syscall boundary and park; `frozen`
+    // says it has. Two flags rather than one because the freezer has to WAIT
+    // for the answer, and "I asked" and "it happened" are different facts --
+    // conflating them is how a checkpoint ends up describing a task that was
+    // still running.
+    //
+    // Atomic and nothing else: set by the freezing thread, read and answered
+    // by the task's own thread, with no lock between them. A task that is
+    // exiting simply never answers, which the freezer's timeout covers.
+    _Atomic bool ckpt_freeze_wanted;
+    _Atomic bool ckpt_frozen;
+    // This task came back from an image, and how many of its syscalls have
+    // been traced. Diagnostics only (ISH_CHECKPOINT_DEBUG): a restored guest
+    // that loads cleanly and then quietly falls over is this feature's usual
+    // failure, and the first few calls each task makes are what name it.
+    bool ckpt_restored;
+    unsigned ckpt_syscalls_traced;
+
     struct tgroup *group; // immutable
     struct list group_links;
     pid_t_ pid, tgid; // immutable
@@ -212,9 +271,11 @@ struct task {
     // and never blocked. Written only by the owning thread; read by others
     // under pids_lock via rusage_get_task.
     unsigned long minflt;
-    // Set by the swap-in path when a slot could not be read, consumed by the
-    // page-fault handler to deliver SIGBUS instead of SIGSEGV. Per-task because
-    // the fault is; see task_note_swap_io_fault below.
+    // Set by the swap-in path when a slot could not be read, and by a
+    // copy-on-write break that could not read the page it was to copy (a file
+    // page past the end of its file); consumed by the page-fault handler to
+    // deliver SIGBUS instead of SIGSEGV. Per-task because the fault is; see
+    // task_note_swap_io_fault below.
     bool swap_io_fault;
     // Set by tlb_handle_miss when the guest is committing memory and the host
     // is low on headroom; consumed by handle_timer_interrupt, which is the
@@ -264,6 +325,12 @@ struct task {
     uid_t_ *groups;
     char comm[16] __strncpy_safe; // locked by general_lock
     bool did_exec; // for that one annoying setsid edge case
+    // Bumped by every execve. Linux replaces the whole cred object there
+    // (prepare_exec_creds), so a descriptor opened before an exec is no longer
+    // one the caller opened "under the credentials it still holds" even though
+    // every uid and gid is unchanged -- and that is the only thing separating
+    // the two. Recorded on each descriptor; see struct fd's open_creds.
+    unsigned exec_gen;
 
     // SELinux process attributes, as exposed by /proc/<pid>/attr/* (fs/proc/pid.c).
     // Nothing here confines anything -- fs/selinuxfs.c is a permissive stub and
@@ -307,10 +374,8 @@ struct task {
         bool traced;
         bool stopped;
         // Attached via PTRACE_SEIZE (vs classic TRACEME/ATTACH). Determines how
-        // a job-control group-stop is reported to the tracer: a seized tracee
-        // gets a PTRACE_EVENT_STOP event-stop (which strace -f recognizes as a
-        // group-stop and resumes with PTRACE_CONT(0)); a classic tracee gets a
-        // plain signal-stop carrying the stop signal.
+        // a job-control group-stop is reported to the tracer, which is the one
+        // thing the two attach styles disagree about: see ptrace_group_stop.
         bool seized;
         bool sysgood;
         bool stop_at_syscall;
@@ -321,7 +386,68 @@ struct task {
         // delivered (run its action) on the next receive, not re-trapped through
         // signal_delivery_stop — otherwise an injected signal loops forever.
         int deliver_sig;
+        // A PTRACE_EVENT_STOP this task owes its tracer: Linux's
+        // JOBCTL_TRAP_STOP. PTRACE_INTERRUPT sets it, and so does the clone
+        // that hands a seizing tracer a new child, whose first stop it is. The
+        // task takes it at its next signal checkpoint, before any signal and
+        // whatever its mask says (ptrace_trap_stop_if_pending). Any stop at all
+        // answers it (ptrace_stop_common), and a detach drops it.
+        //
+        // Written under `lock`. Read without it, as task_trap_stop_pending, by
+        // every wait that has to end so the task can stop -- the same waits
+        // that ask checkpoint_freeze_pending, for the same reason.
+        //
+        // Until 2026-09-17 this was a queued SIGTRAP, and everything a signal
+        // does differently from a flag was a bug. A tracee with SIGTRAP blocked
+        // was never stopped, and one ignoring it dropped the interrupt. A new
+        // child could not be given one at all: glibc blocks every signal around
+        // pthread_create's and posix_spawn's clone, so the child got a SIGSTOP
+        // instead, which strace -f injected as a real signal. And an interrupt
+        // still queued when the tracer detached was an ordinary SIGTRAP from
+        // then on, which is how every process `strace -p` attached to used to
+        // die. See tests/manual/ptrace_seize_trap_stop.c and
+        // ptrace_detach_survives.c.
+        bool trap_stop;
         struct siginfo_ info;
+        // Whether this stop has a siginfo at all -- Linux's last_siginfo, which
+        // ptrace_stop() sets from the info it is handed and do_jobctl_trap
+        // passes as NULL for an UNSEIZED tracee's group-stop. PTRACE_GETSIGINFO
+        // fails with EINVAL when it is clear.
+        //
+        // This is the only thing that tells a classic tracee's group-stop from
+        // a signal-delivery-stop of the very same SIGSTOP: both report status
+        // 0x137f, and only the group-stop refuses GETSIGINFO. Measured on Linux
+        // 6.12.101; it is how gdb and strace tell the two apart, and AOK
+        // answered both, so every group-stop read as a signal to re-inject.
+        bool has_siginfo;
+
+        // Whether a signal the tracer injects to resume THIS stop is discarded
+        // rather than delivered. Linux splits the stops in exactly two: a
+        // signal-delivery-stop (ptrace_signal) and a syscall stop
+        // (ptrace_report_syscall, which re-sends it explicitly) pass the
+        // injected signal on, while do_jobctl_trap and ptrace_event -- every
+        // group-stop, PTRACE_INTERRUPT stop and PTRACE_EVENT_* stop -- throw
+        // away what ptrace_stop() returns. Measured on Linux 6.12.101:
+        // PTRACE_CONT(SIGUSR1) from a group-stop leaves the tracee running and
+        // unkilled, while the same injection at a syscall stop kills it.
+        //
+        // A flag of its own because it has to outlive the tracer's wait: the
+        // trap_event this could otherwise be read from is cleared by wait4 as
+        // it builds the status word (kernel/exit.c), long before the resume.
+        bool stop_discards_signal;
+
+        // PTRACE_LISTEN: the tracer has been shown this tracee's group-stop and
+        // asked for it to stay in it rather than be resumed. Linux's
+        // JOBCTL_LISTENING. The tracee waits the job-control stop out in
+        // group_stop_wait's listening branch without reporting it again, which
+        // is what keeps `kill -STOP` working on a process strace is attached
+        // to. Two things end a listen: a SIGCONT, reported as a
+        // PTRACE_EVENT_STOP carrying SIGTRAP, and a PTRACE_INTERRUPT, which
+        // re-reports the group-stop.
+        //
+        // Written under `lock` by the tracer and by the tracee itself; read
+        // without it by group_stop_wait, so accessed atomically like trap_stop.
+        bool listening;
         int trap_event;
         qword_t eventmsg;
         int syscall;
@@ -362,6 +488,12 @@ struct task {
     // not exiting. See fs/fuse.c's bounded wait.
     bool mm_teardown;
     bool io_block;
+    // This task's guestprof slot, or -1. On the task, not in thread-local
+    // storage, because the release hook runs on whichever thread reaps the
+    // struct. NOT inherited: task_create_ resets it explicitly, for the same
+    // reason it resets cpu.poked_ptr -- the whole-struct copy from the parent
+    // would otherwise hand a child its parent's slot to publish into.
+    int prof_slot;
     // Set once do_exit has banked this task's final thread CPU time into its
     // per-virtual-CPU accounting slot (task_bank_cpu_time); tells the
     // /proc/stat walker to stop live-sampling a thread that may be gone.
@@ -419,18 +551,25 @@ struct task {
     struct task_sockrestart sockrestart;
 
     // current condition/lock, so it can be notified in case of a signal
+    // (whether the wait is interruptible: waiting_interruptible, at the end)
     cond_t *waiting_cond;
     lock_t *waiting_lock;
     bool *waiting_interrupt_flag;
     lock_t waiting_cond_lock;
     bool wait_interrupted;
+    // What the signal that interrupted this syscall's wait says about
+    // restarting it (wake_waiting_task). It belongs to that one syscall:
+    // the dispatchers clear it before each syscall runs, so a syscall that
+    // never asks cannot leave it for the next (signal_restart_state_clear).
     bool restart_interrupted_syscall;
     // Same, but under ERESTARTNOHAND rules: set only when the interrupting
     // signal runs no handler. poll/select/epoll consult this one.
     bool restart_interrupted_syscall_nohand;
     // The syscall whose PC has just been rewound was an _ERESTART_NOHAND one,
     // so a handler about to run must cancel the restart. Set by the dispatcher
-    // at rewind time, consumed by receive_signal.
+    // at rewind time, consumed by receive_signal, and cleared as the next
+    // syscall starts -- the re-execution, after which there is no restart
+    // left to cancel (signal_restart_state_clear).
     bool restart_nohand_pending;
 
     // Set on the OTHER threads of a group by execve, which must leave exactly
@@ -447,13 +586,15 @@ struct task {
     // needs the second before it can release the old group leader.
     _Atomic bool exit_finished;
     // Linux's restart_block, in the two places AOK needs it: a timed wait
-    // restarted after a job-control stop -- poll/select/epoll_wait, or
-    // nanosleep -- must resume the deadline it already had, not start its
-    // relative timeout over. Set only when such a wait returns
-    // _ERESTART_NOHAND, and consumed by the re-executed syscall, which is
+    // restarted after a job-control stop or a checkpoint freeze --
+    // poll/select/epoll_wait, or nanosleep -- must resume the deadline it
+    // already had, not start its relative timeout over. Set only when such a
+    // wait returns _ERESTART_NOHAND, which is how both of those report
+    // themselves, and consumed by the re-executed syscall, which is
     // necessarily the very next one this task makes: _ERESTART_NOHAND
     // re-executes the same instruction, and a handler running in between
-    // cancels the restart outright (see restart_nohand_pending).
+    // cancels the restart outright (see restart_nohand_pending). Host
+    // CLOCK_MONOTONIC; a checkpoint image carries them on the guest's clocks.
     struct timespec poll_restart_deadline;
     bool poll_restart_valid;
     struct timespec sleep_restart_deadline;
@@ -481,7 +622,236 @@ struct task {
     // sighand->lock: set/cleared by the waiter in poll_wait, read by the signal
     // sender in deliver_signal_unlocked_locked.
     int poll_notify_fd;
+
+    // The child this task's exec stand-in is waiting on (kernel/native_libc.c,
+    // nlibc_exec_standin), or 0. A stand-in is ONLY that wait -- the program it
+    // "became" is running as that child -- so a checkpoint restores it as the
+    // wait and never by running the command that exec'd a second time.
+    //
+    // At the END of the struct on purpose: app code reads task fields, and the
+    // Xcode build does not reliably recompile it when this header changes, so a
+    // field added in the middle shifts every offset under a stale object.
+    dword_t native_standin_child;
+
+    // restart_nohand_pending's twin for an _ERESTART rewind: a handler about to
+    // run without SA_RESTART cancels the restart (Linux's ERESTARTSYS). Set by
+    // the dispatcher at rewind time, consumed by receive_signal, and cleared as
+    // the next syscall starts. At the end for the reason given just above.
+    bool restart_sys_pending;
+
+    // The ptrace-stop this task is in is a signal-delivery-stop: ptrace.info is
+    // the siginfo of a signal it was about to take, which is what a tracer
+    // that resumes it with that signal must see delivered (Linux's
+    // ptrace_signal). Locked by ptrace.lock. At the end for the reason given
+    // above native_standin_child.
+    bool ptrace_delivery_stop;
+
+    // This thread's own final CPU time, recorded by do_exit in the same step
+    // that rolls it into group->rusage and sets exit_rusage_counted; valid only
+    // once that flag is set, and locked by group->lock like it. What
+    // /proc/<pid>/task/<tid>/stat reports for a thread whose host thread is
+    // gone (rusage_get_thread_cpu). At the end for the reason given above
+    // native_standin_child.
+    struct timeval_ exit_utime, exit_stime;
+
+    // Whether the wait in waiting_cond is a wait_for, which a signal ends, or a
+    // wait_for_ignore_signals, which consumes no interruption: wake_waiting_task
+    // records one only for the first. Published and read under
+    // waiting_cond_lock. At the end for the reason given above
+    // native_standin_child.
+    bool waiting_interruptible;
+
+    // The guest clock the sleep behind sleep_restart_deadline was on. Within
+    // one process the deadline is simply kept, but a checkpoint image has to
+    // carry it on the clock Linux would count it on -- a relative sleep on
+    // CLOCK_BOOTTIME counts the time the machine was stopped, one on
+    // MONOTONIC or REALTIME does not (kernel/timer_ckpt.h). Set with
+    // sleep_restart_valid. At the end for the reason given above
+    // native_standin_child.
+    uint_t sleep_restart_clock;
+
+    // Linux's restart_block for a timed FUTEX_WAIT: the deadline the parked
+    // wait had (futex_restart_futex), and the relative timeout it was given,
+    // so that the restarted call -- the same futex, the same timeout --
+    // waits out the same deadline instead of its whole timeout again. Only
+    // for a restart nothing ran in front of: a handler clears it
+    // (receive_signal). Owned by the task itself. At the end for the reason
+    // given above native_standin_child.
+    struct timespec futex_restart_deadline;
+    struct timespec futex_restart_timeout;
+    bool futex_restart_timed;
+
+    // Linux's TIF_SIGPENDING, for the process's shared queue (sighand->queue)
+    // alone: this thread has been told to take what is queued there. A signal
+    // sent to the process tells ONE thread, as Linux's complete_signal does
+    // (deliver_signal_to_group_locked), and every other thread leaves the
+    // queue alone -- it ends none of their waits and they do not go looking
+    // in it (task_group_pending in kernel/signal.h) -- so the signal
+    // interrupts the thread that takes it and nobody else. Also set when a
+    // sibling hands a signal on (group_signal_retarget) and when this thread's
+    // own mask lets a queued one through (group_pending_mask_changed_locked);
+    // cleared by the thread itself once nothing there is left for it. Set
+    // and cleared under sighand->lock, read without it too. At the end for the
+    // reason given above native_standin_child.
+    bool group_sigpending;
+    // Shared-queue signals this thread was told to take and has since
+    // blocked, which it hands on to a sibling once it holds no lock
+    // (signal_group_handoff). The thread's own. At the end for the reason
+    // given above native_standin_child.
+    sigset_t_ group_handoff;
+
+    // PR_SET_NO_NEW_PRIVS: no exec by this thread gains privilege, set-id bit
+    // or not (exec_setid_plan). Per thread, as on Linux, and there is no way
+    // to clear it: a fork or clone inherits it through the struct copy, and an
+    // exec keeps it. The prctl was accepted and forgotten, so a sandbox that
+    // set it before running untrusted code could still be escaped with any
+    // setuid-root binary. The thread's own. At the end for the reason given
+    // above native_standin_child.
+    bool no_new_privs;
+    // Whether whoever made this task's ptrace link could have traced anything
+    // at all -- held CAP_SYS_PTRACE -- when it made the link. Linux keeps the
+    // credentials themselves (ptracer_cred), and asks them this one question,
+    // when a traced exec would gain privilege: a tracer that could not have
+    // attached to the privileged program must not get it by attaching first.
+    // The tracee's own for PTRACE_TRACEME, the tracer's for ATTACH and SEIZE,
+    // and a traced parent's for a child it is auto-attached to. Meaningful
+    // only while ptrace.traced. Written holding both pids_lock and ptrace.lock,
+    // so either is enough to read it. At the end for the reason given above
+    // native_standin_child.
+    bool ptrace_link_capable;
+    // seccomp (kernel/seccomp.h): the mode this thread is in and, in filter
+    // mode, the newest filter of its chain, one reference held. Per thread,
+    // as on Linux: a fork or clone inherits both (task_create_pid_ takes the
+    // reference) and an exec keeps them. Written by the thread itself or, for
+    // SECCOMP_FILTER_FLAG_TSYNC, by a sibling, always under pids_lock, and
+    // read at every syscall entry without it: through __atomic loads, and a
+    // filter a sibling replaced stays alive while it is read, because it is
+    // an ancestor of its replacement. At the end for the reason given above
+    // native_standin_child.
+    int seccomp_mode;
+    struct seccomp_filter *seccomp_filter;
+    // The capability bounding set (Linux's cap_bset): the most an exec may
+    // take from a file's permitted capabilities (and all root gets from one),
+    // and the ceiling on what capset may add to the inheritable set. A fork
+    // inherits it and an exec keeps it; PR_CAPBSET_DROP shrinks it and nothing
+    // grows it. It used to be the permitted set under another name, so a
+    // capability dropped from it came back at the next exec. The thread's
+    // own. At the end for the reason given above native_standin_child.
+    dword_t cap_bounding[2];
+    // rseq(2) (kernel/rseq.c): the registered area, 0 when there is none, with
+    // the length and signature it was registered with; and the CPU number the
+    // thread reports (mm->rseq_cpu_users). A fork keeps them and a thread does
+    // not (rseq_fork); an exec and an exit drop them. The thread's own. At the
+    // end for the reason given above native_standin_child.
+    guest_addr_t rseq_area;
+    dword_t rseq_len;
+    dword_t rseq_sig;
+    int rseq_cpu;
+    // The IPC namespace (kernel/ipc_ns.h): whose System V objects and POSIX
+    // message queues this task sees. Shared with the parent, one reference
+    // each, unless CLONE_NEWIPC or unshare(CLONE_NEWIPC) gave it a new one.
+    // Never NULL on a live task; general_lock guards the pointer against a
+    // /proc reader. At the end for the reason given above
+    // native_standin_child.
+    struct ipc_namespace *ipc_ns;
+    // Linux's JOBCTL_TRAP_NOTIFY: a SIGCONT has reached this SEIZED tracee's
+    // process since it last reported a PTRACE_EVENT_STOP, and it owes its
+    // tracer one saying so -- status 0x80057f, or the stop signal's if its
+    // group is job-control stopped again by the time it is taken. Every SIGCONT
+    // sets it, stopped or not (Linux's prepare_signal, ptrace_trap_notify).
+    // Taken wherever ptrace.trap_stop is, and task_trap_stop_pending answers
+    // for both, so every wait that ends for the one ends for the other. Only a
+    // PTRACE_EVENT_STOP clears it -- "any trap clears pending STOP trap, STOP
+    // trap clears NOTIFY" -- and a detach drops it.
+    //
+    // What it is for: strace starts its program stopped, seizes it, and sends
+    // the SIGCONT itself, then answers the group-stop it is shown with
+    // PTRACE_LISTEN. By then the SIGCONT has lifted the stop, and Linux
+    // re-traps at once because of this flag. AOK had no flag, so the tracee
+    // ran on from the LISTEN with no syscall stops at all, straight through
+    // its execve: strace said "Stray PTRACE_EVENT_EXEC", hid everything it
+    // traced until an execve it never saw, and `strace -c` printed no summary.
+    // Written under ptrace.lock, read without it. At the end for the reason
+    // given above native_standin_child.
+    bool ptrace_trap_notify;
+    // Threads a native program running on this task has started with
+    // pthread_create and that have not finished (nlibc_pthread_create). They
+    // run native code against this task, so while there are any its exec
+    // cannot replace the image in place (native_exec_in_place_wanted). Atomic;
+    // not inherited. At the end for the reason given above
+    // native_standin_child.
+    int native_helper_threads;
+    // What /proc/ish/arch names this process as (task_arch_name), recorded as
+    // do_exit begins and before its address space and native state go. A
+    // zombie has neither, and was simply left out of the table, so ktop's ARCH
+    // column read "?" for it. Set once, release-stored; NULL while alive. Not
+    // inherited. At the end for the reason given above native_standin_child.
+    const char *exit_arch;
+    // x86 debug registers DR0-DR7 as a tracer last wrote them through
+    // PTRACE_POKEUSER, so it reads back what it wrote. Nothing arms them:
+    // iSH-AOK has no hardware breakpoints, and a DR7 that would enable one is
+    // refused (kernel/ptrace.c ptrace_set_debugreg). Not inherited. At the
+    // end for the reason given above native_standin_child.
+    qword_t ptrace_debugreg[8];
+    // riscv64 PR_RISCV_V_SET/GET_CONTROL: the current setting in bits 0-1,
+    // the one the next exec takes in 2-3, and whether it is inherited past
+    // that exec in bit 4, as Linux keeps them (0 in bits 0-1 reads as on).
+    // Inherited by fork; exec applies it (riscv64_v_ctrl_exec). At the end
+    // for the reason given above native_standin_child.
+    dword_t riscv64_v_ctrl;
+    // The tracer's last resume was PTRACE_SINGLESTEP (cpu.tf is then its doing,
+    // not the guest's): entering a signal handler keeps stepping rather than
+    // clearing TF as it does for the guest's own (x86_signal_handler_flags).
+    // Not inherited. At the end for the reason given above native_standin_child.
+    bool ptrace_singlestep;
+    // One thread of a native program at a time takes its pending signals
+    // (nlibc_deliver_signals_count). The program's own threads share this
+    // task and every one of them passes a checkpoint on each syscall; two
+    // collecting at once were two sigtimedwaits on one task, which asserts
+    // (signal.c: current->waiting == 0) -- the emulator's abort, found with
+    // two tokio programs running and a child exiting in each. Atomic; not
+    // inherited; cleared where native_helper_threads is. At the end for the
+    // reason given above native_standin_child.
+    int native_delivering;
+    // The mount namespace this task is in (kernel/mnt_ns.h), NULL for the
+    // initial one. Owns a reference. Not inherited by task_create_: a clone
+    // takes it from its parent in copy_task, and a task the app starts is in
+    // the initial namespace whatever its parent did. At the end for the
+    // reason given above.
+    struct mnt_namespace *mnt_ns;
+
+    // The user namespace this task is in (kernel/user_ns.h), NULL for the
+    // initial one. Owns a reference. Like mnt_ns, not inherited by
+    // task_create_: copy_task hands it on, and nothing else may -- a task
+    // that came by it any other way would be the machine's root again.
+    struct user_namespace *user_ns;
+
+    // The pid namespace this task is in (kernel/pid_ns.h), NULL for the
+    // initial one, and the one its children will be made in when that is
+    // another (unshare(CLONE_NEWPID); NULL for "the same"). Each owns a
+    // reference. Like the two above, handed on by copy_task alone.
+    struct pid_namespace *pid_ns;
+    struct pid_namespace *pid_ns_for_children;
+
+    // The network namespace this task is in (kernel/net_ns.h), NULL for the
+    // initial one. Owns a reference; handed on by copy_task alone.
+    struct net_namespace *net_ns;
+
+    // Split LOCK operations (emu/tlb.c, x86_lock_split_begin): when this
+    // thread last did one, monotonic nanoseconds (0: never), read by its
+    // siblings; that it is to stand aside for a quantum at its next exit
+    // from the JIT, because that one took the address space from a sibling
+    // running guest code that is not doing them itself; and when it last
+    // finished standing aside.
+    _Atomic uint64_t split_lock_stamp;
+    bool split_lock_wait;
+    uint64_t split_lock_stood_aside;
 };
+// whether the riscv64 V extension is on for this task (PR_RISCV_V_*)
+static inline bool riscv64_v_enabled(struct task *task) {
+    return (task->riscv64_v_ctrl & 3) != 1;
+}
+void riscv64_v_ctrl_exec(struct task *task);
 
 // current will always give the process that is currently executing
 // if I have to stop using __thread, current will become a macro
@@ -505,6 +875,11 @@ static inline bool task_is_64bit(const struct task *task) {
 // parent as NULL to create the init process. Returns NULL if out of memory.
 // Ends with an underscore because there's a mach function by the same name
 struct task *task_create_(struct task *parent);
+// The same, but claiming a SPECIFIC pid rather than the next free one. For
+// kernel/checkpoint.c: a restored process has to answer to the pid it had, or
+// every $$, getppid() and recorded child pid in the guest is wrong. Returns
+// NULL if that pid is already taken or reserved.
+struct task *task_create_with_pid(struct task *parent, pid_t_ want);
 
 // Synthetic kernel threads (kernel/task.c). They have no task and no thread --
 // just enough of /proc for ps to render them bracketed, which is what programs
@@ -528,6 +903,9 @@ void task_never_ran_destroy(struct task *task);
 // misc
 void vfork_notify(struct task *task);
 pid_t_ task_setsid(struct task *task);
+// Put a restored process back in the session and process group the image gives
+// it -- see kernel/group.c. Only kernel/checkpoint.c has any business here.
+void tgroup_restore_ids(struct task *task, pid_t_ sid, pid_t_ pgid);
 void task_leave_session(struct task *task);
 // True when no member of this process group has a parent elsewhere in the same
 // session -- so nothing outside it could continue it after a stop. Requires
@@ -538,18 +916,28 @@ struct posix_timer {
     // For a CLOCK_THREAD_CPUTIME_ID timer: the thread whose CPU clock it
     // counts against. See posix_timer_thread_cpu_now in kernel/time.c.
     pid_t_ cpu_clock_pid;
+    // The guest clockid it was created on. timer->clockid is only the host
+    // clock under it, which on Darwin is the same for MONOTONIC and BOOTTIME;
+    // an absolute arming needs to know which one the deadline is on. (Here,
+    // in what was padding, so struct tgroup keeps its size.)
+    uint_t clock;
     struct timer *timer;
     int_t timer_id;
+    // Armed with TIMER_ABSTIME. An absolute arming on a wall clock is an
+    // instant, which the time the machine spends stopped across a checkpoint
+    // brings nearer, where a relative one is kept on MONOTONIC and does not
+    // (kernel/timer_ckpt.h). Padding again.
+    bool abstime;
     struct tgroup *tgroup;
     pid_t_ thread_pid;
     int_t signal;
     union sigval_ sig_value;
-    // Overruns counted onto the signal currently queued for this timer, which
-    // is what timer_getoverrun reports. Reset when a fresh signal is queued,
-    // so a handler that reads it sees the count for the expiration it was
-    // just woken for -- the call's only real use. (Linux latches the value at
-    // delivery rather than at queueing, so the two differ only for a caller
-    // that asks while its own timer signal is still blocked and pending.)
+    // What timer_getoverrun reports: the si_overrun of this timer's signal
+    // most recently TAKEN (signal_timer_taken in kernel/signal.c), 0 until one
+    // is and again after every timer_settime -- where Linux latches it. It
+    // used to follow the signal still queued, reset to 0 when a fresh one was
+    // queued, so a handler that outlived a period asked for its own count and
+    // got 0, or the count building behind it.
     int_t last_overrun;
 };
 
@@ -646,6 +1034,44 @@ struct tgroup {
     // for everything in this struct not locked by something else.
     // Lock ordering: pids_lock -> group->lock -> tty->lock.
     lock_t lock;
+
+    // Threads of this process that have exited but are still zombies, because
+    // a tracer has not reaped them yet (kernel/exit.c). A traced task's exit is
+    // its tracer's to collect, so such a thread stays in the pid table after
+    // it has left `threads`. Until the count is back to zero the process
+    // cannot be reaped and its exit is not announced -- Linux's
+    // delay_group_leader -- which is also what keeps this struct alive for
+    // them: it is freed with the leader. Locked by pids_lock.
+    //
+    // At the end of the struct for the same reason native_standin_child is at
+    // the end of struct task.
+    int traced_zombies;
+    // The last thread has gone while traced_zombies was not zero, so telling
+    // the parent (or tracer) is owed to whoever releases the last of them.
+    // Locked by pids_lock.
+    bool exit_notify_deferred;
+    // A SIGCONT resumed this stopped process and its parent has not been told
+    // yet: Linux's SIGNAL_CLD_CONTINUED, which the first thread back from the
+    // stop takes and reports (group_stop_wait). `continued` is the other half,
+    // what a WCONTINUED wait reports, and only that wait clears it -- read in
+    // this one's place, every thread coming back from the stop told the parent
+    // again, and every stop after an unwaited continue was followed by another
+    // CLD_CONTINUED however it ended. A new stop drops it, as Linux's
+    // signal_set_stop_flags does. Lock: group->lock.
+    bool continue_unannounced;
+    // Linux's dumpable flag, inverted so a zeroed group is dumpable: set, the
+    // process may not be inspected -- ptrace, /proc/<pid>/mem, maps, fd and
+    // the rest (task_ptrace_may_access) -- by anyone without CAP_SYS_PTRACE,
+    // even its own user. Set by PR_SET_DUMPABLE(0) (which ssh-agent and sshd
+    // call to keep keys out of reach), by an exec that leaves euid != uid or
+    // egid != gid or runs a binary its caller cannot read, and by a change of
+    // effective or filesystem ids (cred_change_commit). Cleared by an ordinary
+    // exec and PR_SET_DUMPABLE(1). Linux keeps it in the mm; here the process
+    // is the right owner, since a thread group shares one mm and reading
+    // group needs no lock. Inherited by fork through tgroup_copy's struct
+    // copy, as Linux's dup_mm copies it. At the end for the reason given
+    // above traced_zombies.
+    _Atomic bool undumpable;
 };
 
 // Is this thread group the leader of its session? Linux keeps this as a
@@ -660,8 +1086,27 @@ static inline bool tgroup_is_session_leader(struct tgroup *tgroup) {
 }
 
 
+// The architecture a process runs, as /proc/ish/arch names it: the machine
+// uname(2) reports inside it; for a program running as host code, the host's
+// machine marked "(n)"; "-" with no address space. A static string.
+const char *task_arch_name(struct task *task);
+
 static inline bool task_is_leader(struct task *task) {
     return task->group->leader == task;
+}
+
+// The parent of `task`'s PROCESS, which is the parent every thread of it
+// reports -- getppid(), /proc/<pid>/task/<tid>/stat and status, taskstats --
+// as on Linux, where the thread group shares one real_parent. A thread's own
+// ->parent will not do: in AOK a thread is a child of the thread that created
+// it (kernel/fork.c), so for every thread but the first it is a thread of the
+// same process, which then reported itself as its own parent. The leader stays
+// its process's leader after it exits, and moves with the process when it is
+// reparented. Caller holds pids_lock.
+static inline struct task *task_process_parent(struct task *task) {
+    struct task *leader = task->group != NULL && task->group->leader != NULL ?
+        task->group->leader : task;
+    return leader->parent;
 }
 
 struct pid {
@@ -670,6 +1115,11 @@ struct pid {
     struct list alive; // list of alive pids
     struct list session;
     struct list pgroup;
+    // The innermost pid namespace this number has a number of its own in
+    // (kernel/pid_ns.h): it has one in that namespace and in each one above
+    // it. NULL for a pid of the initial namespace. Owns a reference, for as
+    // long as the slot holds anything; guarded by pids_lock.
+    struct pid_namespace *numbered_ns;
 };
 
 // @alive_pids_list is used as a head of all active pids.
@@ -691,19 +1141,46 @@ struct task_snapshot {
 // synchronizes obtaining a pointer to a task and freeing that task
 extern lock_t pids_lock;
 // these functions must be called with pids_lock
+//
+// By number AS THE CALLING TASK KNOWS IT (kernel/pid_ns.h): in a pid
+// namespace a number names only what is in that namespace, and 1 is its init.
+// For a number a guest supplied. Off a task, and in the initial namespace,
+// these are the _global ones.
 struct pid *pid_get(dword_t pid);
 struct pid *pid_get_last_allocated(void);
 struct task *pid_get_task(dword_t pid);
 struct task *pid_get_task_ref(dword_t pid);
 struct task *pid_get_task_zombie(dword_t id); // don't return null if the task exists as a zombie
 struct task *pid_get_task_zombie_ref(dword_t id); // ...and take a reference, like pid_get_task_ref
+// By machine number, whoever is asking: for a number the kernel holds (a
+// task's own pid or tgid, a stored group, a timer's target, the app's).
+struct pid *pid_get_global(dword_t pid);
+struct task *pid_get_task_global(dword_t pid);
+struct task *pid_get_task_global_ref(dword_t pid);
+struct task *pid_get_task_zombie_global(dword_t id);
+struct task *pid_get_task_zombie_global_ref(dword_t id);
+// Give `task`'s pid its numbers in the task's pid namespace and those above
+// it, and take them back: when a fork that had them fails, and when the
+// number stops naming anything (the task reaped, and no process group or
+// session left under it). Caller holds pids_lock.
+int pid_ns_number_task(struct task *task);
+void pid_ns_unnumber(dword_t id);
+void pid_ns_unnumber_if_empty(dword_t id);
 int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only);
+int task_snapshot_collect_all(struct task_snapshot *snapshot);
 void task_snapshot_release(struct task_snapshot *snapshot);
+// Take ANOTHER task's general_lock while holding a reference on it (a /proc
+// handler, a snapshot walk, a peer's memory access). Returns false, without the
+// lock, when that task is in do_exit's teardown; see kernel/task.c.
+bool task_lock_unless_exiting(struct task *task);
 
 dword_t get_count_of_blocked_tasks(void);
 // Live processes (thread group leaders) owned by one real uid, for
 // RLIMIT_NPROC.
 dword_t task_count_for_uid(uid_t_ uid);
+// Would one more process for `task`, whose own soft RLIMIT_NPROC is `soft`,
+// be over the limit at any level of its user namespaces? kernel/task.c.
+bool task_nproc_exceeded(struct task *task, rlim_t_ soft);
 // Count one minor fault against the running task, if there is one. Called from
 // the emulator's fault paths, which can also run with no current task.
 static inline void task_count_minflt(void) {
@@ -735,28 +1212,105 @@ static inline bool task_take_swap_io_fault(void) {
     return true;
 }
 dword_t get_count_of_alive_tasks(void);
+// The guest's 1/5/15-minute load averages, scaled by 65536 as sysinfo(2)
+// reports them. Sampled every 5 s by a timer thread, as on Linux, so the
+// answer does not depend on who reads it or how often; see kernel/task.c.
 void get_guest_loadavg(uint64_t out[3]);
 
-// Live user/system CPU time of one task's host thread, in jiffies (USER_HZ =
-// 100). Works cross-thread. Reports 0/0 if the thread is gone or the host
-// won't say (on non-Mach hosts the user/system split isn't available and the
-// total is reported as user time).
-void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned long *out_stime);
+// Time since the guest booted, on a monotonic host clock (the one the guest's
+// CLOCK_BOOTTIME reads), with its zero placed at the whole second boot_time
+// names. Never goes backward within a boot. The platform get_uptime()
+// implementations report this, and so should anything that wants guest
+// uptime at a finer grain than their ticks.
+uint64_t guest_uptime_ns(void);
+// The guest's reading of guest clock `clock` -- a guest clockid, CLOCK_*_ --
+// which the host reads as `host_clock`, clockid_to_real's answer for it. For a
+// boot-relative one (CLOCK_MONOTONIC, CLOCK_BOOTTIME, CLOCK_MONOTONIC_RAW and
+// their variants) that is the host's reading minus the guest's origin for that
+// clock, so the guest sees time since ITS boot rather than the host's -- the
+// host may have been up for weeks. For any other clock (CLOCK_REALTIME, the
+// CPU-time clocks) it is the host's reading of host_clock unchanged.
+//
+// The GUEST clockid, because it is the guest's clock that has the origin, not
+// the host clock under it: on Darwin the guest's MONOTONIC and BOOTTIME are
+// both the host's CLOCK_MONOTONIC, and after a checkpoint restore they read
+// different values (guest_clock_resume). A timer keeps the guest clockid it
+// was created with for the same reason.
+//
+// Every place a guest-visible absolute time on one of these clocks is read or
+// interpreted must go through this and not timespec_now(): clock_gettime, and
+// the four sites that turn a guest's absolute deadline into an interval
+// (clock_nanosleep/timer_settime/timerfd_settime with TIMER_ABSTIME, and
+// futex FUTEX_WAIT_BITSET). Everything else in the tree -- the timer thread,
+// poll, the socket and futex wait loops -- compares host readings only with
+// other host readings and must keep using timespec_now().
+struct timespec guest_clock_now(uint_t clock, clockid_t host_clock);
+// The same rebasing applied to a reading the caller already took of the host
+// clock under `clock`, for clock_gettime -- which must keep reporting the
+// host's errno rather than silently substituting a fallback clock the way
+// timespec_now does.
+struct timespec guest_clock_from_host(uint_t clock, struct timespec host);
+
+// The guest's boot-relative clocks read at one instant, with the host's wall
+// clock at that instant: what a checkpoint image carries so that a restored
+// machine's clocks go on from where they were instead of restarting at zero.
+// All in ns except boot_time, which is kernel/task.c's boot_time -- the whole
+// second uptime counts from.
+struct guest_clock_reading {
+    int64_t monotonic_ns;
+    int64_t boottime_ns;    // which is also uptime
+    int64_t raw_ns;
+    int64_t realtime_ns;
+    int64_t boot_time;
+};
+void guest_clock_read(struct guest_clock_reading *out);
+// Put the guest's clocks back where `saved` left them, the way a resume from
+// hibernation does on Linux: CLOCK_MONOTONIC and CLOCK_MONOTONIC_RAW go on
+// from their saved values, and CLOCK_BOOTTIME (uptime) also counts the
+// wall-clock time since `saved` was read. For a checkpoint restore, before
+// any restored task runs; see kernel/task.c for why. Returns that time, the
+// ns BOOTTIME was advanced by.
+int64_t guest_clock_resume(const struct guest_clock_reading *saved);
+// Start the guest's clocks again from `boot`, as a boot does. What a restore
+// that failed after guest_clock_resume puts back, so the fresh boot that
+// follows it does not inherit the image's clocks.
+void guest_clock_restart(time_t boot);
+// The same in 100 Hz ticks, the unit struct uptime_info carries -- for now
+// rounded to whole tenths of a second, for the /proc/uptime format reason
+// given at the definition.
+uint64_t guest_uptime_ticks(void);
+// /proc/stat's aggregate "cpu" line, from this process's cumulative user and
+// system CPU time in ns: capacity is get_cpu_count() times guest uptime, and
+// every field only ever grows. For the platform get_total_cpu_usage()s.
+struct cpu_usage;
+void guest_cpu_usage_total(uint64_t user_ns, uint64_t system_ns, struct cpu_usage *out);
+
+// Live user/system CPU time of one task's host thread. Works cross-thread.
+// Reports 0/0 if the thread is gone or the host won't say (on non-Mach hosts
+// the user/system split isn't available and the total is reported as user
+// time). In nanoseconds, to the host's own precision (microseconds on Darwin).
+void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns);
+// The calling host thread's own CPU clock, in nanoseconds (kernel/task.c).
+uint64_t host_thread_cpu_ns_self(void);
 // Charges the exiting task's final thread CPU time to its per-virtual-CPU
 // accounting slot; called once from do_exit while the host thread still
 // exists to be queried. Sets task->cpu_time_banked.
 void task_bank_cpu_time(struct task *task);
 // Per-emulated-CPU usage for /proc/stat's cpuN lines: each task's real thread
-// CPU time charged to slot pid % ncpu (live tasks sampled, exited tasks from
-// the banked totals). Returns 0 and a malloc'd get_cpu_count()-sized array,
-// or _ENOMEM.
-struct cpu_usage;
+// CPU time charged to slot pid % get_cpu_count_allowed(), so the online CPUs
+// outside the affinity mask stay idle (live tasks sampled, exited tasks from
+// the banked totals), against the guest's uptime as each slot's capacity. No
+// field ever decreases between calls. Returns 0 and a malloc'd
+// get_cpu_count()-sized array, or _ENOMEM.
 int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage);
 
 #define MAX_PID (1 << 15) // oughta be enough
 
-// The wrap point for pid allocation, settable through
-// /proc/sys/kernel/pid_max. Bounded by MAX_PID, which sizes the table.
+// Linux's PID_MAX_LIMIT on a 64-bit kernel: the most kernel.pid_max accepts.
+#define PID_MAX_LIMIT (4 * 1024 * 1024)
+
+// /proc/sys/kernel/pid_max, 301..PID_MAX_LIMIT. Pid allocation wraps at the
+// smaller of it and MAX_PID, which sizes the table (kernel/task.c).
 dword_t task_pid_max(void);
 int task_set_pid_max(dword_t value);
 
@@ -766,6 +1320,9 @@ int task_set_pid_max(dword_t value);
 int must_check task_start(struct task *task);
 void task_run_current(void);
 void task_poke_shared_mem(struct task *task, struct mem *mem);
+// The same, counting the siblings found in or near guest code whose last
+// split LOCK operation was before `splitters_since` (or never).
+unsigned task_poke_shared_mem_counting(struct task *task, struct mem *mem, uint64_t splitters_since);
 
 extern void (*exit_hook)(struct task *task, int code);
 // Called when the init process (pid 1) exits, before the brutal halt_system_locked()
@@ -773,21 +1330,42 @@ extern void (*exit_hook)(struct task *task, int code);
 // terminates the host process with a status derived from init's exit code, so the
 // host exit status mirrors the guest's instead of the process dying via the
 // pthread_kill(SIGKILL) sweep. Left NULL by the iOS app, preserving its behavior.
+// Raw return addresses from another task's HOST thread, innermost first: where
+// a task that will not park actually IS. Returns how many were collected, 0 if
+// the thread cannot be read. See kernel/task.c.
+unsigned task_host_backtrace(struct task *task, uintptr_t *frames, unsigned max);
+// The same walk for any host thread the caller knows to be alive.
+unsigned host_thread_backtrace(pthread_t thread, uintptr_t *frames, unsigned max);
+
 extern void (*halt_hook)(int status);
 
-#define superuser() (current != NULL && current->euid == 0)
+// Root over the machine: euid 0 in the initial user namespace. A task in a
+// user namespace of its own is never this, whatever its ids -- there it has
+// the capabilities ns_capable() finds (kernel/user_ns.h), and nothing else.
+#define superuser() (current != NULL && current->euid == 0 && current->user_ns == NULL)
 
+#define CAP_NET_ADMIN_ 12
+#define CAP_DAC_OVERRIDE_ 1
+#define CAP_KILL_ 5
 // Linux capability numbers, for the gates below. Only the ones something
 // actually checks are listed; add as needed rather than transcribing all 40.
+#define CAP_CHOWN_       0
+#define CAP_DAC_READ_SEARCH_ 2
+#define CAP_FOWNER_      3
 #define CAP_FSETID_      4
 #define CAP_SETGID_      6
 #define CAP_SETUID_      7
+#define CAP_SETPCAP_     8
+#define CAP_NET_RAW_     13
+#define CAP_IPC_LOCK_    14
 #define CAP_SYS_CHROOT_  18
+#define CAP_SYS_PACCT_   20
 #define CAP_SYS_PTRACE_  19
 #define CAP_NET_BIND_SERVICE_ 10
 #define CAP_SYS_ADMIN_   21
 #define CAP_SYS_NICE_    23
 #define CAP_SYS_RESOURCE_ 24
+#define CAP_SETFCAP_     31
 #define CAP_WAKE_ALARM_  35
 
 // The equivalent of Linux's capable(): true if the caller holds `cap` in its
@@ -796,6 +1374,33 @@ extern void (*halt_hook)(int status);
 // way it would on Linux. Implemented in kernel/getset.c, next to the capset
 // machinery that maintains the sets.
 bool current_capable(unsigned cap);
+
+// What Linux's commit_creds compares to decide that a change of the caller's
+// own credentials forgets its parent-death signal (PR_SET_PDEATHSIG): the
+// effective and filesystem ids, and the permitted capabilities. Taken with
+// cred_change_begin before the change and handed to cred_change_commit after
+// it. Implemented in kernel/getset.c.
+struct cred_change {
+    uid_t_ euid, egid, fsuid, fsgid;
+    dword_t cap_permitted[2];
+};
+void cred_change_begin(struct cred_change *change);
+void cred_change_commit(const struct cred_change *change);
+
+// Linux's ptrace_may_access(): may the caller inspect `target` -- trace it,
+// read its memory, or read what /proc says about its address space, open
+// files, working directory and executable? A thread of the caller's own
+// process always may. Otherwise the caller's uid and gid must equal ALL of
+// the target's real, effective and saved ids, and the target must be
+// dumpable; CAP_SYS_PTRACE overrides both. Which of the caller's ids count
+// is the mode's: FSCREDS the filesystem ids (/proc), REALCREDS the real ones
+// (ptrace attach, kcmp). READ and ATTACH differ only in LSM policy Linux may
+// add, and are both accepted for the record.
+#define PTRACE_MODE_READ_      0x01
+#define PTRACE_MODE_ATTACH_    0x02
+#define PTRACE_MODE_FSCREDS_   0x04
+#define PTRACE_MODE_REALCREDS_ 0x08
+bool task_ptrace_may_access(struct task *target, unsigned mode);
 
 // The equivalent of Linux's ptrace_may_access(PTRACE_MODE_ATTACH_FSCREDS):
 // may the caller read or write `target`'s memory? Anything that exposes one
@@ -832,11 +1437,18 @@ void task_pthread_canary_note_unwind(void);
 // unblock it after the function is executed.
 __attribute__((always_inline)) inline int task_may_block_start(void) {
     current->io_block = 1;
+    // The profiler's off-CPU bucket. Without it a workload that spends its wall
+    // time waiting on a socket reports as "not in guest code", which reads like
+    // emulator overhead rather than the network.
+    if (unlikely(guestprof_on))
+        guestprof_state(GUESTPROF_BLOCKED);
     return 0;
 }
 
 __attribute__((always_inline)) inline int task_may_block_end(void) {
     current->io_block = 0;
+    if (unlikely(guestprof_on))
+        guestprof_state(GUESTPROF_KERNEL);
     return 0;
 }
 

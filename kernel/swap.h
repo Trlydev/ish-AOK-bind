@@ -56,6 +56,17 @@ bool swap_enabled(void);
 // Idempotent for the same size. A different size is a disable followed by an
 // enable, so it pages everything back in first.
 int swap_enable(uint64_t bytes);
+// An area with slots but NO FILE: every eviction must be taken by the
+// compressed tier or refused, and nothing is ever written to storage. `bytes`
+// is the addressable size, not the memory used -- see swap_ram_only in swap.c.
+int swap_enable_ram_only(uint64_t bytes);
+// swap_enable, with the area in a file the caller opened (a USB drive, through a
+// security-scoped URL) instead of an unlinked temp file in the container. The
+// file is emptied first, since it is not unlinked and may hold a killed run's
+// pages. On SUCCESS the fd belongs to this module and is truncated and closed
+// with the area; the caller must not close it. On FAILURE it is still the
+// caller's to close.
+int swap_enable_fd(int host_fd, uint64_t bytes);
 
 // Turn the pager off: stop new eviction, fault every evicted page back into its
 // address space, then release the slot table and truncate and close the file.
@@ -85,6 +96,17 @@ void swap_startup(void);
 // simulator sitting on the rootfs picker with nothing installed had half a
 // gigabyte of swap file open in its container.
 void swap_set_preference(bool enabled, unsigned size_mb);
+
+// A file on external storage for the next swap_startup() to use, through
+// swap_enable_fd(), instead of the container. Call it before swap_startup().
+// Ownership follows swap_enable_fd's rule; after swap_startup(), ask
+// swap_take_unused_external_fd() whether it is still the caller's.
+void swap_set_external_fd(int fd);
+// After swap_startup(): the fd given to swap_set_external_fd() if the startup
+// did not take it (-1 if it did, or none was given). The caller closes it.
+// Asking this rather than swap_enabled() is what makes ownership exact: a
+// startup can end with swap on without having used the file.
+int swap_take_unused_external_fd(void);
 
 // May a guest process change the switch, through /proc/ish/swap?
 //
@@ -177,10 +199,14 @@ ssize_t swap_area_pwrite(const void *buf, size_t len, off_t off);
 //  - it must never run mm_release, because that can reach mem_destroy, and the
 //    bounded-teardown guard keys on current->mm_teardown -- without it a FUSE
 //    flush in an unmapped file's ->close waits for a guest process that will
-//    never run again. So kswapd never retains an mm at all: it holds a TASK
-//    reference from task_snapshot_collect, and do_exit blocks on exactly those
-//    references before it releases the mm, so task->mm stays valid for as long
-//    as the reference is held.
+//    never run again. So kswapd never retains an mm at all. It PINS the mem
+//    (mem_ref_cnt_mod, which mm_release waits on before mem_destroy) under the
+//    task's general_lock, and the task reference from task_snapshot_collect
+//    keeps the task itself alive. The task reference alone was the original
+//    protocol and it is not sufficient: do_exit blocks on those references
+//    before releasing the mm, but exec swaps task->mm and releases the old
+//    one with the task alive and referenced, which is how kswapd came to
+//    sweep a freed address space on a device (kernel/swap.c, kswapd loop).
 
 // Passes since the last one that did any work, for /proc/ish/swap.
 struct swap_kswapd_stats {
@@ -241,12 +267,15 @@ struct swap_stats {
     uint64_t write_budget_bytes, written_window_bytes;
     uint64_t budget_refusals;  // evictions refused because the window is spent
     bool enabled;
-    bool draining;             // disabled, but slots are still out
+    bool draining;
+    // No backing file: the compressed tier is the only storage. See
+    // swap_ram_only in swap.c.
+    bool ram_only;             // disabled, but slots are still out
     bool quiesced;             // suspension gate held: no new eviction I/O
     bool kswapd_running;
     bool thrashing;            // background reclaim paused: pages come straight back
     bool release_ineffective;  // reclaim paused: released pages stay in the footprint
-    uint64_t kswapd_passes, kswapd_reclaimed_bytes, thrash_backoffs;
+    uint64_t kswapd_passes, kswapd_sweeps, kswapd_reclaimed_bytes, thrash_backoffs;
     uint64_t ledger_backoffs, ledger_refused;
     unsigned release_verdict;  // 0 not measured, 1 ledger moved, 2 it did not
 };

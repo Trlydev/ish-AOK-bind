@@ -13,10 +13,11 @@ compiled into the app: it costs the same under an i386 root as under an arm64
 one. See [native-programs.md](native-programs.md).
 
 To type it bare, run `sh /AOK/tools/native-links.sh` once per root; `md` lands
-in `/usr/local/native-bin` with the other applets. See
-[native-setup.md](native-setup.md). Note that directory is added to your PATH by
-a login shell — if `md` is "command not found" in a non-login shell, that is
-why, and `/usr/local/native-bin/md` still works.
+in `/usr/local/native-bin` and `/usr/local/bin` with the other applets. See
+[native-setup.md](native-setup.md). If you linked with `--target-only`, only a
+login shell puts `/usr/local/native-bin` on your PATH — so if `md` is "command
+not found" in a non-login shell, that is why, and `/usr/local/native-bin/md`
+still works.
 
 ## Where it looks
 
@@ -56,7 +57,6 @@ it reads standard input instead of listing.
   [native-setup.md](native-setup.md).
 - **It does its own paging**, so it needs no external pager. (SmallCLUE's
   `less` and `more` were held off PATH for a while over a bug that turned out
-  not to be theirs; they are linked again as of this release. See
-  [native-setup.md](native-setup.md).)
+  not to be theirs; they are linked again. See [native-setup.md](native-setup.md).)
 - **A URL is fetched through the app**, using the same networking as `curl` and
   `wget` here — see [networking.md](networking.md).

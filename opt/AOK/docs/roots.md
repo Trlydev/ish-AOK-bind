@@ -20,7 +20,7 @@ sudo sh /AOK/tools/manage-roots.sh list        # installed, and which boots next
 sudo sh /AOK/tools/manage-roots.sh available   # what you can install
 
 # From the catalog, then make it the root that boots and quit the app
-sudo sh /AOK/tools/manage-roots.sh install alpine3233arm64 --default --exit-app
+sudo sh /AOK/tools/manage-roots.sh install alpine3242aarch64 --default --exit-app
 
 # From an archive already on the device, or from a URL
 sudo sh /AOK/tools/manage-roots.sh install /AOK/persist/roots/mine.tar.gz Mine
@@ -47,7 +47,10 @@ Three things worth knowing:
   `job state=unavailable` there.
 
 The script is a thin front end over `/proc/ish/roots`, which is the whole
-mechanism. Reading it lists the roots, the catalog and the current job. Writing
+mechanism. Reading it lists the roots, the catalog and the current job, and
+`booted name=` says which root is at `/` this launch — not always the default,
+since `ISH_BOOT_ROOT` can boot another one for a single launch (see
+[tuning-knobs.md](tuning-knobs.md#ish_boot_root)). Writing
 sends a command, one `key=value` per line, with `run` on its own line to commit
 it. Every value runs to the end of its line, so paths and URLs need no quoting:
 
@@ -75,20 +78,29 @@ Images** applet in Workspace — lists four groups:
   running as `/` is tinted and bold, and reads "● IN USE — mounted at / ·
   can't be deleted"; the others read "Mounted at `/AOK/roots/<name>`", or
   carry no subtitle at all if their mount failed. The root set to boot next
-  is usually that same row but need not be — choosing a different default
-  takes effect immediately while `/` stays where it is until the next launch
-  — and neither of those two can be deleted or renamed while it is in use. To
-  delete or rename one, tap it and use the detail screen — swipe-to-delete
-  applies to the cached archives below, not to installed roots.
+  is usually that same row but need not be; when it is another one, that row
+  begins "Boots next". Neither of those two can be deleted or renamed. Delete
+  any other root by swiping its row, or from its detail screen; rename it
+  there. **Boot From This Filesystem** on the detail screen asks when:
+  **Next Launch** keeps everything running and switches the next time
+  iSH-AOK opens, and **Quit Now** closes iSH-AOK, ending every running
+  program, so that the root boots when you open it again. iOS does not let an
+  app restart itself.
 - **Root Cached Filesystems (`/AOK/persist/roots`)** — any root archives
   sitting in that shared, persistent folder, whether they got there via
   automatic download or because you (or the Files app) dropped a
   `.tar.xz`/`.tar.zst`/`.tar.gz`/etc. archive in yourself. Tap one to
   install it as a new named root.
-- **Official Distributions** — Alpine 3.23.3 and Devuan 6 (excalibur), one row
-  per distro with the architecture as a sub-choice. The `aarch64` images are
-  bundled in the app; `i386`, `x86_64` and `riscv64` download on demand into
-  `/AOK/persist/roots` and import from there.
+- **Official Distributions** — Alpine 3.24.2, Alpine 3.23.3 and Devuan 6
+  (excalibur), one row per distro with the architecture as a sub-choice. The
+  Alpine 3.24.2 and Devuan `aarch64` images are bundled in the app; `i386`,
+  `x86_64` and `riscv64` download on demand into `/AOK/persist/roots` and
+  import from there. Alpine 3.23.3 is offered for those three only: the bundled
+  `aarch64` Alpine is 3.24.2 since 557, and a 3.23.3 `aarch64` root you already
+  have keeps working.
+  **iSH-AOK Native** is listed here too: no distribution at all, only the
+  programs built into the app, and nothing to download -- it is created on the
+  spot. See [native-mode.md](native-mode.md).
 - **Community Distributions** — PSCAL + SmallCLUE (arm64) and Arch Linux
   (`x86_64` and ARM `aarch64`). Contributed or experimental, without the same
   support guarantees as the official images.
@@ -116,6 +128,20 @@ skipped for that boot — it'll appear on the next one once the lock clears.
 like `/AOK/persist`, so it's the same location regardless of which root you
 booted into.
 
+## Running another root's programs by path
+
+A static program under `/AOK/roots/<name>` runs from anywhere. A dynamic one
+-- nearly everything -- needs its own root's loader and libraries, which a
+different root (or a [native-mode](native-mode.md) root) does not have, and on
+Linux such an exec fails with "no such file or directory". **Settings → Other
+Filesystems → Programs From Other Roots** decides what happens instead, from
+the next program on: **Run Inside Their Root** (chrooted there, with `/proc`,
+`/dev` and `/AOK/native` bound in, as `mount-root.sh` would; the default),
+**Use Their Libraries Here**, or **Off**. `/proc/ish/foreign_exec` reads and
+sets the same thing (`root`, `libs`, `off`); [native-mode.md](native-mode.md)
+has the trade-offs. A program that already works -- a static one, or a script
+whose interpreter exists here -- is never touched.
+
 ## `mount-root.sh`: turning a root into a real chroot target
 
 Being visible under `/AOK/roots/<name>` isn't enough to actually run
@@ -142,12 +168,22 @@ sh /AOK/tools/mount-root.sh --unmount Devuan6-x86_64
 sh /AOK/tools/mount-root.sh --unmount all
 ```
 
-The script also bind-mounts `/AOK/tools` and `/AOK/tests` into the chroot, so
-`mount-root.sh`, `ktop` and the guest regression suite stay reachable from
-inside it — `/AOK` is the booted root's aokfs mount and does not otherwise
-exist in another root, which is what makes
+The script also bind-mounts `/AOK/native`, `/AOK/docs`, `/AOK/tools`,
+`/AOK/tests` and `/AOK/fakefs` into the chroot -- `/AOK/native` so that a
+native login shell (`SHELL=/AOK/native/zsh`) and the native tools work inside
+it too -- so `mount-root.sh`, `ktop` and the guest regression suite stay
+reachable from inside it — `/AOK` is the booted root's aokfs mount and does not
+otherwise exist in another root, which is what makes
 `mount-root.sh <root> -- sh /AOK/tests/setup-regressions.sh --run`
-possible at all. Root names are sanity-checked to reject `/`, `.`, and `..`.
+possible at all. `/AOK/fakefs` is there for the suite's compiled-test cache:
+without it a per-architecture run falls back to that root's own `/tmp`, which
+init clears on restart, so every run recompiles every test. Root names are
+sanity-checked to reject `/`, `.`, and `..`.
+
+A bare `chroot /AOK/roots/<name>`, without `mount-root.sh`, has none of those
+binds — so when `$SHELL` (native zsh, say) does not exist in the new root,
+SmallCLUE's `chroot` falls back to `/bin/sh` rather than failing with "cannot
+execute".
 
 Because there's only one real kernel underneath, a process started inside
 a `mount-root.sh` chroot is a completely ordinary process from the outer
@@ -183,34 +219,158 @@ mount --bind  /a /b     # anything mounted *under* /a is not visible under /b
 mount --rbind /a /c     # it is under /c
 ```
 
-Recursive propagation flags (`--make-rprivate` and friends) are accepted and do
-nothing, which is the honest answer here: there are no mount namespaces to
-propagate between.
+Propagation works as on Linux (since 559). A mount starts private: a mount
+namespace (`unshare -m`) gets a copy of the tree, and nothing mounted on
+either side afterwards reaches the other. `mount --make-shared` puts a mount
+in a peer group, which a bind of it, or a namespace's copy of it, joins: a
+mount or unmount under one member happens under all of them.
+`--make-slave` receives without giving back, `--make-private` and
+`--make-unbindable` leave, and `r` in front of any of them means everything
+mounted below as well. `findmnt -o TARGET,PROPAGATION` shows which is which.
 
-That last point is the one real difference from a normal Linux box, and it is
-worth keeping in mind — **a bind mount you create is visible to everything**,
-including processes in other roots and other chroots, because there is a single
-mount table underneath all of them (see [00-overview.md](00-overview.md)). A
+```sh
+mount --make-shared /mnt/a
+mount --bind /mnt/a /mnt/b          # a peer of /mnt/a
+mount -t tmpfs none /mnt/a/x        # is under /mnt/b/x too
+umount /mnt/b/x                     # and gone from both
+```
+
+Mounting over a directory hides what was mounted below it, as on Linux, and
+unmounting brings it back:
+
+```sh
+mount -t tmpfs none /mnt/a/b      # a mount at /mnt/a/b
+mount -t tmpfs none /mnt/a        # /mnt/a/b is the new tmpfs's now (and not there)
+umount /mnt/a                     # the first one is back
+```
+
+One thing is worth keeping in mind — **a bind mount you create is visible to
+everything** in the machine's own mount namespace, including processes in other
+roots and other chroots, because a chroot shares its mount table with
+everything outside it, as on Linux (see [00-overview.md](00-overview.md)). A
 bind is a system-wide change, not a private one, so unmount what you no longer
-need.
+need. Only a process in a mount namespace of its own (`unshare -m`, a
+bubblewrap sandbox, a systemd service with private mounts) is spared it — see
+[namespaces.md](namespaces.md).
+
+## The time zone: following the device
+
+A root arrives with a time zone of its own. Devuan's `/etc/localtime` names
+`Etc/UTC`, and Alpine and Arch have no `/etc/localtime` at all, which also
+means UTC. So out of the box a guest's clock ran on UTC rather than on the time
+the device shows.
+
+Each time it boots a root, iSH-AOK points `/etc/localtime` at **the device's
+zone**, but only while the choice is still its to make:
+
+- there is no `/etc/localtime`;
+- it is the distribution's UTC, and iSH-AOK has never set a zone in this root;
+- it still names the zone iSH-AOK set last time, so a root follows the device
+  when you travel.
+
+**Any other zone is yours, and stays.** Set one with `dpkg-reconfigure tzdata`,
+`setup-timezone` or `ln -sf /usr/share/zoneinfo/Asia/Tokyo /etc/localtime` and
+nothing moves it again, whatever the device does — and that includes choosing
+UTC on purpose. When the device itself changes zone, the guest catches up at
+its next boot.
+
+A root without zone data is left alone: a fresh Alpine root has no tzdata, so
+run `apk add tzdata` (the provisioning scripts below install it) and the zone
+arrives at the following boot.
+
+The zone iSH-AOK set is recorded in `/etc/aok-localtime`. Keep that file — it is
+what tells a UTC you chose from the one the distribution shipped. Where a root
+has an `/etc/timezone`, it is kept matching; it is never created, since current
+Debian no longer uses it. `cat /proc/ish/timezone` shows the device's zone.
+
+## The locale: UTF-8 everywhere
+
+Every root gets `LANG=C.UTF-8` — in what the app starts (init, the Wayland
+desktop, a terminal), and for logins that never pass through PAM, such as `ssh`
+and busybox `login`, from `/etc/profile.d/00-aok-locale.sh`, which the app writes
+into each root when it is missing or empty. zsh reads no `profile.d`, so the same
+line goes into `/etc/zshenv` unless the distribution ships `/etc/zsh/zshenv`.
+It sets `LANG` only, and only when neither `LANG` nor `LC_ALL` is set, so a
+locale you choose or forward over ssh wins. `C.UTF-8` is built into glibc and
+needs nothing under musl. Programs that refuse to start without a UTF-8 locale,
+such as `btop`, now start.
+
+### Your own language: `setup-locale.sh`
+
+`C.UTF-8` shows Chinese, Japanese or any other text correctly, but programs
+still talk in English. To switch a root to the device's language:
+
+```
+sudo sh /AOK/tools/setup-locale.sh            # the device's first language
+sudo sh /AOK/tools/setup-locale.sh zh_TW      # or one you name (ja, zh-Hant, pt-BR work too)
+sudo sh /AOK/tools/setup-locale.sh --fonts    # also CJK fonts for the Wayland desktop
+sudo sh /AOK/tools/setup-locale.sh --reset    # back to C.UTF-8
+```
+
+It reads [`/proc/ish/languages`](proc-ish.md), generates the locale on glibc
+roots (installing Devuan's `locales` package first), and records it in
+`/etc/aok-locale`, which `/etc/profile.d/01-aok-lang.sh`, the zsh global
+`zshenv`, `/etc/default/locale` and `start-wayland.sh` all read. It replaces
+only the `C.UTF-8` default: a `LANG` forwarded over ssh still wins. New logins
+and new desktop sessions pick it up.
+
+Devuan carries the translations in its packages, so `ls`, `date` and the rest
+answer in Chinese straight away. Alpine mostly does not: busybox has none,
+few packages ship a `-lang` subpackage, and `musl-locales` covers European
+languages only. For a Chinese-speaking system, use a Devuan root.
 
 ## Provisioning scripts: turning a bare rootfs into a full terminal environment
 
-A freshly-imported root is intentionally minimal. Three scripts under
-`/AOK/tools` turn one into a comfortable, "full Linux feel" terminal
-environment in one pass — matched packages, sudo, a themed shell, tmux, and
-services that behave correctly under iSH-AOK's clock model:
+A freshly-imported root is intentionally minimal. Scripts under `/AOK/tools`
+turn one into a comfortable, "full Linux feel" terminal environment in one
+pass — matched packages, sudo, a themed shell, tmux, and services that behave
+correctly under iSH-AOK's clock model:
 
 ```sh
 sudo sh /AOK/tools/provision-ultimate-alpine.sh
 sudo sh /AOK/tools/provision-ultimate-devuan.sh
 sudo sh /AOK/tools/provision-ultimate-archlinux.sh   # experimental, like the root itself
+sh /AOK/tools/provision-ultimate-pscal.sh            # PSCAL + SmallCLUE
 ```
 
-All three are idempotent (safe to re-run) and interactively prompt for a
-timezone and a target username unless you set `TZ_NAME` / `TARGET_USER`
-(and optionally `NEW_HOSTNAME`, `SUDO_NOPASSWD`) in the environment first.
-Each one:
+All of them are idempotent (safe to re-run) and interactively prompt for
+their settings unless you pre-set them in the environment.
+
+Each one ends by linking iSH-AOK's native programs in, with
+[`native-links.sh`](native-setup.md) — into `/usr/local/native-bin` and
+`/usr/local/bin`, so `sh` is native dash — and your own `/AOK/persist/bin` with
+[`persist-links.sh`](persist.md). The Alpine, Devuan and Arch scripts leave the
+login shell they chose alone (`--no-shell`); `NATIVE_LINKS=0` skips the step.
+
+The PSCAL one is the odd one out, because a PSCAL root has no package manager
+and nothing to install. It configures instead: it gives root and your login
+passwords (the image ships every account locked), puts your login in `wheel`
+so the shipped `/etc/sudoers` authorises it, and keeps the SSH host keys and
+your `authorized_keys` in `/AOK/persist` so the next image update does not
+make you set it all up again.
+
+SmallCLUE's `sudo` asks for **your own** password and then consults
+`/etc/sudoers` (and `/etc/sudoers.d`), like real sudo — user and `%group`
+entries, `(runas)` specs, `NOPASSWD`, explicit command lists, `#includedir` or
+`@includedir`, and last-match-wins. Aliases, negation and globs are not
+implemented, and a line using them is skipped rather than guessed at. With no
+sudoers file at all, nobody is authorised. It also ships inside the PSCAL image
+itself, as `provision-ultimate-pscal.sh` on `PATH`, so it is there even on an
+iSH-AOK build older than the script. Its tunables are `TARGET_USER`,
+`NEW_HOSTNAME`, `PERSIST_SSH`, `PASSWORD_AUTH`, `NATIVE_LINKS` and
+`AUTHORIZED_KEY`; note that `/AOK/persist` is host-backed, so the stash puts
+private host keys somewhere outside the guest — `PERSIST_SSH=0` opts out.
+
+The other three are the package-installing kind, and prompt for a timezone,
+a target username, a hostname and whether sudo should ask for a password,
+unless you set `TZ_NAME` / `TARGET_USER` / `NEW_HOSTNAME` / `SUDO_NOPASSWD`
+in the environment first. Sudo is **passwordless by default** — the login the
+script creates has no password, so a rule that asked for one would leave it
+unable to use sudo at all. Answer `n` (or set `SUDO_NOPASSWD=0`) only after
+giving the login a password with `passwd`.
+The timezone offered is the device's own; accept it and the root keeps
+[following the device](#the-time-zone-following-the-device), while a zone you
+type or put in `TZ_NAME` stays put. Each one:
 
 - Installs a curated set of packages for a comfortable terminal: bash,
   vim/neovim, tmux, htop/btop, fzf, ripgrep, fd, bat, eza, git, a build
@@ -218,8 +378,14 @@ Each one:
   fastfetch, and more.
 - Sets the timezone and a `C.UTF-8` locale, and generates a machine ID.
 - Creates (or configures) the target user, adds them to the sudo group
-  (`wheel` on Alpine, `sudo` on Devuan), and switches login shells to
-  bash.
+  (`wheel` on Alpine and Arch, `sudo` on Devuan), and switches root's and
+  their login shell to the distribution's bash.
+- Authorises that group in a sudoers fragment named to sort **first** —
+  `00-wheel` (Alpine), `00-aok-sudo` (Devuan), `00-aok-wheel` (Arch) — because
+  sudo reads `/etc/sudoers.d` in name order and the last matching rule wins, so
+  a `NOPASSWD` file of your own (`010-me`, `90-me`) overrides it. Re-running
+  removes the older-named fragment (`wheel`, `aok-sudo`, `aok-wheel`) only if
+  it still holds exactly the line the script wrote.
 - Writes a MOTD, a colored prompt, an fzf/dircolors profile snippet, and a
   themed `tmux.conf` plus a dependency-free Neovim starter config
   (including OSC52 clipboard support on Neovim 0.10+).
@@ -274,3 +440,25 @@ sh /AOK/fixes/arch/fix-pacman.sh
 
 Safe to re-run; each step checks whether it is already done. The keyring step
 takes a few minutes and needs no network.
+
+From build 559 an Arch root says so itself: until the script has been run, an
+interactive login prints three lines naming it. The reminder is
+`/etc/profile.d/20-aok-arch-pacman.sh`, written at boot into any root that has
+an `/etc/pacman.conf`; it goes quiet once the three things above are dealt
+with, and replacing its contents with a comment turns it off for good.
+
+`/AOK/fixes/codex` is about OpenAI's Codex CLI, which runs every shell command
+it issues inside bubblewrap. That needs user, mount, pid and network
+namespaces, and from build 559 AOK has them: `codex sandbox -- /bin/echo x`
+prints `x`, for root and for an ordinary user, and there is nothing to fix.
+Before 559 the sandbox could not start, and the script here turned it off by
+putting `sandbox_mode = "danger-full-access"` at the top of
+`~/.codex/config.toml`. The script now does the opposite: it takes that line
+out again (only the one it added), so that a root set up on an older build
+goes back to running Codex's commands confined. `README.txt` beside it says
+what the sandbox is here, and [namespaces.md](namespaces.md) what it is made of.
+
+```sh
+sh /AOK/fixes/codex/fix-codex.sh         # take out the line an older build's copy added
+codex sandbox -- /bin/echo x             # prints x: the sandbox starts
+```

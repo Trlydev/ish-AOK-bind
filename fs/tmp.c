@@ -1,13 +1,18 @@
 #include <sys/stat.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include "kernel/pid_ns.h"
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
+#include "kernel/xattr.h"
 #include "fs/path.h"
+#include "kernel/inotify.h"
 #include "fs/fifo.h"
 #include "fs/poll.h"
 #include "fs/real.h"
@@ -16,15 +21,40 @@
 #include "fs/dyndev.h"
 #include "util/refcount.h"
 #include "util/timer.h"
+#include "platform/platform.h"
 #include "debug.h"
 
 // ========================
 // ======== INODES ========
 // ========================
 
+// A tmpfs mount's size limit and what its files hold against it. Linux's
+// shmem_sb_info, for size= and nr_blocks=: every regular file is charged its
+// size in pages, a write that would pass the limit is cut short at it (ENOSPC
+// if nothing fits), and truncate or fallocate past it is ENOSPC. Shared by the
+// mount and every inode in it, each holding a reference; freed with the last.
+//
+// Files here are stored whole -- malloc'd, or a host file once mmapped -- so a
+// file's size is what it costs, and it is charged as such: a truncate to 1 GiB
+// on a 5 MiB mount is refused, where Linux, which would hold no pages for it
+// yet, allows the hole. The limit was ignored entirely before, so 8 MB went
+// into Devuan's 5 MiB /run/lock, and a user could fill any tmpfs -- /tmp,
+// /run, /dev/shm -- until the app itself was killed for its memory.
+struct tmpfs_sb {
+    _Atomic unsigned refs;
+    lock_t lock;
+    uint64_t max_pages;     // 0: no limit
+    uint64_t used_pages;
+    uint64_t used_inodes;
+};
+
 struct tmp_inode {
     struct refcount refcount;
     lock_t lock;
+    // The mount's accounting, or NULL for an inode no mount charges.
+    struct tmpfs_sb *sb;
+    // Pages this file is charged for; see tmpfs_charge.
+    uint64_t charged_pages;
 
     struct statbuf stat;
     union {
@@ -37,18 +67,102 @@ struct tmp_inode {
     // guest mappings can be host mmaps of it (see tmpfs_inode_host_backing).
     // -1 while still malloc-backed.
     int host_fd;
+    // Extended attributes (tmpfs_xattr_ops), in name order. Locked by `lock`.
+    struct tmp_xattr *xattrs;
+};
+
+struct tmp_xattr {
+    struct tmp_xattr *next;
+    char *name;
+    size_t size;
+    char value[];
 };
 
 static bool tmpfs_is_cgroup2_mount(struct mount *mount) {
     return strcmp(mount->fs->name, "cgroup2") == 0;
 }
 
-static struct tmp_inode *tmp_inode_new(mode_t_ mode) {
+#define TMPFS_BLOCK_SIZE 4096
+
+static void tmpfs_sb_release(struct tmpfs_sb *sb) {
+    if (sb != NULL && atomic_fetch_sub(&sb->refs, 1) == 1)
+        free(sb);
+}
+
+static uint64_t tmpfs_pages_of(size_t bytes) {
+    return ((uint64_t) bytes + TMPFS_BLOCK_SIZE - 1) / TMPFS_BLOCK_SIZE;
+}
+
+// Charge a regular file for `size` bytes instead of what it is charged for
+// now. Growth past the mount's limit is ENOSPC and changes nothing; a shrink
+// always succeeds. Call with the inode's lock held.
+static int tmpfs_charge(struct tmp_inode *inode, size_t size) {
+    struct tmpfs_sb *sb = inode->sb;
+    uint64_t want = tmpfs_pages_of(size);
+    if (sb == NULL || want == inode->charged_pages)
+        return 0;
+    lock(&sb->lock, 0);
+    if (want > inode->charged_pages) {
+        uint64_t more = want - inode->charged_pages;
+        if (sb->max_pages != 0 && sb->used_pages + more > sb->max_pages) {
+            unlock(&sb->lock);
+            return _ENOSPC;
+        }
+        sb->used_pages += more;
+    } else {
+        sb->used_pages -= inode->charged_pages - want;
+    }
+    unlock(&sb->lock);
+    inode->charged_pages = want;
+    return 0;
+}
+
+// The largest size a write ending at `end` may take the file to: `end`
+// itself if it fits, otherwise as far as the pages still free reach (never
+// below the current size). Call with the inode's lock held.
+static size_t tmpfs_fit_end(struct tmp_inode *inode, size_t end) {
+    struct tmpfs_sb *sb = inode->sb;
+    if (sb == NULL || end <= inode->stat.size)
+        return end;
+    lock(&sb->lock, 0);
+    uint64_t avail = sb->max_pages == 0 ? UINT64_MAX :
+            (sb->used_pages >= sb->max_pages ? 0 : sb->max_pages - sb->used_pages);
+    unlock(&sb->lock);
+    if (avail == UINT64_MAX)
+        return end;
+    uint64_t max_pages = inode->charged_pages + avail;
+    if (max_pages > UINT64_MAX / TMPFS_BLOCK_SIZE)
+        return end;
+    uint64_t max_end = max_pages * TMPFS_BLOCK_SIZE;
+    if ((uint64_t) end <= max_end)
+        return end;
+    return max_end > inode->stat.size ? (size_t) max_end : inode->stat.size;
+}
+
+// How much of a write of `len` bytes at `off` fits, as a length: all of it,
+// part of it, or 0, which the caller turns into ENOSPC.
+static size_t tmpfs_fit_write(struct tmp_inode *inode, size_t off, size_t len) {
+    size_t end = off + len;
+    size_t fit = tmpfs_fit_end(inode, end);
+    if (fit >= end)
+        return len;
+    return fit > off ? fit - off : 0;
+}
+
+static struct tmp_inode *tmp_inode_new(mode_t_ mode, struct tmpfs_sb *sb) {
     struct tmp_inode *node = malloc(sizeof(struct tmp_inode));
     if (node == NULL)
         return NULL;
     refcount_init(node);
     lock_init(&node->lock, "tmp_inode_new\0");
+    node->sb = sb;
+    node->charged_pages = 0;
+    if (sb != NULL) {
+        atomic_fetch_add(&sb->refs, 1);
+        lock(&sb->lock, 0);
+        sb->used_inodes++;
+        unlock(&sb->lock);
+    }
 
     node->stat = (struct statbuf) {};
     static _Atomic ino_t next_inode = 1;
@@ -66,9 +180,16 @@ static struct tmp_inode *tmp_inode_new(mode_t_ mode) {
     node->stat.gid = current->egid;
     node->file_data = NULL; // also clears the ->fifo union slot for S_IFIFO
     node->host_fd = -1;
+    node->xattrs = NULL;
     if (S_ISREG(mode)) {
         node->file_data = malloc(0);
         if (node->file_data == NULL) {
+            if (sb != NULL) {
+                lock(&sb->lock, 0);
+                sb->used_inodes--;
+                unlock(&sb->lock);
+                tmpfs_sb_release(sb);
+            }
             free(node);
             return NULL;
         }
@@ -79,6 +200,14 @@ static struct tmp_inode *tmp_inode_new(mode_t_ mode) {
 DEFINE_REFCOUNT_STATIC(tmp_inode)
 
 static void tmp_inode_cleanup(struct tmp_inode *inode) {
+    if (inode->sb != NULL) {
+        tmpfs_charge(inode, 0);
+        lock(&inode->sb->lock, 0);
+        inode->sb->used_inodes--;
+        unlock(&inode->sb->lock);
+        tmpfs_sb_release(inode->sb);
+        inode->sb = NULL;
+    }
     // Regular files keep their contents in file_data; symlinks keep their
     // target string there too (same union slot).
     if (S_ISREG(inode->stat.mode) || S_ISLNK(inode->stat.mode)) {
@@ -87,6 +216,12 @@ static void tmp_inode_cleanup(struct tmp_inode *inode) {
             close(inode->host_fd);
     } else if (S_ISFIFO(inode->stat.mode)) {
         fifo_file_free(inode->fifo);
+    }
+    while (inode->xattrs != NULL) {
+        struct tmp_xattr *x = inode->xattrs;
+        inode->xattrs = x->next;
+        free(x->name);
+        free(x);
     }
     free(inode);
 }
@@ -108,7 +243,7 @@ static void tmpfs_update_atime_relatime(struct tmp_inode *inode) {
     struct timespec now = timespec_now(CLOCK_REALTIME);
     if (inode->stat.atime > inode->stat.mtime &&
             inode->stat.atime > inode->stat.ctime &&
-            (uint64_t) now.tv_sec < (uint64_t) inode->stat.atime + TMPFS_RELATIME_DAY)
+            (int64_t) now.tv_sec < inode->stat.atime + TMPFS_RELATIME_DAY)
         return;
     inode->stat.atime = now.tv_sec;
     inode->stat.atime_nsec = now.tv_nsec;
@@ -251,7 +386,7 @@ static int tmpfs_add_file(struct tmp_dirent *dir, const char *name, mode_t_ mode
     if (err < 0)
         return err;
 
-    struct tmp_inode *inode = tmp_inode_new(S_IFREG | mode);
+    struct tmp_inode *inode = tmp_inode_new(S_IFREG | mode, dir->inode->sb);
     if (inode == NULL)
         return _ENOMEM;
 
@@ -332,7 +467,7 @@ static int tmpfs_add_dev_node(struct tmp_dirent *dir, const char *name, mode_t_ 
     if (err < 0)
         return err;
 
-    struct tmp_inode *inode = tmp_inode_new((mode & S_IFMT) != 0 ? mode : (S_IFCHR | mode));
+    struct tmp_inode *inode = tmp_inode_new((mode & S_IFMT) != 0 ? mode : (S_IFCHR | mode), dir->inode->sb);
     if (inode == NULL)
         return _ENOMEM;
     inode->stat.rdev = dev;
@@ -351,7 +486,7 @@ static int tmpfs_add_dev_subdir(struct tmp_dirent *dir, const char *name, mode_t
     if (err < 0)
         return err;
 
-    struct tmp_inode *inode = tmp_inode_new(S_IFDIR | mode);
+    struct tmp_inode *inode = tmp_inode_new(S_IFDIR | mode, dir->inode->sb);
     if (inode == NULL)
         return _ENOMEM;
     inode->stat.uid = 0;
@@ -371,7 +506,7 @@ static int tmpfs_add_dev_symlink(struct tmp_dirent *dir, const char *name, const
     if (err < 0)
         return err;
 
-    struct tmp_inode *inode = tmp_inode_new(S_IFLNK | 0777);
+    struct tmp_inode *inode = tmp_inode_new(S_IFLNK | 0777, dir->inode->sb);
     if (inode == NULL)
         return _ENOMEM;
     // Same storage a tmpfs symlink uses: raw target bytes in file_data.
@@ -509,11 +644,18 @@ static int tmpfs_file_resize(struct tmp_inode *file, size_t size) {
     // inode of an invalid type, where an assert aborted the whole app.
     if (!S_ISREG(file->stat.mode))
         return _EINVAL;
+    // The mount's size limit, before anything moves. See struct tmpfs_sb.
+    int charge_err = tmpfs_charge(file, size);
+    if (charge_err < 0)
+        return charge_err;
     if (file->host_fd >= 0) {
         // Host-file-backed (has been mmapped): ftruncate keeps live guest
         // mappings coherent, and the host zero-fills growth.
-        if (ftruncate(file->host_fd, size) < 0)
-            return errno_map();
+        if (ftruncate(file->host_fd, size) < 0) {
+            int err = errno_map();
+            tmpfs_charge(file, file->stat.size);
+            return err;
+        }
         file->stat.size = size;
         tmpfs_update_mtime_and_ctime(file);
         return 0;
@@ -522,8 +664,10 @@ static int tmpfs_file_resize(struct tmp_inode *file, size_t size) {
     void *new_data = realloc(file->file_data, size);
     // realloc(ptr, 0) may legitimately return NULL (it frees ptr); only treat
     // NULL as an error for a non-zero request.
-    if (new_data == NULL && size != 0)
+    if (new_data == NULL && size != 0) {
+        tmpfs_charge(file, old_size);
         return _ENOMEM;
+    }
     file->file_data = new_data;
     file->stat.size = size;
     // Only zero newly-grown bytes. When shrinking (e.g. ftruncate to a smaller
@@ -598,6 +742,9 @@ static int tmpfs_dir_unlink(struct tmp_dirent *parent, const char *name, bool re
     } else {
         dirent->inode->stat.nlink--;
     }
+    // The inode changed too -- it lost a name -- which a process holding it
+    // open, or another link to it, sees in its ctime (Linux's shmem_unlink).
+    tmpfs_update_ctime(dirent->inode);
     tmpfs_update_mtime_and_ctime(parent->inode);
     tmp_dirent_release(dirent); // drop tree reference
     tmp_dirent_release(dirent); // drop lookup reference
@@ -609,6 +756,81 @@ static int tmpfs_dir_unlink(struct tmp_dirent *parent, const char *name, bool re
 // ========================
 
 extern const struct fd_ops tmpfs_fdops;
+
+static uint64_t tmpfs_pages_of_u64(uint64_t bytes) {
+    return bytes / TMPFS_BLOCK_SIZE + (bytes % TMPFS_BLOCK_SIZE != 0);
+}
+
+// Linux's totalram_pages / 2 in tmpfs pages: what a tmpfs holds when its
+// mount says nothing. The guest's MemTotal, so a percentage means the same
+// thing here as in /proc/meminfo.
+static uint64_t tmpfs_ram_bytes(void) {
+    uint64_t total = get_mem_usage().total;
+    return total != 0 ? total : (uint64_t) 2 << 30;
+}
+
+static uint64_t tmpfs_default_pages(void) {
+    uint64_t pages = tmpfs_ram_bytes() / 2 / TMPFS_BLOCK_SIZE;
+    return pages != 0 ? pages : 1;
+}
+
+// memparse, plus size='s trailing % of RAM when `percent_ok`. False for
+// anything else, which the mount refuses with EINVAL as Linux does.
+static bool tmpfs_parse_size(const char *s, size_t len, bool percent_ok, uint64_t *out) {
+    char buf[64];
+    if (len == 0 || len >= sizeof(buf))
+        return false;
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    char *end;
+    unsigned long long v = strtoull(buf, &end, 0);
+    if (end == buf)
+        return false;
+    if (percent_ok && *end == '%' && end[1] == '\0') {
+        if (v > 100)
+            return false;
+        *out = tmpfs_ram_bytes() / 100 * v;
+        return true;
+    }
+    unsigned shift = 0;
+    switch (*end) {
+        case 'e': case 'E': shift += 10; FALLTHROUGH;
+        case 'p': case 'P': shift += 10; FALLTHROUGH;
+        case 't': case 'T': shift += 10; FALLTHROUGH;
+        case 'g': case 'G': shift += 10; FALLTHROUGH;
+        case 'm': case 'M': shift += 10; FALLTHROUGH;
+        case 'k': case 'K': shift += 10; end++; break;
+        case '\0': break;
+        default: return false;
+    }
+    if (*end != '\0')
+        return false;
+    if (shift != 0 && v > (UINT64_MAX >> shift))
+        return false;
+    *out = (uint64_t) v << shift;
+    return true;
+}
+
+// One option of a mount's string, if it is size= or nr_blocks=: 1 with the
+// page limit it sets in *max_pages, 0 for any other option, _EINVAL for one
+// of these two that does not parse.
+static int tmpfs_limit_option(const char *opt, size_t len, uint64_t *max_pages) {
+    if (len > 5 && strncmp(opt, "size=", 5) == 0) {
+        uint64_t bytes;
+        if (!tmpfs_parse_size(opt + 5, len - 5, true, &bytes))
+            return _EINVAL;
+        *max_pages = tmpfs_pages_of_u64(bytes);
+        return 1;
+    }
+    if (len > 10 && strncmp(opt, "nr_blocks=", 10) == 0) {
+        uint64_t blocks;
+        if (!tmpfs_parse_size(opt + 10, len - 10, false, &blocks))
+            return _EINVAL;
+        *max_pages = blocks;
+        return 1;
+    }
+    return 0;
+}
 
 static int tmpfs_mount(struct mount *mount) {
     // Linux tmpfs honors mode=/uid=/gid= mount options on its root inode
@@ -625,24 +847,48 @@ static int tmpfs_mount(struct mount *mount) {
     // made every tmpfs world-writable with NO sticky bit, so any guest user
     // could delete or replace another's files in it.
     mode_t_ root_mode = S_IFDIR | 01777;
-    uid_t_ root_uid = 0;
-    uid_t_ root_gid = 0;
+    // The mounter's, as Linux's shmem has it (current_fsuid): root's for
+    // every mount there was before a user namespace's root could make one.
+    uid_t_ root_uid = current != NULL ? current->fsuid : 0;
+    uid_t_ root_gid = current != NULL ? current->fsgid : 0;
+    // size= and nr_blocks=, Linux's defaults and syntax (shmem_parse_one):
+    // bytes with an optional k/m/g/t/p/e suffix or a percentage of RAM,
+    // rounded up to pages; nr_blocks= counts pages; 0 is no limit. Neither
+    // given: half of RAM, the same figure statfs has always reported.
+    uint64_t max_pages = tmpfs_default_pages();
     const char *opt = mount->info;
     while (opt != NULL && *opt != '\0') {
         const char *end = strchr(opt, ',');
         size_t len = end != NULL ? (size_t) (end - opt) : strlen(opt);
         if (len > 5 && strncmp(opt, "mode=", 5) == 0)
             root_mode = S_IFDIR | (mode_t_) (strtoul(opt + 5, NULL, 8) & 07777);
-        else if (len > 4 && strncmp(opt, "uid=", 4) == 0)
-            root_uid = (uid_t_) strtoul(opt + 4, NULL, 10);
-        else if (len > 4 && strncmp(opt, "gid=", 4) == 0)
-            root_gid = (uid_t_) strtoul(opt + 4, NULL, 10);
+        // The mounter's ids, as its user namespace maps them; one it does
+        // not map is no id (kernel/user_ns.h).
+        else if (len > 4 && strncmp(opt, "uid=", 4) == 0) {
+            root_uid = current_make_kuid((uid_t_) strtoul(opt + 4, NULL, 10));
+            if (root_uid == USER_NS_INVALID_ID)
+                return _EINVAL;
+        } else if (len > 4 && strncmp(opt, "gid=", 4) == 0) {
+            root_gid = current_make_kgid((uid_t_) strtoul(opt + 4, NULL, 10));
+            if (root_gid == USER_NS_INVALID_ID)
+                return _EINVAL;
+        } else if (tmpfs_limit_option(opt, len, &max_pages) < 0)
+            return _EINVAL;
         opt = end != NULL ? end + 1 : "";
     }
 
-    struct tmp_inode *root_inode = tmp_inode_new(root_mode);
-    if (root_inode == NULL)
+    struct tmpfs_sb *sb = calloc(1, sizeof(*sb));
+    if (sb == NULL)
         return _ENOMEM;
+    atomic_init(&sb->refs, 1); // the mount's; tmpfs_umount drops it
+    lock_init(&sb->lock, "tmpfs_sb\0");
+    sb->max_pages = max_pages;
+
+    struct tmp_inode *root_inode = tmp_inode_new(root_mode, sb);
+    if (root_inode == NULL) {
+        tmpfs_sb_release(sb);
+        return _ENOMEM;
+    }
     root_inode->stat.uid = root_uid;
     root_inode->stat.gid = root_gid;
 
@@ -694,8 +940,11 @@ static void tmpfs_free_tree(struct tmp_dirent *dirent) {
 static int tmpfs_umount(struct mount *mount) {
     struct tmp_dirent *root = mount->data;
     if (root != NULL) {
+        struct tmpfs_sb *sb = root->inode != NULL ? root->inode->sb : NULL;
         tmpfs_free_tree(root);
         mount->data = NULL;
+        // The mount's own reference; the inodes still alive, if any, keep it.
+        tmpfs_sb_release(sb);
     }
     return 0;
 }
@@ -724,7 +973,7 @@ static struct fd *tmpfs_open(struct mount *mount, const char *path, int flags, i
         }
 
         if (dirent == ERR_PTR(_ENOENT)) {
-            struct tmp_inode *inode = tmp_inode_new(S_IFREG | mode);
+            struct tmp_inode *inode = tmp_inode_new(S_IFREG | mode, parent->inode->sb);
             if (inode == NULL) {
                 err = _ENOMEM;
                 goto out_creat;
@@ -948,6 +1197,7 @@ static int tmpfs_rename(struct mount *mount, const char *src, const char *dst) {
         } else {
             dst_dirent->inode->stat.nlink--;
         }
+        tmpfs_update_ctime(dst_dirent->inode);
         tmp_dirent_release(dst_dirent);
     }
 
@@ -973,6 +1223,9 @@ static int tmpfs_rename(struct mount *mount, const char *src, const char *dst) {
     src_dirent->index = dst_parent->next_index++;
     list_add_tail(&dst_parent->children, &src_dirent->dir);
 
+    // The renamed inode's ctime moves as well as both directories' (Linux's
+    // shmem_rename2); tar and rsync read a rename as a change to the file.
+    tmpfs_update_ctime(src_dirent->inode);
     tmpfs_update_mtime_and_ctime(src_parent->inode);
     tmpfs_update_mtime_and_ctime(dst_parent->inode);
 
@@ -1044,6 +1297,20 @@ static int tmpfs_utime(struct mount *mount, const char *path, struct timespec at
     return 0;
 }
 
+// See fd_ops->reopen. Another description of the same file: its entry, which
+// keeps the inode, retained. The entry of an unlinked file is out of its
+// directory but alive while anything holds it.
+static struct fd *tmpfs_reopen(struct fd *fd, int UNUSED(flags)) {
+    struct fd *reopened = fd_create(&tmpfs_fdops);
+    if (reopened == NULL)
+        return ERR_PTR(_ENOMEM);
+    tmp_dirent_retain(fd->tmpfs.dirent);
+    reopened->tmpfs.dirent = fd->tmpfs.dirent;
+    reopened->tmpfs.dir_pos = NULL;
+    reopened->tmpfs.dots_pos = 0;
+    return reopened;
+}
+
 static int tmpfs_close(struct fd *fd) {
     // shouldn't need locking as this is the last reference to the fd
     struct tmp_inode *inode = fd->tmpfs.dirent->inode;
@@ -1065,7 +1332,7 @@ static int tmpfs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
     if (err < 0)
         goto out;
 
-    struct tmp_inode *inode = tmp_inode_new(S_IFDIR | mode);
+    struct tmp_inode *inode = tmp_inode_new(S_IFDIR | mode, parent->inode->sb);
     err = _ENOMEM;
     if (inode == NULL)
         goto out;
@@ -1150,7 +1417,7 @@ static int tmpfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_
     if (err < 0)
         goto out;
 
-    struct tmp_inode *inode = tmp_inode_new(mode);
+    struct tmp_inode *inode = tmp_inode_new(mode, parent->inode->sb);
     err = _ENOMEM;
     if (inode == NULL)
         goto out;
@@ -1179,7 +1446,7 @@ static int tmpfs_symlink(struct mount *mount, const char *target, const char *li
     if (err < 0)
         goto out;
 
-    struct tmp_inode *inode = tmp_inode_new(S_IFLNK | 0777);
+    struct tmp_inode *inode = tmp_inode_new(S_IFLNK | 0777, parent->inode->sb);
     err = _ENOMEM;
     if (inode == NULL)
         goto out;
@@ -1275,11 +1542,38 @@ static int tmpfs_futime(struct fd *fd, struct timespec atime, struct timespec mt
     return 0;
 }
 
+struct fifo_file *tmpfs_fd_fifo(struct fd *fd) {
+    if (fd == NULL || fd->ops != &tmpfs_fdops)
+        return NULL;
+    struct tmp_inode *inode = tmpfs_fd_inode(fd);
+    if (inode == NULL || !S_ISFIFO(inode->stat.mode))
+        return NULL;
+    return inode->fifo;
+}
+
+// Linux's FMODE_READ and FMODE_WRITE: a description reads and writes only as
+// it was opened to, EBADF otherwise, before anything else is asked. realfs gets
+// this from the host descriptor, which is opened with the same access mode.
+// tmpfs never asked, so any file a user could open for reading was theirs to
+// write -- open(O_RDONLY) checks read permission, and a write through that
+// descriptor went straight into the file.
+static bool tmpfs_fd_readable(struct fd *fd) {
+    return (fd->flags & O_ACCMODE_) != O_WRONLY_;
+}
+static bool tmpfs_fd_writable(struct fd *fd) {
+    return (fd->flags & O_ACCMODE_) != O_RDONLY_;
+}
+
+static void tmpfs_cgroup2_refresh(struct fd *fd, off_t off);
+
 static ssize_t tmpfs_read(struct fd *fd, void *buf, size_t bufsize) {
     ssize_t res;
     struct tmp_inode *inode = tmpfs_fd_inode(fd);
     if (S_ISFIFO(inode->stat.mode))
         return fifo_file_read(inode->fifo, fd, buf, bufsize);
+    if (!tmpfs_fd_readable(fd))
+        return _EBADF;
+    tmpfs_cgroup2_refresh(fd, fd->offset);
     lock(&inode->lock, 0);
     res = _EISDIR;
     if (S_ISDIR(inode->stat.mode))
@@ -1340,8 +1634,11 @@ static ssize_t tmpfs_pread(struct fd *fd, void *buf, size_t bufsize, off_t off) 
     struct tmp_inode *inode = tmpfs_fd_inode(fd);
     if (S_ISFIFO(inode->stat.mode))
         return _ESPIPE;
+    if (!tmpfs_fd_readable(fd))
+        return _EBADF;
     if (off < 0)
         return _EINVAL;
+    tmpfs_cgroup2_refresh(fd, off);
     lock(&inode->lock, 0);
     res = _EISDIR;
     if (S_ISDIR(inode->stat.mode))
@@ -1377,6 +1674,8 @@ static ssize_t tmpfs_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_
     struct tmp_inode *inode = tmpfs_fd_inode(fd);
     if (S_ISFIFO(inode->stat.mode))
         return _ESPIPE;
+    if (!tmpfs_fd_writable(fd))
+        return _EBADF;
     if (off < 0)
         return _EINVAL;
     lock(&inode->lock, 0);
@@ -1395,21 +1694,36 @@ static ssize_t tmpfs_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_
     // also keeps the two host-file-backed filesystems consistent with each
     // other. Done under inode->lock for the same atomicity reason as
     // tmpfs_write.
-    if (fd->flags & O_APPEND_)
+    if (fd_pwrite_appends(fd))
         off = (off_t) inode->stat.size;
     size_t end;
     if (__builtin_add_overflow((size_t) off, bufsize, &end)) {
         res = _EFBIG;
         goto out;
     }
+    // The mount's size limit: a write that would pass it stops at it, and
+    // one of which nothing fits is ENOSPC (Linux's shmem write_begin).
+    if (bufsize > 0) {
+        size_t fits = tmpfs_fit_write(inode, (size_t) off, bufsize);
+        if (fits == 0) {
+            res = _ENOSPC;
+            goto out;
+        }
+        bufsize = fits;
+        end = (size_t) off + bufsize;
+    }
     if (inode->host_fd >= 0) {
+        if (end > inode->stat.size && (res = tmpfs_charge(inode, end)) < 0)
+            goto out;
         ssize_t n = pwrite(inode->host_fd, buf, bufsize, off);
         if (n < 0) {
             res = errno_map();
+            tmpfs_charge(inode, inode->stat.size);
             goto out;
         }
         if (inode->stat.size < (size_t) off + (size_t) n)
             inode->stat.size = off + n;
+        tmpfs_charge(inode, inode->stat.size);
         if (n > 0)
             tmpfs_update_mtime_and_ctime(inode);
         res = n;
@@ -1421,6 +1735,11 @@ static ssize_t tmpfs_pwrite(struct fd *fd, const void *buf, size_t bufsize, off_
             goto out;
     }
     memcpy((char *) inode->file_data + off, buf, bufsize);
+    // Every write that stores something is a modification, not only one that
+    // grows the file: tmpfs_file_resize stamped the times, so an overwrite in
+    // place left mtime and ctime where they were.
+    if (bufsize > 0)
+        tmpfs_update_mtime_and_ctime(inode);
     res = (ssize_t) bufsize;
 out:
     unlock(&inode->lock);
@@ -1429,14 +1748,188 @@ out:
     return res;
 }
 
+// ---- cgroup2: live membership ----
+//
+// The hierarchy is a tmpfs, but three of its interface files describe the
+// process table, not stored bytes, and are rendered from it on every read at
+// offset 0 (Linux's seq_file regenerates the same way): cgroup.procs (the
+// tgids of live processes in the cgroup), cgroup.threads (their live tids),
+// and cgroup.events ("populated" is 1 while a live process is in the cgroup
+// or a descendant). A process is live while it has a thread that has not
+// exited -- a zombie is out of its cgroup, as on Linux, whose cgroup_exit runs
+// in do_exit before the parent hears of it.
+//
+// All three were stored files. cgroup.events said "populated 1" forever and
+// cgroup.procs kept every pid ever written, so systemd never saw a unit's
+// cgroup empty: a failed oneshot (Arch's modprobe@*.service, systemd-sysctl)
+// sat in stop-sigterm until TimeoutStopSec, 90 s each, holding the boot, and
+// the SIGTERM sweep went to stale pids that could by then be anyone's.
+// systemd learns of emptiness through inotify IN_MODIFY on cgroup.events, so
+// every membership change also raises that event (cgroup2_note_membership_change).
+
+static bool cgroup2_is_live_file(const char *name) {
+    return strcmp(name, "cgroup.procs") == 0 || strcmp(name, "cgroup.threads") == 0 ||
+        strcmp(name, "cgroup.events") == 0;
+}
+
+// The cgroup directory of a cgroup2 interface file, hierarchy-relative ("/"
+// for the root). The mount root is the hierarchy root.
+static int cgroup2_dir_of(struct fd *fd, char *path) {
+    int err = tmpfs_getpath(fd, path);
+    if (err < 0)
+        return err;
+    char *slash = strrchr(path, '/');
+    if (slash == NULL)
+        return _EINVAL;
+    *slash = '\0';
+    if (path[0] == '\0')
+        strcpy(path, "/");
+    return 0;
+}
+
+static const char *cgroup2_group_path(struct tgroup *group) {
+    return group->cgroup_path != NULL ? group->cgroup_path : "/";
+}
+
+// True if `member` is `cg` or below it.
+static bool cgroup2_path_within(const char *member, const char *cg) {
+    if (strcmp(cg, "/") == 0)
+        return true;
+    size_t len = strlen(cg);
+    return strncmp(member, cg, len) == 0 && (member[len] == '\0' || member[len] == '/');
+}
+
+struct cgroup2_text {
+    char *buf;
+    size_t len, cap;
+};
+
+static void cgroup2_text_add(struct cgroup2_text *t, const char *fmt, ...) {
+    char item[64];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(item, sizeof(item), fmt, args);
+    va_end(args);
+    if (n <= 0)
+        return;
+    if (t->len + n > t->cap) {
+        size_t cap = t->cap ? t->cap * 2 : 256;
+        while (cap < t->len + n)
+            cap *= 2;
+        char *buf = realloc(t->buf, cap);
+        if (buf == NULL)
+            return;
+        t->buf = buf;
+        t->cap = cap;
+    }
+    memcpy(t->buf + t->len, item, n);
+    t->len += n;
+}
+
+// Renders one live interface file of cgroup `cg`. Caller frees t->buf.
+static void cgroup2_render(const char *cg, const char *name, struct cgroup2_text *t) {
+    bool procs = strcmp(name, "cgroup.procs") == 0;
+    bool threads = strcmp(name, "cgroup.threads") == 0;
+    bool populated = false;
+    complex_lockt(&pids_lock, 0);
+    struct pid *pid;
+    list_for_each_entry(&alive_pids_list, pid, alive) {
+        struct task *task = pid->task;
+        if (task == NULL || task->group == NULL || task->group->leader != task)
+            continue;
+        struct tgroup *group = task->group;
+        if (list_empty(&group->threads))
+            continue; // every thread has exited: a zombie, out of its cgroup
+        const char *path = cgroup2_group_path(group);
+        if (procs || threads) {
+            if (strcmp(path, cg) != 0)
+                continue;
+            // By the reader's pid namespace's numbers, and only what it
+            // has a number for (Linux lists the rest as 0).
+            if (procs) {
+                if (current_pid_shown(task->pid) != 0)
+                    cgroup2_text_add(t, "%d\n", current_pid_shown(task->pid));
+            } else {
+                struct task *thread;
+                list_for_each_entry(&group->threads, thread, group_links)
+                    if (current_pid_shown(thread->pid) != 0)
+                        cgroup2_text_add(t, "%d\n", current_pid_shown(thread->pid));
+            }
+        } else if (cgroup2_path_within(path, cg)) {
+            populated = true;
+            break;
+        }
+    }
+    unlock(&pids_lock);
+    if (!procs && !threads)
+        cgroup2_text_add(t, "populated %d\nfrozen 0\n", populated ? 1 : 0);
+}
+
+// Called by tmpfs_read/tmpfs_pread before they take inode->lock (the render
+// takes pids_lock, which must not nest inside it).
+static void tmpfs_cgroup2_refresh(struct fd *fd, off_t off) {
+    if (off != 0 || !tmpfs_is_cgroup2_mount(fd->mount))
+        return;
+    if (!cgroup2_is_live_file(fd->tmpfs.dirent->name))
+        return;
+    char cg[MAX_PATH];
+    if (cgroup2_dir_of(fd, cg) < 0)
+        return;
+    struct cgroup2_text t = {};
+    cgroup2_render(cg, fd->tmpfs.dirent->name, &t);
+    struct tmp_inode *inode = tmpfs_fd_inode(fd);
+    lock(&inode->lock, 0);
+    if (inode->host_fd < 0) {
+        free(inode->file_data);
+        inode->file_data = t.buf;
+        inode->stat.size = t.len;
+        t.buf = NULL;
+    }
+    unlock(&inode->lock);
+    free(t.buf);
+}
+
+// IN_MODIFY on cgroup.events of `cg` and each of its ancestors, in every
+// cgroup2 mount. Takes mounts_lock and the inotify locks: call with nothing
+// held.
+void cgroup2_note_membership_change(const char *cg) {
+    if (cg == NULL || !inotify_has_instances())
+        return;
+    char *points[8];
+    int npoints = 0;
+    lock(&mounts_lock, 0);
+    struct mount *mount;
+    list_for_each_entry(&mounts, mount, mounts) {
+        if (mount->fs == &cgroup2fs && npoints < (int) array_size(points))
+            points[npoints++] = strdup(mount->point);
+    }
+    unlock(&mounts_lock);
+    for (int i = 0; i < npoints; i++) {
+        if (points[i] == NULL)
+            continue;
+        char dir[MAX_PATH];
+        snprintf(dir, sizeof(dir), "%s", strcmp(cg, "/") == 0 ? "" : cg);
+        for (;;) {
+            char path[MAX_PATH];
+            if (snprintf(path, sizeof(path), "%s%s/cgroup.events", points[i], dir) < (int) sizeof(path))
+                inotify_notify_modify(path);
+            if (dir[0] == '\0')
+                break;
+            *strrchr(dir, '/') = '\0';
+        }
+        free(points[i]);
+    }
+}
+
 // A pid written to a cgroup2 hierarchy's cgroup.procs moves that process
-// into the cgroup. The fake hierarchy stores the write like any tmpfs file;
-// this additionally records the membership on the process's tgroup so
-// /proc/<pid>/cgroup can report it. systemd --user depends on that: it
-// derives its own delegated subtree from /proc/self/cgroup, and the
-// previously hardcoded "0::/" made it try to create init.scope at the
-// hierarchy ROOT -- EACCES for a non-root user manager, so every user@
-// start died with "Failed to allocate manager object: Permission denied".
+// into the cgroup. The write is stored like any tmpfs write (reads render the
+// live list instead, above); this records the membership on the process's
+// tgroup, which is what the renderer and /proc/<pid>/cgroup read. systemd
+// --user depends on that: it derives its own delegated subtree from
+// /proc/self/cgroup, and the previously hardcoded "0::/" made it try to
+// create init.scope at the hierarchy ROOT -- EACCES for a non-root user
+// manager, so every user@ start died with "Failed to allocate manager
+// object: Permission denied". Pid 0 is the writer, as on Linux.
 static void tmpfs_cgroup2_note_procs_write(struct fd *fd, const void *buf, size_t bufsize) {
     if (!tmpfs_is_cgroup2_mount(fd->mount))
         return;
@@ -1447,31 +1940,31 @@ static void tmpfs_cgroup2_note_procs_write(struct fd *fd, const void *buf, size_
         return;
     memcpy(num, buf, bufsize);
     num[bufsize] = '\0';
-    pid_t_ pid = (pid_t_) atoi(num);
-    if (pid <= 0)
+    char *end;
+    long value = strtol(num, &end, 10);
+    if (end == num || value < 0)
         return;
-    // The cgroup is cgroup.procs's parent directory; its mount-relative path
-    // IS the hierarchy-relative path (the mount root is the cgroup root).
+    pid_t_ pid = value == 0 ? current->tgid : (pid_t_) value;
     char path[MAX_PATH];
-    if (tmpfs_getpath(fd, path) < 0)
+    if (cgroup2_dir_of(fd, path) < 0)
         return;
-    size_t plen = strlen(path);
-    const char suffix[] = "/cgroup.procs";
-    if (plen < sizeof(suffix) - 1)
-        return;
-    path[plen - (sizeof(suffix) - 1)] = '\0';
-    if (path[0] == '\0')
-        strcpy(path, "/");
 
+    char *old_path = NULL;
     complex_lockt(&pids_lock, 0);
     struct task *task = pid_get_task(pid);
     if (task != NULL && task->group != NULL) {
         lock(&task->group->lock, 0);
+        old_path = strdup(cgroup2_group_path(task->group));
         free(task->group->cgroup_path);
         task->group->cgroup_path = strdup(path);
         unlock(&task->group->lock);
     }
     unlock(&pids_lock);
+    if (old_path != NULL) {
+        cgroup2_note_membership_change(old_path);
+        cgroup2_note_membership_change(path);
+        free(old_path);
+    }
 }
 
 static ssize_t tmpfs_write(struct fd *fd, const void *buf, size_t bufsize) {
@@ -1479,6 +1972,8 @@ static ssize_t tmpfs_write(struct fd *fd, const void *buf, size_t bufsize) {
     struct tmp_inode *inode = tmpfs_fd_inode(fd);
     if (S_ISFIFO(inode->stat.mode))
         return fifo_file_write(inode->fifo, fd, buf, bufsize);
+    if (!tmpfs_fd_writable(fd))
+        return _EBADF;
     lock(&inode->lock, 0);
     res = _EISDIR;
     if (S_ISDIR(inode->stat.mode))
@@ -1524,17 +2019,31 @@ static ssize_t tmpfs_write(struct fd *fd, const void *buf, size_t bufsize) {
         res = _EFBIG;
         goto out;
     }
+    // The mount's size limit; see tmpfs_pwrite.
+    if (bufsize > 0) {
+        size_t fits = tmpfs_fit_write(inode, off, bufsize);
+        if (fits == 0) {
+            res = _ENOSPC;
+            goto out;
+        }
+        bufsize = fits;
+        end = off + bufsize;
+    }
     if (inode->host_fd >= 0) {
         // Host-file-backed (has been mmapped): write the host file so the data
         // is visible through any MAP_SHARED guest mapping.
+        if (end > inode->stat.size && (res = tmpfs_charge(inode, end)) < 0)
+            goto out;
         ssize_t n = pwrite(inode->host_fd, buf, bufsize, off);
         if (n < 0) {
             res = errno_map();
+            tmpfs_charge(inode, inode->stat.size);
             goto out;
         }
         fd->offset = off + n;
         if (inode->stat.size < off + (size_t) n)
             inode->stat.size = off + n;
+        tmpfs_charge(inode, inode->stat.size);
         if (n > 0)
             tmpfs_update_mtime_and_ctime(inode);
         res = n;
@@ -1546,6 +2055,9 @@ static ssize_t tmpfs_write(struct fd *fd, const void *buf, size_t bufsize) {
             goto out;
     }
     memcpy((char *) inode->file_data + off, buf, bufsize);
+    // See tmpfs_pwrite: an overwrite in place is a modification too.
+    if (bufsize > 0)
+        tmpfs_update_mtime_and_ctime(inode);
     fd->offset = off + bufsize;
     res = bufsize;
 
@@ -1581,6 +2093,22 @@ static off_t_ tmpfs_lseek(struct fd *fd, off_t_ off, int whence) {
         tmpfs_seekdir(fd, (unsigned long) target);
         fd->offset = target;
         return target;
+    }
+
+    // tmpfs keeps a file as one buffer and has no record of holes, so it
+    // answers as realfs does (fs/real.c): a file with no holes -- DATA is the
+    // offset itself, the only HOLE is the one at EOF, and before the start or
+    // at and past EOF is ENXIO for both, as measured on Linux 6.12. And it is
+    // a seek: the offset moves there. generic_seek answered EINVAL, which told
+    // cp, tar and rsync the interface did not exist.
+    if (whence == LSEEK_DATA || whence == LSEEK_HOLE) {
+        lock(&inode->lock, 0);
+        off_t_ eof = (off_t_) inode->stat.size;
+        unlock(&inode->lock);
+        if (off < 0 || off >= eof)
+            return _ENXIO;
+        fd->offset = whence == LSEEK_DATA ? off : eof;
+        return fd->offset;
     }
 
     qword_t size = 0;
@@ -1741,7 +2269,6 @@ static void tmpfs_seekdir(struct fd *fd, unsigned long ptr) {
     unlock(&dir->lock);
 }
 
-#define TMPFS_BLOCK_SIZE 4096
 
 static void tmpfs_count_tree(struct tmp_dirent *dir, uint64_t *pages, uint64_t *inodes) {
     struct tmp_dirent *child;
@@ -1758,24 +2285,92 @@ static void tmpfs_count_tree(struct tmp_dirent *dir, uint64_t *pages, uint64_t *
     unlock(&dir->lock);
 }
 
-static int tmpfs_statfs(struct mount *mount, struct statfsbuf *stat) {
-    // Linux tmpfs reports the mount's size limit as f_blocks (default: half
-    // of RAM) and decrements f_bfree/f_bavail by pages actually stored; the
-    // inode cap defaults to the same count as the block cap. There is no
-    // size= limit enforcement here, so report the Linux default cap derived
-    // from host RAM and subtract what the mount's inodes actually hold.
-    uint64_t total_pages = 0;
-    long phys_pages = sysconf(_SC_PHYS_PAGES);
-    long host_page_size = sysconf(_SC_PAGESIZE);
-    if (phys_pages > 0 && host_page_size > 0)
-        total_pages = (uint64_t) phys_pages * host_page_size / 2 / TMPFS_BLOCK_SIZE;
-    if (total_pages == 0)
-        total_pages = 1 << 18; // 1 GiB fallback
+// mount -o remount,size=... (Linux's shmem_reconfigure): a new size= or
+// nr_blocks= applies at once, and /proc/mounts shows it. As on Linux it is
+// EINVAL below what the files already hold, and a mount made without any
+// limit (size=0) cannot be given one. Other options are left as they were.
+static int tmpfs_remount(struct mount *mount, const char *info) {
+    uint64_t max_pages = 0;
+    const char *limit = NULL;
+    size_t limit_len = 0;
+    for (const char *opt = info; opt != NULL && *opt != '\0';) {
+        const char *end = strchr(opt, ',');
+        size_t len = end != NULL ? (size_t) (end - opt) : strlen(opt);
+        int kind = tmpfs_limit_option(opt, len, &max_pages);
+        if (kind < 0)
+            return kind;
+        if (kind > 0) {
+            limit = opt;
+            limit_len = len;
+        }
+        opt = end != NULL ? end + 1 : "";
+    }
+    if (limit == NULL)
+        return 0;
+    struct tmp_dirent *root = mount->data;
+    struct tmpfs_sb *sb = root != NULL && root->inode != NULL ? root->inode->sb : NULL;
+    if (sb == NULL)
+        return 0;
 
+    // The mount's option string, with its size= and nr_blocks= replaced by
+    // the new one, built before anything changes so a failure changes nothing.
+    const char *old_info = mount->info != NULL ? mount->info : "";
+    char *new_info = malloc(strlen(old_info) + limit_len + 2);
+    if (new_info == NULL)
+        return _ENOMEM;
+    size_t at = 0;
+    for (const char *opt = old_info; *opt != '\0';) {
+        const char *end = strchr(opt, ',');
+        size_t len = end != NULL ? (size_t) (end - opt) : strlen(opt);
+        uint64_t ignored;
+        if (len != 0 && tmpfs_limit_option(opt, len, &ignored) == 0) {
+            memcpy(new_info + at, opt, len);
+            at += len;
+            new_info[at++] = ',';
+        }
+        opt = end != NULL ? end + 1 : "";
+    }
+    memcpy(new_info + at, limit, limit_len);
+    new_info[at + limit_len] = '\0';
+
+    int err = 0;
+    lock(&sb->lock, 0);
+    if (max_pages != 0 && sb->max_pages == 0)
+        err = _EINVAL;  // "Cannot retroactively limit size"
+    else if (max_pages != 0 && sb->used_pages > max_pages)
+        err = _EINVAL;  // "Too small a size for current use"
+    else
+        sb->max_pages = max_pages;
+    unlock(&sb->lock);
+    if (err < 0) {
+        free(new_info);
+        return err;
+    }
+    // Every reader of mount->info holds mounts_lock, as the caller does.
+    free((void *) mount->info);
+    mount->info = new_info;
+    return 0;
+}
+
+static int tmpfs_statfs(struct mount *mount, struct statfsbuf *stat) {
+    // Linux tmpfs reports the mount's size limit as f_blocks and what its
+    // files hold as the difference to f_bfree/f_bavail; the inode cap
+    // defaults to the same count as the block cap. Both from the mount's
+    // accounting (struct tmpfs_sb), which is what the limit is enforced on.
+    uint64_t total_pages = tmpfs_default_pages();
     uint64_t used_pages = 0, used_inodes = 1; // root inode
     struct tmp_dirent *root = mount->data;
-    if (root != NULL)
+    struct tmpfs_sb *sb = root != NULL && root->inode != NULL ? root->inode->sb : NULL;
+    if (sb != NULL) {
+        lock(&sb->lock, 0);
+        if (sb->max_pages != 0)
+            total_pages = sb->max_pages;
+        used_pages = sb->used_pages;
+        used_inodes = sb->used_inodes;
+        unlock(&sb->lock);
+    } else if (root != NULL) {
         tmpfs_count_tree(root, &used_pages, &used_inodes);
+    }
 
     stat->bsize = TMPFS_BLOCK_SIZE;
     stat->frsize = TMPFS_BLOCK_SIZE;
@@ -1796,10 +2391,168 @@ static int cgroupfs_statfs(struct mount *UNUSED(mount), struct statfsbuf *stat) 
     return 0;
 }
 
+// ---------------------------------------------------- extended attributes
+//
+// On the inode, so hard links share them and they last exactly as long as the
+// file. kernel/xattr.c has made every permission and name check already. No
+// limit beyond the per-value one it enforces: measured on 6.12, a tmpfs took
+// two hundred 64 KiB values on one file.
+
+static struct tmp_inode *tmpfs_xattr_inode(struct mount *mount, const char *path, struct fd *fd,
+        struct tmp_dirent **dirent_out) {
+    *dirent_out = NULL;
+    if (fd != NULL)
+        return tmpfs_fd_inode(fd);
+    struct tmp_dirent *dirent = tmpfs_lookup(mount, path);
+    if (IS_ERR(dirent))
+        return ERR_PTR(PTR_ERR(dirent));
+    *dirent_out = dirent;
+    return dirent->inode;
+}
+
+static struct tmp_xattr **tmpfs_xattr_find(struct tmp_inode *inode, const char *name) {
+    struct tmp_xattr **link = &inode->xattrs;
+    while (*link != NULL && strcmp((*link)->name, name) < 0)
+        link = &(*link)->next;
+    return link;
+}
+
+static ssize_t tmpfs_getxattr(struct mount *mount, const char *path, struct fd *fd,
+        const char *name, void *value, size_t size) {
+    struct tmp_dirent *dirent;
+    struct tmp_inode *inode = tmpfs_xattr_inode(mount, path, fd, &dirent);
+    if (IS_ERR(inode))
+        return PTR_ERR(inode);
+    lock(&inode->lock, 0);
+    struct tmp_xattr *x = *tmpfs_xattr_find(inode, name);
+    ssize_t res;
+    if (x == NULL || strcmp(x->name, name) != 0)
+        res = _ENODATA;
+    else if (size == 0)
+        res = (ssize_t) x->size;
+    else if (x->size > size)
+        res = _ERANGE;
+    else {
+        memcpy(value, x->value, x->size);
+        res = (ssize_t) x->size;
+    }
+    unlock(&inode->lock);
+    if (dirent != NULL)
+        tmp_dirent_release(dirent);
+    return res;
+}
+
+static int tmpfs_setxattr(struct mount *mount, const char *path, struct fd *fd,
+        const char *name, const void *value, size_t size, int flags) {
+    struct tmp_dirent *dirent;
+    struct tmp_inode *inode = tmpfs_xattr_inode(mount, path, fd, &dirent);
+    if (IS_ERR(inode))
+        return PTR_ERR(inode);
+    // Built before the lock is taken; nothing can fail once it is.
+    struct tmp_xattr *fresh = malloc(sizeof(struct tmp_xattr) + size);
+    char *fresh_name = strdup(name);
+    int err = 0;
+    if (fresh == NULL || fresh_name == NULL) {
+        free(fresh);
+        free(fresh_name);
+        err = _ENOMEM;
+    } else {
+        fresh->name = fresh_name;
+        fresh->size = size;
+        if (size != 0)
+            memcpy(fresh->value, value, size);
+        lock(&inode->lock, 0);
+        struct tmp_xattr **link = tmpfs_xattr_find(inode, name);
+        bool exists = *link != NULL && strcmp((*link)->name, name) == 0;
+        if ((flags & XATTR_CREATE_) && exists)
+            err = _EEXIST;
+        else if ((flags & XATTR_REPLACE_) && !exists)
+            err = _ENODATA;
+        if (err == 0) {
+            if (exists) {
+                struct tmp_xattr *old = *link;
+                fresh->next = old->next;
+                *link = fresh;
+                free(old->name);
+                free(old);
+            } else {
+                fresh->next = *link;
+                *link = fresh;
+            }
+            tmpfs_update_ctime(inode);
+        }
+        unlock(&inode->lock);
+        if (err < 0) {
+            free(fresh->name);
+            free(fresh);
+        }
+    }
+    if (dirent != NULL)
+        tmp_dirent_release(dirent);
+    return err;
+}
+
+static ssize_t tmpfs_listxattr(struct mount *mount, const char *path, struct fd *fd,
+        char *list, size_t size) {
+    struct tmp_dirent *dirent;
+    struct tmp_inode *inode = tmpfs_xattr_inode(mount, path, fd, &dirent);
+    if (IS_ERR(inode))
+        return PTR_ERR(inode);
+    lock(&inode->lock, 0);
+    size_t total = 0;
+    ssize_t res = 0;
+    for (struct tmp_xattr *x = inode->xattrs; x != NULL; x = x->next) {
+        size_t n = strlen(x->name) + 1;
+        if (size != 0) {
+            if (total + n > size) {
+                res = _ERANGE;
+                break;
+            }
+            memcpy(list + total, x->name, n);
+        }
+        total += n;
+    }
+    unlock(&inode->lock);
+    if (dirent != NULL)
+        tmp_dirent_release(dirent);
+    return res < 0 ? res : (ssize_t) total;
+}
+
+static int tmpfs_removexattr(struct mount *mount, const char *path, struct fd *fd,
+        const char *name) {
+    struct tmp_dirent *dirent;
+    struct tmp_inode *inode = tmpfs_xattr_inode(mount, path, fd, &dirent);
+    if (IS_ERR(inode))
+        return PTR_ERR(inode);
+    lock(&inode->lock, 0);
+    struct tmp_xattr **link = tmpfs_xattr_find(inode, name);
+    int err = _ENODATA;
+    if (*link != NULL && strcmp((*link)->name, name) == 0) {
+        struct tmp_xattr *old = *link;
+        *link = old->next;
+        free(old->name);
+        free(old);
+        tmpfs_update_ctime(inode);
+        err = 0;
+    }
+    unlock(&inode->lock);
+    if (dirent != NULL)
+        tmp_dirent_release(dirent);
+    return err;
+}
+
+const struct xattr_ops tmpfs_xattr_ops = {
+    .get = tmpfs_getxattr,
+    .set = tmpfs_setxattr,
+    .list = tmpfs_listxattr,
+    .remove = tmpfs_removexattr,
+};
+
 const struct fs_ops tmpfs = {
     .name = "tmpfs", .magic = 0x01021994,
     .mount = tmpfs_mount,
     .umount = tmpfs_umount,
+    .remount = tmpfs_remount,
     .statfs = tmpfs_statfs,
     .open = tmpfs_open,
     .close = tmpfs_close,
@@ -1827,6 +2580,7 @@ const struct fs_ops devtmpfs = {
     .name = "devtmpfs", .magic = 0x01021994,
     .mount = tmpfs_mount,
     .umount = tmpfs_umount,
+    .remount = tmpfs_remount,
     .statfs = tmpfs_statfs,
     .open = tmpfs_open,
     .close = tmpfs_close,
@@ -1927,6 +2681,7 @@ static int tmpfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t page
 }
 
 const struct fd_ops tmpfs_fdops = {
+    .name = "tmpfs",
     .read = tmpfs_read,
     .write = tmpfs_write,
     .pread = tmpfs_pread,
@@ -1937,4 +2692,5 @@ const struct fd_ops tmpfs_fdops = {
     .readdir = tmpfs_readdir,
     .telldir = tmpfs_telldir,
     .seekdir = tmpfs_seekdir,
+    .reopen = tmpfs_reopen,
 };

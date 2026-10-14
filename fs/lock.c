@@ -1,5 +1,6 @@
 #include <limits.h>
 #include "kernel/calls.h"
+#include "kernel/pid_ns.h"
 #include "kernel/fs.h"
 #include "fs/inode.h"
 #include "kernel/signal.h"
@@ -305,7 +306,9 @@ static int flock_from_file_lock(struct file_lock *lock, struct flock_ *flock) {
         flock->len = lock->end - lock->start + 1;
     else
         flock->len = 0;
-    flock->pid = lock->pid;
+    // The holder, as the caller's pid namespace knows it: 0 for one it has
+    // no number for (-1, an open file description's lock, is left alone).
+    flock->pid = current_pid_shown(lock->pid);
     strncpy(flock->comm, lock->comm, sizeof(flock->comm));
     return 0;
 }
@@ -375,7 +378,10 @@ int fcntl_setlk(struct fd *fd, struct flock_ *flock, bool blocking, bool ofd) {
             }
             struct lock_waiter waiter;
             posix_lock_waiter_add(&waiter, request.owner, blocker_owner);
-            err = wait_for(&inode->posix_unlock, &inode->lock, NULL);
+            // wait_for_blocked, although TASK_MAY_BLOCK has set io_block
+            // already: the barrier can read the flag just before it was set,
+            // and plain wait_for would hand that poke back as EINTR.
+            err = wait_for_blocked(&inode->posix_unlock, &inode->lock, NULL);
             posix_lock_waiter_remove(&waiter);
             if (err < 0)
                 break;
@@ -423,6 +429,14 @@ int flock_lock(struct fd *fd, int operation) {
     };
     strncpy(request.comm, current->comm, sizeof(request.comm));
 
+    // Nothing may return from inside TASK_MAY_BLOCK. It is a for loop, and
+    // leaving its body any way but the bottom skips task_may_block_end. Both
+    // failures here used to return from it, so a flock that failed -- EAGAIN
+    // for LOCK_NB against a held lock, or EINTR -- left the task marked
+    // blocked while it went on running: /proc/<pid>/stat said S, the load
+    // average did not count it, and the address-space barrier stopped poking
+    // it, until its next blocking call cleared the flag.
+    int err = 0;
     TASK_MAY_BLOCK {
         while (true) {
             bool conflict = false;
@@ -435,15 +449,17 @@ int flock_lock(struct fd *fd, int operation) {
             if (!conflict)
                 break;
             if (operation & LOCK_NB_) {
-                unlock(&inode->lock);
-                return _EAGAIN;
+                err = _EAGAIN;
+                break;
             }
-            int err = wait_for(&inode->flock_unlock, &inode->lock, NULL);
-            if (err < 0) {
-                unlock(&inode->lock);
-                return err;
-            }
+            err = wait_for_blocked(&inode->flock_unlock, &inode->lock, NULL);
+            if (err < 0)
+                break;
         }
+    }
+    if (err < 0) {
+        unlock(&inode->lock);
+        return err;
     }
 
     struct file_lock *new_lock = file_lock_copy(&request);

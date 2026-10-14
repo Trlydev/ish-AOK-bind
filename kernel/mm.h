@@ -48,6 +48,10 @@ struct mm {
     _Atomic unsigned fault_oom_strikes;
     _Atomic size_t fault_last_resident_pages;
     struct fd *exefile;
+    // How many of the address space's rseq-registered threads report each
+    // CPU number (kernel/rseq.c): a thread takes the least used, so none
+    // shares one while there are CPUs enough to go round.
+    _Atomic uint16_t rseq_cpu_users[64];
 };
 
 // Create a new address space
@@ -71,6 +75,15 @@ void mem_fault_backpressure(void);
 // host_mem_headroom_low() is amortised and cannot itself become the cost of
 // touching memory -- while still noticing a 240 MiB/s writer within ~17 ms.
 #define MEM_HEADROOM_PROBE_MISSES 1024
+
+// mlockall(MCL_FUTURE) for a mapping made outside kernel/mmap.c's own paths
+// (shmat): sets *lock to the lock the `pages` about to be mapped start with --
+// 0, PT_LOCKED, or with PT_LOCKONFAULT under MCL_ONFAULT, which is not
+// populated -- and returns _EAGAIN when they would take the process past
+// RLIMIT_MEMLOCK, 0 otherwise. Reads the limit, so call it before taking the
+// address-space lock; lock the pages with mem_lock_new_range once they are
+// mapped. Defined in kernel/mmap.c.
+int mm_future_lock_check(struct mm *mm, pages_t pages, uint8_t *lock);
 
 // SysV shm bookkeeping hooks owned by kernel/ipc.c.
 void ipc_mm_init(struct mm *mm);

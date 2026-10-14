@@ -7,6 +7,7 @@
 
 #import <FileProvider/FileProvider.h>
 #import "Diagnostics.h"
+#import "FileProvider/ISHFileProviderDomainCleanup.h"
 #import "Roots.h"
 #import "AppGroup.h"
 #import "AppDelegate.h"
@@ -14,6 +15,7 @@
 #include "fs/proc/ish.h"
 #include "kernel/errno.h"
 #import "NSObject+SaneKVO.h"
+#include <os/lock.h>
 #include <archive.h>
 #include <archive_entry.h>
 #include "tools/fakefs.h"
@@ -84,6 +86,22 @@ static NSString *const kBundledRootFamilyDisplayNameKey = @"familyDisplayName";
 static NSString *const kBundledRootTierKey = @"tier";
 static NSString *const kBundledRootTierOfficial = @"official";
 static NSString *const kBundledRootTierCommunity = @"community";
+// A "series" is a line of images published repeatedly from the same source as
+// that source moves on -- same distro, same architectures, a newer build (the
+// PSCAL + SmallCLUE rootfs is the first). Every version ever published stays
+// in the manifest, because that file is the record of what exists and an
+// older build stays installable by identifier through ish-cli, but the picker
+// offers only the most recent few: a list that grows a row on every rebuild
+// stops being a picker. Entries with no series are unversioned and always
+// offered.
+static NSString *const kBundledRootSeriesKey = @"series";
+static NSString *const kBundledRootVersionKey = @"version";
+static const NSUInteger kBundledRootSeriesVersionsOffered = 2;
+// A choice the picker never offers but that stays in the catalogue, so roots
+// imported from it still resolve (BundledRootChoiceMatchingName: the guest ABI
+// of a root whose metadata predates kRootMetadataGuestABIKey). The previously
+// bundled image, once a newer one replaces it in the app.
+static NSString *const kBundledRootLegacyKey = @"legacy";
 // Present only for choices whose archive isn't shipped in the app bundle --
 // importing them downloads this URL into /AOK/persist/roots on demand
 // instead (see DownloadBundledArchive / importBundledRootChoice:).
@@ -92,6 +110,14 @@ static NSString *const kBundledRootDownloadSizeKey = @"downloadSize";
 static NSString *const kRootsErrorDomain = @"iSH.Roots";
 static NSString *const kRootMetadataFileName = @"ish-root.plist";
 static NSString *const kRootMetadataGuestABIKey = @"guestABI";
+// What a root IS, beside its ABI: absent for a distribution unpacked from an
+// archive, "native" for a native-mode root (docs/native_mode_plan.md) -- one
+// with no distribution in it, created empty and provisioned by the kernel at
+// every boot (kernel/native_root.c). The catalogue entry that creates one
+// carries the same key and value.
+static NSString *const kRootMetadataKindKey = @"kind";
+static NSString *const kBundledRootKindKey = @"kind";
+static NSString *const kRootKindNative = @"native";
 
 NSNotificationName const RootsDidFinishInitialSelectionNotification = @"RootsDidFinishInitialSelectionNotification";
 
@@ -113,25 +139,26 @@ static NSArray<NSString *> *RequiredManifestKeys(void) {
     return keys;
 }
 
-static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoicesFromManifest(void) {
-    NSURL *manifestURL = [NSBundle.mainBundle URLForResource:@"manifest" withExtension:@"json"];
-    if (manifestURL == nil) {
-        NSLog(@"manifest.json not found in app bundle (deps/rootfs-manifest submodule) -- no downloadable filesystem choices available");
-        return @[];
-    }
-    NSData *data = [NSData dataWithContentsOfURL:manifestURL];
+// Parses one manifest, whatever it came from -- the copy inside the app, the
+// cached copy of the last good download, or bytes straight off the network.
+// One function on purpose: the downloaded manifest decides which filesystems
+// the app will fetch and from where, so it has to clear exactly the same bar
+// as the one shipped in the IPA, not a laxer one. `source` only labels log
+// lines. Returns nil (not @[]) when the manifest as a whole is unusable, so a
+// caller can tell "this source failed" from "this source lists nothing".
+static NSArray<NSDictionary<NSString *, NSString *> *> *ParseRootManifest(NSData *data, NSString *source) {
     NSError *error = nil;
     id parsed = data != nil ? [NSJSONSerialization JSONObjectWithData:data options:0 error:&error] : nil;
     if (![parsed isKindOfClass:NSArray.class]) {
-        NSLog(@"rootfs-manifest.json could not be parsed: %@", error);
-        return @[];
+        NSLog(@"rootfs manifest (%@) could not be parsed: %@", source, error);
+        return nil;
     }
 
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *entries = [NSMutableArray array];
     NSMutableSet<NSString *> *seenIdentifiers = [NSMutableSet set];
     for (id rawEntry in (NSArray *) parsed) {
         if (![rawEntry isKindOfClass:NSDictionary.class]) {
-            NSLog(@"rootfs-manifest.json: skipping non-object entry");
+            NSLog(@"rootfs manifest (%@): skipping non-object entry", source);
             continue;
         }
         NSDictionary<NSString *, NSString *> *entry = rawEntry;
@@ -139,16 +166,29 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoi
         for (NSString *key in RequiredManifestKeys()) {
             id value = entry[key];
             if (![value isKindOfClass:NSString.class] || [(NSString *) value length] == 0) {
-                NSLog(@"rootfs-manifest.json: entry missing required key '%@', skipping", key);
+                NSLog(@"rootfs manifest (%@): entry missing required key '%@', skipping", source, key);
                 valid = NO;
                 break;
             }
         }
         if (!valid)
             continue;
+        // The manifest can now arrive over the network, so the URL it hands the
+        // downloader has to be one worth following. https only: a plain-http
+        // entry would let anyone on the path choose the root filesystem a user
+        // installs. Every entry ever shipped is already https, so this rejects
+        // nothing that exists today -- it stops what could be added later.
+        NSString *downloadURLString = entry[kBundledRootDownloadURLKey];
+        NSURLComponents *components = [NSURLComponents componentsWithString:downloadURLString];
+        if (![components.scheme isEqualToString:@"https"] || components.host.length == 0) {
+            NSLog(@"rootfs manifest (%@): entry '%@' has a non-https downloadURL, skipping",
+                  source, entry[kBundledRootIdentifierKey]);
+            continue;
+        }
+
         NSString *identifier = entry[kBundledRootIdentifierKey];
         if ([seenIdentifiers containsObject:identifier]) {
-            NSLog(@"rootfs-manifest.json: duplicate identifier '%@', skipping", identifier);
+            NSLog(@"rootfs manifest (%@): duplicate identifier '%@', skipping", source, identifier);
             continue;
         }
         [seenIdentifiers addObject:identifier];
@@ -159,16 +199,93 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *LoadDownloadableRootChoi
             fixedUp[kBundledRootTierKey] = kBundledRootTierCommunity;
             entry = fixedUp;
         }
+
+        // series/version are optional, so they aren't in RequiredManifestKeys
+        // and nothing above has checked their type. JSON will happily hand us
+        // `"version": 3` as an NSNumber, and every reader from here on treats
+        // these as strings -- so drop anything that isn't one. Losing the keys
+        // makes the entry unversioned (always offered), which is the harmless
+        // direction to fail in.
+        for (NSString *key in @[kBundledRootSeriesKey, kBundledRootVersionKey]) {
+            id value = entry[key];
+            if (value != nil && ![value isKindOfClass:NSString.class]) {
+                NSLog(@"rootfs manifest (%@): entry '%@' has a non-string '%@', ignoring that key", source, identifier, key);
+                NSMutableDictionary<NSString *, NSString *> *fixedUp = [entry mutableCopy];
+                [fixedUp removeObjectForKey:key];
+                entry = fixedUp;
+            }
+        }
         [entries addObject:entry];
     }
     return entries;
 }
 
-static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void) {
-    static NSArray<NSDictionary<NSString *, NSString *> *> *choices;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSMutableArray<NSDictionary<NSString *, NSString *> *> *mutableChoices = [@[
+// The catalogue is fetched from here at runtime, and the copy inside the app is
+// only the fallback. It has to work that way: the app bundles a SNAPSHOT of
+// manifest.json taken when it was built, so an installed build's idea of which
+// filesystems exist is frozen at its release. Publishing a new rootfs left
+// every existing install unable to see it, and withdrawing one left them asking
+// for a URL that had stopped existing -- "Couldn't download the filesystem
+// image", with nothing fixable from the device. Now an old build tracks the
+// catalogue like a new one.
+static NSString *const kRemoteManifestURLString =
+    @"https://raw.githubusercontent.com/emkey1/ish-AOK-rootfs/main/manifest.json";
+// A catalogue is a few kB; anything remotely near this is not one, and the cap
+// keeps a wrong or hostile response from being read into memory wholesale.
+static const NSUInteger kRemoteManifestMaxBytes = 1024 * 1024;
+// Re-fetching on every glance at the Filesystems screen would hammer the host
+// for a file that changes a few times a year.
+static const NSTimeInterval kRemoteManifestMinRefreshInterval = 10 * 60;
+
+NSNotificationName const RootsCatalogDidChangeNotification = @"RootsCatalogDidChangeNotification";
+
+// Last good download, kept so the catalogue survives being offline: a device
+// that has fetched once never falls back to the frozen in-app snapshot again.
+// A .json here is ignored by cachedRootArchiveURLs, which only collects archive
+// suffixes, so it cannot show up as an importable file.
+static NSURL *RemoteManifestCacheURL(void) {
+    NSURL *container = ContainerURL();
+    if (container == nil)
+        return nil;
+    return [[[container URLByAppendingPathComponent:@"AOK" isDirectory:YES]
+             URLByAppendingPathComponent:@"persist" isDirectory:YES]
+            URLByAppendingPathComponent:@"manifest-cache.json"];
+}
+
+// Best catalogue available right now, newest source first. Each is validated by
+// the same parser, and a source that fails to parse falls through to the next
+// rather than emptying the picker.
+static NSArray<NSDictionary<NSString *, NSString *> *> *DownloadableRootChoices(void) {
+    NSURL *cacheURL = RemoteManifestCacheURL();
+    if (cacheURL != nil) {
+        NSData *cached = [NSData dataWithContentsOfURL:cacheURL];
+        if (cached != nil) {
+            NSArray *entries = ParseRootManifest(cached, @"downloaded");
+            if (entries != nil)
+                return entries;
+            // Corrupt or truncated: drop it so the next fetch starts clean,
+            // and use the in-app copy meanwhile.
+            [NSFileManager.defaultManager removeItemAtURL:cacheURL error:NULL];
+        }
+    }
+    NSURL *bundledURL = [NSBundle.mainBundle URLForResource:@"manifest" withExtension:@"json"];
+    if (bundledURL == nil) {
+        NSLog(@"manifest.json not found in app bundle (deps/rootfs-manifest submodule) -- no downloadable filesystem choices available");
+        return @[];
+    }
+    return ParseRootManifest([NSData dataWithContentsOfURL:bundledURL], @"in-app") ?: @[];
+}
+
+// Rebuilt whenever a fetch lands, so it cannot be a dispatch_once. Read from
+// the guest's thread (the /proc/ish/roots catalogue listing) as well as the
+// UI's, so the array is swapped under a lock and never mutated in place -- an
+// enumeration in progress keeps walking the array it started on.
+static os_unfair_lock gRootChoicesLock = OS_UNFAIR_LOCK_INIT;
+static NSArray<NSDictionary<NSString *, NSString *> *> *gRootChoices;
+static NSArray<NSDictionary<NSString *, NSString *> *> *gOfferedRootChoices;
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *BuildRootChoices(void) {
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *mutableChoices = [@[
             // Bundled-in-the-app choices (arm64 guests -- the only architecture
             // still shipped in the IPA); every download-backed choice comes from
             // the rootfs-manifest submodule instead (loaded below).
@@ -177,17 +294,50 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void)
             // splits into "Official Distributions" / "Community Distributions"
             // table sections along kBundledRootTierKey.
             @{
+                // The same image, identifier and import name as the
+                // manifest's download entry, which older app versions keep
+                // using; BuildRootChoices drops that entry here, so the
+                // bundled copy is the only one this build offers.
+                kBundledRootIdentifierKey: @"alpine3242aarch64",
+                kBundledRootDisplayNameKey: @"Alpine 3.24.2 (aarch64)",
+                kBundledRootArchiveNameKey: @"alpine-minirootfs-3.24.2-aarch64",
+                // Native AArch64 guest (same-architecture dispatch on Apple
+                // silicon — see aarch64_guest_plan.md).
+                kBundledRootImportNameKey: @"Alpine3.24.2-aarch64",
+                kBundledRootInitialWindowKey: @"session-shell",
+                kBundledRootGuestABIKey: @"arm64",
+                kBundledRootFamilyKey: @"alpine3242",
+                kBundledRootFamilyDisplayNameKey: @"Alpine 3.24.2",
+                kBundledRootTierKey: kBundledRootTierOfficial,
+            },
+            @{
+                // Bundled until 3.24.2 replaced it: no longer shipped, so
+                // not offered, but roots imported from it still match it.
                 kBundledRootIdentifierKey: @"alpine3233arm64",
                 kBundledRootDisplayNameKey: @"Alpine3.23.3(arm64)",
                 kBundledRootArchiveNameKey: @"alpine-minirootfs-3.23.3-aarch64",
-                // Native AArch64 guest (same-architecture dispatch on Apple
-                // silicon — see aarch64_guest_plan.md). Import name follows
-                // the RootNameIsValid rules like the x86_64 entry above.
                 kBundledRootImportNameKey: @"Alpine3.23.3-arm64",
                 kBundledRootInitialWindowKey: @"session-shell",
                 kBundledRootGuestABIKey: @"arm64",
                 kBundledRootFamilyKey: @"alpine3233",
                 kBundledRootFamilyDisplayNameKey: @"Alpine 3.23.3",
+                kBundledRootTierKey: kBundledRootTierOfficial,
+                kBundledRootLegacyKey: @"1",
+            },
+            @{
+                // Native mode: no distribution at all. Nothing to download or
+                // unpack -- importing it creates an empty filesystem, and the
+                // kernel links /bin and /usr/bin into /AOK/native at every
+                // boot. Bundled in the sense that matters (no download), and
+                // not the default: it cannot install packages.
+                kBundledRootIdentifierKey: @"aoknative",
+                kBundledRootDisplayNameKey: @"iSH-AOK Native (no distribution)",
+                kBundledRootImportNameKey: @"AOK-Native",
+                kBundledRootInitialWindowKey: @"session-shell",
+                kBundledRootGuestABIKey: @"arm64",
+                kBundledRootKindKey: kRootKindNative,
+                kBundledRootFamilyKey: @"aoknative",
+                kBundledRootFamilyDisplayNameKey: @"iSH-AOK Native",
                 kBundledRootTierKey: kBundledRootTierOfficial,
             },
             @{
@@ -202,10 +352,100 @@ static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void)
                 kBundledRootTierKey: kBundledRootTierOfficial,
             },
         ] mutableCopy];
-        [mutableChoices addObjectsFromArray:LoadDownloadableRootChoicesFromManifest()];
-        choices = mutableChoices;
-    });
-    return choices;
+    // A bundled image wins over a manifest entry with the same identifier.
+    NSMutableSet<NSString *> *bundledIdentifiers = [NSMutableSet set];
+    for (NSDictionary<NSString *, NSString *> *choice in mutableChoices)
+        [bundledIdentifiers addObject:choice[kBundledRootIdentifierKey]];
+    for (NSDictionary<NSString *, NSString *> *choice in DownloadableRootChoices())
+        if (![bundledIdentifiers containsObject:choice[kBundledRootIdentifierKey] ?: @""])
+            [mutableChoices addObject:choice];
+    return mutableChoices;
+}
+
+// Recomputes both cached arrays from whatever catalogue is current. Returns YES
+// if what the picker offers actually changed, so a fetch that returns the same
+// manifest does not churn the table.
+// Defined below, beside the series/version rule it implements.
+static NSArray<NSDictionary<NSString *, NSString *> *> *OfferedRootChoices(NSArray<NSDictionary<NSString *, NSString *> *> *choices);
+
+static BOOL ReloadRootChoices(void) {
+    NSArray<NSDictionary<NSString *, NSString *> *> *all = BuildRootChoices();
+    NSArray<NSDictionary<NSString *, NSString *> *> *offered = OfferedRootChoices(all);
+    os_unfair_lock_lock(&gRootChoicesLock);
+    BOOL changed = ![offered isEqualToArray:gOfferedRootChoices ?: @[]];
+    gRootChoices = all;
+    gOfferedRootChoices = offered;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    return changed;
+}
+
+static NSArray<NSDictionary<NSString *, NSString *> *> *BundledRootChoices(void) {
+    os_unfair_lock_lock(&gRootChoicesLock);
+    NSArray<NSDictionary<NSString *, NSString *> *> *choices = gRootChoices;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    if (choices != nil)
+        return choices;
+    ReloadRootChoices();
+    os_unfair_lock_lock(&gRootChoicesLock);
+    choices = gRootChoices;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    return choices ?: @[];
+}
+
+// The subset of BundledRootChoices() the picker (and `ish-cli roots catalog`)
+// actually lists: for every series, only the kBundledRootSeriesVersionsOffered
+// most recent versions. Versions are deduped per series first, so a series
+// that ships three architectures per version still counts that as one version.
+// Ordering is NSNumericSearch so "2026.9.19" and "2026.09.19" compare the way
+// a human reads them, and descending so the newest build is the first row.
+//
+// Superseded entries are hidden, not dropped: BundledRootChoices() still has
+// them, so a root imported from one keeps matching its origin choice (tier,
+// guest ABI) and `ish-cli roots install source=catalog id=...` still installs
+// it for anyone whose script already names it.
+static NSArray<NSDictionary<NSString *, NSString *> *> *OfferedRootChoices(NSArray<NSDictionary<NSString *, NSString *> *> *choices) {
+    // Legacy choices are never offered (kBundledRootLegacyKey).
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *current = [NSMutableArray array];
+    for (NSDictionary<NSString *, NSString *> *choice in choices)
+        if (choice[kBundledRootLegacyKey].length == 0)
+            [current addObject:choice];
+    choices = current;
+    NSMutableDictionary<NSString *, NSMutableOrderedSet<NSString *> *> *versionsBySeries = [NSMutableDictionary dictionary];
+    for (NSDictionary<NSString *, NSString *> *choice in choices) {
+        NSString *series = choice[kBundledRootSeriesKey];
+        NSString *version = choice[kBundledRootVersionKey];
+        if (series.length == 0 || version.length == 0)
+            continue;
+        NSMutableOrderedSet<NSString *> *versions = versionsBySeries[series];
+        if (versions == nil) {
+            versions = [NSMutableOrderedSet orderedSet];
+            versionsBySeries[series] = versions;
+        }
+        [versions addObject:version];
+    }
+    if (versionsBySeries.count == 0)
+        return choices;
+
+    NSMutableSet<NSString *> *offeredVersions = [NSMutableSet set];
+    [versionsBySeries enumerateKeysAndObjectsUsingBlock:^(NSString *series, NSMutableOrderedSet<NSString *> *versions, __unused BOOL *stop) {
+        [versions sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            return [b compare:a options:NSNumericSearch];
+        }];
+        NSUInteger keep = MIN(versions.count, kBundledRootSeriesVersionsOffered);
+        for (NSUInteger i = 0; i < keep; i++)
+            [offeredVersions addObject:[NSString stringWithFormat:@"%@\t%@", series, versions[i]]];
+    }];
+
+    NSMutableArray<NSDictionary<NSString *, NSString *> *> *offered = [NSMutableArray array];
+    for (NSDictionary<NSString *, NSString *> *choice in choices) {
+        NSString *series = choice[kBundledRootSeriesKey];
+        NSString *version = choice[kBundledRootVersionKey];
+        if (series.length == 0 || version.length == 0 ||
+                [offeredVersions containsObject:[NSString stringWithFormat:@"%@\t%@", series, version]]) {
+            [offered addObject:choice];
+        }
+    }
+    return offered;
 }
 
 // Bundled root archives may ship in any container format libarchive (and thus
@@ -319,12 +559,12 @@ static NSError *FakefsImportNSError(struct fakefsify_error fs_err) {
         domain = @"SQLite";
 
     if (fs_err.type == ERR_POSIX && fs_err.code == ENOSPC) {
-        description = @"Not enough free space to extract the filesystem.";
-        recoverySuggestion = @"Free up storage space and try again.";
+        description = NSLocalizedString(@"Not enough free space to extract the filesystem.", @"Filesystem import error");
+        recoverySuggestion = NSLocalizedString(@"Free up storage space and try again.", @"Filesystem import error recovery suggestion");
     } else if (fs_err.type == ERR_ARCHIVE) {
-        description = @"The filesystem archive could not be read.";
+        description = NSLocalizedString(@"The filesystem archive could not be read.", @"Filesystem import error");
     } else if (fs_err.type == ERR_SQLITE) {
-        description = @"The filesystem metadata database could not be created.";
+        description = NSLocalizedString(@"The filesystem metadata database could not be created.", @"Filesystem import error");
     } else {
         description = [NSString stringWithUTF8String:fs_err.message];
     }
@@ -346,7 +586,7 @@ static BOOL EstimateArchiveExtractionRequirement(NSURL *archiveURL, long long *r
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"libarchive"
                                          code:ENOMEM
-                                     userInfo:@{NSLocalizedDescriptionKey: @"Could not allocate archive reader."}];
+                                     userInfo:@{NSLocalizedDescriptionKey: NSLocalizedString(@"Could not allocate archive reader.", @"Filesystem import error")}];
         }
         return NO;
     }
@@ -357,7 +597,7 @@ static BOOL EstimateArchiveExtractionRequirement(NSURL *archiveURL, long long *r
             *error = [NSError errorWithDomain:@"libarchive"
                                          code:archive_errno(archive)
                                      userInfo:@{NSLocalizedDescriptionKey:
-                                                    @"The filesystem archive could not be read."}];
+                                                    NSLocalizedString(@"The filesystem archive could not be read.", @"Filesystem import error")}];
         }
         archive_read_free(archive);
         return NO;
@@ -378,7 +618,7 @@ static BOOL EstimateArchiveExtractionRequirement(NSURL *archiveURL, long long *r
                 *error = [NSError errorWithDomain:@"libarchive"
                                              code:archive_errno(archive)
                                          userInfo:@{NSLocalizedDescriptionKey:
-                                                        @"The filesystem archive could not be read."}];
+                                                        NSLocalizedString(@"The filesystem archive could not be read.", @"Filesystem import error")}];
             }
             archive_read_free(archive);
             return NO;
@@ -431,9 +671,9 @@ static BOOL RootsCheckAvailableSpaceForArchive(NSURL *archiveURL, NSURL *destina
     if (availableBytes.longLongValue < requiredBytes) {
         if (error != NULL) {
             *error = RootsStorageError([NSString stringWithFormat:
-                                        @"Not enough free space to extract the filesystem. About %@ is needed, but only %@ is available.",
+                                        NSLocalizedString(@"Not enough free space to extract the filesystem. About %@ is needed, but only %@ is available.", @"Filesystem import error; first %@ is the needed size, second the free space"),
                                         FormatByteCount(requiredBytes), FormatByteCount(availableBytes.longLongValue)],
-                                       @"Free up storage space and try again.");
+                                       NSLocalizedString(@"Free up storage space and try again.", @"Filesystem import error recovery suggestion"));
         }
         return NO;
     }
@@ -463,9 +703,9 @@ totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     double fraction = totalBytesExpectedToWrite > 0
         ? (double) totalBytesWritten / (double) totalBytesExpectedToWrite : 0;
     NSString *message = totalBytesExpectedToWrite > 0
-        ? [NSString stringWithFormat:@"Downloading… %@ of %@",
+        ? [NSString stringWithFormat:NSLocalizedString(@"Downloading… %@ of %@", @"Filesystem download progress; byte counts so far and in total"),
            FormatByteCount(totalBytesWritten), FormatByteCount(totalBytesExpectedToWrite)]
-        : [NSString stringWithFormat:@"Downloading… %@", FormatByteCount(totalBytesWritten)];
+        : [NSString stringWithFormat:NSLocalizedString(@"Downloading… %@", @"Filesystem download progress; byte count so far"), FormatByteCount(totalBytesWritten)];
     [self.progress updateProgress:fraction message:message];
     if ([self.progress shouldCancel]) {
         self.cancelled = YES;
@@ -479,7 +719,7 @@ didFinishDownloadingToURL:(NSURL *)location {
     NSHTTPURLResponse *response = (NSHTTPURLResponse *) downloadTask.response;
     if ([response isKindOfClass:NSHTTPURLResponse.class] && response.statusCode != 200) {
         self.error = [NSError errorWithDomain:NSURLErrorDomain code:NSURLErrorBadServerResponse userInfo:@{
-            NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Server returned status %ld", (long) response.statusCode],
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:NSLocalizedString(@"Server returned status %ld", @"Filesystem download error; %ld is an HTTP status code"), (long) response.statusCode],
         }];
         return;
     }
@@ -523,7 +763,7 @@ static BOOL DownloadBundledArchive(NSURL *url, NSURL *destination, id<ProgressRe
     NSURLSessionConfiguration *config = NSURLSessionConfiguration.ephemeralSessionConfiguration;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:config delegate:delegate delegateQueue:nil];
     NSURLSessionDownloadTask *task = [session downloadTaskWithURL:url];
-    [progress updateProgress:0 message:@"Downloading…"];
+    [progress updateProgress:0 message:NSLocalizedString(@"Downloading…", @"Filesystem download progress")];
     [task resume];
     dispatch_semaphore_wait(delegate.semaphore, DISPATCH_TIME_FOREVER);
     [session finishTasksAndInvalidate];
@@ -536,8 +776,8 @@ static BOOL DownloadBundledArchive(NSURL *url, NSURL *destination, id<ProgressRe
     if (delegate.error != nil) {
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{
-                NSLocalizedDescriptionKey: @"Couldn't download the filesystem image.",
-                NSLocalizedRecoverySuggestionErrorKey: @"Check your internet connection and try again.",
+                NSLocalizedDescriptionKey: NSLocalizedString(@"Couldn't download the filesystem image.", @"Filesystem download error"),
+                NSLocalizedRecoverySuggestionErrorKey: NSLocalizedString(@"Check your internet connection and try again.", @"Filesystem download error recovery suggestion"),
                 NSUnderlyingErrorKey: delegate.error,
             }];
         }
@@ -579,9 +819,9 @@ static void EnableCaseSensitiveFilesystemLookupsIfPossible(void) {
 static BOOL RootNameIsValid(NSString *name, NSError **error) {
     NSString *reason = nil;
     if (name.length == 0) {
-        reason = @"Filesystem name can't be empty";
+        reason = NSLocalizedString(@"Filesystem name can't be empty", @"Filesystem name validation error");
     } else if ([name hasPrefix:@"."]) {
-        reason = @"Filesystem name can't start with '.'";
+        reason = NSLocalizedString(@"Filesystem name can't start with '.'", @"Filesystem name validation error");
     } else {
         static NSCharacterSet *disallowed;
         static dispatch_once_t onceToken;
@@ -590,7 +830,7 @@ static BOOL RootNameIsValid(NSString *name, NSError **error) {
                 @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-"] invertedSet];
         });
         if ([name rangeOfCharacterFromSet:disallowed].location != NSNotFound)
-            reason = @"Filesystem name can only contain letters, numbers, '.', '-', and '_' (no spaces)";
+            reason = NSLocalizedString(@"Filesystem name can only contain letters, numbers, '.', '-', and '_' (no spaces)", @"Filesystem name validation error");
     }
     if (reason != nil) {
         if (error != NULL)
@@ -668,6 +908,12 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
 
         if ((!self.defaultRoot || ![self.roots containsObject:self.defaultRoot]) && self.roots.count)
             self.defaultRoot = PreferredDefaultRootName(self.roots);
+
+        // Not only when the Filesystems screen opens: a first launch with no
+        // roots goes straight to picking one, and that picker should list what
+        // exists today rather than whatever this build shipped with. Async, so
+        // it costs launch nothing and a device with no network is unaffected.
+        [self refreshRootCatalogFromNetwork];
     }
     return self;
 }
@@ -679,12 +925,100 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
     [NSUserDefaults.standardUserDefaults setObject:defaultRoot forKey:kDefaultRoot];
 }
 
+// ISH_BOOT_ROOT=<name> boots that root for this launch only and leaves the
+// saved default alone -- for driving a device from a Mac
+// (`devicectl device process launch -e '{"ISH_BOOT_ROOT":"Alpine3.23.3"}'`),
+// so a test leg boots each root rather than chrooting into it from the default
+// one. A name that is not an installed root is still returned: the boot then
+// fails on that name instead of quietly booting the default, because a leg
+// that asked for one root and tested another would report the wrong root's
+// results as that root's.
+- (NSString *)bootRootOverride {
+    const char *name = getenv("ISH_BOOT_ROOT");
+    if (name == NULL || name[0] == '\0')
+        return nil;
+    return @(name) ?: @"";
+}
+
+- (NSString *)rootToBoot {
+    return self.bootRootOverride ?: self.defaultRoot;
+}
+
 - (BOOL)needsInitialRootSelection {
     return self.roots.count == 0;
 }
 
 - (NSArray<NSDictionary<NSString *,NSString *> *> *)bundledRootChoices {
     return BundledRootChoices();
+}
+
+- (NSArray<NSDictionary<NSString *,NSString *> *> *)offeredRootChoices {
+    BundledRootChoices();   // builds both arrays on first use
+    os_unfair_lock_lock(&gRootChoicesLock);
+    NSArray<NSDictionary<NSString *, NSString *> *> *offered = gOfferedRootChoices;
+    os_unfair_lock_unlock(&gRootChoicesLock);
+    return offered ?: @[];
+}
+
+// Fetches the current catalogue and, if it differs from what is on screen,
+// swaps it in and says so. Everything about this is best-effort: no network, a
+// GitHub outage, a truncated body or a manifest that will not parse all leave
+// the previous catalogue exactly as it was. The picker is never emptied by a
+// failed refresh, and nothing here blocks a caller.
+- (void)refreshRootCatalogFromNetwork {
+    static os_unfair_lock refreshLock = OS_UNFAIR_LOCK_INIT;
+    static NSDate *lastAttempt;
+    static BOOL inFlight;
+    os_unfair_lock_lock(&refreshLock);
+    BOOL tooSoon = lastAttempt != nil &&
+        [NSDate.date timeIntervalSinceDate:lastAttempt] < kRemoteManifestMinRefreshInterval;
+    if (inFlight || tooSoon) {
+        os_unfair_lock_unlock(&refreshLock);
+        return;
+    }
+    inFlight = YES;
+    lastAttempt = NSDate.date;
+    os_unfair_lock_unlock(&refreshLock);
+
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:kRemoteManifestURLString]];
+    // The catalogue is the thing being checked for changes, so a stored copy is
+    // exactly what must not be served here.
+    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+    request.timeoutInterval = 15;
+    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:request
+            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        os_unfair_lock_lock(&refreshLock);
+        inFlight = NO;
+        os_unfair_lock_unlock(&refreshLock);
+
+        NSInteger status = [response isKindOfClass:NSHTTPURLResponse.class]
+            ? ((NSHTTPURLResponse *) response).statusCode : 0;
+        if (error != nil || status != 200 || data.length == 0 || data.length > kRemoteManifestMaxBytes) {
+            NSLog(@"root catalogue refresh skipped (status %ld, %lu bytes): %@",
+                  (long) status, (unsigned long) data.length, error.localizedDescription ?: @"no error");
+            return;
+        }
+        // Parse BEFORE caching: a body that does not survive the same
+        // validation the in-app copy gets must not replace a good cache.
+        if (ParseRootManifest(data, @"downloaded") == nil)
+            return;
+
+        NSURL *cacheURL = RemoteManifestCacheURL();
+        if (cacheURL != nil) {
+            [NSFileManager.defaultManager createDirectoryAtURL:cacheURL.URLByDeletingLastPathComponent
+                                   withIntermediateDirectories:YES attributes:nil error:NULL];
+            NSError *writeError = nil;
+            if (![data writeToURL:cacheURL options:NSDataWritingAtomic error:&writeError])
+                NSLog(@"root catalogue downloaded but could not be cached: %@", writeError);
+        }
+        if (ReloadRootChoices()) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                [NSNotificationCenter.defaultCenter postNotificationName:RootsCatalogDidChangeNotification
+                                                                  object:self];
+            });
+        }
+    }];
+    [task resume];
 }
 
 - (BOOL)bundledRootChoiceNeedsDownload:(NSDictionary<NSString *, NSString *> *)choice {
@@ -773,38 +1107,37 @@ static NSString *PreferredDefaultRootName(NSOrderedSet<NSString *> *roots) {
 //     API_AVAILABLE(ios(8.0)) API_UNAVAILABLE(macos, macCatalyst)
 //
 // and the extension point is com.apple.fileprovider-nonui, the classic API.
-// macOS hosts only the replicated API (NSFileProviderReplicatedExtension). So
-// on an Apple Silicon Mac running this as a "Designed for iPad" app, the
-// framework loads the extension, finds one it cannot host, and aborts it with
-// __FILEPROVIDER_BAD_EXTENSION__ inside beginRequestWithDomain: -- before a
-// single line of ours runs, which is why the crash reports carry no AOK frame.
+// macOS hosts only the replicated API (NSFileProviderReplicatedExtension) and
+// treats every domain as replicated. So on an Apple Silicon Mac running this as
+// a "Designed for iPad" app, the framework loads the extension, finds one it
+// cannot host, and aborts it with __FILEPROVIDER_BAD_EXTENSION__ inside
+// beginRequestWithDomain: -- which is why the crash reports carry no AOK frame.
 //
-// Nothing inside the extension can prevent that; the only lever is here, in the
-// app: do not register a domain, and the extension is never asked to begin a
-// request. Everything else about AOK works on a Mac -- it is the Files
-// integration specifically that is unavailable.
+// Two levers, because fileproviderd launches the extension without the app.
+// Here, the app never registers a domain and removes any an earlier build left.
+// And the extension, when macOS starts it, exits before it can take a request
+// (ISHFileProviderRetireOnMac in FileProviderExtension.m). First it removes the
+// domains too, unless an earlier launch already did, or this build's removal
+// has failed three or more times and the last failure is less than a day old.
+// Everything else about AOK works on a Mac -- it is the Files integration
+// specifically that is unavailable.
 static BOOL ISHFileProviderUnavailableOnThisPlatform(void) {
-    if (@available(iOS 14.0, *)) {
-        NSProcessInfo *info = NSProcessInfo.processInfo;
-        return info.isiOSAppOnMac || info.isMacCatalystApp;
-    }
-    return NO;
+    return ISHFileProviderRunningOnMac();
 }
 
 // Drop a domain a previous run (or an earlier build) left registered, so a Mac
 // -- or a re-signed build that has since lost its app group -- does not keep a
-// stale one that Finder or Files would try to open.
+// stale one that Finder or Files would try to open. This runs at launch and
+// again on every roots change, so only a removal that found something (or
+// failed) is worth a breadcrumb.
 - (void)removeAllFileProviderDomains {
-    [NSFileProviderManager getDomainsWithCompletionHandler:^(NSArray<NSFileProviderDomain *> *domains, NSError *error) {
-        if (error != nil || domains.count == 0)
+    ISHFileProviderRemoveRegisteredDomains(nil, ^(NSDictionary<NSString *, id> *summary) {
+        if ([summary[@"domains"] unsignedIntegerValue] == 0 && summary[@"listError"] == nil)
             return;
-        for (NSFileProviderDomain *domain in domains) {
-            [NSFileProviderManager removeDomain:domain completionHandler:^(NSError *removeError) {
-                if (removeError != nil)
-                    NSLog(@"error removing file provider domain: %@", removeError);
-            }];
-        }
-    }];
+        [ISHDiagnosticsStore recordBreadcrumb:@"fileprovider.domainSync.removedDomains" details:summary];
+        if (summary[@"listError"] != nil || summary[@"errors"] != nil)
+            NSLog(@"removing file provider domains: %@", summary);
+    });
 }
 
 - (void)requestFileProviderDomainSync {
@@ -925,11 +1258,14 @@ static BOOL ISHFileProviderUnavailableOnThisPlatform(void) {
     if (selectedChoice == nil) {
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{
-                NSLocalizedDescriptionKey: @"Unknown bundled root choice"
+                NSLocalizedDescriptionKey: NSLocalizedString(@"Unknown bundled root choice", @"Filesystem import error")
             }];
         }
         return NO;
     }
+
+    if ([selectedChoice[kBundledRootKindKey] isEqualToString:kRootKindNative])
+        return [self createNativeRootFromChoice:selectedChoice error:error];
 
     NSURL *archive = BundledRootArchiveURL(selectedChoice[kBundledRootArchiveNameKey]);
     if (archive == nil) {
@@ -957,7 +1293,7 @@ static BOOL ISHFileProviderUnavailableOnThisPlatform(void) {
     if (archive == nil) {
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{
-                NSLocalizedDescriptionKey: @"Bundled root archive is missing"
+                NSLocalizedDescriptionKey: NSLocalizedString(@"Bundled root archive is missing", @"Filesystem import error")
             }];
         }
         return NO;
@@ -987,6 +1323,65 @@ static BOOL ISHFileProviderUnavailableOnThisPlatform(void) {
     return ok;
 }
 
+// A native-mode root: an empty fakefs and a metadata file saying what it is.
+// Everything in it is the kernel's to provision at boot (kernel/native_root.c),
+// so there is no archive, no progress to report and nothing to cancel.
+- (BOOL)createNativeRootFromChoice:(NSDictionary<NSString *, NSString *> *)choice error:(NSError **)error {
+    NSString *baseName = choice[kBundledRootImportNameKey];
+    NSString *name = baseName;
+    unsigned suffix = 2;
+    while ([self.roots containsObject:name])
+        name = [NSString stringWithFormat:@"%@_%u", baseName, suffix++];
+    if (!RootNameIsValid(name, error))
+        return NO;
+    NSURL *destination = [self rootUrl:name];
+    if (destination == nil) {
+        if (error != NULL) {
+            *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{
+                NSLocalizedDescriptionKey: NSLocalizedString(@"No filesystem storage available (the app group container is missing -- check the App Group entitlement)", @"Filesystem import error")
+            }];
+        }
+        return NO;
+    }
+    NSURL *tempDestination = [NSFileManager.defaultManager.temporaryDirectory
+        URLByAppendingPathComponent:NSProcessInfo.processInfo.globallyUniqueString];
+    struct fakefsify_error fs_err = {};
+    if (!fakefs_init_empty(tempDestination.fileSystemRepresentation, &fs_err)) {
+        if (error != NULL)
+            *error = FakefsImportNSError(fs_err);
+        [ISHDiagnosticsStore recordBreadcrumb:@"root.nativeCreateFailed"
+                                      details:@{@"name": name,
+                                                @"error": fs_err.message ? @(fs_err.message) : @"unknown"}];
+        free(fs_err.message);
+        [NSFileManager.defaultManager removeItemAtURL:tempDestination error:nil];
+        return NO;
+    }
+    WriteRootMetadata(tempDestination, @{
+        kRootMetadataGuestABIKey: choice[kBundledRootGuestABIKey] ?: @"arm64",
+        kRootMetadataKindKey: kRootKindNative,
+    });
+    if (![NSFileManager.defaultManager moveItemAtURL:tempDestination toURL:destination error:error]) {
+        [NSFileManager.defaultManager removeItemAtURL:tempDestination error:nil];
+        return NO;
+    }
+    [self mutateRoots:^(NSMutableOrderedSet<NSString *> *roots) {
+        [roots addObject:name];
+    }];
+    return YES;
+}
+
+- (BOOL)isNativeRootNamed:(NSString *)name {
+    if (name.length == 0)
+        return NO;
+    NSDictionary<NSString *, id> *metadata = ReadRootMetadata([self rootUrl:name]);
+    id kind = metadata[kRootMetadataKindKey];
+    return [kind isKindOfClass:NSString.class] && [kind isEqualToString:kRootKindNative];
+}
+
++ (BOOL)bundledRootChoiceIsNative:(NSDictionary<NSString *, NSString *> *)choice {
+    return [choice[kBundledRootKindKey] isEqualToString:kRootKindNative];
+}
+
 void root_progress_callback(void *cookie, double progress, const char *message, bool *should_cancel) {
     id <ProgressReporter> reporter = (__bridge id<ProgressReporter>) cookie;
     [reporter updateProgress:progress message:[NSString stringWithUTF8String:message]];
@@ -1011,8 +1406,7 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
     if (destination == nil) {
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{
-                NSLocalizedDescriptionKey: @"No filesystem storage available "
-                    @"(the app group container is missing -- check the App Group entitlement)"
+                NSLocalizedDescriptionKey: NSLocalizedString(@"No filesystem storage available (the app group container is missing -- check the App Group entitlement)", @"Filesystem import error")
             }];
         }
         return NO;
@@ -1119,21 +1513,22 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
 // history is kept because the failure it caused is not obvious from the code.
 //
 // Returns NO with *error set only if the root is genuinely busy (something
-// still has an open fd/cwd/root inside it, e.g. an active chroot session --
-// mount_detach reports this as EBUSY). Any other outcome (most commonly
-// EINVAL: this root was never touched via mount-root.sh, so there's nothing
-// mounted at all) is harmless and silently ignored -- mount_detach is safe to
-// call unconditionally on a path that isn't currently mounted.
+// still has an open fd/cwd/root inside it, e.g. an active chroot session),
+// and then nothing has been unmounted. Everything mounted inside the root --
+// mount-root.sh's binds, whatever else the guest put there -- goes with it,
+// lazily: see mount_detach_tree in fs/mount.c. That used to be a fixed list
+// of binds unmounted one by one before the root was checked. A session in the
+// root lost them before the root was found busy, a bind in use stayed behind
+// once binds became busy while used, and AOK/tests and AOK/fakefs, which the
+// list had fallen behind on, stayed behind every time. Any other outcome
+// (most commonly EINVAL: the root was never exposed) is harmless and silently
+// ignored, so this is safe to call unconditionally.
 - (BOOL)unmountExposedRootNamed:(NSString *)name error:(NSError **)error {
     NSString *base = ExposedRootPoint(name);
-    NSArray<NSString *> *binds = @[@"AOK/tools", @"run", @"dev/pts", @"dev", @"sys", @"proc"];
-    for (NSString *bind in binds)
-        mount_detach([base stringByAppendingPathComponent:bind].UTF8String);
-
-    if (mount_detach(base.UTF8String) == _EBUSY) {
+    if (mount_detach_tree(base.UTF8String) == _EBUSY) {
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{NSLocalizedDescriptionKey:
-                @"This filesystem is currently mounted or in use (e.g. via mount-root.sh) -- exit any active session into it first"}];
+                NSLocalizedString(@"This filesystem is currently mounted or in use (e.g. via mount-root.sh) -- exit any active session into it first", @"Filesystem delete or rename error")}];
         }
         return NO;
     }
@@ -1234,10 +1629,15 @@ void root_progress_callback(void *cookie, double progress, const char *message, 
 // live guest.
 - (BOOL)rejectIfBootedOrDefault:(NSString *)name verb:(NSString *)verb error:(NSError **)error {
     NSString *reason = nil;
+    BOOL deleting = [verb isEqualToString:@"delete"];
     if ([name isEqualToString:self.bootedRoot])
-        reason = [NSString stringWithFormat:@"Cannot %@ the filesystem this session is booted from", verb];
+        reason = deleting
+            ? NSLocalizedString(@"Cannot delete the filesystem this session is booted from", @"Filesystem delete error")
+            : NSLocalizedString(@"Cannot rename the filesystem this session is booted from", @"Filesystem rename error");
     else if ([name isEqualToString:self.defaultRoot])
-        reason = [NSString stringWithFormat:@"Cannot %@ the default filesystem", verb];
+        reason = deleting
+            ? NSLocalizedString(@"Cannot delete the default filesystem", @"Filesystem delete error")
+            : NSLocalizedString(@"Cannot rename the default filesystem", @"Filesystem rename error");
     if (reason == nil)
         return NO;
     if (error != NULL)
@@ -1254,7 +1654,7 @@ static BOOL RootIsInstalled(Roots *roots, NSString *name, NSError **error) {
         return YES;
     if (error != NULL) {
         *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{NSLocalizedDescriptionKey:
-            [NSString stringWithFormat:@"There is no filesystem named %@", name ?: @""]}];
+            [NSString stringWithFormat:NSLocalizedString(@"There is no filesystem named %@", @"Filesystem error; %@ is a filesystem name"), name ?: @""]}];
     }
     return NO;
 }
@@ -1266,12 +1666,15 @@ static BOOL RootIsInstalled(Roots *roots, NSString *name, NSError **error) {
         return NO;
     if (![self unmountExposedRootNamed:name error:error])
         return NO;
+    // Before it goes: afterwards there is no directory left to name it by.
+    uint64_t sessionRoot = ISHSessionRootIdentityNamed(name);
     if (![NSFileManager.defaultManager removeItemAtURL:[self rootUrl:name] error:error]) {
         // The store is still there, so put the guest's view of it back rather
         // than leaving a root that is installed but no longer reachable.
         [self exposeRootNamed:name];
         return NO;
     }
+    ISHSessionsDeleteForRoot(sessionRoot);
     [self removeExposedMountPointForRootNamed:name];
     [self mutateRoots:^(NSMutableOrderedSet<NSString *> *roots) {
         [roots removeObject:name];
@@ -1282,7 +1685,7 @@ static BOOL RootIsInstalled(Roots *roots, NSString *name, NSError **error) {
 - (BOOL)renameRoot:(NSString *)name toName:(NSString *)newName error:(NSError **)error {
     if (name.length == 0) {
         if (error != NULL)
-            *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{NSLocalizedDescriptionKey: @"Filesystem name can't be empty"}];
+            *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{NSLocalizedDescriptionKey: NSLocalizedString(@"Filesystem name can't be empty", @"Filesystem name validation error")}];
         return NO;
     }
     if ([self rejectIfBootedOrDefault:name verb:@"rename" error:error])
@@ -1300,7 +1703,7 @@ static BOOL RootIsInstalled(Roots *roots, NSString *name, NSError **error) {
     if ([self.roots containsObject:newName]) {
         if (error != NULL) {
             *error = [NSError errorWithDomain:@"iSH" code:0 userInfo:@{NSLocalizedDescriptionKey:
-                [NSString stringWithFormat:@"There is already a filesystem named %@", newName]}];
+                [NSString stringWithFormat:NSLocalizedString(@"There is already a filesystem named %@", @"Filesystem rename error; %@ is a filesystem name"), newName]}];
         }
         return NO;
     }
@@ -1545,7 +1948,11 @@ static NSString *const kRootsJobStateDone = @"done";
         [text appendFormat:@"root default=%d\n", [name isEqualToString:defaultRoot] ? 1 : 0];
         [text appendFormat:@"root name=%@\n", name];
     }
-    for (NSDictionary<NSString *, NSString *> *choice in [roots bundledRootChoices]) {
+    // offeredRootChoices, not bundledRootChoices: this listing is what a
+    // person browses to find an id, so it shows the same set the picker does.
+    // A superseded id still installs (see the install handler) -- it just
+    // isn't advertised any more.
+    for (NSDictionary<NSString *, NSString *> *choice in [roots offeredRootChoices]) {
         [text appendFormat:@"available id=%@\n", choice[kBundledRootIdentifierKey] ?: @""];
         [text appendFormat:@"available abi=%@\n", choice[kBundledRootGuestABIKey] ?: @"unknown"];
         [text appendFormat:@"available download=%d\n", [roots bundledRootChoiceNeedsDownload:choice] ? 1 : 0];
@@ -1564,6 +1971,9 @@ static NSString *const kRootsJobStateDone = @"done";
     [_lock unlock];
 
     [text appendFormat:@"default name=%@\n", defaultRoot];
+    // The root at / this launch, empty before the boot. Not the default: that
+    // is the next launch's, and ISH_BOOT_ROOT boots a root without touching it.
+    [text appendFormat:@"booted name=%@\n", roots.bootedRoot ?: @""];
     return text;
 }
 
@@ -1618,7 +2028,9 @@ static NSString *ValidateInstalledRoot(NSString *name, NSString **abiOut) {
     NSString *abi = [roots guestABIForRootNamed:name];
     NSURL *data = [[roots rootUrl:name] URLByAppendingPathComponent:@"data"];
     NSFileManager *fm = NSFileManager.defaultManager;
-    BOOL executable = NO;
+    // A native root is empty until its first boot provisions it
+    // (kernel/native_root.c), so there is nothing to probe for yet.
+    BOOL executable = [roots isNativeRootNamed:name];
     for (NSString *probe in @[@"bin/sh", @"bin/busybox", @"sbin/init", @"usr/bin/sh"]) {
         if ([fm fileExistsAtPath:[data URLByAppendingPathComponent:probe].path]) {
             executable = YES;
@@ -1873,6 +2285,13 @@ static int ISHRootsCommandImpl(const char *fragment) {
             BOOL known = NO;
             for (NSDictionary<NSString *, NSString *> *choice in [roots bundledRootChoices]) {
                 if ([choice[kBundledRootIdentifierKey] isEqualToString:identifier]) {
+                    if (choice[kBundledRootLegacyKey].length != 0) {
+                        // Kept only so roots imported from it still resolve;
+                        // its archive is no longer in the app.
+                        [control rejectOp:op message:[NSString stringWithFormat:
+                            @"%@ is no longer shipped; see `manage-roots.sh available`", identifier]];
+                        return _ENOENT;
+                    }
                     known = YES;
                     break;
                 }

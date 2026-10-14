@@ -66,6 +66,7 @@
 // can exceed 32 bits.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
@@ -126,6 +127,30 @@ arm64_segfault_write:
 // free for these routines' own internal use.
 .global arm64_handle_read_miss
 arm64_handle_read_miss:
+    // The second chance (emu/tlb.h, TLB_VICTIMS): the page most recently
+    // evicted from the table is the other of two pages that share an entry
+    // and are used in turn. Found, it changes places with the one in the
+    // entry, here, without the trip to C. A real miss pays the four
+    // instructions down to the branch. x27 is this helper's own; x9-x11 are
+    // the probe's scratch.
+    ldur x11, [_tlb, #(TLB_victim - TLB_entries + TLB_ENTRY_page)]
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3          // the page's entry
+    sub x27, _tlb, #(TLB_entries - TLB_victim)
+    .irp field, TLB_ENTRY_page, TLB_ENTRY_page_if_writable, TLB_ENTRY_data_minus_addr
+    ldr x9, [x27, #\field]
+    ldr x11, [x10, #\field]
+    str x9, [x10, #\field]
+    str x11, [x27, #\field]
+    .endr
+    add x7, x9, x7                      // x9: the found entry's data_minus_addr
+    ret
+1:
     save_c
     sub x0, _tlb, #TLB_entries
     mov x1, _addr
@@ -139,6 +164,32 @@ arm64_handle_read_miss:
 
 .global arm64_handle_write_miss
 arm64_handle_write_miss:
+    // The second chance (emu/tlb.h, TLB_VICTIMS): the page most recently
+    // evicted from the table is the other of two pages that share an entry
+    // and are used in turn. Found, it changes places with the one in the
+    // entry, here, without the trip to C. A real miss pays the four
+    // instructions down to the branch. x27 is this helper's own; x9-x11 are
+    // the probe's scratch.
+    // (write_prep has already found the table current and no revalidation due.)
+    ldur x11, [_tlb, #(TLB_victim - TLB_entries + TLB_ENTRY_page_if_writable)]
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3          // the page's entry
+    sub x27, _tlb, #(TLB_entries - TLB_victim)
+    .irp field, TLB_ENTRY_page, TLB_ENTRY_page_if_writable, TLB_ENTRY_data_minus_addr
+    ldr x9, [x27, #\field]
+    ldr x11, [x10, #\field]
+    str x9, [x10, #\field]
+    str x11, [x27, #\field]
+    .endr
+    add x7, x9, x7                      // x9: the found entry's data_minus_addr
+    ret
+1:
     save_c
     sub x0, _tlb, #TLB_entries
     mov x1, _addr
@@ -492,6 +543,56 @@ ldpsw_gadget ldpsw
 stp_gadget stp64, 128, 8, x17, x25
 stp_gadget stp32, 64, 4, w17, w25
 
+// ---- Fast-path LDP/STP (offset mode, no writeback) ---------------------
+// Same idea as load_single_fast/store_single_fast: everything but the TLB
+// walk baked at compile time. Covers offset mode (mode 2) with both rt and
+// rt2 != 31 (real registers, not XZR) — the dominant form in function
+// prologues/epilogues (stp x29, x30, [sp, #-N]! lowered to offset after
+// frame setup) and -O0 stack traffic.
+//
+// Code stream: [gadget][rt_slot | rt2_slot<<16][rn_slot][offset][orig_ip]
+// — 4 param words, same total as the generic ldp/stp gadgets.
+//
+// rt_slot and rn_slot are precomputed cpu_state byte offsets (gen.c's
+// gen_arm64_reg_slot), so the gadget loads base from a known position and
+// stores results without runtime register decoding. The rn_slot encodes
+// SP (r=31) as CPU_sp, same as the single-register fast path.
+.macro ldp_fast name, bits, bytes, ldr_reg1, ldr_reg2
+    f_gadget \name, f_ldp, \bits, \bytes, \ldr_reg1, \ldr_reg2, _
+.endm
+
+.macro stp_fast name, bits, bytes, str_reg1, str_reg2
+    f_gadget \name, f_stp, \bits, \bytes, \str_reg1, \str_reg2, _
+.endm
+
+ldp_fast ldp64_fast, 128, 8, x17, x25
+ldp_fast ldp32_fast, 64, 4, w17, w25
+stp_fast stp64_fast, 128, 8, x17, x25
+stp_fast stp32_fast, 64, 4, w17, w25
+
+// Post-index and pre-index LDP/STP (`stp x29, x30, [sp, #-16]!` opens most
+// functions, `ldp x29, x30, [sp], #16` closes them), the "lspec" pass: the
+// same code stream as the offset form; the new base (base + offset) is
+// computed before the access and written to rn after it, so a fault leaves
+// rn untouched. gen.c keeps rt or rt2 == rn on the generic gadgets. x23
+// holds the new base and x24 rn's slot across the prep helpers.
+.macro ldp_wb name, bits, bytes, ldr_reg1, ldr_reg2, pre
+    f_gadget \name, f_ldp_wb, \bits, \bytes, \ldr_reg1, \ldr_reg2, \pre
+.endm
+
+.macro stp_wb name, bits, bytes, str_reg1, str_reg2, pre
+    f_gadget \name, f_stp_wb, \bits, \bytes, \str_reg1, \str_reg2, \pre
+.endm
+
+ldp_wb ldp64_post, 128, 8, x17, x25, 0
+ldp_wb ldp64_pre, 128, 8, x17, x25, 1
+ldp_wb ldp32_post, 64, 4, w17, w25, 0
+ldp_wb ldp32_pre, 64, 4, w17, w25, 1
+stp_wb stp64_post, 128, 8, x17, x25, 0
+stp_wb stp64_pre, 128, 8, x17, x25, 1
+stp_wb stp32_post, 64, 4, w17, w25, 0
+stp_wb stp32_pre, 64, 4, w17, w25, 1
+
 // ---- Single-register load/store ----------------------------------------
 // One generic gadget per (size, direction, extend) covering four guest
 // encoding families through a shared parameter format, so gen_step_arm64
@@ -576,8 +677,10 @@ store_single store64,  64, str,  x17
 // [sp, #imm]): the generic single load/store path was 68% of total
 // runtime; this form covers every load and store in that loop.
 //
-// Code stream: [gadget][rt_slot | rn_slot<<16][offset][orig_ip]
-// — 3 param words, same trailing-orig_ip fault-restart contract at
+// Code stream: [gadget][rt_slot][rn_slot][offset][orig_ip] — 4 param words
+// (separate words, not one packed [rt | rn<<16]: rn's slot feeds the address,
+// and unpacking it put a ubfx on the critical path; plain loads measured
+// faster, see alu_spec.S), same trailing-orig_ip fault-restart contract at
 // [_ip, #-8] as the generic family (see arm64_segfault_read/write).
 //
 // Register discipline: x8 (the param word) must survive the prep macro —
@@ -586,34 +689,11 @@ store_single store64,  64, str,  x17
 // guarantee the generic store gadgets already rely on for x17's ride
 // across write_prep.
 .macro load_single_fast name, bits, ldinsn, reg
-.gadget \name
-    ldp x8, x19, [_ip]        // [rt_slot | rn_slot<<16], offset
-    add _ip, _ip, #24
-    ubfx x9, x8, #16, #16
-    ldr x10, [_cpu, x9]       // base
-    add x7, x10, x19
-    read_prep \bits, \name
-    \ldinsn \reg, [_addr]
-    and x9, x8, #0xffff
-    str x17, [_cpu, x9]       // full X store: 32-bit loads must clear the upper half
-    gret
-    read_bullshit \bits, \name
+    f_gadget \name, f_load, \bits, \ldinsn, \reg, _, _
 .endm
 
 .macro store_single_fast name, bits, stinsn, reg
-.gadget \name
-    ldp x8, x19, [_ip]        // [rt_slot | rn_slot<<16], offset
-    add _ip, _ip, #24
-    ubfx x9, x8, #16, #16
-    ldr x10, [_cpu, x9]       // base
-    and x9, x8, #0xffff
-    ldr x17, [_cpu, x9]       // value (x17 survives write_prep's helpers)
-    add x7, x10, x19
-    write_prep \bits, \name
-    \stinsn \reg, [_addr]
-    write_done \bits, \name   // clobbers x9 — rt_slot already consumed
-    gret
-    write_bullshit \bits, \name
+    f_gadget \name, f_store, \bits, \stinsn, \reg, _, _
 .endm
 
 load_single_fast load8_fast,      8, ldrb,  w17
@@ -629,6 +709,198 @@ store_single_fast store8_fast,    8, strb, w17
 store_single_fast store16_fast,  16, strh, w17
 store_single_fast store32_fast,  32, str,  w17
 store_single_fast store64_fast,  64, str,  x17
+
+// ---- Fast writeback and register-offset forms (the "lspec" pass) ---------
+// The same precomputed-slot treatment for the forms the fast family above
+// leaves to the generic gadgets, which pay the full decode and mode compare
+// chain (twice the fast form's cost on an A10X): post-index and pre-index
+// (`ldrb w0, [x1], #1`, loops walking a buffer) and register offset
+// (`ldr w0, [x1, x2, lsl #2]`, `ldrb w0, [x1, w2, sxtw]`, array indexing).
+// gen.c keeps rt = 31, rm = 31 and a writeback whose rt is also rn on the
+// generic gadgets. Selected by gen_arm64_ldst_lspec_gadget; the "lspec" bit
+// of /proc/ish/arm64_jit_fuse switches it.
+//
+// Writeback: [gadget][rt_slot][rn_slot][imm][orig_ip]. The new base is
+// computed before the access and written after it, so a fault leaves rn
+// untouched and the instruction restarts whole. x21 carries it across the
+// prep macro's helpers (callee-saved, as in the generic family).
+// Register offset: [gadget][rt_slot][rn_slot][rm_slot][shift][orig_ip], the
+// extend chosen by the gadget. x24 keeps rn's slot for the writeback.
+.macro load_single_wb name, bits, ldinsn, reg, pre
+.gadget \name
+    ldp x8, x24, [_ip]        // rt_slot, rn_slot
+    ldr x19, [_ip, #16]
+    add _ip, _ip, #32
+    ldr x10, [_cpu, x24]      // base
+    add x21, x10, x19         // base + imm: the written-back value
+.if \pre
+    mov x7, x21
+.else
+    mov x7, x10
+.endif
+    read_prep \bits, \name
+    \ldinsn \reg, [_addr]
+    str x17, [_cpu, x8]
+    str x21, [_cpu, x24]
+    gret
+    read_bullshit \bits, \name
+.endm
+
+.macro store_single_wb name, bits, stinsn, reg, pre
+.gadget \name
+    ldp x8, x24, [_ip]
+    ldr x19, [_ip, #16]
+    add _ip, _ip, #32
+    ldr x10, [_cpu, x24]
+    add x21, x10, x19
+    ldr x17, [_cpu, x8]       // value (survives write_prep's helpers)
+.if \pre
+    mov x7, x21
+.else
+    mov x7, x10
+.endif
+    write_prep \bits, \name
+    \stinsn \reg, [_addr]
+    write_done \bits, \name   // clobbers x9 only
+    str x21, [_cpu, x24]
+    gret
+    write_bullshit \bits, \name
+.endm
+
+// ext: 0 = LSL/UXTX/SXTX (Rm as a whole X register), 1 = SXTW, 2 = UXTW.
+// x11 = rm_slot, x12 = shift on entry; x11 = the scaled index on exit.
+// (rx_index is in frag.h, with the register-offset bodies)
+
+.macro load_single_rx name, bits, ldinsn, reg, ext
+    f_gadget \name, f_load_rx, \bits, \ldinsn, \reg, \ext, _
+.endm
+
+.macro store_single_rx name, bits, stinsn, reg, ext
+    f_gadget \name, f_store_rx, \bits, \stinsn, \reg, \ext, _
+.endm
+
+// The SIMD/FP twins (ldr q0, [x1, x2, lsl #4]; ldr s0, [x1, w2, sxtw #2]):
+// [gadget][vt_slot][rn_slot][rm_slot][shift][orig_ip]. A narrower load
+// clears the rest of Vt; v31 only after the prep (see simd.S).
+.macro vload_single_rx name, bits, ldinsn, vreg, ext
+.gadget \name
+    ldp x8, x9, [_ip]         // vt_slot, rn_slot
+    ldp x11, x12, [_ip, #16]  // rm_slot, shift
+    add _ip, _ip, #40
+    ldr x10, [_cpu, x9]
+    rx_index \ext
+    add x7, x10, x11
+    read_prep \bits, \name
+    .if \bits != 128
+        movi v31.2d, #0
+    .endif
+    \ldinsn \vreg, [_addr]
+    str q31, [_cpu, x8]
+    gret
+    read_bullshit \bits, \name
+.endm
+
+.macro vstore_single_rx name, bits, stinsn, vreg, ext
+.gadget \name
+    ldp x8, x9, [_ip]         // vt_slot, rn_slot
+    ldp x11, x12, [_ip, #16]  // rm_slot, shift
+    add _ip, _ip, #40
+    ldr x10, [_cpu, x9]
+    rx_index \ext
+    add x7, x10, x11
+    write_prep \bits, \name
+    ldr q31, [_cpu, x8]
+    \stinsn \vreg, [_addr]
+    write_done \bits, \name
+    gret
+    write_bullshit \bits, \name
+.endm
+
+vload_single_rx vload32_rxl, 32, ldr, s31, 0
+vload_single_rx vload32_rxs, 32, ldr, s31, 1
+vload_single_rx vload32_rxu, 32, ldr, s31, 2
+vload_single_rx vload64_rxl, 64, ldr, d31, 0
+vload_single_rx vload64_rxs, 64, ldr, d31, 1
+vload_single_rx vload64_rxu, 64, ldr, d31, 2
+vload_single_rx vload128_rxl, 128, ldr, q31, 0
+vload_single_rx vload128_rxs, 128, ldr, q31, 1
+vload_single_rx vload128_rxu, 128, ldr, q31, 2
+vstore_single_rx vstore32_rxl, 32, str, s31, 0
+vstore_single_rx vstore32_rxs, 32, str, s31, 1
+vstore_single_rx vstore32_rxu, 32, str, s31, 2
+vstore_single_rx vstore64_rxl, 64, str, d31, 0
+vstore_single_rx vstore64_rxs, 64, str, d31, 1
+vstore_single_rx vstore64_rxu, 64, str, d31, 2
+vstore_single_rx vstore128_rxl, 128, str, q31, 0
+vstore_single_rx vstore128_rxs, 128, str, q31, 1
+vstore_single_rx vstore128_rxu, 128, str, q31, 2
+
+// Suffixes: _post, _pre, _rxl (LSL/UXTX/SXTX), _rxs (SXTW), _rxu (UXTW).
+load_single_wb load8_post, 8, ldrb, w17, 0
+load_single_wb load8_pre, 8, ldrb, w17, 1
+load_single_rx load8_rxl, 8, ldrb, w17, 0
+load_single_rx load8_rxs, 8, ldrb, w17, 1
+load_single_rx load8_rxu, 8, ldrb, w17, 2
+load_single_wb load16_post, 16, ldrh, w17, 0
+load_single_wb load16_pre, 16, ldrh, w17, 1
+load_single_rx load16_rxl, 16, ldrh, w17, 0
+load_single_rx load16_rxs, 16, ldrh, w17, 1
+load_single_rx load16_rxu, 16, ldrh, w17, 2
+load_single_wb load32_post, 32, ldr, w17, 0
+load_single_wb load32_pre, 32, ldr, w17, 1
+load_single_rx load32_rxl, 32, ldr, w17, 0
+load_single_rx load32_rxs, 32, ldr, w17, 1
+load_single_rx load32_rxu, 32, ldr, w17, 2
+load_single_wb load64_post, 64, ldr, x17, 0
+load_single_wb load64_pre, 64, ldr, x17, 1
+load_single_rx load64_rxl, 64, ldr, x17, 0
+load_single_rx load64_rxs, 64, ldr, x17, 1
+load_single_rx load64_rxu, 64, ldr, x17, 2
+load_single_wb loads8_32_post, 8, ldrsb, w17, 0
+load_single_wb loads8_32_pre, 8, ldrsb, w17, 1
+load_single_rx loads8_32_rxl, 8, ldrsb, w17, 0
+load_single_rx loads8_32_rxs, 8, ldrsb, w17, 1
+load_single_rx loads8_32_rxu, 8, ldrsb, w17, 2
+load_single_wb loads8_64_post, 8, ldrsb, x17, 0
+load_single_wb loads8_64_pre, 8, ldrsb, x17, 1
+load_single_rx loads8_64_rxl, 8, ldrsb, x17, 0
+load_single_rx loads8_64_rxs, 8, ldrsb, x17, 1
+load_single_rx loads8_64_rxu, 8, ldrsb, x17, 2
+load_single_wb loads16_32_post, 16, ldrsh, w17, 0
+load_single_wb loads16_32_pre, 16, ldrsh, w17, 1
+load_single_rx loads16_32_rxl, 16, ldrsh, w17, 0
+load_single_rx loads16_32_rxs, 16, ldrsh, w17, 1
+load_single_rx loads16_32_rxu, 16, ldrsh, w17, 2
+load_single_wb loads16_64_post, 16, ldrsh, x17, 0
+load_single_wb loads16_64_pre, 16, ldrsh, x17, 1
+load_single_rx loads16_64_rxl, 16, ldrsh, x17, 0
+load_single_rx loads16_64_rxs, 16, ldrsh, x17, 1
+load_single_rx loads16_64_rxu, 16, ldrsh, x17, 2
+load_single_wb loads32_64_post, 32, ldrsw, x17, 0
+load_single_wb loads32_64_pre, 32, ldrsw, x17, 1
+load_single_rx loads32_64_rxl, 32, ldrsw, x17, 0
+load_single_rx loads32_64_rxs, 32, ldrsw, x17, 1
+load_single_rx loads32_64_rxu, 32, ldrsw, x17, 2
+store_single_wb store8_post, 8, strb, w17, 0
+store_single_wb store8_pre, 8, strb, w17, 1
+store_single_rx store8_rxl, 8, strb, w17, 0
+store_single_rx store8_rxs, 8, strb, w17, 1
+store_single_rx store8_rxu, 8, strb, w17, 2
+store_single_wb store16_post, 16, strh, w17, 0
+store_single_wb store16_pre, 16, strh, w17, 1
+store_single_rx store16_rxl, 16, strh, w17, 0
+store_single_rx store16_rxs, 16, strh, w17, 1
+store_single_rx store16_rxu, 16, strh, w17, 2
+store_single_wb store32_post, 32, str, w17, 0
+store_single_wb store32_pre, 32, str, w17, 1
+store_single_rx store32_rxl, 32, str, w17, 0
+store_single_rx store32_rxs, 32, str, w17, 1
+store_single_rx store32_rxu, 32, str, w17, 2
+store_single_wb store64_post, 64, str, x17, 0
+store_single_wb store64_pre, 64, str, x17, 1
+store_single_rx store64_rxl, 64, str, x17, 0
+store_single_rx store64_rxs, 64, str, x17, 1
+store_single_rx store64_rxu, 64, str, x17, 2
 
 // ---- Fused -O0 idioms (the pattern-fusion pass) --------------------------
 // The single-gadget fast path above brought per-gadget cost to parity with
@@ -769,3 +1041,13 @@ ldld_op_st ldldeor_st_fast32, 32, eor, ldr, str, w17, w21
 load_literal load_lit32,   32, ldr,   w17
 load_literal load_lit64,   64, ldr,   x17
 load_literal load_lit_sw,  32, ldrsw, x17
+
+// ISH_JIT_PROFILE (jit/jitprof.c): count one entry of this block. Emitted
+// first in every block while profiling, so chained entries count too.
+// Code stream: [&counter].
+.gadget block_count
+    ldr x8, [_ip], #8
+    ldr x9, [x8]
+    add x9, x9, #1
+    str x9, [x8]
+    gret

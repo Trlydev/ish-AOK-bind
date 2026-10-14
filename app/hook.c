@@ -36,7 +36,10 @@ extern __thread guest_addr_t jit_crash_addr;
 // jit_crash_bus_fn() (jit/jit.c) does the reverse-map with `current` intact,
 // delivering a guest SIGBUS for a genuine guest-memory fault or crashing for a
 // real bug.
-extern void jit_crash_bus_fn(void *host_addr);
+extern void jit_crash_bus_fn(void *host_addr, long kind, void *fault_pc);
+// jit/jit.c: saves the amd64 register cache when the fault is in one of the
+// gadgets that keep it live.
+extern void jit_amd64_fault_spill(uint64_t pc, const uint64_t *x);
 
 kern_return_t catch_mach_exception_raise(
     mach_port_t exception_port,
@@ -120,9 +123,17 @@ kern_return_t catch_mach_exception_raise_state(
     if (exception_port == jit_crash_port &&
         exception == EXC_BAD_ACCESS &&
         codeCnt > 1) {
+        jit_amd64_fault_spill((uint64_t) arm_thread_state64_get_pc(*old), old->__x);
         *new = *old;
         *new_stateCnt = old_stateCnt;
-        new->__x[0] = (uint64_t) code[1]; // fault address -> first arg register
+        // Everything the exception knew, into the argument registers. The PC
+        // especially: setting it below is what destroys it, so a handler that
+        // does not pass it on has thrown away the only fact that names the
+        // faulting instruction. code[0] is the kern_return saying whether this
+        // was a protection failure, an unmapped address or a failed page-in.
+        new->__x[0] = (uint64_t) code[1]; // fault address
+        new->__x[1] = (uint64_t) code[0]; // kern_return: what it was doing
+        new->__x[2] = (uint64_t) arm_thread_state64_get_pc(*old); // culprit
         arm_thread_state64_set_pc_fptr(*new, (void *)jit_crash_bus_fn);
         return KERN_SUCCESS;
     }

@@ -45,8 +45,31 @@ struct tlb_entry {
     page_t page_if_writable;
     uintptr_t data_minus_addr;
 };
+#ifndef TLB_BITS
 #define TLB_BITS 10
+#endif
 #define TLB_SIZE (1 << TLB_BITS)
+// A second chance for an evicted page. The table is direct-mapped, and two
+// pages a program uses in turn can share an index: each access then evicts
+// the other and goes all the way through tlb_handle_miss -- some 400 host
+// instructions, where a hit is six. It is not rare. Which pages collide is
+// decided by the guest's ASLR, and a Python loop measured 2026-10-11 ran 7.5%
+// more host instructions in about one start in five (nine million misses
+// where the other starts had sixty thousand), and 26% more in one of a dozen.
+//
+// So the last two pages evicted are kept, newest first, and a miss looks
+// there before it is taken for real; a page found changes places with the
+// one in its entry. The arm64 and riscv64 guests' miss helpers look at the
+// newest in assembly -- the other page of a pair used in turn is always the
+// newest -- and tlb_handle_miss looks at all of them, for every guest. The
+// first probe, the one every load and store makes, is unchanged, and a miss
+// that is real pays four instructions and a copy for it: 7-Zip, with 55
+// million real misses in a 4 MB dictionary, is what a first version of this
+// (a second table index, probed and filled on every miss) made 1.6% slower.
+//
+// A page is in the table or among the victims, never both; whatever revokes
+// one entry (tlb_revoke_writable) looks in both.
+#define TLB_VICTIMS 2
 struct tlb {
     struct mmu *mmu;
     page_t dirty_page;
@@ -69,7 +92,20 @@ struct tlb {
     guest_addr_t prev_write_addr;
     guest_addr_t prev_write_ip;
     uint64_t prev_write_changes;
+    // The pages most recently evicted from `entries`, newest first: see
+    // TLB_VICTIMS. Directly before `entries`, where the gadgets' miss helpers
+    // reach victim[0] at a small offset from the pointer they hold.
+    struct tlb_entry victim[TLB_VICTIMS];
     struct tlb_entry entries[TLB_SIZE];
+    // Instruction fetch (tlb_fetch). fetch_denied: the last fetch failed
+    // because its page may not be executed, rather than because it is not
+    // mapped -- what an engine's fault gadget reports as INT_PF_EXEC.
+    // exec_ok_page (page + 1, 0 for none) is the last page found executable,
+    // valid while mmu->changes still equals exec_ok_changes. At the end so the
+    // generated offsets of everything above stay put.
+    bool fetch_denied;
+    page_t exec_ok_page;
+    uint64_t exec_ok_changes;
 };
 
 #define TLB_INDEX(addr) ((((addr >> PAGE_BITS) ^ (addr >> (PAGE_BITS + TLB_BITS)))) & (TLB_SIZE - 1))
@@ -116,13 +152,15 @@ int arm64_stxp(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                unsigned sz, uint64_t desired_lo, uint64_t desired_hi,
                uint32_t *status_out);
 
-// x86 LOCK-prefixed read-modify-write with real host atomics (emu/tlb.c).
-// Aligned accesses run as one host atomic on the resolved host pointer, so
-// they interlock both with other guest threads and with the kernel's own
-// C11 atomics on guest memory; misaligned ones (legal on x86, and able to
-// straddle a page) fall back to the global atomic_l_lock. `fn` MUST be pure:
-// the aligned path re-runs it on every compare-exchange retry. All return
-// 0 or INT_PF with cpu->segfault_addr/was_write set.
+// x86 LOCK-prefixed read-modify-write with real host atomics (emu/tlb.c), for
+// the amd64 interpreter. Aligned accesses run as one host atomic on the
+// resolved host pointer, so they interlock both with other guest threads and
+// with the kernel's own C11 atomics on guest memory; misaligned ones (legal
+// on x86, and able to straddle a page) take "Misaligned LOCK" in emu/tlb.c.
+// `fn` MUST be pure: the aligned path re-runs it on every compare-exchange
+// retry. All return 0 or INT_PF with cpu->segfault_addr/was_write set. The
+// JIT's gadgets do their own (jit/gadgets-aarch64/math.S x86_lock_rmw), with
+// the split lock from x86_lock_split_begin/_end.
 typedef qword_t (*x86_atomic_fn)(qword_t old, void *ctx);
 int x86_atomic_rmw(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                    unsigned size_bytes, x86_atomic_fn fn, void *ctx,
@@ -135,6 +173,19 @@ int x86_atomic_cas16b(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                       qword_t old_out[2], bool *swapped);
 int x86_atomic_xchg(struct cpu_state *cpu, struct tlb *tlb, guest_addr_t addr,
                     unsigned size_bytes, qword_t value, qword_t *old_out);
+int x86_lock_split_begin(struct cpu_state *cpu, struct tlb *tlb,
+                         guest_addr_t addr, unsigned size_bytes, uintptr_t out[3]);
+void x86_lock_split_end(struct tlb *tlb);
+
+// Stop a cached entry for addr's page from serving stores, wherever it is.
+static inline void tlb_revoke_writable(struct tlb *tlb, guest_addr_t addr) {
+    struct tlb_entry *entry = &tlb->entries[TLB_INDEX(addr)];
+    if (entry->page_if_writable == TLB_PAGE(addr))
+        entry->page_if_writable = TLB_PAGE_EMPTY;
+    for (unsigned v = 0; v < TLB_VICTIMS; v++)
+        if (tlb->victim[v].page_if_writable == TLB_PAGE(addr))
+            tlb->victim[v].page_if_writable = TLB_PAGE_EMPTY;
+}
 
 forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, guest_addr_t addr) {
     if (unlikely(tlb->mem_changes != atomic_load_explicit(&tlb->mmu->changes, memory_order_relaxed)))
@@ -148,6 +199,18 @@ forceinline __no_instrument void *__tlb_read_ptr(struct tlb *tlb, guest_addr_t a
     return tlb_handle_miss(tlb, addr, MEM_READ);
 }
 bool __tlb_read_cross_page(struct tlb *tlb, guest_addr_t addr, char *out, unsigned size);
+// Instruction fetch: tlb_read, but every page the bytes are on must be
+// executable. One that is mapped and not executable fails with
+// tlb->fetch_denied set and tlb->segfault_addr at its first byte; an unmapped
+// one fails as tlb_read does. Every engine reads the code it runs through
+// this, so memory mapped without PROT_EXEC does not execute (NX). Defined in
+// emu/tlb.c.
+bool tlb_fetch(struct tlb *tlb, guest_addr_t addr, void *out, unsigned size);
+// While a compile runs, tlb_fetch can serve one page of code from a copy taken
+// before it, so the compile decodes a single version of that page however the
+// guest rewrites it meanwhile. See emu/tlb.c.
+void tlb_fetch_snapshot_begin(struct tlb *tlb, guest_addr_t ip);
+void tlb_fetch_snapshot_end(void);
 forceinline __no_instrument bool tlb_read(struct tlb *tlb, guest_addr_t addr, void *out, unsigned size) {
     if (PGOFFSET(addr) > PAGE_SIZE - size)
         return __tlb_read_cross_page(tlb, addr, out, size);

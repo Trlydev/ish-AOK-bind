@@ -36,7 +36,22 @@ about the wrong machine — the iOS account, which is called `mobile`, and which
 is not root. `uname` is the same: no state, no I/O, and it reports Darwin.
 `getenv`, `isatty`, `ttyname`, `gethostname`, `getpwnam`, `getloadavg`,
 `time`, `localtime` — every one of them is harmless by the usual test and wrong
-by this one.
+by this one. And the question has to be asked above the shim as well: in 557 the
+shim's `uname` already answered as the guest kernel, but SmallCLUE's applet
+replaced the machine with the host's own `hw.machine`, so `uname -m` printed
+`iPad17,3` where `/bin/uname` said `aarch64` (#622).
+
+558 found the question's quieter form: a function with no machine in it at all,
+whose answer depends on whose *libc* wrote it. `fnmatch` reads no state, and
+Darwin's refuses a pattern holding a `[` that opens no bracket expression, where
+glibc matches the `[` as itself — so SmallCLUE's `find -name 'a[b'` found
+nothing, and `ls -I`, `grep --include`, `diff -x` and `tar --wildcards` failed
+the same way; over a 14,960-case table the two disagreed on 2,340. The guest
+expects glibc's answer, so the shim now routes `fnmatch` to
+`kernel/native_fnmatch.c`, which follows glibc's `fnmatch_loop` and agrees with
+glibc 2.41 on every case of that table. Native dash had the same bug one layer
+up and takes the other way out: it is built without `HAVE_FNMATCH`, so it uses
+its own matcher, as Debian's dash does.
 
 ## 23.2 Force-include, and the order that matters
 
@@ -267,6 +282,16 @@ locations.** All of them from the guest.
 > The fix in each case was `__thread`, and the lesson recorded alongside is that
 > they "were found one report at a time rather than by sweeping".
 
+The host's libc has the same kind of state, and 559 found it there. Darwin's
+`basename()` answers from one buffer for the whole process, and SmallCLUE
+picks its applet with `basename(argv[0])`, so an applet starting beside
+another could read the other's name: `cat … | sha256sum | cut -c1-32` printed
+"sha256sum: unsupported option '-c1-32'". With `rm` in the pair it would not
+have been a wrong message. The shim now routes `basename`, `dirname`,
+`strtok`, `gmtime` and `asctime` to versions whose state is the thread's, and
+its own `ttyname`, `ptsname`, `getmntinfo`, `getservent` and `getprotoent`
+buffers are per thread too.
+
 ## 23.9 Signals cannot be handled the ordinary way
 
 One routing problem has no clean answer, and the shape of the compromise is
@@ -292,6 +317,16 @@ says".
 The symptom when this was missing is the kind that gets reported as flakiness:
 `^C` during `sleep 30` under a native bash did nothing until the *next*
 keystroke — and the interrupted read then ate that keystroke too.
+
+The signal a program sends itself was the last to be routed. `abort()`, and
+Darwin's assert handler, went to the host until 559, on the grounds that it
+is a crash either way — and it is not the same crash: the host's `abort`
+takes the whole app with it. A Rust program built `panic=abort` made that
+build 558's one new crash signature, native `helix` on an iPad. Now the
+program dies of `SIGABRT` after a handler for it has had its turn, and the
+shell says "Aborted". The program's other threads share its task, so they
+then fail every call into the shim, and one that reaches `abort()` in its
+turn — Rust's `join()` does at once — ends only itself.
 
 ## 23.10 What the shim is
 

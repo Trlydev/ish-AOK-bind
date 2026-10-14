@@ -6,10 +6,12 @@
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/task.h"
+#include "kernel/personality.h"
 #include "fs/fd.h"
 #include "emu/memory.h"
 #include "platform/platform.h"
 #include "kernel/mm.h"
+#include "jit/jit.h"
 #include "kernel/resource.h"
 #include "kernel/swap.h"
 #include "util/sync.h"
@@ -242,6 +244,11 @@ struct mm *mm_copy(struct mm *mm) {
     // A copy is a different address space, whatever it holds. The struct copy
     // above would otherwise hand it the original's identity.
     new_mm->id = mm_next_id();
+    // ...and a fork's child holds no locks, now or future: Linux's mm_init
+    // does not carry VM_LOCKED into the child's def_flags (MEASURED on 6.12: a
+    // child of an mlockall(MCL_FUTURE) parent maps unlocked, while the parent
+    // still maps locked). Its entries start unlocked too (emu/memory.c).
+    new_mm->mlockall_flags = 0;
     // Fix wrlock_init failing because it thinks it's reinitializing the same lock
     memset(&new_mm->mem.lock, 0, sizeof(new_mm->mem.lock));
     new_mm->refcount = 1;
@@ -252,6 +259,7 @@ struct mm *mm_copy(struct mm *mm) {
     // child runs the same image on the same stack under the same limit.
     mem_set_stack_bounds(&new_mm->mem, mm->mem.stack_top,
                          (uint64_t) atomic_load(&mm->mem.stack_limit_pages) << PAGE_BITS);
+    atomic_store(&new_mm->mem.memlock_limit_pages, atomic_load(&mm->mem.memlock_limit_pages));
     ipc_mm_init(new_mm);
     // NULL for a task that has not exec'd anything yet, and mm_release already
     // tolerates that. A native exec is no longer one of those cases: it takes
@@ -267,6 +275,12 @@ struct mm *mm_copy(struct mm *mm) {
     int copy_err = pt_copy_on_write(&mm->mem, &new_mm->mem, 0, mm->mem.page_limit);
     if (copy_err == 0)
         ipc_mm_copy(new_mm, mm);
+#if ENGINE_JIT
+    // The child's misses may copy this address space's blocks while their
+    // code is still the same memory in both (jit_fork).
+    if (copy_err == 0)
+        jit_fork(mm->mem.mmu.jit, new_mm->mem.mmu.jit);
+#endif
     mem_write_unlock_with_pokes(&mm->mem);
 
     // pt_copy_on_write stops at the first page-table allocation it cannot make
@@ -337,7 +351,148 @@ void mm_release(struct mm *mm) {
     }
 }
 
-static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_t flags, fd_t fd_no, qword_t offset) {
+// RLIMIT_AS and RLIMIT_DATA, read BEFORE the address-space lock is taken:
+// rlimit takes group->lock, which nests outside mem->lock everywhere else (see
+// struct mem's stack_limit_pages).
+struct vm_limits {
+    rlim_t_ as, data, data_max;
+};
+
+static struct vm_limits vm_limits_now(void) {
+    struct rlimit_ as = rlimit_both(RLIMIT_AS_);
+    struct rlimit_ data = rlimit_both(RLIMIT_DATA_);
+    return (struct vm_limits) {as.cur, data.cur, data.max};
+}
+
+static bool vm_limits_finite(const struct vm_limits *l) {
+    return l->as != RLIM_INFINITY_ || l->data != RLIM_INFINITY_;
+}
+
+// Linux's may_expand_vm(): whether `pages` more pages -- data pages if
+// is_data -- fit under RLIMIT_AS and RLIMIT_DATA, counting as gone whatever
+// [replace_start, replace_end) holds now (a MAP_FIXED lands on top of it).
+// Under an address-space lock.
+//
+// Neither limit was enforced: a 128 MB allocation under a 64 MB limit
+// succeeded. The address-space total is a running count now, as Linux's
+// total_vm is -- mem_vm_pages_now, the same figure VmSize prints -- so
+// RLIMIT_AS costs nothing per mmap. It was a walk of every mapped page, which
+// under `ulimit -v` made each mmap cost what the hole finder used to (see
+// tests/manual/mmap_hole_scaling). The data total is still counted by walking
+// the page table, and only when RLIMIT_DATA is finite and the new pages are
+// data: whether a page is data depends on its flags, which change at more
+// sites than the entry counter's, and a wrong running count here would refuse
+// or permit mappings silently.
+static bool vm_may_expand(struct mem *mem, const struct vm_limits *l, size_t pages,
+        bool is_data, page_t replace_start, page_t replace_end) {
+    if (!vm_limits_finite(l) || pages == 0)
+        return true;
+    size_t total = mem_vm_pages_now(mem), data = 0, gone_total = 0, gone_data = 0;
+    if (is_data && l->data != RLIM_INFINITY_)
+        mem_vm_pages(mem, &total, &data);
+    if (replace_start < replace_end)
+        mem_vm_pages_range(mem, replace_start, replace_end, &gone_total, &gone_data);
+    total -= gone_total;
+    data -= gone_data;
+    if (l->as != RLIM_INFINITY_ && total + pages > (l->as >> PAGE_BITS))
+        return false;
+    if (is_data && l->data != RLIM_INFINITY_ && data + pages > (l->data >> PAGE_BITS)) {
+        // Linux's exception for Valgrind: a soft limit of 0 falls back to the
+        // hard one.
+        if (!(l->data == 0 && (l->data_max == RLIM_INFINITY_ ||
+                data + pages <= (l->data_max >> PAGE_BITS))))
+            return false;
+    }
+    return true;
+}
+
+// is_data_mapping() for a set of pt flags.
+static bool vm_flags_are_data(unsigned flags) {
+    return (flags & (P_WRITE | P_SHARED | P_GROWSDOWN)) == P_WRITE;
+}
+
+#define MCL_CURRENT_ 0x1
+#define MCL_FUTURE_ 0x2
+#define MCL_ONFAULT_ 0x4
+#define MLOCK_ONFAULT_ 0x1
+
+// RLIMIT_MEMLOCK the way Linux's mlock paths read it, before the address-space
+// lock like the limits above. CAP_IPC_LOCK lifts it; without that a limit of 0
+// forbids locking at all (can_do_mlock: EPERM from mlock, mlockall and a
+// MAP_LOCKED mmap, MEASURED on 6.12), and any other limit bounds the pages a
+// process may have locked -- VmLck, mem_locked_page_count.
+struct memlock_limit {
+    bool unlimited;
+    bool may_lock;
+    size_t pages;
+};
+
+static struct memlock_limit memlock_limit_now(void) {
+    rlim_t_ limit = rlimit(RLIMIT_MEMLOCK_);
+    bool capable = current_capable(CAP_IPC_LOCK_);
+    return (struct memlock_limit) {
+        .unlimited = capable || limit == RLIM_INFINITY_,
+        .may_lock = capable || limit != 0,
+        .pages = (size_t) (limit >> PAGE_BITS),
+    };
+}
+
+// Linux's mlock_future_ok: may `pages` more pages be locked on top of what is?
+// Asked wherever a mapping is made or grows locked -- under MCL_FUTURE or
+// MAP_LOCKED, by brk, and when mremap grows a locked mapping, all EAGAIN (a
+// failed brk) when not (MEASURED on 6.12). Under the address-space lock or not:
+// the count is a counter.
+static bool memlock_room(struct mem *mem, const struct memlock_limit *lim, pages_t pages) {
+    return lim->unlimited || mem_locked_page_count(mem) + pages <= lim->pages;
+}
+
+// The same, for a call that also takes `going` locked pages away first.
+static bool memlock_room_replacing(struct mem *mem, const struct memlock_limit *lim,
+        pages_t pages, size_t going) {
+    if (lim->unlimited)
+        return true;
+    size_t now = mem_locked_page_count(mem);
+    return (now > going ? now - going : 0) + pages <= lim->pages;
+}
+
+// Does a new mapping start locked -- MAP_LOCKED, or mlockall(MCL_FUTURE) --
+// and how? The lock it gets (emu/memory.h, pt_entry::locked), 0 for none.
+// Linux gives it VM_LOCKED from mm->def_flags or the mmap flag, and
+// VM_LOCKONFAULT from def_flags when MCL_ONFAULT put it there -- a MAP_LOCKED
+// mapping's too -- and populates it unless it is VM_LOCKONFAULT (MEASURED:
+// under MCL_FUTURE a new anonymous, file or PROT_NONE mapping, a brk and a
+// shmat all raise VmLck by their size, and all but the PROT_NONE one become
+// resident; under MCL_FUTURE|MCL_ONFAULT each of them, MAP_LOCKED or not, is
+// "lo lf" and none does).
+static uint8_t mmap_locks_new(struct mm *mm, bool map_locked) {
+    dword_t mcl = mm->mlockall_flags;
+    if (!map_locked && !(mcl & MCL_FUTURE_))
+        return 0;
+    if ((mcl & MCL_FUTURE_) && (mcl & MCL_ONFAULT_))
+        return PT_LOCKED | PT_LOCKONFAULT;
+    return PT_LOCKED;
+}
+
+int mm_future_lock_check(struct mm *mm, pages_t pages, uint8_t *lock) {
+    *lock = mmap_locks_new(mm, false);
+    if (!*lock)
+        return 0;
+    struct memlock_limit limit = memlock_limit_now();
+    return memlock_room(&mm->mem, &limit, pages) ? 0 : _EAGAIN;
+}
+
+// How a mapping made locked is made: see mmap_locks_new. NULL for an ordinary
+// one. A plain lock populates it, an on-fault one does not.
+struct mmap_lock {
+    struct memlock_limit limit;
+    uint8_t lock;
+};
+
+#define MMAP_32BIT_START 0x40000000ull
+#define MMAP_32BIT_END 0x80000000ull
+
+static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_t flags, fd_t fd_no, qword_t offset,
+        const struct vm_limits *lim, const struct mmap_lock *lock) {
     int err;
     pages_t pages = PAGE_ROUND_UP(len);
     if (!pages) return _EINVAL;
@@ -353,6 +508,11 @@ static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_
     // answer is EPERM.
     if (fixed && addr == 0)
         return _EPERM;
+    // MAP_32BIT (x86-64): Linux's find_start_end places it in [1 GB, 2 GB),
+    // the lowest hole first (the legacy bottom-up search), and takes a hint
+    // only if the mapping fits below 2 GB. It was ignored: the mapping went
+    // anywhere, and a program that then used it as a 32-bit address faulted.
+    bool low32 = !fixed && (flags & MMAP_32BIT) && current->abi == GUEST_ABI_AMD64;
     if (addr != 0) {
         // A non-FIXED address is only a hint: Linux rounds an unaligned value
         // down to a page boundary rather than rejecting it. MAP_FIXED and
@@ -365,7 +525,10 @@ static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_
         if (!guest_abi_range_valid(current->abi, addr, len))
             return _ENOMEM;
         page = PAGE(addr);
-        if (!fixed && !pt_is_hole(current->mem, page, pages)) {
+        if (low32 && addr + len > MMAP_32BIT_END) {
+            // a hint MAP_32BIT cannot honour: placed in its range instead
+            addr = 0;
+        } else if (!fixed && !pt_is_hole(current->mem, page, pages)) {
             // hint region is occupied -> let the kernel place it anywhere
             addr = 0;
         } else if ((flags & MMAP_FIXED_NOREPLACE) && !pt_is_hole(current->mem, page, pages)) {
@@ -374,13 +537,25 @@ static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_
         }
     }
     if (addr == 0) {
-        page = pt_find_hole(current->mem, pages);
+        page = low32 ? pt_find_hole_in(current->mem, pages, PAGE(MMAP_32BIT_START), PAGE(MMAP_32BIT_END))
+                     : pt_find_hole(current->mem, pages);
         if (page == BAD_PAGE)
             return _ENOMEM;
     }
     qword_t mapped_addr = (qword_t) page << PAGE_BITS;
     if (!guest_abi_range_valid(current->abi, mapped_addr, len))
         return _ENOMEM;
+    // Private and writable is data, file-backed or not (Linux's
+    // is_data_mapping); a MAP_FIXED replaces what it lands on.
+    if (!vm_may_expand(current->mem, lim, pages,
+            (prot & P_WRITE) && !(flags & MMAP_SHARED),
+            fixed ? page : 0, fixed ? page + pages : 0))
+        return _ENOMEM;
+    // A locked mapping has to fit under RLIMIT_MEMLOCK with what is locked
+    // already, the pages a MAP_FIXED is about to replace included, as Linux
+    // counts them (mlock_future_ok before mmap_region unmaps anything).
+    if (lock != NULL && !memlock_room(current->mem, &lock->limit, pages))
+        return _EAGAIN;
     if (flags & MMAP_SHARED)
         prot |= P_SHARED;
 
@@ -390,7 +565,14 @@ static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_
         // untouched reservation used to cost ~16.6 MB per GiB the instant it
         // was asked for. mem_lazy_reserve declines below the size threshold
         // and when the table is full, leaving the eager path unchanged.
-        if (!mem_lazy_reserve(current->mem, page, pages, prot)) {
+        //
+        // A locked one Linux would populate gets its entries now, to be
+        // locked and populated below, as mlockall populates a reservation;
+        // one it would not (PROT_NONE, MCL_ONFAULT) may stay reserved, with
+        // the marks that lock whatever it materialises.
+        bool eager = lock != NULL && lock->lock == PT_LOCKED && (prot & P_RWX);
+        if (eager || !mem_lazy_reserve(current->mem, page, pages,
+                                       prot | (lock != NULL ? mem_lazy_lock_marks(lock->lock) : 0))) {
             if ((err = pt_map_nothing(current->mem, page, pages, prot)) < 0)
                 return err;
         }
@@ -423,6 +605,8 @@ static guest_addr_t do_mmap(guest_addr_t addr, qword_t len, dword_t prot, dword_
             pt->data->file_offset = offset;
         }
     }
+    if (lock != NULL)
+        mem_lock_new_range(current->mem, page, pages, lock->lock, true);
     return mapped_addr;
 }
 
@@ -449,17 +633,85 @@ static bool mmap_is_pure_growth(dword_t flags) {
            !(flags & (MMAP_FIXED | MMAP_FIXED_NOREPLACE));
 }
 
+// Would growing the address space by `bytes` be refused right now?
+//
+// host_mem_headroom_low() answers "is the app near its ceiling", which is a
+// property of the APP. Whether to refuse is a property of the REQUEST too, and
+// the guard used to ignore that entirely -- so under pressure a 5 GB mapping
+// and a 1 MiB one got the same verdict.
+//
+// MEASURED on a device, 2026-09-07. A 5.5 GB `stress` run raised CRITICAL:
+//
+//     WARNING: 744(stress) mmap refused, low iOS memory headroom (len=0x140001000)
+//     WARNING: 745(zsh) mmap refused, low iOS memory headroom (len=0x100000)
+//
+// The first is the guard doing its job. The second is a shell being denied a
+// MEGABYTE, nine seconds later, with stress already dead and 1228 MB of our own
+// headroom free -- and it is fatal in a way the first is not, because a guest
+// that cannot get a megabyte cannot start a process, cannot exec, and cannot
+// run the command the user would fix it with. Every command after it failed.
+// The user's report was "forcing swap breaks AOK", and this is what broke.
+//
+// Refusing a small request buys almost nothing, and three things say so:
+//
+//   * Anonymous growth here is a lazy RESERVATION (mem_lazy_reserve), not
+//     committed memory. It costs the app nothing until the pages are touched.
+//   * Touching them is policed separately and better, by
+//     mem_fault_backpressure below: it throttles the thread doing the touching
+//     and ultimately OOM-kills it, on evidence of sustained growth rather than
+//     on one allocation's size.
+//   * The amount at stake is a rounding error against the floor being defended
+//     -- a few MiB against hundreds.
+//
+// So the threshold is per REQUEST, and a guest creeping upward in small steps
+// is not what it lets through: those steps still have to be touched to cost
+// anything, and that is where the throttle and the kill live.
+#define MEM_GROWTH_ALWAYS_ALLOWED_MIN (2ull * 1024 * 1024)
+#define MEM_GROWTH_ALWAYS_ALLOWED_MAX (16ull * 1024 * 1024)
+#define MEM_GROWTH_FLOOR_FRACTION 64ull
+
+static bool mem_growth_refused(uint64_t bytes) {
+    if (!host_mem_headroom_low())
+        return false;
+    // Scaled off the same floor the guard defends, so the two move together:
+    // a build or a device with a smaller ceiling gets a smaller exemption. The
+    // clamps keep it inside the range that is useful either way -- below 2 MiB
+    // a shell cannot start, above 16 MiB the exemption is no longer small.
+    uint64_t small = host_mem_headroom_floor() / MEM_GROWTH_FLOOR_FRACTION;
+    if (small < MEM_GROWTH_ALWAYS_ALLOWED_MIN)
+        small = MEM_GROWTH_ALWAYS_ALLOWED_MIN;
+    if (small > MEM_GROWTH_ALWAYS_ALLOWED_MAX)
+        small = MEM_GROWTH_ALWAYS_ALLOWED_MAX;
+    return bytes > small;
+}
+
 static guest_addr_t mmap_common_guest(guest_addr_t addr, qword_t len, dword_t prot, dword_t flags, fd_t fd_no, qword_t offset) {
     STRACE("mmap(%#llx, %#llx, 0x%x, 0x%x, %d, %#llx)",
            (unsigned long long) addr, (unsigned long long) len, prot, flags, fd_no,
            (unsigned long long) offset);
+    // A file offset that is not page-aligned is EINVAL, and before anything
+    // else is looked at -- even a bad descriptor, even MAP_ANONYMOUS -- as at
+    // every Linux mmap entry (x86_64, arm64 and riscv64 mmap, i386's old
+    // mmap; mmap2's offset counts pages). Accepted, it made a mapping Linux
+    // never has: the file from part way into a page, at a page boundary of
+    // guest memory, where /proc/<pid>/maps and mem_shared_page_id -- the
+    // JIT's alias index, a shared futex's key -- take every page of a file
+    // mapping to start at a page of the file. musl and glibc refuse such an
+    // offset themselves, so it arrived only from raw callers, Go's
+    // syscall.Mmap for one.
+    if (PGOFFSET(offset) != 0)
+        return _EINVAL;
     if (len == 0)
         return _EINVAL;
+    const struct vm_limits lim = vm_limits_now();
     // Accepted and ignored, as Linux does. See PROT_SEM_ in kernel/calls.h
     // for why it is stripped rather than passed through.
     prot &= ~(dword_t) PROT_SEM_;
     if (prot & ~P_RWX)
         return _EINVAL;
+    // READ_IMPLIES_EXEC (kernel/personality.h): anything readable runs.
+    if ((prot & P_READ) && (current->group->personality & READ_IMPLIES_EXEC_))
+        prot |= P_EXEC;
     // Refuse guest memory growth when the app is close to its jetsam budget:
     // a runaway guest (e.g. a 10k-thread storm mapping a stack per thread)
     // must get clean ENOMEMs here rather than starving UIKit/libobjc into a
@@ -474,7 +726,7 @@ static guest_addr_t mmap_common_guest(guest_addr_t addr, qword_t len, dword_t pr
     // recursive. A no-op returning 0 when swap is off, which is the default.
     if (host_mem_headroom_low())
         swap_direct_reclaim(current->mem, len);
-    if (host_mem_headroom_low()) {
+    if (mem_growth_refused(len)) {
         // This guard fires silently otherwise -- from the guest's point of
         // view every mmap() in the whole app just starts failing with a
         // clean ENOMEM, with nothing to explain why (e.g. a Wayland
@@ -499,13 +751,25 @@ static guest_addr_t mmap_common_guest(guest_addr_t addr, qword_t len, dword_t pr
     // exactly one of MAP_PRIVATE / MAP_SHARED is required
     if (!(flags & (MMAP_PRIVATE | MMAP_SHARED)))
         return _EINVAL;
+    // MAP_LOCKED was accepted and ignored, and MCL_FUTURE recorded and never
+    // applied, so a mapping either asked to have locked was an ordinary one:
+    // evictable, and in no VmLck. RLIMIT_MEMLOCK is read here, before any lock,
+    // and only for a mapping that will be locked.
+    struct mmap_lock lock_buf, *lock = NULL;
+    lock_buf.lock = mmap_locks_new(current->mm, (flags & MMAP_LOCKED) != 0);
+    if (lock_buf.lock != 0) {
+        lock_buf.limit = memlock_limit_now();
+        if ((flags & MMAP_LOCKED) && !lock_buf.limit.may_lock)
+            return _EPERM;
+        lock = &lock_buf;
+    }
 
     // Fast path: a pure-growth mmap (the musl mallocng hot path) skips the
     // stop-the-world poke barrier entirely -- it serializes only against other
     // structural writers and never evicts the running sibling threads.
     if (mmap_growth_fast_enabled() && mmap_is_pure_growth(flags)) {
         mem_growth_lock(current->mem);
-        guest_addr_t res = do_mmap(addr, len, prot, flags, fd_no, offset);
+        guest_addr_t res = do_mmap(addr, len, prot, flags, fd_no, offset, &lim, lock);
         mem_growth_unlock(current->mem);
         if ((sqword_t) res == _ENOMEM)
             amd64_vm_failure_trace("mmap", res, addr, len, prot, flags, (qword_t) fd_no, offset);
@@ -536,7 +800,7 @@ static guest_addr_t mmap_common_guest(guest_addr_t addr, qword_t len, dword_t pr
     }
 
     mem_write_lock_with_pokes(current->mem);
-    guest_addr_t res = do_mmap(addr, len, prot, flags, fd_no, offset);
+    guest_addr_t res = do_mmap(addr, len, prot, flags, fd_no, offset, &lim, lock);
     mem_write_unlock_with_pokes(current->mem);
     if ((sqword_t) res == _ENOMEM)
         amd64_vm_failure_trace("mmap", res, addr, len, prot, flags, (qword_t) fd_no, offset);
@@ -548,7 +812,11 @@ guest_addr_t sys_mmap_guest(guest_addr_t addr, qword_t len, dword_t prot, dword_
 }
 
 addr_t sys_mmap2(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_t fd_no, dword_t offset) {
-    return (addr_t) mmap_common_guest(addr, len, prot, flags, fd_no, offset << PAGE_BITS);
+    // mmap2 counts the offset in 4 KiB pages so a 32-bit caller can reach past
+    // 4 GiB: widen BEFORE the shift. `offset << PAGE_BITS` in 32 bits wrapped
+    // every offset >= 4 GiB -- a large file's tail, and every virtgpu MAP
+    // offset (they start at 1 << 32), which came back as offset 0.
+    return (addr_t) mmap_common_guest(addr, len, prot, flags, fd_no, (qword_t) offset << PAGE_BITS);
 }
 
 enum membarrier_cmd {
@@ -743,12 +1011,31 @@ int_t sys_munmap(addr_t addr, uint_t len) {
 #define MREMAP_MAYMOVE_ 1
 #define MREMAP_FIXED_ 2
 
+// The file offset of the page just past [start, start + pages), a file mapping
+// whose first page's struct data is `data`: counted from that page's own
+// offset, which is not the mapping's first page's once an mprotect or munmap
+// has split the mapping.
+static qword_t mremap_tail_file_offset(struct mem *mem, page_t start, pages_t pages,
+        struct data *data) {
+    struct pt_entry *pt = mem_pt(mem, start);
+    if (data == NULL || pt == NULL || pt->data != data)
+        return 0;
+    return (qword_t) data_file_offset(data, pt->offset) + ((qword_t) pages << PAGE_BITS);
+}
+
 // Map the freshly-grown tail of a file-backed mapping during an mremap grow. The extra
 // pages continue the same file at file_offset; the existing pages are left untouched (the
 // caller pt_moves them when relocating), which preserves both MAP_SHARED contents and any
 // MAP_PRIVATE/COW data already written. Mirrors the fd path in do_mmap().
+//
+// A locked mapping grows locked, and Linux populates what it adds (MEASURED on
+// 6.12: an mremap that grows a locked mapping, in place or moving it, raises
+// VmLck by the growth, and the whole mapping is one resident "lo" region) --
+// unless the lock is an on-fault one, whose growth is locked the same way and
+// not populated (the whole mapping one "lo lf" region, only what was touched
+// resident). `lock` is the mapping's.
 static int mremap_map_file_extra(struct mem *mem, page_t start, pages_t pages,
-        struct fd *fd, qword_t file_offset, unsigned pt_flags) {
+        struct fd *fd, qword_t file_offset, unsigned pt_flags, uint8_t lock) {
     if (fd == NULL || fd->ops->mmap == NULL)
         return _EFAULT;
     int prot = pt_flags & (P_READ | P_WRITE | P_EXEC | P_SHARED);
@@ -761,7 +1048,65 @@ static int mremap_map_file_extra(struct mem *mem, page_t start, pages_t pages,
         e->data->fd = fd_retain(fd);
         e->data->file_offset = file_offset;
     }
+    if (lock != 0)
+        mem_lock_new_range(mem, start, pages, lock, true);
     return 0;
+}
+
+// Map the freshly-grown tail of an ANONYMOUS mapping at [start, start + pages),
+// a hole, the way mmap would have mapped a mapping of the new size.
+//
+// When the mapping's last page (start - 1, or the page the caller is about to
+// move there) is reserved, the tail is reserved too and the caller joins the
+// two, whatever the tail's size: one mapping, one reservation, as an mmap of
+// the new size would be. Otherwise a tail of MEM_LAZY_MIN_PAGES or more is a
+// reservation of its own, and a smaller one gets entries. Growing a large
+// untouched block by realloc used to build page tables for the whole tail.
+//
+// Only for the flags mmap itself reserves with; anything else (P_GROWSDOWN,
+// P_WIPEONFORK) keeps the eager map it always had.
+//
+// A locked mapping grows locked, as mremap_map_file_extra says, and populated
+// when the lock is a plain one -- so an accessible tail gets entries to lock
+// and populate, as a locked mmap does. Linux populates the growth alone, so it
+// does that whether or not the mapping's own end is reserved: a reserved end
+// that is locked plainly is one mlock's populate stopped short of, at a
+// PROT_NONE page before it. A tail nothing populates -- an on-fault lock's, a
+// PROT_NONE one, an unlocked one -- is reserved like any other, with the lock's
+// marks.
+static int mremap_map_anon_extra(struct mem *mem, page_t start, pages_t pages,
+        unsigned pt_flags, bool tail_reserved, uint8_t lock) {
+    unsigned flags = pt_flags & ~P_COW;
+    if ((flags & ~(P_RWX | P_SHARED | P_ANONYMOUS)) == 0 &&
+            (lock != PT_LOCKED || !(flags & P_RWX))) {
+        unsigned lazy_flags = (flags & ~P_ANONYMOUS) | mem_lazy_lock_marks(lock);
+        if (tail_reserved
+                ? mem_lazy_reserve_any_size(mem, start, pages, lazy_flags)
+                : mem_lazy_reserve(mem, start, pages, lazy_flags))
+            return 0;
+    }
+    int err = pt_map_nothing(mem, start, pages, flags);
+    if (err == 0 && lock != 0)
+        mem_lock_new_range(mem, start, pages, lock, true);
+    return err;
+}
+
+// True iff `page` is reserved, i.e. has no entry and lies in a reservation.
+static bool mremap_page_reserved(struct mem *mem, page_t page) {
+    return mem_pt(mem, page) == NULL && mem_lazy_find(mem, page) != NULL;
+}
+
+// Once the mapping's pages are in place below it, join a reserved tail to the
+// mapping's reserved end. A tail reserved only for that join, below the size
+// mmap would reserve, whose mapping ended up with entries there after all --
+// pt_move materialises a range it cannot move as reservations -- gets the
+// entries mmap would have given it, rather than keeping a slot.
+static void mremap_join_anon_extra(struct mem *mem, page_t start, pages_t pages) {
+    mem_lazy_join(mem, start);
+    struct mem_lazy_map *lazy = mem_lazy_find(mem, start);
+    if (pages < MEM_LAZY_MIN_PAGES && lazy != NULL &&
+            lazy->start == start && lazy->end == start + pages)
+        mem_lazy_materialize_range(mem, start, start + pages);
 }
 
 guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_len, dword_t flags,
@@ -793,10 +1138,18 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
     if (new_pages > old_pages && host_mem_headroom_low()) {
         swap_direct_reclaim(current->mem,
                 (uint64_t) (new_pages - old_pages) << PAGE_BITS);
-        if (host_mem_headroom_low())
+        if (mem_growth_refused((uint64_t) (new_pages - old_pages) << PAGE_BITS))
             return _ENOMEM;
     }
     guest_addr_t res = _ENOMEM;
+    const struct vm_limits lim = vm_limits_now();
+    // Growing a locked mapping, or aliasing one, adds locked pages, which
+    // RLIMIT_MEMLOCK has to allow (Linux's vma_to_resize: EAGAIN, MEASURED on
+    // 6.12 for both). Whether the mapping is locked is only known under the
+    // lock, so the limit is read for any growth.
+    struct memlock_limit memlock = {.unlimited = true};
+    if (new_pages > old_pages)
+        memlock = memlock_limit_now();
 
     mem_write_lock_with_pokes(current->mem);
 
@@ -809,11 +1162,12 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
     // the caller lost coherence with the original and was told it had not.
     if (old_pages == 0) {
         struct pt_entry *entry = mem_pt(current->mem, PAGE(addr));
-        if (entry == NULL) {
+        struct mem_lazy_map *lazy = entry == NULL ? mem_lazy_find(current->mem, PAGE(addr)) : NULL;
+        if (entry == NULL && lazy == NULL) {
             res = _EFAULT;
             goto out;
         }
-        if (!(entry->flags & P_SHARED)) {
+        if (!((entry != NULL ? entry->flags : lazy->flags) & P_SHARED)) {
             res = _EINVAL;
             goto out;
         }
@@ -831,6 +1185,19 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
                 goto out;
             }
         }
+        // The alias is a copy of the VMA at addr, its lock included.
+        if (mem_page_locked(current->mem, PAGE(addr)) &&
+                !memlock_room(current->mem, &memlock, new_pages)) {
+            res = _EAGAIN;
+            goto out;
+        }
+        // An alias shares the pages themselves -- pt_dup copies entries -- so
+        // whatever it covers of a large shared mapping that is still reserved,
+        // untouched or only partly faulted in, has to become entries first.
+        // Only what it covers, and only once the destination is settled, so a
+        // 16 MiB alias of an untouched 1 GiB mapping does not build page tables
+        // for the gigabyte, and one refused for its destination builds none.
+        mem_lazy_populate(current->mem, PAGE(addr), PAGE(addr) + new_pages);
         int dup_err = pt_dup(current->mem, PAGE(addr), dest, new_pages);
         res = dup_err < 0 ? (guest_addr_t) dup_err : (guest_addr_t) (dest << PAGE_BITS);
         goto out;
@@ -850,19 +1217,32 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             goto out;
         }
 
-        struct pt_entry *entry = mem_pt(current->mem, src_page);
-        if (entry == NULL) {
+        // Every page mapped or reserved, all with one set of flags: a
+        // reservation reads as the entry it would materialise to, since a
+        // split or a partial fault leaves one mapping in both states.
+        unsigned pt_flags;
+        struct data *backing_data;
+        uint8_t lock;
+        if (!mem_range_flags(current->mem, src_page, old_pages, &pt_flags, &backing_data,
+                             &lock)) {
             res = _EFAULT;
             goto out;
         }
-        dword_t pt_flags = entry->flags;
-        struct data *backing_data = entry->data;
-        for (page_t page = src_page; page < src_page + old_pages; page++) {
-            entry = mem_pt(current->mem, page);
-            if (entry == NULL || (entry->flags & ~P_COW) != (pt_flags & ~P_COW)) {
-                res = _EFAULT;
-                goto out;
-            }
+        // RLIMIT_MEMLOCK (EAGAIN) and then RLIMIT_AS and RLIMIT_DATA (ENOMEM)
+        // for the growth, in Linux's order (vma_to_resize), counting the
+        // destination's old contents as gone: Linux unmaps them first. It
+        // unmaps them even when a limit then refuses the call; this keeps
+        // them, as it does for the ENOMEM it has always checked here.
+        if (new_pages > old_pages && lock != 0 &&
+                !memlock_room_replacing(current->mem, &memlock, new_pages - old_pages,
+                        mem_locked_page_count_range(current->mem, dest_page, new_pages))) {
+            res = _EAGAIN;
+            goto out;
+        }
+        if (new_pages > old_pages && !vm_may_expand(current->mem, &lim, new_pages - old_pages,
+                vm_flags_are_data(pt_flags), dest_page, dest_page + new_pages)) {
+            res = _ENOMEM;
+            goto out;
         }
 
         // Clear whatever's currently mapped at the destination -- MREMAP_FIXED
@@ -873,6 +1253,9 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             res = _EFAULT;
             goto out;
         }
+        // Asked after that unmap, which can materialise a reservation holding
+        // both ranges when it may not split it.
+        bool tail_reserved = mremap_page_reserved(current->mem, src_page + old_pages - 1);
 
         if (new_pages > old_pages) {
             bool is_file = !(pt_flags & P_ANONYMOUS);
@@ -882,12 +1265,12 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
                 res = _EFAULT;
                 goto out;
             }
-            qword_t extra_file_offset = backing_data != NULL
-                    ? backing_data->file_offset + ((qword_t) old_pages << PAGE_BITS) : 0;
+            qword_t extra_file_offset = mremap_tail_file_offset(current->mem, src_page,
+                    old_pages, backing_data);
             pages_t extra_pages = new_pages - old_pages;
             err = is_file
-                    ? mremap_map_file_extra(current->mem, dest_page + old_pages, extra_pages, backing_fd, extra_file_offset, pt_flags)
-                    : pt_map_nothing(current->mem, dest_page + old_pages, extra_pages, pt_flags & ~P_COW);
+                    ? mremap_map_file_extra(current->mem, dest_page + old_pages, extra_pages, backing_fd, extra_file_offset, pt_flags, lock)
+                    : mremap_map_anon_extra(current->mem, dest_page + old_pages, extra_pages, pt_flags, tail_reserved, lock);
             if (err < 0) {
                 res = err;
                 goto out;
@@ -903,6 +1286,8 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
             res = err;
             goto out;
         }
+        if (new_pages > old_pages && (pt_flags & P_ANONYMOUS))
+            mremap_join_anon_extra(current->mem, dest_page + old_pages, new_pages - old_pages);
         if (new_pages < old_pages) {
             err = pt_unmap(current->mem, src_page + move_pages, old_pages - move_pages);
             if (err < 0) {
@@ -927,30 +1312,38 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
         goto out;
     }
 
-    struct pt_entry *entry = mem_pt(current->mem, PAGE(addr));
-    if (entry == NULL) {
-        res = _EFAULT;
-        goto out;
-    }
-    dword_t pt_flags = entry->flags;
-    struct data *backing_data = entry->data; // capture before the loop reassigns `entry`
     // P_COW is internal per-page copy-on-write state: it legitimately differs across a
     // single mapping after fork() + partial writes -- exactly how apt's anonymous
     // DynamicMMap looks when it tries to grow. Require only the mapping's type and
-    // permission bits to match, not COW state.
-    for (page_t page = PAGE(addr); page < PAGE(addr) + old_pages; page++) {
-        entry = mem_pt(current->mem, page);
-        if (entry == NULL || (entry->flags & ~P_COW) != (pt_flags & ~P_COW)) {
-            res = _EFAULT;
-            goto out;
-        }
+    // permission bits to match, not COW state. mem_range_flags ignores P_COW, and
+    // reads a reserved page as the entry it would materialise to: a lazy mapping
+    // that is partly touched, or a remainder a split left, is still one mapping.
+    unsigned pt_flags;
+    struct data *backing_data;
+    uint8_t lock;
+    if (!mem_range_flags(current->mem, PAGE(addr), old_pages, &pt_flags, &backing_data,
+                         &lock)) {
+        res = _EFAULT;
+        goto out;
     }
+    // RLIMIT_MEMLOCK when the mapping is locked, then RLIMIT_AS and
+    // RLIMIT_DATA, for the growth, in Linux's order (vma_to_resize).
+    if (lock != 0 && !memlock_room(current->mem, &memlock, new_pages - old_pages)) {
+        res = _EAGAIN;
+        goto out;
+    }
+    if (!vm_may_expand(current->mem, &lim, new_pages - old_pages,
+            vm_flags_are_data(pt_flags), 0, 0)) {
+        res = _ENOMEM;
+        goto out;
+    }
+    bool tail_reserved = mremap_page_reserved(current->mem, PAGE(addr) + old_pages - 1);
     // File-backed grow: map the extra tail pages from the same fd. Only fd-backed
     // mappings whose fd we retained (data->fd) are growable this way.
     bool is_file = !(pt_flags & P_ANONYMOUS);
     struct fd *backing_fd = is_file && backing_data != NULL ? backing_data->fd : NULL;
-    qword_t extra_file_offset = backing_data != NULL
-            ? backing_data->file_offset + ((qword_t) old_pages << PAGE_BITS) : 0;
+    qword_t extra_file_offset = mremap_tail_file_offset(current->mem, PAGE(addr), old_pages,
+            backing_data);
     if (is_file && (backing_fd == NULL || backing_fd->ops->mmap == NULL)) {
         FIXME("mremap grow on a mapping with no growable backing fd");
         res = _EFAULT;
@@ -962,8 +1355,10 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
     bool extra_is_hole = pt_is_hole(current->mem, extra_start, extra_pages);
     if (extra_is_hole) {
         int err = is_file
-                ? mremap_map_file_extra(current->mem, extra_start, extra_pages, backing_fd, extra_file_offset, pt_flags)
-                : pt_map_nothing(current->mem, extra_start, extra_pages, pt_flags & ~P_COW);
+                ? mremap_map_file_extra(current->mem, extra_start, extra_pages, backing_fd, extra_file_offset, pt_flags, lock)
+                : mremap_map_anon_extra(current->mem, extra_start, extra_pages, pt_flags, tail_reserved, lock);
+        if (err == 0 && !is_file)
+            mremap_join_anon_extra(current->mem, extra_start, extra_pages);
         res = err < 0 ? err : addr;
         goto out;
     }
@@ -981,12 +1376,14 @@ guest_addr_t sys_mremap_guest(guest_addr_t addr, qword_t old_len, qword_t new_le
         goto out;
     }
     int err = is_file
-            ? mremap_map_file_extra(current->mem, new_page + old_pages, extra_pages, backing_fd, extra_file_offset, pt_flags)
-            : pt_map_nothing(current->mem, new_page + old_pages, extra_pages, pt_flags & ~P_COW);
+            ? mremap_map_file_extra(current->mem, new_page + old_pages, extra_pages, backing_fd, extra_file_offset, pt_flags, lock)
+            : mremap_map_anon_extra(current->mem, new_page + old_pages, extra_pages, pt_flags, tail_reserved, lock);
     if (err == 0) {
         err = pt_move(current->mem, PAGE(addr), new_page, old_pages);
         if (err < 0)
             pt_unmap_always(current->mem, new_page + old_pages, extra_pages);
+        else if (!is_file)
+            mremap_join_anon_extra(current->mem, new_page + old_pages, extra_pages);
     }
     if (err < 0) {
         if (err == _ENOMEM)
@@ -1016,36 +1413,134 @@ int_t sys_mremap(addr_t addr, dword_t old_len, dword_t new_len, dword_t flags, a
 // see that coming. mmap already refused the same thing at map time; this is
 // the door it left open.
 //
-// Caller holds the memory write lock.
-static bool mprotect_write_forbidden(struct mem *mem, page_t start, pages_t pages) {
-    for (page_t page = start; page < start + pages; page++) {
-        struct pt_entry *e = mem_pt(mem, page);
+// Returns how many pages from `start` may be made writable: the change stops
+// at the first that may not, as Linux's stops at that mapping. Caller holds the
+// memory write lock.
+static pages_t mprotect_writable_prefix(struct mem *mem, page_t start, pages_t pages) {
+    for (pages_t i = 0; i < pages; i++) {
+        struct pt_entry *e = mem_pt(mem, start + i);
         if (e == NULL || !(e->flags & P_SHARED) || e->data == NULL)
             continue;
         // Shared ANONYMOUS memory has no file behind it and is always writable.
         struct fd *fd = e->data->fd;
         if (fd != NULL && (fd->flags & O_ACCMODE_) == O_RDONLY_)
-            return true;
+            return i;
+    }
+    return pages;
+}
+
+#define PROT_GROWSDOWN_ 0x01000000
+#define PROT_GROWSUP_ 0x02000000
+
+// The flags of a page that is mapped or reserved; false for a hole.
+static bool mprotect_page_flags(struct mem *mem, page_t page, unsigned *flags) {
+    struct pt_entry *e = mem_pt(mem, page);
+    if (e != NULL) {
+        *flags = e->flags;
+        return true;
+    }
+    struct mem_lazy_map *l = mem_lazy_find(mem, page);
+    if (l != NULL) {
+        *flags = l->flags;
+        return true;
     }
     return false;
+}
+
+// PROT_GROWSDOWN: the change runs from the bottom of the grows-down mapping
+// the range starts in -- glibc's _dl_make_stack_executable names one page near
+// the top of the stack and means all of it. The first mapping in the range
+// has to be one that grows down; in AOK that is only ever the main stack.
+// Caller holds the memory write lock.
+static int_t mprotect_grows_down(struct mem *mem, page_t *start, pages_t *pages) {
+    pages_t skip = 0;
+    unsigned flags = 0;
+    while (skip < *pages && *start + skip < mem->page_limit &&
+            !mprotect_page_flags(mem, *start + skip, &flags))
+        skip++;
+    if (skip >= *pages || *start + skip >= mem->page_limit)
+        return _ENOMEM;
+    if (!(flags & P_GROWSDOWN))
+        return _EINVAL;
+    page_t bottom = *start + skip;
+    while (bottom > 0 && mprotect_page_flags(mem, bottom - 1, &flags) && (flags & P_GROWSDOWN))
+        bottom--;
+    *pages = *start + *pages - bottom;
+    *start = bottom;
+    return 0;
 }
 
 int_t sys_mprotect_guest(guest_addr_t addr, qword_t len, int_t prot) {
     STRACE("mprotect(%#llx, %#llx, 0x%x)", (unsigned long long) addr,
            (unsigned long long) len, prot);
+    // Linux's order: the grows pair, the alignment, and an empty range
+    // succeeds before prot itself is looked at.
+    int_t grows = prot & (PROT_GROWSDOWN_ | PROT_GROWSUP_);
+    prot &= ~(PROT_GROWSDOWN_ | PROT_GROWSUP_);
+    if (grows == (PROT_GROWSDOWN_ | PROT_GROWSUP_))
+        return _EINVAL;
     if (PGOFFSET(addr) != 0)
         return _EINVAL;
+    if (len == 0)
+        return 0;
     prot &= ~(int_t) PROT_SEM_;    // see mmap_common_guest
     if (prot & ~P_RWX)
         return _EINVAL;
+    // READ_IMPLIES_EXEC, as mmap_common_guest.
+    if ((prot & P_READ) && (current->group->personality & READ_IMPLIES_EXEC_))
+        prot |= P_EXEC;
+    page_t start = PAGE(addr);
     pages_t pages = PAGE_ROUND_UP(len);
+    const struct vm_limits lim = vm_limits_now();
     mem_write_lock_with_pokes(current->mem);
-    if ((prot & P_WRITE) && mprotect_write_forbidden(current->mem, PAGE(addr), pages)) {
-        mem_write_unlock_with_pokes(current->mem);
-        return _EACCES;
+    int_t err = 0;
+    if (grows & PROT_GROWSDOWN_) {
+        err = mprotect_grows_down(current->mem, &start, &pages);
+    } else if (grows & PROT_GROWSUP_) {
+        // Nothing grows up on the architectures AOK runs.
+        err = pt_mapped_prefix(current->mem, start, 1) != 0 ? _EINVAL : _ENOMEM;
     }
-    int err = pt_set_flags(current->mem, PAGE(addr), pages, prot);
+    if (err < 0) {
+        mem_write_unlock_with_pokes(current->mem);
+        return err;
+    }
+
+    // Linux changes the mappings one after another and stops at the first it
+    // cannot: those before a hole, or before a shared read-only file mapping
+    // asked to be writable, keep their new protection and the call still
+    // fails. A program that rounds its length up past the end of a mapping
+    // and ignores the ENOMEM -- as tests/manual/modify.c once did -- gets the
+    // pages it meant. A range that STARTS in a hole changes nothing.
+    pages_t todo = pt_mapped_prefix(current->mem, start, pages);
+    int_t stop = todo < pages ? _ENOMEM : 0;
+    if (prot & P_WRITE) {
+        pages_t writable = mprotect_writable_prefix(current->mem, start, todo);
+        if (writable < todo) {
+            todo = writable;
+            stop = _EACCES;
+        }
+    }
+    // RLIMIT_DATA: making private pages writable makes them data (Linux's
+    // mprotect_fixup), so a heap reserved PROT_NONE and opened up piece by
+    // piece -- glibc's thread arenas -- is held to the limit too. Checked for
+    // the whole change at once, where Linux could still make the mappings
+    // before the one that crosses the limit writable.
+    if ((prot & P_WRITE) && lim.data != RLIM_INFINITY_ && todo != 0) {
+        size_t in_total, in_data, in_private;
+        mem_vm_pages_range_ex(current->mem, start, start + todo,
+                &in_total, &in_data, &in_private);
+        struct vm_limits data_only = {RLIM_INFINITY_, lim.data, lim.data_max};
+        if (in_private > in_data &&
+                !vm_may_expand(current->mem, &data_only, in_private - in_data, true, 0, 0)) {
+            todo = 0;
+            stop = _ENOMEM;
+        }
+    }
+    if (todo != 0)
+        err = pt_set_flags(current->mem, start, todo, prot);
     mem_write_unlock_with_pokes(current->mem);
+    if (err == 0)
+        err = stop;
     if (err == _ENOMEM)
         amd64_vm_failure_trace("mprotect", err, addr, len, prot, 0, 0, 0);
     return err;
@@ -1060,6 +1555,18 @@ int_t sys_mprotect(addr_t addr, uint_t len, int_t prot) {
 #define MADV_REMOVE_ 9
 #define MADV_WIPEONFORK_ 18
 #define MADV_KEEPONFORK_ 19
+#define MADV_COLD_ 20
+#define MADV_PAGEOUT_ 21
+
+// The advices Linux refuses on a locked mapping, with EINVAL: the ones that
+// would drop its pages or send them toward swap, which is what the lock rules
+// out (madvise_dontneed_free_valid_vma, can_madv_lru_vma, madvise_remove).
+// MEASURED on 6.12 for all five; AOK said 0 to each, and MADV_DONTNEED and
+// MADV_FREE threw the locked page's contents away.
+static bool madvise_refused_when_locked(dword_t advice) {
+    return advice == MADV_DONTNEED_ || advice == MADV_FREE_ || advice == MADV_REMOVE_ ||
+            advice == MADV_COLD_ || advice == MADV_PAGEOUT_;
+}
 
 // Advices Linux's madvise() accepts. Linux validates the argument up front and
 // returns EINVAL for anything it does not recognize, independent of whether the
@@ -1117,21 +1624,66 @@ dword_t sys_madvise_guest(guest_addr_t addr, qword_t len, dword_t advice) {
     struct mem *mem = current->mem;
     int err = 0;
     bool saw_hole = false;
-    mem_write_lock_with_pokes(mem);
+    // Only these change the address space. Every other advice is a hint that
+    // reads it -- the range must be mapped, and a locked page refuses COLD and
+    // PAGEOUT -- so it takes the read lock like mincore rather than stopping
+    // every thread of the process: JavaScriptCore marks its heap MADV_DONTDUMP
+    // and MADV_DODUMP piece by piece, 2,500 calls in one `opencode --version`,
+    // each of which was a stop-the-world barrier.
+    bool changes = advice == MADV_DONTNEED_ || advice == MADV_FREE_ ||
+            advice == MADV_REMOVE_ || advice == MADV_WIPEONFORK_ || advice == MADV_KEEPONFORK_;
+    if (changes)
+        mem_write_lock_with_pokes(mem);
+    else
+        mem_read_lock_quiesce_aware(mem);
     page_t start = PAGE(addr);
     page_t end = start + pages;
     if (end < start || end > mem->page_limit) {
         saw_hole = true;       // part of the range is outside the address space
         end = mem->page_limit; // clamp the loop bound / guard overflow
     }
+    // The FORK pair records itself in per-page flags, so any lazy reservation
+    // in range has to become real entries before the loop can mark them. No
+    // other advice materialises,
+    // and that is the point: MADV_DONTDUMP over a 128 MB buffer pool must not
+    // fault in 128 MB to answer a hint.
+    if (advice == MADV_WIPEONFORK_ || advice == MADV_KEEPONFORK_)
+        mem_lazy_materialize_range(mem, start, end);
     for (page_t page = start; page < end; ) {
         struct pt_entry *pt = mem_pt(mem, page);
         if (pt == NULL) {
-            // A gap anywhere in the range makes the whole call ENOMEM on Linux,
-            // after the advice is still applied to the mapped portion.
-            saw_hole = true;
-            page++;
+            // A lazy anonymous reservation has no page-table entry yet, but it
+            // IS mapped as far as the guest is concerned -- the same reading
+            // mincore takes below. Only a genuine hole is ENOMEM. InnoDB
+            // MADV_DONTDUMPs its whole buffer pool immediately after mapping
+            // it, so every MariaDB start logged "Failed to set memory to
+            // MADV_DONTDUMP: Cannot allocate memory" for a range that was
+            // mapped the whole time.
+            struct mem_lazy_map *lazy = mem_lazy_find(mem, page);
+            if (lazy == NULL) {
+                // A gap anywhere in the range makes the whole call ENOMEM on
+                // Linux, after the advice is still applied to the mapped
+                // portion.
+                saw_hole = true;
+                page++;
+                continue;
+            }
+            // Nothing to do for the reservation itself: its pages have never
+            // been written, so they already read back as zero, which is all
+            // DONTNEED and FREE promise -- and REMOVE has no shared backing to
+            // punch, so it keeps the EINVAL a private mapping gets below. A
+            // locked one refuses them all, as its entries do.
+            if ((advice == MADV_REMOVE_ && !(lazy->flags & P_SHARED)) ||
+                    ((lazy->flags & MEM_LAZY_LOCKED) && madvise_refused_when_locked(advice))) {
+                err = _EINVAL;
+                break;
+            }
+            page = lazy->end < end ? lazy->end : end;
             continue;
+        }
+        if (pt->locked && madvise_refused_when_locked(advice)) {
+            err = _EINVAL;
+            break;
         }
         // MADV_WIPEONFORK marks the range so a child of fork() gets fresh zero
         // pages instead of the parent's data. The point is a page holding
@@ -1210,6 +1762,9 @@ dword_t sys_madvise_guest(guest_addr_t addr, qword_t len, dword_t advice) {
         // with fresh zero-filled anonymous memory in one shot. pt_map_nothing
         // unmaps the old mapping internally (and only after its own allocation
         // succeeds), so there is no unmapped window on failure.
+        // A locked page ends the run: the next pass refuses it, and the pages
+        // before it are discarded first, as Linux advises the VMAs ahead of the
+        // one it refuses.
         unsigned flags = pt->flags & ~P_COW;
         page_t run = page;
         do {
@@ -1217,12 +1772,15 @@ dword_t sys_madvise_guest(guest_addr_t addr, qword_t len, dword_t advice) {
         } while (page < end &&
                  (pt = mem_pt(mem, page)) != NULL &&
                  (pt->flags & P_ANONYMOUS) && !(pt->flags & P_SHARED) &&
-                 (pt->flags & ~P_COW) == flags);
+                 (pt->flags & ~P_COW) == flags && !pt->locked);
         err = pt_map_nothing(mem, run, page - run, flags);
         if (err < 0)
             break;
     }
-    mem_write_unlock_with_pokes(mem);
+    if (changes)
+        mem_write_unlock_with_pokes(mem);
+    else
+        mem_read_unlock_quiesce_aware(mem);
     if (err < 0)
         return err;
     if (saw_hole)
@@ -1232,6 +1790,112 @@ dword_t sys_madvise_guest(guest_addr_t addr, qword_t len, dword_t advice) {
 
 dword_t sys_madvise(addr_t addr, dword_t len, dword_t advice) {
     return sys_madvise_guest(addr, len, advice);
+}
+
+// process_madvise(2) (5.10): madvise on a process's address space, named by a
+// pidfd. It takes only hints -- WILLNEED, COLD, PAGEOUT and COLLAPSE -- and AOK
+// keeps no page ages or huge pages for any of them to act on, so what it does
+// is Linux's checking, in Linux's order: flags, the vector, the pidfd, the
+// advice, then PTRACE_MODE_READ on the target (EACCES, which is what
+// mm_access answers) and CAP_SYS_NICE for anyone else's (EPERM). Each range
+// must start on a page (EINVAL) and be mapped (ENOMEM). The answer is the bytes
+// advised; a failure after some ranges were done reports those instead.
+static int process_madvise_range(struct mem *mem, guest_addr_t start, size_t len,
+        dword_t advice) {
+    if (PGOFFSET(start) != 0)
+        return _EINVAL;
+    pages_t pages = PAGE_ROUND_UP(len);
+    if (len != 0 && pages == 0)
+        return _EINVAL;
+    page_t first = PAGE(start);
+    if (first + pages < first)
+        return _EINVAL;
+    for (page_t pg = first; pg < first + pages; pg++) {
+        if (pg >= mem->page_limit)
+            return _ENOMEM;
+        if (mem_pt(mem, pg) == NULL && mem_lazy_find(mem, pg) == NULL)
+            return _ENOMEM;
+        // COLD and PAGEOUT are refused on a locked mapping here as in madvise.
+        if (madvise_refused_when_locked(advice) && mem_page_locked(mem, pg))
+            return _EINVAL;
+    }
+    return 0;
+}
+
+dword_t sys_process_madvise_guest(fd_t pidfd, guest_addr_t vec, qword_t vlen, dword_t advice,
+        dword_t flags) {
+    STRACE("process_madvise(%d, %#llx, %llu, %d, %#x)", pidfd, (unsigned long long) vec,
+           (unsigned long long) vlen, advice, flags);
+    if (flags != 0)
+        return _EINVAL;
+    if (vlen > IOV_MAX)
+        return _EINVAL;
+    struct guest_iovec_ *iov = NULL;
+    if (vlen != 0) {
+        iov = user_read_iovecs_abi(current, current->abi, vec, (dword_t) vlen);
+        if (IS_ERR(iov))
+            return PTR_ERR(iov);
+    }
+    int err;
+    struct task *task = pidfd_task_ref(pidfd, &err);
+    if (task == NULL) {
+        free(iov);
+        return err;
+    }
+    switch (advice) {
+        case 3:  // MADV_WILLNEED
+        case 20: // MADV_COLD
+        case 21: // MADV_PAGEOUT
+        case 25: // MADV_COLLAPSE
+            break;
+        default:
+            err = _EINVAL;
+            goto out;
+    }
+
+    // The target's address space, pinned so it cannot go away under us. Not
+    // a plain lock -- we hold a reference on the task, and see
+    // task_lock_unless_exiting for why that and its general_lock do not mix.
+    struct mm *mm = NULL;
+    if (task_lock_unless_exiting(task)) {
+        mm = task->mm;
+        if (mm != NULL)
+            mm_retain(mm);
+        unlock(&task->general_lock);
+    }
+    if (mm == NULL) {
+        err = _ESRCH;
+        goto out;
+    }
+    bool remote = mm != current->mm;
+    if (remote && !task_ptrace_may_access(task, PTRACE_MODE_READ_ | PTRACE_MODE_FSCREDS_))
+        err = _EACCES;
+    else if (remote && !current_capable(CAP_SYS_NICE_))
+        err = _EPERM;
+    if (err == 0) {
+        size_t done = 0;
+        mem_read_lock_quiesce_aware(&mm->mem);
+        for (qword_t i = 0; i < vlen; i++) {
+            if (iov[i].len == 0)
+                continue;
+            err = process_madvise_range(&mm->mem, iov[i].base, iov[i].len, advice);
+            if (err < 0)
+                break;
+            done += iov[i].len;
+        }
+        mem_read_unlock_quiesce_aware(&mm->mem);
+        if (done != 0)
+            err = (int) (done > INT32_MAX ? INT32_MAX : done);
+    }
+    mm_release(mm);
+out:
+    task_ref_cnt_mod(task, -1);
+    free(iov);
+    return err;
+}
+
+dword_t sys_process_madvise(fd_t pidfd, addr_t vec, dword_t vlen, dword_t advice, dword_t flags) {
+    return sys_process_madvise_guest(pidfd, vec, vlen, advice, flags);
 }
 
 dword_t sys_mincore_guest(guest_addr_t addr, qword_t len, guest_addr_t vec_addr) {
@@ -1327,11 +1991,9 @@ long sys_set_mempolicy_guest(int UNUSED(mode), guest_addr_t UNUSED(nodemask_addr
     return 0;
 }
 
-// Linux checks the range before doing anything: a range with an unmapped
-// page in it is ENOMEM, for mlock and munlock alike. AOK returned 0 for any
-// range at all, so a caller that locked a region it had got wrong -- the
-// usual reason to call mlock is keeping a secret out of swap -- was told it
-// had succeeded.
+// mlock(2) and munlock(2). AOK returned 0 for any range at all, so a caller
+// that locked a region it had got wrong -- the usual reason to call mlock is
+// keeping a secret out of swap -- was told it had succeeded.
 //
 // THE LOCK IS REAL NOW, and it had to become real the moment the pager did.
 // This comment used to say "a lock is advisory against swap, which iOS manages
@@ -1339,72 +2001,150 @@ long sys_set_mempolicy_guest(int UNUSED(mode), guest_addr_t UNUSED(nodemask_addr
 // file of its own. mlock's entire purpose is keeping something out of swap -- a
 // key, a passphrase, a decrypted buffer -- so answering 0 and then paging it
 // out is a lie about the one thing the caller asked for. Eviction now refuses
-// any frame with a locked page in it (emu/memory.c, swap_frame_eligible).
+// any frame with a locked page in it (emu/memory.c, swap_frame_eligible), and
+// /proc/<pid>/status, smaps and maps report the lock as Linux reports VM_LOCKED.
 //
 // It is still not a HOST pin. AOK cannot stop iOS paging its own memory and
 // never could, so a guest that locks a page has AOK's promise not to write it
 // out, not the operating system's. That is the honest scope of it and it is
 // what opt/AOK/docs says.
-static int_t mlock_apply(guest_addr_t addr, qword_t len, bool locked) {
-    if (len == 0)
-        return 0;
-    if (PGOFFSET(addr) != 0)
-        return _EINVAL;
-    pages_t pages = PAGE_ROUND_UP(len);
-    page_t start = PAGE(addr);
+//
+// Linux's order, every step MEASURED on 6.12 (tests/manual/mlock_accounting):
+//   1. mlock without CAP_IPC_LOCK under a RLIMIT_MEMLOCK of 0 is EPERM.
+//   2. The range becomes whole pages: an unaligned start is rounded down and
+//      the length grown to match, where AOK said EINVAL.
+//   3. RLIMIT_MEMLOCK: what is locked already plus the request, less what of
+//      the range is locked already -- re-locking at the limit succeeds -- or
+//      ENOMEM. ENOMEM, not EPERM, which is what Linux said before 2.6.9.
+//   4. A range whose end wraps is EINVAL, where AOK said ENOMEM.
+//   5. Pages are locked up to the first hole, which makes it ENOMEM with the
+//      pages before it locked; AOK locked nothing then.
+//   6. With no hole, mlock populates up to the first PROT_NONE page, which
+//      makes it ENOMEM with the whole range locked; AOK said 0.
+//
+// mlock2(2) is the same call with flags, and it was ENOSYS: a toolchain whose
+// glibc assumes the syscall issues it directly, so mlock2(MLOCK_ONFAULT) and
+// even mlock2(0) failed. Its one flag makes the lock an on-fault one
+// (pt_entry::locked in emu/memory.h), which takes every step above but the
+// sixth: it populates nothing, so a PROT_NONE page is no failure either. Any
+// other flag is EINVAL before step 1 (MEASURED: ahead of the limit's EPERM and
+// a hole's ENOMEM). mlock over an on-fault lock makes it a plain one again and
+// populates it, and mlock2(MLOCK_ONFAULT) over a plain one leaves resident what
+// was; VmLck moves for neither.
+//
+// `lock` is what the range's lock becomes: 0 for munlock, PT_LOCKED for mlock
+// and mlock2(0), and with PT_LOCKONFAULT for mlock2(MLOCK_ONFAULT). Only a
+// plain lock populates.
+static int_t mlock_apply(guest_addr_t addr, qword_t len, uint8_t lock) {
+    bool populate = lock == PT_LOCKED;
+    struct memlock_limit limit = {.unlimited = true, .may_lock = true};
+    if (lock != 0) {
+        limit = memlock_limit_now();
+        if (!limit.may_lock)
+            return _EPERM;
+    }
+    // In Linux's own arithmetic, which is unsigned and wraps: PAGE_ALIGN(len +
+    // offset) of a length near the top of the address space comes out small or
+    // 0, so mlock(p, SIZE_MAX) locks nothing and returns 0, and only an END
+    // that wraps is EINVAL (MEASURED on x86_64; a 32-bit process's arguments
+    // are widened first, as by a 64-bit kernel, and get ENOMEM there).
+    qword_t off = PGOFFSET(addr);
+    qword_t bytes = (len + off + (PAGE_SIZE - 1)) & ~(qword_t) (PAGE_SIZE - 1);
+    pages_t pages = bytes >> PAGE_BITS;
+    guest_addr_t base = addr - off;
+    page_t start = PAGE(base);
+    struct mem *mem = current->mem;
 
-    if (locked) {
-        // RLIMIT_MEMLOCK, charged against what is ALREADY locked plus what this
-        // call would newly lock. Enforced before the change rather than after,
-        // because a lock that has to be undone was never granted.
-        //
-        // superuser() is exempt, as on Linux: CAP_IPC_LOCK bypasses the limit.
-        // The AOK CLI runs as uid 0, so this exemption is the whole story
-        // there and the limit is only really visible to an unprivileged guest
-        // process -- worth knowing when testing it.
-        rlim_t_ limit = rlimit(RLIMIT_MEMLOCK_);
-        if (!superuser() && limit != RLIM_INFINITY_) {
-            size_t already = mem_locked_page_count(current->mem);
-            // A page already locked costs nothing to lock again, but counting
-            // the overlap exactly would mean walking the range twice; charging
-            // the whole request is the conservative direction and matches what
-            // Linux does for a range it has not yet examined.
-            uint64_t want_bytes = ((uint64_t) already + pages) * PAGE_SIZE;
-            // ENOMEM, not EPERM. EPERM is what Linux returned before 2.6.9;
-            // since then exceeding a RLIMIT_MEMLOCK you are not privileged to
-            // exceed is ENOMEM (mm/mlock.c: `if (locked > lock_limit &&
-            // !capable(CAP_IPC_LOCK)) error = -ENOMEM`), including when the
-            // limit is 0. A program that distinguishes the two -- and one that
-            // retries on ENOMEM with a smaller range is the obvious case --
-            // would take the wrong branch on EPERM.
-            if (want_bytes > (uint64_t) limit)
+    if (lock != 0 && !limit.unlimited) {
+        size_t want = mem_locked_page_count(mem) + pages;
+        if (want > limit.pages) {
+            mem_read_lock_quiesce_aware(mem);
+            size_t already = mem_locked_page_count_range(mem, start, pages);
+            mem_read_unlock_quiesce_aware(mem);
+            if (want - already > limit.pages)
                 return _ENOMEM;
         }
     }
+    if (pages == 0)
+        return 0;
+    if (base + bytes < base)
+        return _EINVAL;
 
-    long changed = pt_set_locked(current->mem, start, pages, locked);
-    return changed < 0 ? (int_t) changed : 0;
+    // How much of the range is mapped, a reserved page counting as mapped
+    // (emu/memory.h, struct mem_lazy_map): that much is changed, and less
+    // than all of it is ENOMEM.
+    //
+    // A reservation has no entry to carry the lock. mem_lazy_lock_range
+    // populates it, as Linux populates what it locks, or marks it; munlock
+    // clears the marks. That changes the reservation table, so it takes the
+    // barrier, and only when the read-locked question says a reservation needs
+    // it: an mlock of anything else costs what it always did. Linux populates
+    // nothing when there is a hole, and neither does this.
+    mem_read_lock_quiesce_aware(mem);
+    pages_t mapped = pt_mapped_prefix(mem, start, pages);
+    bool populating = populate && mapped == pages;
+    bool needed = mapped != 0 &&
+            mem_lazy_lock_range_needed(mem, start, start + mapped, lock, populating);
+    mem_read_unlock_quiesce_aware(mem);
+    if (mapped == 0)
+        return _ENOMEM;
+    if (needed) {
+        mem_write_lock_with_pokes(mem);
+        bool ok = mem_lazy_lock_range(mem, start, start + mapped, lock, populating);
+        mem_write_unlock_with_pokes(mem);
+        if (!ok)
+            return _ENOMEM;     // a sibling unmapped part of it meanwhile
+    }
+
+    long changed = pt_set_locked(mem, start, mapped, lock, populating);
+    if (changed < 0)
+        return (int_t) changed;
+    return mapped < pages ? _ENOMEM : 0;
+}
+
+// mlockall's and munlockall's part for reservations; see mem_lazy_lock_all.
+static void mlock_reservations(uint8_t lock, bool populate) {
+    struct mem *mem = current->mem;
+    mem_read_lock_quiesce_aware(mem);
+    bool any = mem_lazy_overlaps(mem, 0, mem->page_limit);
+    mem_read_unlock_quiesce_aware(mem);
+    if (!any)
+        return;
+    mem_write_lock_with_pokes(mem);
+    mem_lazy_lock_all(mem, lock, populate);
+    mem_write_unlock_with_pokes(mem);
 }
 
 int_t sys_mlock_guest(guest_addr_t addr, qword_t len) {
-    return mlock_apply(addr, len, true);
+    return mlock_apply(addr, len, PT_LOCKED);
 }
 
 int_t sys_mlock(addr_t addr, dword_t len) {
     return sys_mlock_guest(addr, len);
 }
 
+// The flags are an int to Linux, so the upper half of a 64-bit caller's
+// register is never looked at (MEASURED on x86_64: (1 << 32) | MLOCK_ONFAULT
+// is an on-fault lock and 1 << 32 a plain one); the dispatch passes the low
+// half.
+int_t sys_mlock2_guest(guest_addr_t addr, qword_t len, dword_t flags) {
+    if (flags & ~(dword_t) MLOCK_ONFAULT_)
+        return _EINVAL;
+    return mlock_apply(addr, len, (flags & MLOCK_ONFAULT_) ? PT_LOCKED | PT_LOCKONFAULT
+                                                           : PT_LOCKED);
+}
+
+int_t sys_mlock2(addr_t addr, dword_t len, dword_t flags) {
+    return sys_mlock2_guest(addr, len, flags);
+}
+
 int_t sys_munlock_guest(guest_addr_t addr, qword_t len) {
-    return mlock_apply(addr, len, false);
+    return mlock_apply(addr, len, 0);
 }
 
 int_t sys_munlock(addr_t addr, dword_t len) {
     return sys_munlock_guest(addr, len);
 }
-
-#define MCL_CURRENT_ 0x1
-#define MCL_FUTURE_ 0x2
-#define MCL_ONFAULT_ 0x4
 
 int_t sys_mlockall_guest(qword_t flags) {
     qword_t supported = MCL_CURRENT_ | MCL_FUTURE_ | MCL_ONFAULT_;
@@ -1414,15 +2154,39 @@ int_t sys_mlockall_guest(qword_t flags) {
         return _EINVAL;
     if ((flags & MCL_ONFAULT_) != 0 && (flags & (MCL_CURRENT_ | MCL_FUTURE_)) == 0)
         return _EINVAL;
+    // Linux's gates, which AOK did not have: no locking at all under a
+    // RLIMIT_MEMLOCK of 0 (EPERM), and MCL_CURRENT only for an address space
+    // that fits the limit whole (ENOMEM) -- every page of it, VmSize, not what
+    // is resident. CAP_IPC_LOCK lifts both. A refused call changes nothing,
+    // MCL_FUTURE included. MEASURED on 6.12.
+    struct memlock_limit limit = memlock_limit_now();
+    if (!limit.may_lock)
+        return _EPERM;
+    if ((flags & MCL_CURRENT_) && !limit.unlimited &&
+            mem_vm_pages_now(current->mem) > limit.pages)
+        return _ENOMEM;
+    // MCL_FUTURE locks every mapping made from here on (mmap_locks_new), and
+    // every call replaces what the last one asked for: MCL_CURRENT alone ends
+    // an MCL_FUTURE (MEASURED), as Linux rewrites mm->def_flags each time.
     current->mm->mlockall_flags = (dword_t) flags;
-    // MCL_CURRENT locks what is mapped NOW, which is the half that can be done
-    // here. MCL_FUTURE is recorded and not yet acted on: it would have to reach
-    // pt_map, which is in emu/ and knows nothing about struct mm, and a flag
-    // that silently did nothing would be worse than one that is written down.
-    // Recorded rather than refused because the flag combination is legal and
-    // programs pass MCL_CURRENT|MCL_FUTURE together as a matter of course.
-    if ((flags & MCL_CURRENT_) != 0)
-        pt_set_locked_all(current->mem, true);
+    // A reservation is part of what is mapped now. Without MCL_ONFAULT Linux
+    // populates every mapping it can access, so the accessible reservations are
+    // materialised and locked with the rest. A PROT_NONE one is not populated
+    // there either, and under MCL_ONFAULT nothing is: those keep marks that
+    // lock each entry they materialise later, as a page faulted into a locked
+    // mapping is locked on Linux. Reservations first: a page a sibling thread
+    // materialises before the entry walk below is then locked either way.
+    //
+    // Every mapping's lock is replaced, as mlock's is: MCL_CURRENT|MCL_ONFAULT
+    // makes each one "lo lf", those mlock had locked and populated included,
+    // and leaves what was resident resident; a later MCL_CURRENT makes them
+    // plain again and populates them (MEASURED on 6.12).
+    if ((flags & MCL_CURRENT_) != 0) {
+        bool onfault = (flags & MCL_ONFAULT_) != 0;
+        uint8_t lock = onfault ? PT_LOCKED | PT_LOCKONFAULT : PT_LOCKED;
+        mlock_reservations(lock, !onfault);
+        pt_set_locked_all(current->mem, lock, !onfault);
+    }
     return 0;
 }
 
@@ -1432,7 +2196,8 @@ int_t sys_mlockall(dword_t flags) {
 
 int_t sys_munlockall_guest(void) {
     current->mm->mlockall_flags = 0;
-    pt_set_locked_all(current->mem, false);
+    mlock_reservations(0, false);
+    pt_set_locked_all(current->mem, 0, false);
     return 0;
 }
 
@@ -1541,11 +2306,20 @@ int_t sys_msync_guest(guest_addr_t addr, qword_t len, int_t flags) {
     if (end < start || end > mem->page_limit) {
         err = _ENOMEM;     // range extends outside the address space
     } else {
-        for (page_t page = start; page < end; page++) {
+        for (page_t page = start; page < end; ) {
             if (mem_pt(mem, page) == NULL) {
-                err = _ENOMEM;   // a gap in the range -> ENOMEM
-                break;
+                // Mapped, just not materialised yet -- mincore and madvise read
+                // a lazy reservation the same way. There is nothing to write
+                // back for one either: it has never been written to.
+                struct mem_lazy_map *lazy = mem_lazy_find(mem, page);
+                if (lazy == NULL) {
+                    err = _ENOMEM;   // a gap in the range -> ENOMEM
+                    break;
+                }
+                page = lazy->end < end ? lazy->end : end;
+                continue;
             }
+            page++;
         }
     }
     struct msync_fds seen = {0};
@@ -1590,6 +2364,22 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk) {
     if (host_mem_headroom_low() && new_brk > mm->brk)
         swap_direct_reclaim(&mm->mem, new_brk - mm->brk);
 
+    const struct vm_limits lim = vm_limits_now();
+    // The heap is read-write, and executable only under READ_IMPLIES_EXEC
+    // (Linux's VM_DATA_DEFAULT_FLAGS). Read before the address-space lock,
+    // like the limits.
+    const unsigned brk_flags = P_READ | P_WRITE |
+            ((current->group->personality & READ_IMPLIES_EXEC_) ? P_EXEC : 0);
+    // Under mlockall(MCL_FUTURE) the heap grows locked, and within
+    // RLIMIT_MEMLOCK or not at all (Linux's check_brk_limits; MEASURED on
+    // 6.12: sbrk past the limit fails, and VmLck follows the break both ways).
+    // Under MCL_ONFAULT too it grows on-fault locked, unpopulated.
+    struct mmap_lock lock_buf, *lock = NULL;
+    lock_buf.lock = new_brk > mm->brk ? mmap_locks_new(mm, false) : 0;
+    if (lock_buf.lock != 0) {
+        lock_buf.limit = memlock_limit_now();
+        lock = &lock_buf;
+    }
     mem_write_lock_with_pokes(&mm->mem);
     if (new_brk < mm->start_brk)
         goto out;
@@ -1599,13 +2389,26 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk) {
         // expand heap: map region from old_brk to new_brk
         // round up because of the definition of brk: "the first location after the end of the uninitialized data segment." (brk(2))
         // if the brk is 0x2000, page 0x2000 shouldn't be mapped, but it should be if the brk is 0x2001.
-        // Same jetsam-headroom backpressure as mmap_common_guest.
-        if (host_mem_headroom_low()) {
+        // Same jetsam-headroom backpressure as mmap_common_guest, and sized
+        // the same way: a heap creeping up by a page at a time is the throttle's
+        // business, not this guard's. Refusing it here is what stops a shell
+        // starting at all.
+        if (mem_growth_refused(new_brk - old_brk)) {
             expand_failed = true;
             goto out;
         }
         page_t start = PAGE_ROUND_UP(old_brk);
         pages_t size = PAGE_ROUND_UP(new_brk) - PAGE_ROUND_UP(old_brk);
+        // RLIMIT_DATA over the whole heap (Linux's check_data_rlimit, less
+        // the data segment, which AOK does not record), then RLIMIT_AS and
+        // RLIMIT_DATA for the pages being added. A refused brk leaves the
+        // break where it was, which is how the guest learns.
+        if ((lim.data != RLIM_INFINITY_ && new_brk - mm->start_brk > lim.data) ||
+                !vm_may_expand(&mm->mem, &lim, size, true, 0, 0) ||
+                (lock != NULL && !memlock_room(&mm->mem, &lock->limit, size))) {
+            expand_failed = true;
+            goto out;
+        }
         // brk only ever grows forward from start_brk, where the exec-time
         // reservation (kernel/exec.c) begins, so start is always at or past
         // brk_reserve_start once a reservation exists; it can never start
@@ -1621,7 +2424,7 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk) {
             pages_t claim_size = size;
             if (start + size > reserve_end)
                 claim_size = reserve_end - start;
-            int err = pt_map_nothing(&mm->mem, start, claim_size, P_WRITE);
+            int err = pt_map_nothing(&mm->mem, start, claim_size, brk_flags);
             if (err < 0) {
                 expand_failed = true;
                 goto out;
@@ -1634,7 +2437,7 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk) {
                     expand_failed = true;
                     goto out;
                 }
-                int err2 = pt_map_nothing(&mm->mem, rest_start, rest_size, P_WRITE);
+                int err2 = pt_map_nothing(&mm->mem, rest_start, rest_size, brk_flags);
                 if (err2 < 0) {
                     expand_failed = true;
                     goto out;
@@ -1644,12 +2447,14 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk) {
             expand_failed = true;
             goto out;
         } else {
-            int err = pt_map_nothing(&mm->mem, start, size, P_WRITE);
+            int err = pt_map_nothing(&mm->mem, start, size, brk_flags);
             if (err < 0) {
                 expand_failed = true;
                 goto out;
             }
         }
+        if (lock != NULL)
+            mem_lock_new_range(&mm->mem, start, size, lock->lock, true);
     } else if (new_brk < old_brk) {
         // shrink heap: unmap region from new_brk to old_brk
         // first page to unmap is PAGE(new_brk)
@@ -1779,7 +2584,16 @@ void mem_fault_backpressure(void) {
     // nothing at all -- because some OTHER part of the app is near the ceiling.
     // Residency is the honest question: only a space whose page count is rising
     // is the one making things worse.
-    size_t resident = mem_resident_page_count(current->mem);
+    //
+    // The resident-set COUNTER, not a walk. This used to be
+    // mem_resident_page_count, which visits every mapped entry -- and it runs
+    // on every poke while the host is under pressure, which on a Mac is any
+    // time the machine is busy. Sampling `dotnet --info` found its main thread
+    // sitting in that walk. The counter is also the better answer: it moves
+    // when a page is first touched and when one is evicted, which is exactly
+    // "committing memory", where the walk counted mapped entries whether or
+    // not anything had ever used them.
+    size_t resident = mem_rss_pages_now(current->mem);
     size_t before = atomic_exchange_explicit(&mm->fault_last_resident_pages,
             resident, memory_order_relaxed);
     bool growing = before == 0 || resident > before;

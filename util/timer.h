@@ -56,7 +56,32 @@ static inline struct timespec timespec_normalize(struct timespec ts) {
     return ts;
 }
 
-typedef void (*timer_callback_t)(void *data);
+// Linux's default timer slack, and what PR_GET_TIMERSLACK answers here
+// (kernel/misc.c): how late a sleeping task's wake may run there -- nanosleep,
+// and the other sleeps with a deadline. POSIX timers, itimers and timerfds get
+// none.
+#define HOST_TIMER_SLACK_NS 50000L
+
+// Sleep `req` on the host and wake within `slack_ns` of the deadline, as a
+// Linux hrtimer does. 0 once the time has passed; -1 with errno EINTR if a
+// signal handler ran first -- the wake pokes -- with nothing said about the
+// time left, which every caller recomputes from its own deadline.
+//
+// A plain nanosleep on Darwin is subject to timer coalescing: the kernel may
+// run it late by a quarter of the time asked for, up to 5ms, and an idle
+// machine takes all of it. Measured on an M4 iPad, every guest timer and
+// sleep woke that late -- a 5ms periodic timer 1.0ms after each boundary, a
+// 50ms one 5ms after -- where Linux wakes within microseconds. mach_wait_until,
+// pthread_cond_timedwait and select are no better; a thread's QoS does not
+// change it. Only a kqueue timer marked NOTE_CRITICAL opts out.
+int host_nanosleep_precise(struct timespec req, long slack_ns);
+
+// Called on the timer's own thread, with timer->lock dropped, for what has
+// expired: `expirations` is 1, or for a periodic timer whose thread fell
+// behind -- the host stopped, a CPU clock that ran ahead of it -- 1 plus every
+// period missed since, counted in the one call rather than replayed. A timerfd
+// adds them all, a POSIX timer counts them as overruns.
+typedef void (*timer_callback_t)(void *data, uint64_t expirations);
 // Where a timer reads "now" from. Almost every timer just calls
 // timespec_now(clockid) on its own thread, which is right for the wall clocks
 // and for the process CPU clock (the timer thread is in the same process). It
@@ -77,8 +102,20 @@ struct timer {
 
     bool active;
     bool thread_running;
+    // The thread is inside the callback for an expiry, with the lock dropped.
+    // A one-shot stays `active` after it fires -- nothing clears it -- so this
+    // and thread_running are what tell "due, and not fired yet" from "fired",
+    // which timer_read has to.
+    bool firing;
+    // Callbacks that have returned, for timer_settle.
+    uint64_t fired;
     uint64_t generation;
     pthread_t thread;
+    // What timer_set and timer_free raise to cut the thread's sleep short: a
+    // kqueue on Darwin, an eventfd on Linux. The thread's own, open only
+    // while thread_running, -1 otherwise and when the host had none to give.
+    // See timer_wake_open in timer.c.
+    int wake_fd;
     timer_callback_t callback;
     void *data;
     lock_t lock;
@@ -91,7 +128,9 @@ struct timer *timer_new(clockid_t clockid, timer_callback_t callback, void *data
 // the timer is armed.
 void timer_set_clock_source(struct timer *timer, timer_clock_fn fn, void *data);
 void timer_free(struct timer *timer);
-// value is how long to wait until the next fire
+// value is how long to wait until the next fire; negative, how long ago it was
+// due (an absolute arming in the past, a timer_read of one overdue), which
+// fires at once and counts every period since (if interval is non-zero)
 // interval is how long after that to wait until the next fire (if non-zero)
 // bizzare interface is based off setitimer, because this is going to be used
 // to implement setitimer
@@ -100,5 +139,20 @@ struct timer_spec {
     struct timespec interval;
 };
 int timer_set(struct timer *timer, struct timer_spec spec, struct timer_spec *oldspec);
+// Whether the timer will still fire, and if so how long it has left by its own
+// clock -- a sampler installed with timer_set_clock_source included -- and its
+// interval, which is reported either way. For describing a timer so that it
+// can be armed again elsewhere (kernel/checkpoint.c), where "armed" has to be
+// exact: one that is due but has not fired yet reports how long ago it was due,
+// as a negative time (never zero), which timer_set takes back as it is; and one
+// whose callback is running is waited for, so that what the expiry delivers is
+// in place -- a signal queued, a count raised -- before the answer is given.
+// The caller must hold nothing a callback takes, and the timer must not be
+// freed meanwhile.
+bool timer_read(struct timer *timer, struct timer_spec *spec);
+// Wait until no callback is running, and return how many have returned: a
+// caller that reads state a callback changes can tell, by asking before and
+// after, whether one ran in between. The same conditions as timer_read.
+uint64_t timer_settle(struct timer *timer);
 
 #endif

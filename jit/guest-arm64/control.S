@@ -35,6 +35,7 @@
 // than decoding the condition and testing it generically in assembly.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
@@ -87,43 +88,89 @@
 .global arm64_branch_dispatch
 arm64_branch_dispatch:
     tbz _ip, #63, arm64_chain
+arm64_branch_unchained:
     and x8, _ip, #0x7fffffffffffffff
     str x8, [_cpu, #CPU_pc]
     b jit_ret
+
+// The same, a copy for each branch gadget: arm64_chain's work written out, so
+// that the indirect branch into the next block is the gadget's own. Through
+// the shared tail every transition between blocks in the whole guest left by
+// ONE `br`, and a predictor has one entry's worth of history to tell their
+// targets apart; the i386 and amd64 engines each gained 2-2.5% from the same
+// change (chain_ip, jit/gadgets-aarch64/gadgets.h). The rare ways out -- an
+// unchained target, the budget spent, the one transition in 64 that looks at
+// the poke flag -- stay shared.
+.macro branch_dispatch
+    tbnz _ip, #63, 9f       // (a test-and-branch reaches 32K: hence the stub)
+    ldr x8, [_cpu, #CPU_poked_ptr]
+    ldrb w8, [x8]
+    cbnz w8, arm64_chain_poked
+    ldr x8, [_cpu, #LOCAL_chain_budget]
+    subs x8, x8, #1
+    str x8, [_cpu, #LOCAL_chain_budget]
+    b.le arm64_chain_poked
+    sub x8, _ip, #JIT_BLOCK_code
+    str x8, [_cpu, #LOCAL_last_block]
+#if !defined(ISH_ARM64_GRET_LDAR)
+    dmb ishld
+#endif
+    gret
+9:  b arm64_branch_unchained
+.endm
 // Global, not file-local: the ret_cache_dispatch macro below enters here with a
 // block->code pointer it has already validated, skipping the tagged-word test
 // above (a cache entry is a host pointer, never a tagged guest address).
 .global arm64_chain
 arm64_chain:
-    ldr x8, [_cpu, #CPU_poked_ptr]
-    ldrb w8, [x8]
-    cbnz w8, arm64_chain_poked
     // Chain budget: bounded time-in-JIT is what makes chaining BACKWARD
     // edges (loops) safe — see jit_frame.chain_budget. Expiry exits to C
     // exactly like a poke, at the destination block's start.
+    ldr x8, [_cpu, #CPU_poked_ptr]
+    ldrb w8, [x8]
+    cbnz w8, arm64_chain_poked
     ldr x8, [_cpu, #LOCAL_chain_budget]
     subs x8, x8, #1
     str x8, [_cpu, #LOCAL_chain_budget]
     b.le arm64_chain_poked
+arm64_chain_go:
     sub x8, _ip, #JIT_BLOCK_code       // recover the block pointer for the
     str x8, [_cpu, #LOCAL_last_block]  // C loop's chaining bookkeeping
+#if !defined(ISH_ARM64_GRET_LDAR)
+    // The one barrier of the default build: _ip came from a chain link another
+    // thread may just have patched, so order it before the new block's contents
+    // (gadgets.h's gret carries none).
+    dmb ishld
+#endif
     gret
+arm64_chain_look:
+    ldr x8, [_cpu, #CPU_poked_ptr]
+    ldrb w8, [x8]
+    cbz w8, arm64_chain_go
 arm64_chain_poked:
     // Poked or out of budget mid-chain: resume at the DESTINATION block.
     ldur x8, [_ip, #(JIT_BLOCK_addr - JIT_BLOCK_code)]
     str x8, [_cpu, #CPU_pc]
     b jit_ret
 
-.gadget b
+.macro f_b_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
     ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
+.endm
+.macro f_b_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.endm
+f_gadget b, f_b, _, _, _, _, _
 
-.gadget bl
+.macro f_bl_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
     ldr x9, [_ip, #8]
     add x10, _cpu, #CPU_x0
     str x9, [x10, #(30*8)]  // X30 = return address
     ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
+.endm
+.macro f_bl_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.endm
+f_gadget bl, f_bl, _, _, _, _, _
 
 // BR, BLR, RET — branch to a register value. Code stream: [gadget][rn].
 // For blr, code stream also has [return_addr] after rn, same as bl.
@@ -156,9 +203,10 @@ arm64_chain_poked:
 // HLE "giant gadget": the whole block is one fingerprinted libc function
 // (jit/hle.c). Bridges to hle_call(cpu, tlb, fn, entry_ip), which performs
 // the function against guest memory, writes the return register, and sets
-// cpu->pc to the guest return address. Result INT_NONE -> exit the block
-// via jit_ret (dispatcher continues at the new pc); any other interrupt
-// (INT_PF after a guest memory fault, pc rewound to entry) -> jit_exit.
+// cpu->pc to the guest return address. Result INT_NONE -> continue at the
+// new pc through the ret cache (hle_call_return; jit_ret on a miss); any
+// other interrupt (INT_PF after a guest memory fault, pc rewound to entry)
+// -> jit_exit.
 // x27 carries the result across restore_c (x0-x18 + lr are reloaded).
 // Code stream: [fn | abi<<8][entry_ip].
 .gadget hle_call
@@ -175,9 +223,387 @@ arm64_chain_poked:
     tbnz w27, #31, 1f          // INT_NONE (-1): success, pc updated
     mov w0, w27
     b jit_exit
-1:  b jit_ret
+1:  b hle_call_return          // the return address, through the ret cache
 
 .extern hle_call
+
+// FEAT_MOPS CPY*/CPYF*/SET* (see jit/arm64_mops.c for the model): the
+// prologue does the whole operation, so the main and epilogue find Xn = 0
+// and do nothing. Up to 64 bytes, each side inside one page and a TLB hit
+// -- most memcpy/memset calls -- is done first thing, every load before any
+// store (glibc's small-copy shape), which is a memmove whichever way the
+// ranges overlap. Anything else goes a page span at a time through the TLB
+// (a miss takes tlb_handle_miss / tlb_write_ptr_slow), with the registers
+// brought up to date after each span: a fault exits INT_PF with pc at this
+// instruction and the registers describing what is left, so it restarts
+// where it stopped. NZCV ends 0000, as option A leaves it.
+// Code stream: [insn][orig_ip].
+
+// \out = host pointer for guest \addr if the TLB entry's \field holds its
+// page, else branch to \fail. Clobbers x11-x13.
+.macro mops_tlb addr, out, field, fail
+    // ish-AOK-bind -- TBI: the page and the host pointer are taken from the
+    // address with its tag (bits 56-63) cleared; \addr itself is left alone,
+    // since it is the guest's register and keeps its tag. The index needs no
+    // mask: the bits it is built from end below the tag.
+    and x11, \addr, #0x00fffffffffff000
+    ubfx x12, \addr, #12, #10
+    eor x12, x12, \addr, lsr #22
+    and x12, x12, #(1 << TLB_BITS) - 1
+    mov w13, #TLB_ENTRY_SIZE
+    madd x12, x12, x13, _tlb
+    ldr x13, [x12, #\field]
+    cmp x11, x13
+    b.ne \fail
+    ldr x13, [x12, #TLB_ENTRY_data_minus_addr]
+    add x13, x13, x11
+    and \out, \addr, #0xfff
+    add \out, \out, x13
+.endm
+
+.gadget mops
+    ldr x8, [_ip]
+    ubfx x9, x8, #5, #5        // Rn, the count (never 31: gen.c)
+    add x10, _cpu, #CPU_x0
+    ldr x14, [x10, x9, lsl #3]
+    cbz x14, 8f
+    cmp x14, #64
+    b.hi 9f                    // big, or a "negative" count
+    ldr x11, [_tlb, #(-TLB_entries+TLB_mmu)]
+    ldr x12, [_tlb, #(-TLB_entries+TLB_mem_changes)]
+    ldr x13, [x11, #MMU_changes]
+    cmp x12, x13
+    b.ne 9f
+    ldrb w13, [x11, #MMU_requires_write_revalidate]
+    cbnz w13, 9f
+    and x20, x8, #0x1f         // Rd
+    ldr x15, [x10, x20, lsl #3] // dst
+    and x11, x15, #0xfff
+    add x11, x11, x14
+    cmp x11, #0x1000
+    b.hi 9f
+    mops_tlb x15, x16, TLB_ENTRY_page_if_writable, 9f
+    ubfx x21, x8, #16, #5      // Rs: the source, or SET's value
+    ubfx x11, x8, #22, #2      // op1: 3 = SET
+    cmp x11, #3
+    b.eq 5f
+
+    ldr x22, [x10, x21, lsl #3] // src
+    and x11, x22, #0xfff
+    add x11, x11, x14
+    cmp x11, #0x1000
+    b.hi 9f
+    mops_tlb x22, x17, TLB_ENTRY_page, 9f
+    and x11, x15, #0x00fffffffffff000  // (ish-AOK-bind: TBI, untagged page)
+    str x11, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    add x12, x17, x14          // source end
+    add x13, x16, x14          // destination end
+    cmp x14, #16
+    b.lo 3f
+    cmp x14, #32
+    b.ls 2f
+    ldp q0, q1, [x17]          // 33..64
+    ldp q2, q3, [x12, #-32]
+    stp q0, q1, [x16]
+    stp q2, q3, [x13, #-32]
+    b 7f
+2:  ldr q0, [x17]              // 16..32
+    ldr q1, [x12, #-16]
+    str q0, [x16]
+    str q1, [x13, #-16]
+    b 7f
+3:  cmp x14, #8
+    b.lo 4f
+    ldr x11, [x17]             // 8..15
+    ldr x12, [x12, #-8]
+    str x11, [x16]
+    str x12, [x13, #-8]
+    b 7f
+4:  cmp x14, #4
+    b.lo 6f
+    ldr w11, [x17]             // 4..7
+    ldr w12, [x12, #-4]
+    str w11, [x16]
+    str w12, [x13, #-4]
+    b 7f
+6:  lsr x11, x14, #1           // 1..3: first, middle, last
+    ldrb w12, [x17]
+    ldrb w13, [x17, x11]
+    add x17, x17, x14
+    ldurb w17, [x17, #-1]
+    strb w12, [x16]
+    strb w13, [x16, x11]
+    add x16, x16, x14
+    sturb w17, [x16, #-1]
+7:  add x22, x22, x14          // Xs += n
+    str x22, [x10, x21, lsl #3]
+    b 1f
+
+5:  mov x12, #0                // SET: the low byte of Xs (31 = XZR)
+    cmp x21, #31
+    b.eq 51f
+    ldr x12, [x10, x21, lsl #3]
+51: and x11, x15, #0x00fffffffffff000  // (ish-AOK-bind: TBI, untagged page)
+    str x11, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    dup v0.16b, w12
+    add x13, x16, x14
+    cmp x14, #16
+    b.lo 53f
+    cmp x14, #32
+    b.ls 52f
+    stp q0, q0, [x16]          // 33..64
+    stp q0, q0, [x13, #-32]
+    b 1f
+52: str q0, [x16]              // 16..32
+    str q0, [x13, #-16]
+    b 1f
+53: fmov x12, d0
+    cmp x14, #8
+    b.lo 54f
+    str x12, [x16]             // 8..15
+    str x12, [x13, #-8]
+    b 1f
+54: cmp x14, #4
+    b.lo 55f
+    str w12, [x16]             // 4..7
+    str w12, [x13, #-4]
+    b 1f
+55: lsr x11, x14, #1           // 1..3: first, middle, last
+    strb w12, [x16]
+    strb w12, [x16, x11]
+    sturb w12, [x13, #-1]
+
+1:  add x15, x15, x14          // Xd += n, Xn = 0
+    str x15, [x10, x20, lsl #3]
+    str xzr, [x10, x9, lsl #3]
+8:  add _ip, _ip, #16
+    str wzr, [_cpu, #CPU_nzcv]
+    gret
+
+9:  ldr x19, [_ip, #8]         // orig_ip (fault restart), callee-saved
+    add _ip, _ip, #16
+    str x19, [_tlb, #(-TLB_entries+TLB_watch_ip)]  // for the store watch
+    mov x26, x10               // &regs
+    and x20, x8, #0x1f         // Rd
+    ubfx x21, x8, #16, #5      // Rs
+    mov x22, x9                // Rn
+    // Xn is the byte count; the architecture takes it as signed and caps
+    // it, so a "negative" count means nothing to do. (Option B's negative
+    // intermediate counts never exist here: the prologue finishes.)
+    cmp x14, #0
+    b.gt 10f
+    str xzr, [x26, x22, lsl #3]
+    b 89f
+10: ubfx x11, x8, #22, #2      // op1: 3 = SET
+    cmp x11, #3
+    b.ne 20f
+
+    // SET: a page span at a time, Xd and Xn kept current for a restart
+    mov x25, #0
+    cmp x21, #31
+    b.eq 11f
+    ldr x25, [x26, x21, lsl #3]
+11: dup v0.16b, w25
+    fmov x25, d0               // the byte, 8 times
+12: ldr x14, [x26, x22, lsl #3] // left
+    cbz x14, 89f
+    ldr x7, [x26, x20, lsl #3]  // dst
+    and x11, x7, #0xfff
+    mov x5, #0x1000
+    sub x5, x5, x11
+    cmp x5, x14
+    csel x5, x5, x14, lo        // this span
+    mov x24, x5
+    bl a64_xlate_w
+    cbz x7, 92f
+    mov x3, x7
+    bl mops_fill
+    ldr x11, [x26, x20, lsl #3]
+    add x11, x11, x24
+    str x11, [x26, x20, lsl #3]
+    ldr x11, [x26, x22, lsl #3]
+    sub x11, x11, x24
+    str x11, [x26, x22, lsl #3]
+    b 12b
+
+    // CPY/CPYF. CPYF* is forward-only; CPY copies backward when the
+    // destination is above an overlapping source.
+20: ldr x15, [x26, x20, lsl #3] // dst
+    ldr x16, [x26, x21, lsl #3] // src
+    tbz x8, #26, 30f            // CPYF*
+    cmp x15, x16
+    b.ls 30f
+    sub x11, x15, x16
+    cmp x11, x14
+    b.hs 30f
+
+    // backward: from the end, shrinking Xn only; Xd and Xs advance once
+    // everything is done, so what a fault leaves is the untouched prefix
+    mov x23, x14                // total
+21: ldr x14, [x26, x22, lsl #3]
+    cbz x14, 28f
+    ldr x16, [x26, x21, lsl #3]
+    add x16, x16, x14           // source end
+    ldr x15, [x26, x20, lsl #3]
+    add x15, x15, x14           // destination end
+    ands x11, x16, #0xfff
+    mov x12, #0x1000
+    csel x11, x11, x12, ne      // bytes of the source's page below its end
+    ands x13, x15, #0xfff
+    csel x13, x13, x12, ne
+    cmp x11, x13
+    csel x11, x11, x13, lo
+    cmp x11, x14
+    csel x24, x11, x14, lo      // this span
+    sub x7, x16, x24
+    bl a64_xlate_r
+    cbz x7, 91f
+    mov x4, x7
+    ldr x15, [x26, x20, lsl #3]
+    ldr x11, [x26, x22, lsl #3]
+    add x15, x15, x11
+    sub x7, x15, x24
+    bl a64_xlate_w
+    cbz x7, 92f
+    mov x3, x7
+    mov x5, x24
+    bl mops_copy_back
+    ldr x11, [x26, x22, lsl #3]
+    sub x11, x11, x24
+    str x11, [x26, x22, lsl #3]
+    b 21b
+28: ldr x11, [x26, x20, lsl #3]
+    add x11, x11, x23
+    str x11, [x26, x20, lsl #3]
+    ldr x11, [x26, x21, lsl #3]
+    add x11, x11, x23
+    str x11, [x26, x21, lsl #3]
+    b 89f
+
+    // forward, a span at a time, all three registers kept current
+30: ldr x14, [x26, x22, lsl #3]
+    cbz x14, 89f
+    ldr x16, [x26, x21, lsl #3]
+    ldr x15, [x26, x20, lsl #3]
+    and x11, x16, #0xfff
+    and x13, x15, #0xfff
+    cmp x11, x13
+    csel x11, x11, x13, hi      // the further into its page
+    mov x12, #0x1000
+    sub x11, x12, x11
+    cmp x11, x14
+    csel x24, x11, x14, lo      // this span
+    mov x7, x16
+    bl a64_xlate_r
+    cbz x7, 91f
+    mov x4, x7
+    ldr x7, [x26, x20, lsl #3]
+    bl a64_xlate_w
+    cbz x7, 92f
+    mov x3, x7
+    mov x5, x24
+    bl mops_copy_fwd
+    ldr x11, [x26, x20, lsl #3]
+    add x11, x11, x24
+    str x11, [x26, x20, lsl #3]
+    ldr x11, [x26, x21, lsl #3]
+    add x11, x11, x24
+    str x11, [x26, x21, lsl #3]
+    ldr x11, [x26, x22, lsl #3]
+    sub x11, x11, x24
+    str x11, [x26, x22, lsl #3]
+    b 30b
+
+89: str wzr, [_cpu, #CPU_nzcv]
+    gret
+
+91: mov w12, #0                 // a read fault
+    b 93f
+92: mov w12, #1
+93: ldr x11, [_tlb, #(-TLB_entries+TLB_segfault_addr)]
+    str x11, [_cpu, #CPU_segfault_addr]
+    strb w12, [_cpu, #CPU_segfault_was_write]
+    str x19, [_cpu, #CPU_pc]
+    mov w0, #INT_PF
+    b jit_exit
+
+// x5 bytes from host x4 to host x3, lowest first: right for any overlap
+// with the destination below the source (each 64 or 8 bytes is loaded
+// before the stores that could reach it). Clobbers x3-x5, x11, q0-q3.
+mops_copy_fwd:
+1:  cmp x5, #64
+    b.lo 2f
+    ldp q0, q1, [x4]
+    ldp q2, q3, [x4, #32]
+    add x4, x4, #64
+    stp q0, q1, [x3]
+    stp q2, q3, [x3, #32]
+    add x3, x3, #64
+    sub x5, x5, #64
+    b 1b
+2:  cmp x5, #8
+    b.lo 3f
+    ldr x11, [x4], #8
+    str x11, [x3], #8
+    sub x5, x5, #8
+    b 2b
+3:  cbz x5, 4f
+    ldrb w11, [x4], #1
+    strb w11, [x3], #1
+    sub x5, x5, #1
+    b 3b
+4:  ret
+
+// The same, highest first, for a destination above an overlapping source.
+mops_copy_back:
+    add x3, x3, x5
+    add x4, x4, x5
+1:  cmp x5, #64
+    b.lo 2f
+    ldp q2, q3, [x4, #-32]
+    ldp q0, q1, [x4, #-64]
+    sub x4, x4, #64
+    stp q2, q3, [x3, #-32]
+    stp q0, q1, [x3, #-64]
+    sub x3, x3, #64
+    sub x5, x5, #64
+    b 1b
+2:  cmp x5, #8
+    b.lo 3f
+    ldr x11, [x4, #-8]!
+    str x11, [x3, #-8]!
+    sub x5, x5, #8
+    b 2b
+3:  cbz x5, 4f
+    ldrb w11, [x4, #-1]!
+    strb w11, [x3, #-1]!
+    sub x5, x5, #1
+    b 3b
+4:  ret
+
+// x5 bytes at host x3 set to the byte x25 holds eight times. The vector copy
+// is made here, per span: the caller's a64_xlate_w may have called C on a TLB
+// miss, and save_c keeps no vector register across that -- a pattern left in
+// v0 from before the loop came back as whatever the call left there.
+mops_fill:
+    dup v0.2d, x25
+1:  cmp x5, #64
+    b.lo 2f
+    stp q0, q0, [x3]
+    stp q0, q0, [x3, #32]
+    add x3, x3, #64
+    sub x5, x5, #64
+    b 1b
+2:  cmp x5, #8
+    b.lo 3f
+    str x25, [x3], #8
+    sub x5, x5, #8
+    b 2b
+3:  cbz x5, 4f
+    strb w25, [x3], #1
+    sub x5, x5, #1
+    b 3b
+4:  ret
 
 // RET has identical semantics to BR (branch to register value) -- same
 // gadget body, just invoked for a different guest mnemonic/encoding.
@@ -244,40 +670,45 @@ arm64_chain_poked:
     b jit_ret
 .endm
 
-.gadget br_cached
-    ldr x8, [_ip]
-    and x8, x8, #0x1f
-    add x9, _cpu, #CPU_x0
-    cmp x8, #31
-    b.eq 1f
-    ldr x10, [x9, x8, lsl #3]
-    b 2f
-1:  mov x10, #0
-2:  ret_cache_dispatch x10
-
-.gadget blr_cached
-    ldr x8, [_ip]
-    and x8, x8, #0x1f
-    add x9, _cpu, #CPU_x0
-    cmp x8, #31
-    b.eq 1f
-    ldr x10, [x9, x8, lsl #3]
-    b 2f
-1:  mov x10, #0
-2:  ldr x11, [_ip, #8]      // return address
-    str x11, [x9, #(30*8)]  // X30 = return address, AFTER the target is read
+// hle_call's success tail: the function "returned" to the pc the C side
+// stored, so enter it the way ret_cached does -- straight into the translated
+// block when the cache has it -- instead of always exiting to the dispatcher.
+// That exit was most of an intercepted call's cost, which made HLE slower
+// than the guest's own code for small copies.
+hle_call_return:
+    ldr x10, [_cpu, #CPU_pc]
     ret_cache_dispatch x10
 
-.gadget ret_cached
+.macro f_br_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
+    ldr x8, [_ip]             // the register's cpu_state offset (gen.c: never XZR)
+    ldr x10, [_cpu, x8]
+.else
+    mov x10, x\fn            // the target, from the pair's first half
+.endif
+    ret_cache_dispatch x10
+.endm
+.macro f_br_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.endm
+f_gadget br_cached, f_br_cached, _, _, _, _, _
+
+.macro f_blr_cached_body id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
     ldr x8, [_ip]
-    and x8, x8, #0x1f
-    add x9, _cpu, #CPU_x0
-    cmp x8, #31
-    b.eq 1f
-    ldr x10, [x9, x8, lsl #3]
-    b 2f
-1:  mov x10, #0
-2:  ret_cache_dispatch x10
+    ldr x10, [_cpu, x8]
+.else
+    mov x10, x\fn
+.endif
+    ldr x11, [_ip, #8]      // return address
+    str x11, [_cpu, #(CPU_x0 + 30*8)]  // X30 = return address, AFTER the target is read
+    ret_cache_dispatch x10
+.endm
+.macro f_blr_cached_stub id, last, a1, a2, a3, a4, a5, fn=_, fm=_
+.endm
+f_gadget blr_cached, f_blr_cached, _, _, _, _, _
+
+// (the same body as br_cached)
+f_gadget ret_cached, f_br_cached, _, _, _, _, _
 
 // CBZ, CBNZ — code stream: [gadget][rt | sf<<8][taken_pc][fallthrough_pc]
 .gadget cbz
@@ -297,10 +728,10 @@ arm64_chain_poked:
     b not_taken_cbz
 taken_cbz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_cbz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 .gadget cbnz
     ldr x8, [_ip]
@@ -319,10 +750,10 @@ not_taken_cbz:
     b not_taken_cbnz
 taken_cbnz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_cbnz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 // TBZ, TBNZ — code stream: [gadget][rt | bit_pos<<8][taken_pc][fallthrough_pc]
 .gadget tbz
@@ -340,10 +771,10 @@ not_taken_cbnz:
     b not_taken_tbz
 taken_tbz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_tbz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
 
 .gadget tbnz
     ldr x8, [_ip]
@@ -360,22 +791,105 @@ not_taken_tbz:
     b not_taken_tbnz
 taken_tbnz:
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 not_taken_tbnz:
     ldr _ip, [_ip, #16]
-    b arm64_branch_dispatch
+    branch_dispatch
+
+// Offset-fed CBZ/CBNZ/TBZ/TBNZ (the "ospec" pass; rt != 31). Streams:
+//   cb_*: [gadget][rt_off][taken][fallthrough]
+//   tb_*: [gadget][rt_off][bit mask][taken][fallthrough]
+// Two layouts each, picked by gen from the branch's direction (the "btfn"
+// bit): the plain one keeps the fallthrough straight-line (forward branches,
+// mostly not taken), _bk keeps the taken path straight-line (backward ones,
+// loops). Whichever path jumps inside the gadget costs ~1.3 ns more on the
+// A10X (measured on the riscv64 twins, jit/guest-riscv64/alu.S branch_tail).
+// No host flags are touched: bcond_nf relies on NZCV surviving other gadgets.
+.macro f_cb_body id, last, reg, jmp, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
+    ldr x9, [_ip]
+    ldr x9, [_cpu, x9]
+.else
+    mov x9, x\fn
+.endif
+    \jmp \reg, 1f
+    ldr _ip, [_ip, #16]      // fallthrough
+    branch_dispatch
+1:  ldr _ip, [_ip, #8]       // taken
+    branch_dispatch
+.endm
+.macro f_cb_stub id, last, reg, jmp, a3, a4, a5, fn=_, fm=_
+.endm
+.macro f_cb_bk_body id, last, reg, jmp_bk, a3, a4, a5, fn=_, fm=_
+.ifc \fn,_
+    ldr x9, [_ip]
+    ldr x9, [_cpu, x9]
+.else
+    mov x9, x\fn
+.endif
+    \jmp_bk \reg, 1f
+    ldr _ip, [_ip, #8]       // taken
+    branch_dispatch
+1:  ldr _ip, [_ip, #16]      // fallthrough
+    branch_dispatch
+.endm
+.macro f_cb_bk_stub id, last, reg, jmp_bk, a3, a4, a5, fn=_, fm=_
+.endm
+.macro a64_cb name, reg, jmp, jmp_bk
+    f_gadget \name, f_cb, \reg, \jmp, _, _, _
+    f_gadget \name\()_bk, f_cb_bk, \reg, \jmp_bk, _, _, _
+.endm
+a64_cb cbz_x,  x9, cbz,  cbnz
+a64_cb cbz_w,  w9, cbz,  cbnz
+a64_cb cbnz_x, x9, cbnz, cbz
+a64_cb cbnz_w, w9, cbnz, cbz
+
+.macro f_tb_body id, last, jmp, a2, a3, a4, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]       // rt_off, mask
+    f_src 9, x9, \fn
+    and x9, x9, x10
+    \jmp x9, 1f
+    ldr _ip, [_ip, #24]      // fallthrough
+    branch_dispatch
+1:  ldr _ip, [_ip, #16]      // taken
+    branch_dispatch
+.endm
+.macro f_tb_stub id, last, jmp, a2, a3, a4, a5, fn=_, fm=_
+.endm
+.macro f_tb_bk_body id, last, jmp_bk, a2, a3, a4, a5, fn=_, fm=_
+    ldp x9, x10, [_ip]
+    f_src 9, x9, \fn
+    and x9, x9, x10
+    \jmp_bk x9, 1f
+    ldr _ip, [_ip, #16]      // taken
+    branch_dispatch
+1:  ldr _ip, [_ip, #24]      // fallthrough
+    branch_dispatch
+.endm
+.macro f_tb_bk_stub id, last, jmp_bk, a2, a3, a4, a5, fn=_, fm=_
+.endm
+.macro a64_tb name, jmp, jmp_bk
+    f_gadget \name, f_tb, \jmp, _, _, _, _
+    f_gadget \name\()_bk, f_tb_bk, \jmp_bk, _, _, _, _
+.endm
+a64_tb tb_z,  cbz,  cbnz
+a64_tb tb_nz, cbnz, cbz
 
 // B.cond family — code stream: [gadget][taken_pc][fallthrough_pc]. One
 // gadget per condition code; gen_step_arm64 picks the right one at
 // compile time based on the decoded cond field.
-.macro bcond_gadget name, cc
-.gadget \name
+.macro f_bcond_body id, last, cc, a2, a3, a4, a5, fn=_, fm=_
     load_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
+.endm
+.macro f_bcond_stub id, last, cc, a2, a3, a4, a5, fn=_, fm=_
+.endm
+.macro bcond_gadget name, cc
+    f_gadget \name, f_bcond, \cc, _, _, _, _
 .endm
 
 // bcond_nf_* — B.cond WITHOUT the load_flags reload, for use directly
@@ -388,13 +902,17 @@ not_taken_tbnz:
 // only emits these when the immediately preceding instruction in the
 // SAME block set the flags via a fast gadget (state->arm64_flags_live);
 // everything else keeps the reloading bcond_* family above.
-.macro bcond_nf_gadget name, cc
-.gadget \name
+.macro f_bcond_nf_body id, last, cc, a2, a3, a4, a5, fn=_, fm=_
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
+.endm
+.macro f_bcond_nf_stub id, last, cc, a2, a3, a4, a5, fn=_, fm=_
+.endm
+.macro bcond_nf_gadget name, cc
+    f_gadget \name, f_bcond_nf, \cc, _, _, _, _
 .endm
 
 bcond_nf_gadget bcond_nf_eq, eq
@@ -446,38 +964,58 @@ bcond_gadget bcond_le, le
 //   fused_andsi: [gadget][rd | rn<<8][imm][taken][fallthrough]
 //   fused_andsr: [gadget][rd | rn<<8 | rm<<16][taken][fallthrough]
 
-.macro fused_cmpi name, cmpop, zr, r15, r11, cc
-.gadget \name
+.macro f_fused_cmpi_body id, last, cmpop, zr, r15, r11, cc, fn=_, fm=_
     ldr x10, [_ip]
     ldr x11, [_ip, #8]
     add _ip, _ip, #16
+.ifc \fn,_
     add x14, _cpu, #CPU_x0
     ldr x15, [x14, x10, lsl #3]
+.else
+    mov x15, x\fn
+.endif
     \cmpop \zr, \r15, \r11
     store_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
+.endm
+.macro f_fused_cmpi_stub id, last, cmpop, zr, r15, r11, cc, fn=_, fm=_
+.endm
+.macro fused_cmpi name, cmpop, zr, r15, r11, cc
+    f_gadget \name, f_fused_cmpi, \cmpop, \zr, \r15, \r11, \cc
 .endm
 
-.macro fused_cmpr name, cmpop, zr, r15, r13, cc
-.gadget \name
+.macro f_fused_cmpr_body id, last, cmpop, zr, r15, r13, cc, fn=_, fm=_
     ldr x8, [_ip]
     add _ip, _ip, #8
     and x10, x8, #0x1f
-    ubfx x12, x8, #8, #5
+    ubfx x16, x8, #8, #5      // (not x12: a pair's first half may have left its result there)
     add x14, _cpu, #CPU_x0
+.ifc \fm,_
+    ldr x13, [x14, x16, lsl #3]
+.else
+    mov x13, x\fm
+.endif
+.ifc \fn,_
     ldr x15, [x14, x10, lsl #3]
-    ldr x13, [x14, x12, lsl #3]
+.else
+    mov x15, x\fn
+.endif
     \cmpop \zr, \r15, \r13
     store_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
+.endm
+.macro f_fused_cmpr_stub id, last, cmpop, zr, r15, r13, cc, fn=_, fm=_
+.endm
+.macro fused_cmpr name, cmpop, zr, r15, r13, cc
+    f_gadget \name, f_fused_cmpr, \cmpop, \zr, \r15, \r13, \cc
 .endm
 
 .macro fused_subsi name, subop, r16, r15, r11, cc
@@ -494,9 +1032,9 @@ bcond_gadget bcond_le, le
     str x16, [x14, x9, lsl #3]
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 #define CC_LIST eq,ne,cs,cc,mi,pl,vs,vc,hi,ls,ge,lt,gt,le
@@ -559,9 +1097,9 @@ fused_table arm64_fused_subsi32_table, fused_subsi32
 1:  msr nzcv, x8                 // restore ANDS flags for branch
     b.\cc 2f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 2:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 .macro fused_andsr name, andop, r16, r15, r13, cc
@@ -583,9 +1121,9 @@ fused_table arm64_fused_subsi32_table, fused_subsi32
 1:  msr nzcv, x8                 // restore ANDS flags for branch
     b.\cc 2f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 2:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
 .endm
 
 .irp cc, CC_LIST
@@ -628,9 +1166,9 @@ fused_andsr fused_andsr32_\cc, ands, w16, w15, w13, \cc
     store_flags
     b.\cc 1f
     ldr _ip, [_ip, #8]
-    b arm64_branch_dispatch
+    branch_dispatch
 1:  ldr _ip, [_ip]
-    b arm64_branch_dispatch
+    branch_dispatch
     read_bullshit \bits, \name
 .endm
 
@@ -647,3 +1185,16 @@ fused_table arm64_fused_andsi32_table, fused_andsi32
 fused_table arm64_fused_andsr64_table, fused_andsr64
 fused_table arm64_fused_andsr32_table, fused_andsr32
 .text
+
+// ---- Fused pairs ----------------------------------------------------------
+// One gadget for two guest instructions that run one after the other: the
+// first body, the second, one dispatch (frag.h). pairs.h lists them; the
+// translator finds them by the two gadgets it would otherwise have emitted
+// (gen.c's arm64_pair_fuse). Stream: the first gadget's parameters, then the
+// second's -- the two streams as they were, less the second gadget's word.
+// Here, at the end of the file that defines the branch bodies, because a
+// branch can be the second of a pair.
+.text
+#define FUSE2(a, b) fuse2 a##__##b, R_##a, K_##b, F_##a, F_##b
+#include "pairs.h"
+#undef FUSE2

@@ -5,7 +5,14 @@
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
+#include "kernel/net_ns.h"
+#include "kernel/pid_ns.h"
+#include "kernel/user_ns.h"
 #include "emu/memory.h"
+#include "kernel/ipc_ns.h"
+#include "kernel/uts.h"
+#include "kernel/mnt_ns.h"
+#include "kernel/rseq.h"
 #include "kernel/calls.h"
 #include "fs/proc.h"
 #include "fs/fd.h"
@@ -15,10 +22,13 @@
 #include "kernel/vdso.h"
 #include "platform/platform.h"
 #include "kernel/swap.h"
+#include "kernel/seccomp.h"
 #include "util/sync.h"
 
+// A process's directory is named as the reader's pid namespace numbers it:
+// the namespace's own init is "1" (kernel/pid_ns.h).
 static void proc_pid_getname(struct proc_entry *entry, char *buf) {
-    snprintf(buf, 256, "%d", entry->pid);
+    snprintf(buf, 256, "%d", current_pid_shown(entry->pid));
 }
 
 static char proc_task_state_char_from_snapshot(pid_t_ pid, bool zombie, bool io_block, bool stopped) {
@@ -28,6 +38,22 @@ static char proc_task_state_char_from_snapshot(pid_t_ pid, bool zombie, bool io_
             'R');
 }
 
+// A line of /proc/<pid>/status that gives one of a task's ids in each pid
+// namespace the task has a number in, from the reader's down to its own
+// (NStgid, NSpid, NSpgid, NSsid): one number for a task in the reader's
+// namespace, "<pid> 1" for the init of one made below it.
+static void proc_status_ns_ids(struct proc_data *buf, const char *key, struct task *task, pid_t_ id) {
+    struct pid_namespace *below[PID_NS_MAX_LEVEL + 1];
+    unsigned depth = 0;
+    struct pid_namespace *reader = current_pid_ns();
+    for (struct pid_namespace *ns = task->pid_ns; ns != NULL && ns != reader && depth <= PID_NS_MAX_LEVEL; ns = ns->parent)
+        below[depth++] = ns;
+    proc_printf(buf, "%s:\t%d", key, pid_ns_shown(reader, id));
+    while (depth > 0)
+        proc_printf(buf, "\t%d", pid_ns_shown(below[--depth], id));
+    proc_printf(buf, "\n");
+}
+
 static struct task *proc_get_task(struct proc_entry *entry) {
     // Zombies included. An exited-but-unreaped process still has a /proc entry
     // on Linux -- that is where ps gets the "Z" it shows and where a monitor
@@ -35,16 +61,22 @@ static struct task *proc_get_task(struct proc_entry *entry) {
     // whole directory, so a zombie was invisible to every tool. The handlers
     // below were already written for one (proc_task_state_char_from_snapshot
     // takes a `zombie` flag and returns 'Z'); they simply never received it.
-    return pid_get_task_zombie_ref(entry->pid);
+    return pid_get_task_zombie_global_ref(entry->pid);
 }
 static void proc_put_task(struct task *task) {
     if (task != NULL)
         task_ref_cnt_mod(task, -1);
 }
 
+// Every handler below holds a reference on its task (proc_get_task), so none
+// of them may block on the task's general_lock: do_exit holds it while it waits
+// for those references to go. task_lock_unless_exiting() waits out any other
+// holder and gives up only on the exit itself, which the handlers report as
+// the process having gone. See kernel/task.c.
 static struct mm *proc_task_mm_retain(struct task *task) {
     struct mm *mm = NULL;
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task))
+        return NULL;
     if (task->mm != NULL) {
         mm = task->mm;
         mm_retain(mm);
@@ -55,7 +87,8 @@ static struct mm *proc_task_mm_retain(struct task *task) {
 
 static struct fdtable *proc_task_files_retain(struct task *task) {
     struct fdtable *files = NULL;
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task))
+        return NULL;
     if (task->files != NULL)
         files = fdtable_retain(task->files);
     unlock(&task->general_lock);
@@ -64,7 +97,8 @@ static struct fdtable *proc_task_files_retain(struct task *task) {
 
 static struct fs_info *proc_task_fs_retain(struct task *task) {
     struct fs_info *fs = NULL;
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task))
+        return NULL;
     if (task->fs != NULL)
         fs = fs_info_retain(task->fs);
     unlock(&task->general_lock);
@@ -86,96 +120,123 @@ static int proc_pid_copy_user_range(struct task *task, struct mem *mem, addr_t s
     return 0;
 }
 
-static int proc_pid_copy_cmdline_range(struct task *task, struct mem *mem, addr_t start,
-                                       size_t size, addr_t env_start, addr_t env_end,
-                                       struct proc_data *buf) {
-    if (mem == NULL || size == 0)
-        return 0;
-
-    char *data = malloc(size);
-    if (data == NULL)
-        return _ENOMEM;
-    if (user_read_task_mem(task, mem, start, data, size) == 0) {
-        char *first_nul = memchr(data, '\0', size);
-        if (first_nul != NULL && first_nul > data) {
-            size_t title_len = first_nul - data;
-            bool has_tail = false;
-            for (char *p = first_nul + 1; p < data + size; p++) {
-                if (*p != '\0') {
-                    has_tail = true;
-                    break;
-                }
-            }
-            if (has_tail && memchr(data, ':', title_len) != NULL) {
-                proc_buf_append(buf, data, title_len);
-                proc_buf_append(buf, "\0", 1);
-                free(data);
-                return 0;
-            }
-        }
-
-        size_t visible = size;
-        if (data[size - 1] != '\0' && env_end > env_start) {
-            visible = strnlen(data, size);
-            if (visible == size) {
-                size_t env_size = env_end - env_start;
-                char *expanded = realloc(data, size + env_size);
-                if (expanded == NULL) {
-                    free(data);
-                    return _ENOMEM;
-                }
-                data = expanded;
-                if (user_read_task_mem(task, mem, env_start, data + size, env_size) == 0)
-                    visible = strnlen(data, size + env_size);
-                else
-                    visible = size;
-            }
-        }
-        proc_buf_append(buf, data, visible);
+// Read [start, end) into `page` a page segment at a time, stopping at the first
+// segment that cannot be read -- access_remote_vm()'s rule, so a range running
+// into unmapped memory yields its readable prefix rather than nothing. With a
+// NULL `buf` the bytes go no further than `page` (at most `limit` of them);
+// otherwise every segment is appended to `buf`. Returns the bytes read.
+static size_t proc_pid_read_prefix(struct task *task, struct mem *mem, guest_addr_t start,
+                                   guest_addr_t end, char *page, size_t limit,
+                                   struct proc_data *buf) {
+    size_t done = 0;
+    guest_addr_t at = start;
+    while (at < end && (buf != NULL || done < limit)) {
+        size_t chunk = PAGE_SIZE - (size_t) (at & (PAGE_SIZE - 1));
+        if (chunk > end - at)
+            chunk = (size_t) (end - at);
+        if (buf == NULL && chunk > limit - done)
+            chunk = limit - done;
+        char *dest = buf != NULL ? page : page + done;
+        if (user_read_task_mem(task, mem, at, dest, chunk) != 0)
+            break;
+        if (buf != NULL)
+            proc_buf_append(buf, page, chunk);
+        done += chunk;
+        at += chunk;
     }
-    free(data);
+    return done;
+}
+
+// /proc/<pid>/cmdline, by fs/proc/base.c's get_mm_cmdline():
+//
+//   - Nothing before exec has laid out an environment (env_end == 0), and
+//     nothing for an empty or inverted argument range.
+//   - [arg_start, arg_end) exactly -- each argument and its one NUL.
+//   - Unless the byte at arg_end - 1 is not a NUL: a setproctitle() wrote over
+//     the terminator, and the answer is the first string at arg_start with its
+//     NUL, one page at most, and never past env_end. That string may run on
+//     into the environment, but only when the environment starts where the
+//     arguments end; otherwise arg_end is the limit.
+//
+// All three are measured on Linux 6.12 by tests/manual/proc_cmdline_environ.c,
+// which also covers what this replaced: a title containing ':' was cut at its
+// first NUL, a rule Linux does not have, and the addresses were held in the
+// 32-bit addr_t, so a PR_SET_MM range above 4 GiB (systemd's rename_process
+// maps one) read as ENOMEM.
+static int proc_pid_copy_cmdline(struct task *task, struct mem *mem, guest_addr_t arg_start,
+                                 guest_addr_t arg_end, guest_addr_t env_start,
+                                 guest_addr_t env_end, struct proc_data *buf) {
+    if (mem == NULL || env_end == 0 || arg_start >= arg_end)
+        return 0;
+    if (env_start != arg_end || env_end < env_start)
+        env_start = env_end = arg_end;
+
+    char *page = malloc(PAGE_SIZE);
+    if (page == NULL)
+        return _ENOMEM;
+    char last;
+    if (user_read_task_mem(task, mem, arg_end - 1, &last, 1) == 0 && last != '\0') {
+        size_t got = proc_pid_read_prefix(task, mem, arg_start, env_end, page, PAGE_SIZE, NULL);
+        size_t len = strnlen(page, got);
+        if (len < got)
+            len++; // the NUL that ended it
+        proc_buf_append(buf, page, len);
+    } else {
+        proc_pid_read_prefix(task, mem, arg_start, arg_end, page, 0, buf);
+    }
+    free(page);
     return 0;
 }
 
-// Count the number of mapped pages in a mem.
-// Intentionally lock-free: the count is only used for /proc reporting, so a
-// slightly stale snapshot is acceptable.
-static size_t proc_mem_count_pages(struct mem *mem) {
-    return mem_mapped_page_count(mem);
+// /proc/<pid>/environ: [env_start, env_end), by environ_read()'s rules.
+static int proc_pid_copy_environ(struct task *task, struct mem *mem, guest_addr_t env_start,
+                                 guest_addr_t env_end, struct proc_data *buf) {
+    if (mem == NULL || env_end == 0 || env_start >= env_end)
+        return 0;
+    char *page = malloc(PAGE_SIZE);
+    if (page == NULL)
+        return _ENOMEM;
+    proc_pid_read_prefix(task, mem, env_start, env_end, page, 0, buf);
+    free(page);
+    return 0;
 }
 
-// Of those mapped pages, the ones that are actually in host memory: mapped
-// minus what the pager has evicted. This is what VmRSS, statm's second field,
-// stat's field 24 and smaps' Rss all report, and they take it from here so that
-// they cannot disagree with each other -- Linux derives all four from one
-// counter, and section 11 of docs/simulated_swap_plan.md records that bounding
-// them independently was tried and rejected four times because it replaces an
-// impossible value with an inconsistent pair.
+// An address space's size and resident set as status, stat and statm report
+// them -- one source, so the three files cannot disagree, as Linux derives
+// them all from mm's counters. See "usage counters" in emu/memory.c: VmSize
+// is every page of the address space, reservations and PROT_NONE included;
+// VmRSS the pages used and still in memory; the peaks are high-water marks.
 //
-// With swap DISABLED this returns the caller's mapped count without walking
-// anything. That is not an optimisation for its own sake: no entry can be
-// non-resident when nothing evicts, so the value is identical, and skipping the
-// walk keeps the cost of /proc/<pid>/status identical too -- top and htop read
-// it once per process per refresh, and quietly doubling that walk for a figure
-// that cannot have changed would be a real regression for every guest that
-// never turns swap on.
-//
-// It is still not a true residency measure, and the comment on
-// mem_resident_page_count in emu/memory.c says exactly why: AOK builds
-// page-table entries eagerly at mmap() time and no pt_entry field records
-// whether a page was ever touched, so an untouched mapping is counted here in
-// full. What it does know is that a SWAPPED page is definitively absent.
-static size_t proc_mem_count_resident_pages(struct mem *mem, size_t mapped_pages) {
-    if (mem == NULL || !swap_enabled())
-        return mapped_pages;
-    size_t resident = mem_resident_page_count(mem);
-    // The two counts are two separate lock-free walks at two different
-    // instants, so a mapping created between them makes resident look larger
-    // than mapped. Every caller subtracts one from the other (VmSize - VmRSS is
-    // VmSwap), and an unsigned subtraction that wraps would print a process
-    // with sixteen exabytes swapped. Clamping can only under-report the swapped
-    // figure by whatever was mapped in that window.
-    return resident > mapped_pages ? mapped_pages : resident;
+// All four are reads of counters, so top and htop reading this once per
+// process per refresh cost nothing. Only VmSwap still walks, and only with swap
+// on: the pages whose frames the pager has taken, which is the entries minus
+// the entries whose frames are in memory.
+struct proc_mem_usage {
+    size_t vm, vm_peak, locked, rss, rss_peak, swap;
+    size_t pte_bytes;
+};
+
+static struct proc_mem_usage proc_mem_usage(struct mem *mem) {
+    struct proc_mem_usage u = {0};
+    if (mem == NULL)
+        return u;
+    u.vm = mem_vm_pages_now(mem);
+    u.vm_peak = mem_vm_pages_peak(mem);
+    // VmLck: the pages of locked mappings, Linux's locked_vm -- mapped, not
+    // necessarily resident, and never a special mapping. A counter, like the
+    // two above; it was printed as 0 whatever the process had locked.
+    u.locked = mem_locked_page_count(mem);
+    u.rss = mem_rss_pages_now(mem);
+    u.rss_peak = mem_rss_pages_peak(mem);
+    u.pte_bytes = mem_page_table_bytes(mem);
+    if (swap_enabled()) {
+        // Two lock-free walks at two instants; a mapping made between them
+        // must not wrap the difference into sixteen exabytes of swap.
+        size_t mapped = mem_mapped_page_count(mem);
+        size_t resident = mem_resident_page_count(mem);
+        u.swap = resident < mapped ? mapped - resident : 0;
+    }
+    return u;
 }
 
 // A synthetic kernel thread has no task behind it (kernel/task.c explains
@@ -208,6 +269,15 @@ static int proc_kthread_status(pid_t_ pid, const char *name, struct proc_data *b
     return 0;
 }
 
+// The thread directory, /proc/<pid>/task/<tid>/, defined with the task
+// listing further down.
+static struct proc_dir_entry proc_pid_task;
+
+// Clock ticks (USER_HZ = 100), wide enough that no CPU total wraps.
+static unsigned long long proc_ticks_from_timeval(struct timeval_ tv) {
+    return (unsigned long long) tv.sec * 100 + tv.usec / 10000;
+}
+
 // A zombie is still shown: it is what ps reports as state Z, and the only way
 // a monitor learns something exited and was never reaped. Only a task that is
 // mid-exit and not yet a zombie is refused, because its fields are still
@@ -223,13 +293,27 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
         return _ESRCH;
     }
 
-    // Gather CPU time and memory before the main locks (independent of general_lock)
-    unsigned long utime_jiffies, stime_jiffies;
-    task_thread_cpu_time(task, &utime_jiffies, &stime_jiffies);
+    // utime and stime, fields 14 and 15, are the WHOLE PROCESS: every live
+    // thread plus every thread that has already exited. So they are in
+    // /proc/<tid>/stat for any thread of it, as Linux's tgid entries are
+    // (do_task_stat with whole=1). Only /proc/<pid>/task/<tid>/stat is one
+    // thread. Every view used to report the one thread its id named, so a
+    // process whose work ran on a worker thread showed none of it: Thunar's
+    // GLib worker spun a whole core while ps, top, htop and btop all put
+    // Thunar at 0%.
+    //
+    // Before the main locks: both helpers take pids_lock or group->lock.
+    bool thread_view = entry->parent == &proc_pid_task;
+    struct rusage_ cpu = thread_view ? rusage_get_thread_cpu(task)
+                                     : rusage_get_group_cpu_of(task->group);
+    unsigned long long utime_ticks = proc_ticks_from_timeval(cpu.utime);
+    unsigned long long stime_ticks = proc_ticks_from_timeval(cpu.stime);
+    // Fields 16 and 17, in both views: the process's waited-for children,
+    // what getrusage(RUSAGE_CHILDREN) reports. They were a hardcoded 0.
+    unsigned long long cutime_ticks = 0, cstime_ticks = 0;
 
     struct mm *mm = proc_task_mm_retain(task);
-    size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
-    size_t resident_pages = proc_mem_count_resident_pages(mm ? &mm->mem : NULL, page_count);
+    struct proc_mem_usage usage = proc_mem_usage(mm ? &mm->mem : NULL);
     pid_t_ pid = 0;
     char comm[sizeof(task->comm) + 1];
     char proc_state = 'R';
@@ -239,26 +323,36 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     dword_t tty_dev = 0;
     int tty_fg_group = 0;
     long thread_count = 0;
-    addr_t stack_start = 0;
-    addr_t start_brk = 0;
-    addr_t argv_start = 0;
-    addr_t argv_end = 0;
-    addr_t env_start = 0;
-    addr_t env_end = 0;
+    guest_addr_t stack_start = 0;
+    guest_addr_t start_brk = 0;
+    guest_addr_t argv_start = 0;
+    guest_addr_t argv_end = 0;
+    guest_addr_t env_start = 0;
+    guest_addr_t env_end = 0;
     sigset_t_ pending = 0;
     sigset_t_ blocked = 0;
     int exit_signal = 0;
     bool zombie = false;
     bool io_block = false;
 
-    lock(&task->general_lock, 0);
-    if (mm != NULL) {
-        stack_start = (addr_t)mm->stack_start;
-        start_brk = (addr_t)mm->start_brk;
-        argv_start = (addr_t)mm->argv_start;
-        argv_end = (addr_t)mm->argv_end;
-        env_start = (addr_t)mm->env_start;
-        env_end = (addr_t)mm->env_end;
+    // Linux blanks the addresses below for a reader who may not inspect the
+    // process (do_task_stat's `permitted`): with the layout randomized they
+    // are what an attacker would need to know.
+    bool permitted = task_ptrace_may_access(task, PTRACE_MODE_READ_ | PTRACE_MODE_FSCREDS_);
+    if (!task_lock_unless_exiting(task)) {
+        if (mm != NULL)
+            mm_release(mm);
+        proc_put_task(task);
+        return _ESRCH;
+    }
+    if (mm != NULL && permitted) {
+        // All six whole: a 64-bit guest's addresses do not fit addr_t.
+        stack_start = mm->stack_start;
+        start_brk = mm->start_brk;
+        argv_start = mm->argv_start;
+        argv_end = mm->argv_end;
+        env_start = mm->env_start;
+        env_end = mm->env_end;
     }
     uint64_t start_time_ticks = task->start_time_ticks;
     pid = task->pid;
@@ -271,6 +365,8 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     bool stopped = task->group->stopped;
     pgid = task->group->pgid;
     sid = task->group->sid;
+    cutime_ticks = proc_ticks_from_timeval(task->group->children_rusage.utime);
+    cstime_ticks = proc_ticks_from_timeval(task->group->children_rusage.stime);
     struct tty *tty = task->group->tty;
     if (tty != NULL) {
         lock(&tty->lock, 0);
@@ -287,8 +383,11 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     // which means its io_block is set to true. When a proc reads an
     // information about itself, but it shouldn't be marked as blocked.
     // Parent PROCESS, not the forking thread: Linux's task_ppid_nr() is
-    // task_tgid_nr(real_parent). See sys_getppid() for why ->pid is wrong here.
-    parent_pid = task->parent ? task->parent->tgid : 0;
+    // task_tgid_nr(real_parent). See sys_getppid() for why ->pid is wrong here,
+    // and task_process_parent for why a thread's own ->parent is.
+    struct task *parent = task_process_parent(task);
+    // (0 for a parent the reader's pid namespace does not hold.)
+    parent_pid = parent != NULL && task_visible(parent) ? parent->tgid : 0;
     thread_count = list_size(&task->group->threads);
     pending = task->pending;
     blocked = task->blocked;
@@ -301,14 +400,15 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
 
     proc_state = proc_task_state_char_from_snapshot(pid, zombie, io_block, stopped);
 
-    proc_printf(buf, "%d ", pid);
+    // Every pid here as the reader's pid namespace numbers it.
+    proc_printf(buf, "%d ", current_pid_shown(pid));
     proc_printf(buf, "(%.16s) ", comm);
     proc_printf(buf, "%c ", proc_state);
-    proc_printf(buf, "%d ", parent_pid);
-    proc_printf(buf, "%d ", pgid);
-    proc_printf(buf, "%d ", sid);
+    proc_printf(buf, "%d ", current_pid_shown(parent_pid));
+    proc_printf(buf, "%d ", current_pid_shown(pgid));
+    proc_printf(buf, "%d ", current_pid_shown(sid));
     proc_printf(buf, "%d ", tty_dev);
-    proc_printf(buf, "%d ", tty_fg_group);
+    proc_printf(buf, "%d ", current_pid_shown(tty_fg_group));
     proc_printf(buf, "%u ", 0); // flags
 
     // page faults (no data available)
@@ -318,10 +418,10 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%lu ", 0l); // children major faults
 
     // values that would be returned from getrusage
-    proc_printf(buf, "%lu ", utime_jiffies); // user time
-    proc_printf(buf, "%lu ", stime_jiffies); // system time
-    proc_printf(buf, "%ld ", 0l); // children user time
-    proc_printf(buf, "%ld ", 0l); // children system time
+    proc_printf(buf, "%llu ", utime_ticks); // user time
+    proc_printf(buf, "%llu ", stime_ticks); // system time
+    proc_printf(buf, "%llu ", cutime_ticks); // children user time
+    proc_printf(buf, "%llu ", cstime_ticks); // children system time
 
     proc_printf(buf, "%ld ", 20l); // priority (not adjustable)
     proc_printf(buf, "%ld ", 0l); // nice (also not adjustable)
@@ -329,18 +429,15 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%ld ", 0l); // itimer value (deprecated, always 0)
     proc_printf(buf, "%llu ", (unsigned long long) start_time_ticks); // starttime
 
-    proc_printf(buf, "%lu ", (unsigned long)(page_count * PAGE_SIZE)); // vsize in bytes
-    // Field 24, rss: pages in memory, so mapped MINUS what the pager has taken
-    // away -- the same figure VmRSS, statm's second field and smaps' Rss report.
-    // vsize above stays the whole mapped address space, which is what swapping
-    // does not change.
-    proc_printf(buf, "%ld ", (long)resident_pages); // rss in pages
+    // Fields 23 and 24: VmSize in bytes and VmRSS in pages (proc_mem_usage).
+    proc_printf(buf, "%lu ", (unsigned long)(usage.vm * PAGE_SIZE)); // vsize in bytes
+    proc_printf(buf, "%ld ", (long)usage.rss); // rss in pages
     proc_printf(buf, "%lu ", (unsigned long)-1); // rss limit (RLIM_INFINITY)
 
     // bunch of shit that can only be accessed by a debugger
     proc_printf(buf, "%lu ", 0l); // startcode
     proc_printf(buf, "%lu ", 0l); // endcode
-    proc_printf(buf, "%lu ", (unsigned long)stack_start);
+    proc_printf(buf, "%llu ", (unsigned long long) stack_start);
     proc_printf(buf, "%lu ", 0l); // kstkesp
     proc_printf(buf, "%lu ", 0l); // kstkeip
 
@@ -363,7 +460,7 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%lu ", 0l); // nswap
     proc_printf(buf, "%lu ", 0l); // cnswap
     proc_printf(buf, "%d ", exit_signal);
-    proc_printf(buf, "%d ", 0); // processor
+    proc_printf(buf, "%d ", task_current_cpu(task)); // processor
 
     // htop and similar procfs consumers expect the modern trailing fields too.
     // We don't track most of these yet, but the record still needs to be
@@ -375,11 +472,11 @@ static int proc_pid_stat_show(struct proc_entry *entry, struct proc_data *buf) {
     proc_printf(buf, "%ld ", 0l); // cguest_time
     proc_printf(buf, "%lu ", 0ul); // start_data
     proc_printf(buf, "%lu ", 0ul); // end_data
-    proc_printf(buf, "%lu ", (unsigned long)start_brk); // start_brk
-    proc_printf(buf, "%lu ", (unsigned long)argv_start); // arg_start
-    proc_printf(buf, "%lu ", (unsigned long)argv_end); // arg_end
-    proc_printf(buf, "%lu ", (unsigned long)env_start); // env_start
-    proc_printf(buf, "%lu ", (unsigned long)env_end); // env_end
+    proc_printf(buf, "%llu ", (unsigned long long) start_brk); // start_brk
+    proc_printf(buf, "%llu ", (unsigned long long) argv_start); // arg_start
+    proc_printf(buf, "%llu ", (unsigned long long) argv_end); // arg_end
+    proc_printf(buf, "%llu ", (unsigned long long) env_start); // env_start
+    proc_printf(buf, "%llu ", (unsigned long long) env_end); // env_end
     proc_printf(buf, "%d", 0); // exit_code
     proc_printf(buf, "\n");
 
@@ -394,6 +491,75 @@ static int proc_pid_oom_score_adj_show(struct proc_entry *entry, struct proc_dat
     proc_printf(buf, "%d\n", task->oom_score_adj);
     proc_put_task(task);
     return 0;
+}
+
+// /proc/<pid>/uid_map, gid_map and setgroups: the maps of the user namespace
+// the process is in, and whether setgroups() works there (kernel/user_ns.h).
+// The rules for writing them -- once, by the namespace's creator or someone
+// with the capability over its parent -- are the namespace's own.
+//
+// *held is the task's namespace with a reference, NULL for the initial one;
+// false when there is no such task any more.
+static bool proc_pid_user_ns(struct proc_entry *entry, struct user_namespace **held) {
+    struct task *task = proc_get_task(entry);
+    if (task == NULL)
+        return false;
+    bool alive = task_lock_unless_exiting(task);
+    if (alive) {
+        *held = user_ns_retain(task->user_ns);
+        unlock(&task->general_lock);
+    }
+    proc_put_task(task);
+    return alive;
+}
+
+static int proc_pid_uid_map_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    user_ns_show_map(ns, false, buf);
+    user_ns_release(ns);
+    return 0;
+}
+static int proc_pid_gid_map_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    user_ns_show_map(ns, true, buf);
+    user_ns_release(ns);
+    return 0;
+}
+static int proc_pid_setgroups_show(struct proc_entry *entry, struct proc_data *buf) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    user_ns_show_setgroups(ns, buf);
+    user_ns_release(ns);
+    return 0;
+}
+static int proc_pid_uid_map_update(struct proc_entry *entry, struct proc_data *data) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    int err = user_ns_write_map(ns, false, data->data, data->size);
+    user_ns_release(ns);
+    return err;
+}
+static int proc_pid_gid_map_update(struct proc_entry *entry, struct proc_data *data) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    int err = user_ns_write_map(ns, true, data->data, data->size);
+    user_ns_release(ns);
+    return err;
+}
+static int proc_pid_setgroups_update(struct proc_entry *entry, struct proc_data *data) {
+    struct user_namespace *ns;
+    if (!proc_pid_user_ns(entry, &ns))
+        return _ESRCH;
+    int err = user_ns_write_setgroups(ns, data->data, data->size);
+    user_ns_release(ns);
+    return err;
 }
 
 static int proc_pid_oom_score_adj_update(struct proc_entry *entry, struct proc_data *data) {
@@ -435,15 +601,13 @@ static int proc_pid_statm_show(struct proc_entry *entry, struct proc_data *buf) 
         return _ESRCH;
     }
     struct mm *mm = proc_task_mm_retain(task);
-    size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
-    size_t resident_pages = proc_mem_count_resident_pages(mm ? &mm->mem : NULL, page_count);
+    struct proc_mem_usage usage = proc_mem_usage(mm ? &mm->mem : NULL);
     if (mm != NULL)
         mm_release(mm);
     proc_put_task(task);
-    proc_printf(buf, "%lu ", (unsigned long)page_count); // size (total pages)
-    // Resident: no longer "the same, no swap" -- mapped minus what the pager
-    // has evicted, from the same source as VmRSS and stat's field 24.
-    proc_printf(buf, "%lu ", (unsigned long)resident_pages); // resident
+    // VmSize and VmRSS in pages (proc_mem_usage).
+    proc_printf(buf, "%lu ", (unsigned long)usage.vm); // size (total pages)
+    proc_printf(buf, "%lu ", (unsigned long)usage.rss); // resident
     proc_printf(buf, "%lu ", 0l); // shared
     proc_printf(buf, "%lu ", 0l); // text
     proc_printf(buf, "%lu ", 0l); // lib (unused since Linux 2.6)
@@ -470,7 +634,10 @@ static int proc_pid_auxv_show(struct proc_entry *entry, struct proc_data *buf) {
     struct mm *mm = NULL;
     addr_t start = 0;
     size_t size = 0;
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task)) {
+        proc_put_task(task);
+        return 0;
+    }
     if (task->mm == NULL)
         goto out_free_task;
 
@@ -496,22 +663,31 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     if (pid_is_kthread((dword_t) entry->pid, NULL))
         return 0;
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true)) {
-        proc_put_task(task);
+    if (task == NULL)
         return _ESRCH;
+    // Past the start of exit -- exiting, or a zombie waiting to be reaped --
+    // there is no address space to describe, and Linux reads that as empty
+    // (get_task_mm() is NULL once exit_mm has run), not as an error. This
+    // answered ESRCH for a directory that was still there to be listed.
+    if (task->exiting) {
+        proc_put_task(task);
+        return 0;
     }
-    
+
     int err = 0;
     struct mm *mm = NULL;
-    addr_t start = 0;
-    addr_t env_start = 0;
-    addr_t env_end = 0;
-    size_t size = 0;
-    lock(&task->general_lock, 0);
+    guest_addr_t arg_start = 0;
+    guest_addr_t arg_end = 0;
+    guest_addr_t env_start = 0;
+    guest_addr_t env_end = 0;
+    if (!task_lock_unless_exiting(task)) {
+        proc_put_task(task);
+        return 0;
+    }
 
     if (task->mm != NULL) {
-        start = task->mm->argv_start;
-        size = task->mm->argv_end - start;
+        arg_start = task->mm->argv_start;
+        arg_end = task->mm->argv_end;
         env_start = task->mm->env_start;
         env_end = task->mm->env_end;
     }
@@ -521,7 +697,7 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     // was no image to load. Its arguments are kept on the task instead, already
     // in this file's format. Before the mm == NULL bail below, since a task can
     // be running one with no address space left at all.
-    if (size == 0 && task->native_cmdline != NULL && task->native_cmdline_len != 0) {
+    if (arg_start == arg_end && task->native_cmdline != NULL && task->native_cmdline_len != 0) {
         size_t len = task->native_cmdline_len;
         char *copy = malloc(len);
         if (copy != NULL)
@@ -544,11 +720,11 @@ static int proc_pid_cmdline_show(struct proc_entry *entry, struct proc_data *buf
     mm_retain(mm);
     unlock(&task->general_lock);
 
-    err = proc_pid_copy_cmdline_range(task, &mm->mem, start, size, env_start, env_end, buf);
+    err = proc_pid_copy_cmdline(task, &mm->mem, arg_start, arg_end, env_start, env_end, buf);
     mm_release(mm);
     proc_put_task(task);
     return err;
-    
+
 out_free_task:
     unlock(&task->general_lock);
     proc_put_task(task);
@@ -568,7 +744,10 @@ static int proc_pid_comm_show(struct proc_entry *entry, struct proc_data *buf) {
     }
 
     char name[sizeof(task->comm) + 1];
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task)) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
     strncpy(name, task->comm, sizeof(task->comm));
     name[sizeof(task->comm)] = '\0';
     unlock(&task->general_lock);
@@ -579,10 +758,18 @@ static int proc_pid_comm_show(struct proc_entry *entry, struct proc_data *buf) {
 }
 
 static int proc_pid_environ_show(struct proc_entry *entry, struct proc_data *buf) {
+    // A kernel thread, and (below) a task past exit_mm, have no environment to
+    // show: Linux opens the file and reads nothing. Only a reader the file's
+    // mode lets in gets this far -- once the mm is gone the file is root's, so
+    // anyone else was refused at open, which is also what Linux does.
+    if (pid_is_kthread((dword_t) entry->pid, NULL))
+        return 0;
     struct task *task = proc_get_task(entry);
-    if ((task == NULL) || (task->exiting == true)) {
-        proc_put_task(task);
+    if (task == NULL)
         return _ESRCH;
+    if (task->exiting) {
+        proc_put_task(task);
+        return 0;
     }
     // Same credential rule as /proc/<pid>/mem: this is the target's address
     // space by another name. environ in particular carries whatever secrets a
@@ -594,19 +781,22 @@ static int proc_pid_environ_show(struct proc_entry *entry, struct proc_data *buf
 
     int err = 0;
     struct mm *mm = NULL;
-    addr_t start = 0;
-    size_t size = 0;
-    lock(&task->general_lock, 0);
+    guest_addr_t env_start = 0;
+    guest_addr_t env_end = 0;
+    if (!task_lock_unless_exiting(task)) {
+        proc_put_task(task);
+        return 0;
+    }
     if (task->mm == NULL)
         goto out_free_task;
 
-    start = task->mm->env_start;
-    size = task->mm->env_end - start;
+    env_start = task->mm->env_start;
+    env_end = task->mm->env_end;
     mm = task->mm;
     mm_retain(mm);
     unlock(&task->general_lock);
 
-    err = proc_pid_copy_user_range(task, &mm->mem, start, size, buf);
+    err = proc_pid_copy_environ(task, &mm->mem, env_start, env_end, buf);
     mm_release(mm);
     proc_put_task(task);
     return err;
@@ -633,20 +823,29 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     sigset_t_ pending = 0;
     sigset_t_ blocked = 0;
     unsigned long thread_count = 0;
+    unsigned seccomp_filters = 0;
     complex_lockt(&pids_lock, 0);
-    // PPid is the parent PROCESS (task_tgid_nr(real_parent)), see sys_getppid().
-    if (task->parent != NULL)
-        ppid = task->parent->tgid;
+    // PPid is the parent PROCESS (task_tgid_nr(real_parent)), see sys_getppid()
+    // and task_process_parent.
+    struct task *parent = task_process_parent(task);
+    if (parent != NULL && task_visible(parent))
+        ppid = parent->tgid;
     zombie = task->zombie;
     io_block = task->io_block;
     pending = task->pending;
     blocked = task->blocked;
     thread_count = list_size(&task->group->threads);
+    // Seccomp_filters (Linux 5.9+). pids_lock is what keeps the chain from
+    // changing under a TSYNC while it is walked -- and it is counted HERE, not
+    // beside the Seccomp line below, because pids_lock ranks above
+    // group->lock: do_exit_group takes pids_lock and then group->lock, so a
+    // reader taking them the other way round froze the whole guest the
+    // moment a process exited while its status was being read.
+    seccomp_filters = seccomp_filter_count(task->seccomp_filter);
     unlock(&pids_lock);
 
     struct mm *mm = proc_task_mm_retain(task);
-    size_t page_count = proc_mem_count_pages(mm ? &mm->mem : NULL);
-    size_t resident_pages = proc_mem_count_resident_pages(mm ? &mm->mem : NULL, page_count);
+    struct proc_mem_usage usage = proc_mem_usage(mm ? &mm->mem : NULL);
     if (mm != NULL)
         mm_release(mm);
     struct fdtable *files = proc_task_files_retain(task);
@@ -657,51 +856,58 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
         unlock(&files->lock);
         fdtable_release(files);
     }
-    unsigned long vm_kb = (unsigned long)(page_count * (PAGE_SIZE / 1024));
-    unsigned long rss_kb = (unsigned long)(resident_pages * (PAGE_SIZE / 1024));
-    unsigned long swap_kb = vm_kb - rss_kb;
+    const unsigned long page_kb = PAGE_SIZE / 1024;
 
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task)) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
     lock(&task->group->lock, 0);
     bool stopped = task->group->stopped;
 
-    // Cpus_allowed reflects the affinity mask, so use the scheduler-visible
-    // count (matches sched_getaffinity), not the full /proc/cpuinfo topology.
-    unsigned cpu_count = get_cpu_count_for_affinity();
+    // Cpus_allowed is the affinity mask: every guest CPU (sched_getaffinity).
+    unsigned cpu_count = get_cpu_count_allowed();
     unsigned allowed_mask = cpu_count >= 31 ? 0x7fffffffU : ((1U << cpu_count) - 1U);
 
     proc_printf(buf, "Name:\t%s\n", task->comm);
     proc_printf(buf, "State:\t%c\n", proc_task_state_char_from_snapshot(task->pid, zombie, io_block, stopped));
-    proc_printf(buf, "Tgid:\t%d\n", task->tgid);
+    proc_printf(buf, "Tgid:\t%d\n", current_pid_shown(task->tgid));
     proc_printf(buf, "Ngid:\t0\n");
-    proc_printf(buf, "Pid:\t%d\n", task->pid);
-    proc_printf(buf, "PPid:\t%d\n", ppid);
+    proc_printf(buf, "Pid:\t%d\n", current_pid_shown(task->pid));
+    proc_printf(buf, "PPid:\t%d\n", current_pid_shown(ppid));
     proc_printf(buf, "TracerPid:\t0\n");
-    proc_printf(buf, "Uid:\t%u\t%u\t%u\t%u\n", task->uid, task->euid, task->suid, task->fsuid);
-    proc_printf(buf, "Gid:\t%u\t%u\t%u\t%u\n", task->gid, task->egid, task->sgid, task->fsgid);
+    // As the READER's user namespace names them (kernel/user_ns.h).
+    proc_printf(buf, "Uid:\t%u\t%u\t%u\t%u\n", current_uid_shown(task->uid), current_uid_shown(task->euid),
+            current_uid_shown(task->suid), current_uid_shown(task->fsuid));
+    proc_printf(buf, "Gid:\t%u\t%u\t%u\t%u\n", current_gid_shown(task->gid), current_gid_shown(task->egid),
+            current_gid_shown(task->sgid), current_gid_shown(task->fsgid));
     proc_printf(buf, "FDSize:\t%u\n", fd_size);
     proc_printf(buf, "Groups:\t");
     for (unsigned i = 0; i < task->ngroups; i++)
-        proc_printf(buf, "%s%u", i == 0 ? "" : " ", task->groups[i]);
+        proc_printf(buf, "%s%u", i == 0 ? "" : " ", current_gid_shown(task->groups[i]));
     proc_printf(buf, "\n");
-    proc_printf(buf, "VmPeak:\t%lu kB\n", vm_kb);
-    proc_printf(buf, "VmSize:\t%lu kB\n", vm_kb);
-    proc_printf(buf, "VmLck:\t0 kB\n");
+    proc_status_ns_ids(buf, "NStgid", task, task->tgid);
+    proc_status_ns_ids(buf, "NSpid", task, task->pid);
+    proc_status_ns_ids(buf, "NSpgid", task, task->group->pgid);
+    proc_status_ns_ids(buf, "NSsid", task, task->group->sid);
+    proc_printf(buf, "VmPeak:\t%lu kB\n", (unsigned long) usage.vm_peak * page_kb);
+    proc_printf(buf, "VmSize:\t%lu kB\n", (unsigned long) usage.vm * page_kb);
+    proc_printf(buf, "VmLck:\t%lu kB\n", (unsigned long) usage.locked * page_kb);
     proc_printf(buf, "VmPin:\t0 kB\n");
-    // VmHWM is a peak, so it stays the whole mapped figure: it is by
-    // construction >= VmRSS, and lowering it to the current resident count
-    // would be reporting a high-water mark that goes DOWN. It is still not a
-    // real peak -- there is no rss high-water mark on struct mm that this layer
-    // can read -- which is unchanged by swap and pre-existing.
-    proc_printf(buf, "VmHWM:\t%lu kB\n", vm_kb);
-    proc_printf(buf, "VmRSS:\t%lu kB\n", rss_kb);
+    proc_printf(buf, "VmHWM:\t%lu kB\n", (unsigned long) usage.rss_peak * page_kb);
+    proc_printf(buf, "VmRSS:\t%lu kB\n", (unsigned long) usage.rss * page_kb);
+    // VmPTE, as Linux has it: the host memory in this address space's page
+    // tables, which is what a guest can see of an emulator cost that has been
+    // over a gigabyte (emu/memory.c, mem_lazy_materialize_only). Linux's order,
+    // less the Vm lines between VmRSS and VmPTE that AOK does not print.
+    proc_printf(buf, "VmPTE:\t%lu kB\n", (unsigned long) (usage.pte_bytes / 1024));
     // VmSwap appears only when swap is on, because with it off this file has to
     // be byte-for-byte what it was before the pager existed and there was no
     // VmSwap line here at all. Linux prints it unconditionally; the comment on
     // swap_enabled() in kernel/swap.h says why the disabled column wins that
-    // argument. Its value is exactly VmSize - VmRSS, so the three lines close.
+    // argument.
     if (swap_enabled())
-        proc_printf(buf, "VmSwap:\t%lu kB\n", swap_kb);
+        proc_printf(buf, "VmSwap:\t%lu kB\n", (unsigned long) usage.swap * page_kb);
     proc_printf(buf, "Threads:\t%lu\n", thread_count);
     // Linux prints Umask between Name and State; it was missing entirely, and
     // it is the only place a process's umask is observable from outside.
@@ -717,14 +923,13 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
     // Linux's render_sigset_t() prints the whole 64-bit sigset, all 16 hex
     // digits of it. sigset_t_ is 64 bits here too, so %08x both under-read the
     // argument and told consumers the mask was half the width it is.
-    proc_printf(buf, "SigPnd:\t%016llx\n", (unsigned long long)pending);
-    proc_printf(buf, "ShdPnd:\t0000000000000000\n");
-    proc_printf(buf, "SigBlk:\t%016llx\n", (unsigned long long)blocked);
-    // Hardcoded zero before, which told every reader the process ignored
-    // nothing and caught nothing -- the two fields a debugger or a supervisor
-    // reads to find out which signals will actually reach it. Built from the
-    // dispositions, the way Linux's collect_sigign_sigcatch does.
-    sigset_t_ ignored = 0, caught = 0;
+    // SigIgn and SigCgt were hardcoded zero before, which told every reader the
+    // process ignored nothing and caught nothing -- the two fields a debugger
+    // or a supervisor reads to find out which signals will actually reach it.
+    // Built from the dispositions, the way Linux's collect_sigign_sigcatch
+    // does. ShdPnd was zero too: what is pending on the process rather than on
+    // one thread, which is where kill() leaves a signal every thread blocks.
+    sigset_t_ ignored = 0, caught = 0, shared_pending = 0;
     if (task->sighand != NULL) {
         lock(&task->sighand->lock, 0);
         for (int sig = 1; sig < NUM_SIGS; sig++) {
@@ -734,17 +939,25 @@ static int proc_pid_status_show(struct proc_entry *entry, struct proc_data *buf)
             else if (handler != SIG_DFL_)
                 caught |= (sigset_t_) 1 << (sig - 1);
         }
+        shared_pending = task->sighand->pending;
         unlock(&task->sighand->lock);
     }
+    proc_printf(buf, "SigPnd:\t%016llx\n", (unsigned long long)pending);
+    proc_printf(buf, "ShdPnd:\t%016llx\n", (unsigned long long) shared_pending);
+    proc_printf(buf, "SigBlk:\t%016llx\n", (unsigned long long)blocked);
     proc_printf(buf, "SigIgn:\t%016llx\n", (unsigned long long) ignored);
     proc_printf(buf, "SigCgt:\t%016llx\n", (unsigned long long) caught);
     proc_printf(buf, "CapInh:\t%08x%08x\n", task->cap_inheritable[1], task->cap_inheritable[0]);
     proc_printf(buf, "CapPrm:\t%08x%08x\n", task->cap_permitted[1], task->cap_permitted[0]);
     proc_printf(buf, "CapEff:\t%08x%08x\n", task->cap_effective[1], task->cap_effective[0]);
-    proc_printf(buf, "CapBnd:\t%08x%08x\n", task->cap_permitted[1], task->cap_permitted[0]);
-    proc_printf(buf, "CapAmb:\t0000000000000000\n");
-    proc_printf(buf, "NoNewPrivs:\t0\n");
-    proc_printf(buf, "Seccomp:\t0\n");
+    proc_printf(buf, "CapBnd:\t%08x%08x\n", task->cap_bounding[1], task->cap_bounding[0]);
+    proc_printf(buf, "CapAmb:\t%08x%08x\n", task->cap_ambient[1], task->cap_ambient[0]);
+    proc_printf(buf, "NoNewPrivs:\t%d\n", task->no_new_privs ? 1 : 0);
+    {
+        int mode = __atomic_load_n(&task->seccomp_mode, __ATOMIC_ACQUIRE);
+        proc_printf(buf, "Seccomp:\t%d\n", mode);
+        proc_printf(buf, "Seccomp_filters:\t%u\n", seccomp_filters);
+    }
     proc_printf(buf, "Cpus_allowed:\t%x\n", allowed_mask);
     proc_printf(buf, "Cpus_allowed_list:\t0-%u\n", cpu_count > 0 ? cpu_count - 1 : 0);
     proc_printf(buf, "Mems_allowed:\t1\n");
@@ -801,6 +1014,9 @@ static int proc_pid_cgroup_show(struct proc_entry *entry, struct proc_data *buf)
     char seen[512] = "|";
     size_t seen_len = 1; // Length of seen
     struct mount *mount;
+    // Under mounts_lock, as /proc/mounts walks it: a mount or umount frees
+    // entries, and a tmpfs remount replaces mount->info.
+    lock(&mounts_lock, 0);
     list_for_each_entry(&mounts, mount, mounts) {
         if (strcmp(mount->fs->name, "cgroup") != 0)
             continue;
@@ -825,6 +1041,7 @@ static int proc_pid_cgroup_show(struct proc_entry *entry, struct proc_data *buf)
         }
         proc_printf(buf, "%d:%s:/\n", next_id++, controller);
     }
+    unlock(&mounts_lock);
     char v2_path[MAX_PATH] = "/";
     struct task *task = proc_get_task(entry);
     if (task != NULL) {
@@ -866,8 +1083,27 @@ static int proc_pid_sched_show(struct proc_entry *entry, struct proc_data *buf) 
     return 0;
 }
 
+// Lazy reservations have no page-table entries, so a walk of the page table
+// cannot see them -- but the guest has them mapped, and readers of maps and
+// smaps (the JVM sizes itself from maps; sanitizers and debuggers parse both)
+// must be told. Collects a copy sorted by address into `pending`
+// (MEM_LAZY_MAX long) for the walk to merge in: both files are in address
+// order and parsers rely on that. Caller holds the mem lock.
+static unsigned collect_pending_reservations(struct mem *mem, struct mem_lazy_map *pending) {
+    unsigned pending_n = 0;
+    for (unsigned i = 0; i < mem->lazy_count; i++)
+        if (mem->lazy[i].start < mem->lazy[i].end)
+            pending[pending_n++] = mem->lazy[i];
+    for (unsigned i = 1; i < pending_n; i++)
+        for (unsigned j = i; j > 0 && pending[j - 1].start > pending[j].start; j--) {
+            struct mem_lazy_map t = pending[j - 1];
+            pending[j - 1] = pending[j]; pending[j] = t;
+        }
+    return pending_n;
+}
+
 // Emit any lazy reservation starting before `limit`, keeping proc_maps_dump's
-// output in address order. See its caller for why reservations must appear.
+// output in address order.
 static void emit_pending_maps(struct proc_data *buf, struct mem_lazy_map *pending,
                               unsigned pending_n, unsigned *pending_i, page_t limit) {
     while (*pending_i < pending_n && pending[*pending_i].start < limit) {
@@ -882,6 +1118,80 @@ static void emit_pending_maps(struct proc_data *buf, struct mem_lazy_map *pendin
     }
 }
 
+// Does the page `pt` continue the region that starts at `start_pt`, `pages`
+// pages before it? AOK keeps no VMAs, so maps and smaps rebuild each region
+// from its pages, and a region is what Linux's would be: one struct data; or
+// anonymous pages under one name; or pages of one file (one struct fd, as a
+// VMA has one struct file) at consecutive offsets -- which is what a
+// copy-on-write break leaves, the copy keeping its file (emu/memory.c,
+// mem_break_cow_group), and what Linux merges adjacent mappings of one file
+// into; or pages of one special mapping, a name with no file ([vdso]). All
+// with one protection, sharing and growsdown.
+//
+// And one lock: mlock of the middle page of a mapping makes three VMAs of it on
+// Linux, a file's at their own offsets, and munlock merges them back (MEASURED
+// on 6.12; an anonymous mapping rejoins or not by Linux's VMA merge rules, and
+// here always does). The locked byte follows a mapping everywhere its
+// VM_LOCKED does -- stack growth, mremap, a copy-on-write copy -- so a locked
+// process's [stack] stays one line. The whole byte: an on-fault lock is a VMA
+// flag of its own (mlock2(MLOCK_ONFAULT) of the middle page of a locked file
+// mapping is three lines, and mlock of it one again).
+static bool maps_region_continues(const struct pt_entry *start_pt,
+                                  const struct pt_entry *pt, page_t pages) {
+    const unsigned kind = P_RWX | P_SHARED | P_GROWSDOWN | P_ANONYMOUS;
+    if ((pt->flags & kind) != (start_pt->flags & kind))
+        return false;
+    if (__atomic_load_n(&pt->locked, __ATOMIC_RELAXED) !=
+            __atomic_load_n(&start_pt->locked, __ATOMIC_RELAXED))
+        return false;
+    const struct data *data = start_pt->data;
+    if (pt->data == data)
+        return true;
+    if (pt->data->name != data->name)
+        return false;
+    if (pt->flags & P_ANONYMOUS)
+        return true;
+    if (data->fd != NULL)
+        return pt->data->fd == data->fd &&
+                data_file_offset(pt->data, pt->offset) ==
+                data_file_offset(data, start_pt->offset) + ((size_t) pages << PAGE_BITS);
+    return data->name != NULL;
+}
+
+// The file offset maps and smaps print for a region starting at `start_pt`:
+// its own page's, which is not the mapping's first page's when an mprotect or
+// munmap has split the mapping. 0 for memory with no file, as on Linux.
+static unsigned long maps_region_offset(const struct pt_entry *start_pt) {
+    const struct data *data = start_pt->data;
+    if (data->fd == NULL)
+        return (unsigned long) data->file_offset;
+    return (unsigned long) data_file_offset(data, start_pt->offset);
+}
+
+// " (deleted)" after a mapped file's name that no longer reaches it
+// (generic_mark_deleted) -- what needrestart and lsof look for to find a
+// library that was replaced under a running program. Asked once per file, not
+// once per region: a library is mapped several times over, and the question
+// is a lookup.
+struct maps_mark {
+    struct fd *fd;
+    bool deleted;
+};
+
+static void maps_mark_deleted(struct fd *fd, char *path, bool unreachable, struct maps_mark *mark) {
+    if (unreachable)
+        return;
+    if (fd != mark->fd) {
+        char probe[MAX_PATH + 1];
+        snprintf(probe, sizeof(probe), "%s", path);
+        generic_mark_deleted(fd, probe, sizeof(probe));
+        mark->fd = fd;
+        mark->deleted = strcmp(probe, path) != 0;
+    }
+    if (mark->deleted && strlen(path) + 10 < MAX_PATH)
+        strcat(path, " (deleted)");
+}
+
 void proc_maps_dump(struct task *task, struct proc_data *buf) {
     struct mm *mm = proc_task_mm_retain(task);
     struct mem *mem = mm ? &mm->mem : NULL;
@@ -890,22 +1200,11 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
 
     mem_read_lock_quiesce_aware(mem);
 
-    // Lazy reservations have no page-table entries, so the walk below cannot
-    // see them -- but the guest has them mapped, and readers of this file (the
-    // JVM sizes itself from it; sanitizers and debuggers parse it) must be
-    // told. Merge a sorted copy in: /proc/maps is in address order and parsers
-    // rely on that.
+    // See collect_pending_reservations.
     struct mem_lazy_map pending[MEM_LAZY_MAX];
-    unsigned pending_n = 0;
-    for (unsigned i = 0; i < mem->lazy_count; i++)
-        if (mem->lazy[i].start < mem->lazy[i].end)
-            pending[pending_n++] = mem->lazy[i];
-    for (unsigned i = 1; i < pending_n; i++)
-        for (unsigned j = i; j > 0 && pending[j - 1].start > pending[j].start; j--) {
-            struct mem_lazy_map t = pending[j - 1];
-            pending[j - 1] = pending[j]; pending[j] = t;
-        }
+    unsigned pending_n = collect_pending_reservations(mem, pending);
     unsigned pending_i = 0;
+    struct maps_mark mark = {0};
 
     page_t page = 0;
     while (page < mem->page_limit) {
@@ -922,12 +1221,7 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
         // find the end of said region
         while (page < mem->page_limit) {
             struct pt_entry *pt = mem_pt(mem, page);
-            if (pt == NULL)
-                break;
-            if ((pt->flags & P_RWX) != (start_pt->flags & P_RWX))
-                break;
-            // region continues if data is the same or both are anonymous
-            if (!(pt->data == data || (pt->flags & P_ANONYMOUS && start_pt->flags & P_ANONYMOUS)))
+            if (pt == NULL || !maps_region_continues(start_pt, pt, page - start))
                 break;
             page_t prev = page;
             mem_next_page(mem, &page);
@@ -966,7 +1260,9 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
             strncpy(path, data->name, sizeof(path) - 1);
             path[sizeof(path) - 1] = '\0';
         } else if (data->fd != NULL) {
-            generic_getpath(start_pt->data->fd, path);
+            bool unreachable;
+            generic_getpath_shown(start_pt->data->fd, path, &unreachable);
+            maps_mark_deleted(start_pt->data->fd, path, unreachable, &mark);
         }
         proc_printf(buf, "%08llx-%08llx %c%c%c%c %08lx 00:00 %-10d %s\n",
                 (unsigned long long) (start << PAGE_BITS), (unsigned long long) (end << PAGE_BITS),
@@ -974,7 +1270,7 @@ void proc_maps_dump(struct task *task, struct proc_data *buf) {
                 start_pt->flags & P_WRITE ? 'w' : '-',
                 start_pt->flags & P_EXEC ? 'x' : '-',
                 start_pt->flags & P_SHARED ? '-' : 'p',
-                (unsigned long) data->file_offset, // offset
+                maps_region_offset(start_pt),
                 0, // inode
                 path);
     }
@@ -1021,57 +1317,100 @@ static int proc_pid_maps_show(struct proc_entry *entry, struct proc_data *buf) {
 // each cache entry to track its members' own intra-lineage counts to avoid
 // double-counting, which isn't worth the complexity for a best-effort
 // estimate.
+//
+// Per struct data, not per region. A region is not one struct data any more:
+// a copy-on-write break's copy stays in its file's region (maps_region_
+// continues), so a forked child's .data region can start with a page only it
+// has, and judging the region by that page called all of it private -- Pss
+// 16K where it was 10K. Each run of pages under one struct data is judged on
+// its own, and the intra-lineage count is refcount over THIS mem's entries in
+// the data (data_owner_entries), which stays right when an mprotect splits a
+// mapping into several regions -- refcount / region pages called an
+// exclusive page shared there (see mem_break_cow_group). A copy is anonymous
+// memory, dirty, even in a file's region, as Linux counts it.
+struct smaps_run {
+    struct data *data;
+    uint64_t pages, resident, swapped;
+};
+
 struct smaps_totals {
     uint64_t rss_kb, pss_kb;
     uint64_t shared_clean_kb, shared_dirty_kb;
     uint64_t private_clean_kb, private_dirty_kb;
     uint64_t anonymous_kb;
     uint64_t swap_kb;
+    uint64_t locked_kb;
 };
 
-static void proc_smaps_region(struct proc_data *buf, page_t start, page_t end,
-                               struct pt_entry *start_pt, struct data *data,
-                               const char *path, bool print_header,
-                               uint64_t swapped_pages,
+// The sharer estimate for one run of a region: see the comment above.
+static uint64_t smaps_run_sharers(struct mem *mem, const struct smaps_run *run) {
+    struct data *data = run->data;
+    unsigned refcount = atomic_load_explicit(&data->refcount, memory_order_relaxed);
+    if (refcount == 0)
+        refcount = 1;
+    uint32_t mine = data_owner_entries(data, mem);
+    uint64_t intra_lineage_sharers = refcount / (mine != 0 ? mine : run->pages);
+    if (intra_lineage_sharers == 0)
+        intra_lineage_sharers = 1;
+    unsigned cross_process_sharers = mmap_cache_count(data->cache_entry);
+    return intra_lineage_sharers > cross_process_sharers ?
+        intra_lineage_sharers : cross_process_sharers;
+}
+
+static void proc_smaps_region(struct proc_data *buf, struct mem *mem, page_t start, page_t end,
+                               struct pt_entry *start_pt, const struct smaps_run *runs,
+                               size_t nruns, const char *path, bool print_header,
                                struct smaps_totals *totals) {
     uint64_t region_pages = (uint64_t)(end - start);
     uint64_t size_kb = region_pages * (PAGE_SIZE / 1024);
-    // Rss = Size - Swap, which is section 3.12's rule for this row and the same
-    // arithmetic /proc/<pid>/status uses for VmRSS. Everything derived from
-    // rss_kb below -- Pss, the Shared/Private split, Referenced, Anonymous --
-    // follows it, so a region with pages out does not report them twice.
-    // swapped_pages is 0 whenever swap is off, so this is size_kb and every
-    // figure in this block is exactly what it was.
-    uint64_t swap_kb = swapped_pages * (PAGE_SIZE / 1024);
-    if (swap_kb > size_kb)
-        swap_kb = size_kb;
-    uint64_t rss_kb = size_kb - swap_kb;
-    unsigned refcount = data != NULL ?
-        atomic_load_explicit(&data->refcount, memory_order_relaxed) : 1;
-    if (refcount == 0)
-        refcount = 1;
-    uint64_t intra_lineage_sharers = region_pages != 0 ? refcount / region_pages : refcount;
-    if (intra_lineage_sharers == 0)
-        intra_lineage_sharers = 1;
-    unsigned cross_process_sharers = mmap_cache_count(data != NULL ? data->cache_entry : NULL);
-    uint64_t sharers = intra_lineage_sharers > cross_process_sharers ?
-        intra_lineage_sharers : cross_process_sharers;
-    bool shared = (start_pt->flags & P_SHARED) || sharers > 1;
-    bool anon = (start_pt->flags & P_ANONYMOUS) != 0;
-    uint64_t pss_kb = shared ? rss_kb / sharers : rss_kb;
-
+    // Rss is the region's pages in the resident set -- used since they were
+    // mapped, and not swapped out (mem_page_is_touched) -- counted the way
+    // VmRSS is, so the regions add up to it. Everything derived from rss_kb
+    // below -- Pss, the Shared/Private split, Referenced, Anonymous -- follows
+    // it. It was Size - Swap, which counted a page that was never used.
+    uint64_t swap_kb = 0, rss_kb = 0, pss_kb = 0, anonymous_kb = 0;
     uint64_t shared_clean_kb = 0, shared_dirty_kb = 0;
     uint64_t private_clean_kb = 0, private_dirty_kb = 0;
-    if (shared) {
+    // The header's letter and VmFlags' "sh" go by the first run, as they went
+    // by the region's one struct data.
+    bool shared_header = (start_pt->flags & P_SHARED) != 0;
+    for (size_t i = 0; i < nruns; i++) {
+        const struct smaps_run *run = &runs[i];
+        uint64_t run_size_kb = run->pages * (PAGE_SIZE / 1024);
+        uint64_t run_swap_kb = run->swapped * (PAGE_SIZE / 1024);
+        if (run_swap_kb > run_size_kb)
+            run_swap_kb = run_size_kb;
+        uint64_t run_rss_kb = run->resident * (PAGE_SIZE / 1024);
+        if (run_rss_kb > run_size_kb - run_swap_kb)
+            run_rss_kb = run_size_kb - run_swap_kb;
+        uint64_t sharers = smaps_run_sharers(mem, run);
+        bool shared = (start_pt->flags & P_SHARED) || sharers > 1;
+        bool anon = (start_pt->flags & P_ANONYMOUS) || run->data->copied;
+        if (i == 0 && shared)
+            shared_header = true;
+        swap_kb += run_swap_kb;
+        rss_kb += run_rss_kb;
+        pss_kb += shared ? run_rss_kb / sharers : run_rss_kb;
         if (anon)
-            shared_dirty_kb = rss_kb;
-        else
-            shared_clean_kb = rss_kb;
-    } else if (anon) {
-        private_dirty_kb = rss_kb;
-    } else {
-        private_clean_kb = rss_kb;
+            anonymous_kb += run_rss_kb;
+        if (shared) {
+            if (anon)
+                shared_dirty_kb += run_rss_kb;
+            else
+                shared_clean_kb += run_rss_kb;
+        } else if (anon) {
+            private_dirty_kb += run_rss_kb;
+        } else {
+            private_clean_kb += run_rss_kb;
+        }
     }
+    bool shared = shared_header;
+    // Linux's Locked is the Pss of the region's resident pages when the region
+    // is locked, and a region is all locked or none (maps_region_continues):
+    // a locked mapping's pages that are not resident count in VmLck and not
+    // here (MEASURED on 6.12: a locked PROT_NONE mapping is "lo" with Locked
+    // 0 kB, and 16 kB once made writable, which populates it).
+    uint64_t locked_kb = start_pt->locked ? pss_kb : 0;
 
     if (print_header) {
         proc_printf(buf, "%08llx-%08llx %c%c%c%c %08lx 00:00 %-10d %s\n",
@@ -1080,7 +1419,7 @@ static void proc_smaps_region(struct proc_data *buf, page_t start, page_t end,
                 start_pt->flags & P_WRITE ? 'w' : '-',
                 start_pt->flags & P_EXEC ? 'x' : '-',
                 shared ? 's' : 'p',
-                (unsigned long) data->file_offset, 0, path);
+                maps_region_offset(start_pt), 0, path);
         proc_printf(buf, "Size:           %8"PRIu64" kB\n", size_kb);
         proc_printf(buf, "KernelPageSize: %8u kB\n", PAGE_SIZE / 1024);
         proc_printf(buf, "MMUPageSize:    %8u kB\n", PAGE_SIZE / 1024);
@@ -1091,20 +1430,20 @@ static void proc_smaps_region(struct proc_data *buf, page_t start, page_t end,
         proc_printf(buf, "Private_Clean:  %8"PRIu64" kB\n", private_clean_kb);
         proc_printf(buf, "Private_Dirty:  %8"PRIu64" kB\n", private_dirty_kb);
         proc_printf(buf, "Referenced:     %8"PRIu64" kB\n", rss_kb);
-        proc_printf(buf, "Anonymous:      %8"PRIu64" kB\n", anon ? rss_kb : 0);
+        proc_printf(buf, "Anonymous:      %8"PRIu64" kB\n", anonymous_kb);
         proc_printf(buf, "AnonHugePages:  %8d kB\n", 0);
         proc_printf(buf, "Swap:           %8"PRIu64" kB\n", swap_kb);
-        // Locked stays 0: mlock/mlockall are still range checks with no pin
-        // behind them (kernel/mmap.c), so no page in this region is actually
-        // pinned and 0 is the true count, not a placeholder. Section 3.12 pairs
-        // real pins with this field; both belong to the same change and neither
-        // is in this layer.
-        proc_printf(buf, "Locked:         %8d kB\n", 0);
-        proc_printf(buf, "VmFlags:%s%s%s%s\n",
+        proc_printf(buf, "Locked:         %8"PRIu64" kB\n", locked_kb);
+        // "lo" is VM_LOCKED and "lf" VM_LOCKONFAULT, in the places Linux's
+        // flag order puts them after the ones printed here: " lo lf" when both
+        // (MEASURED on 6.12, "rd wr mr mw me lo lf ac sd").
+        proc_printf(buf, "VmFlags:%s%s%s%s%s%s\n",
                 start_pt->flags & P_READ ? " rd" : "",
                 start_pt->flags & P_WRITE ? " wr" : "",
                 start_pt->flags & P_EXEC ? " ex" : "",
-                shared ? " sh" : "");
+                shared ? " sh" : "",
+                start_pt->locked ? " lo" : "",
+                start_pt->locked & PT_LOCKONFAULT ? " lf" : "");
     }
 
     if (totals != NULL) {
@@ -1114,9 +1453,49 @@ static void proc_smaps_region(struct proc_data *buf, page_t start, page_t end,
         totals->shared_dirty_kb += shared_dirty_kb;
         totals->private_clean_kb += private_clean_kb;
         totals->private_dirty_kb += private_dirty_kb;
-        totals->anonymous_kb += anon ? rss_kb : 0;
+        totals->anonymous_kb += anonymous_kb;
         totals->swap_kb += swap_kb;
+        totals->locked_kb += locked_kb;
     }
+}
+
+// A lazy reservation, as smaps shows it: mapped, never touched, so nothing of
+// it is resident, shared or swapped. Its size, page sizes and flags are set; every count is 0.
+// Without this smaps left out every reservation that maps lists: an untouched
+// 128M mmap was in maps and missing here, and once splits stopped materialising
+// the rest of a reservation, a JVM heap with one committed page was three
+// regions in maps and one here.
+static void proc_smaps_reservation(struct proc_data *buf, const struct mem_lazy_map *l,
+                                   bool print_header) {
+    if (!print_header)
+        return;
+    uint64_t size_kb = (uint64_t) (l->end - l->start) * (PAGE_SIZE / 1024);
+    bool shared = (l->flags & P_SHARED) != 0;
+    proc_printf(buf, "%08llx-%08llx %c%c%c%c %08lx 00:00 %-10d \n",
+            (unsigned long long) (l->start << PAGE_BITS), (unsigned long long) (l->end << PAGE_BITS),
+            l->flags & P_READ ? 'r' : '-',
+            l->flags & P_WRITE ? 'w' : '-',
+            l->flags & P_EXEC ? 'x' : '-',
+            shared ? 's' : 'p',
+            0ul, 0);
+    proc_printf(buf, "Size:           %8"PRIu64" kB\n", size_kb);
+    proc_printf(buf, "KernelPageSize: %8u kB\n", PAGE_SIZE / 1024);
+    proc_printf(buf, "MMUPageSize:    %8u kB\n", PAGE_SIZE / 1024);
+    static const char *const zero_rows[] = {
+        "Rss:            ", "Pss:            ", "Shared_Clean:   ", "Shared_Dirty:   ",
+        "Private_Clean:  ", "Private_Dirty:  ", "Referenced:     ", "Anonymous:      ",
+        "AnonHugePages:  ", "Swap:           ", "Locked:         ",
+    };
+    for (size_t i = 0; i < sizeof(zero_rows) / sizeof(zero_rows[0]); i++)
+        proc_printf(buf, "%s%8d kB\n", zero_rows[i], 0);
+    // Locked, but with nothing resident, so Locked above is 0 all the same.
+    proc_printf(buf, "VmFlags:%s%s%s%s%s%s\n",
+            l->flags & P_READ ? " rd" : "",
+            l->flags & P_WRITE ? " wr" : "",
+            l->flags & P_EXEC ? " ex" : "",
+            shared ? " sh" : "",
+            l->flags & MEM_LAZY_LOCKED ? " lo" : "",
+            l->flags & MEM_LAZY_LOCKONFAULT ? " lf" : "");
 }
 
 static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollup) {
@@ -1126,6 +1505,8 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
         return;
 
     struct smaps_totals totals = {0};
+    struct smaps_run *runs = NULL;
+    size_t runs_cap = 0;
     page_t rollup_start = 0;
     page_t rollup_end = 0;
     bool any_region = false;
@@ -1135,6 +1516,12 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
     bool count_swapped = swap_enabled();
 
     mem_read_lock_quiesce_aware(mem);
+    // Reservations are regions too, merged in by address as proc_maps_dump
+    // does, so the two files list the same regions.
+    struct mem_lazy_map pending[MEM_LAZY_MAX];
+    unsigned pending_n = collect_pending_reservations(mem, pending);
+    unsigned pending_i = 0;
+    struct maps_mark mark = {0};
     page_t page = 0;
     while (page < mem->page_limit) {
         while (page < mem->page_limit && mem_pt(mem, page) == NULL) {
@@ -1145,16 +1532,28 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
         page_t start = page;
         struct pt_entry *start_pt = mem_pt(mem, start);
         struct data *data = start_pt->data;
-        uint64_t swapped_pages = 0;
+        size_t nruns = 0;
 
         while (page < mem->page_limit) {
             struct pt_entry *pt = mem_pt(mem, page);
-            if (pt == NULL)
+            if (pt == NULL || !maps_region_continues(start_pt, pt, page - start))
                 break;
-            if ((pt->flags & P_RWX) != (start_pt->flags & P_RWX))
-                break;
-            if (!(pt->data == data || (pt->flags & P_ANONYMOUS && start_pt->flags & P_ANONYMOUS)))
-                break;
+            // A new run where the struct data changes. Out of memory for the
+            // array, the page joins the run before it: a worse estimate, not a
+            // wrong region.
+            if (nruns == 0 || runs[nruns - 1].data != pt->data) {
+                if (nruns == runs_cap) {
+                    size_t cap = runs_cap == 0 ? 16 : runs_cap * 2;
+                    struct smaps_run *grown = realloc(runs, cap * sizeof(*runs));
+                    if (grown != NULL) {
+                        runs = grown;
+                        runs_cap = cap;
+                    }
+                }
+                if (nruns < runs_cap)
+                    runs[nruns++] = (struct smaps_run) {.data = pt->data};
+            }
+            struct smaps_run *run = nruns != 0 ? &runs[nruns - 1] : NULL;
             // Counted here, after the three tests that decide the page is part
             // of this region and before the step that can end it, so each page
             // of the region is counted exactly once -- including the page that
@@ -1171,8 +1570,13 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
             // does ask the frame -- two figures for one fact, differing, which
             // is exactly what deriving them from one source is meant to
             // prevent.
-            if (count_swapped && mem_page_is_swapped(pt))
-                swapped_pages++;
+            if (run != NULL) {
+                run->pages++;
+                if (count_swapped && mem_page_is_swapped(pt))
+                    run->swapped++;
+                if (mem_page_is_touched(pt))
+                    run->resident++;
+            }
             page_t prev = page;
             mem_next_page(mem, &page);
             // Same sparse-walk trap as proc_maps_dump; see the comment there.
@@ -1185,6 +1589,12 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
         }
         page_t end = page;
 
+        for (; pending_i < pending_n && pending[pending_i].start < start; pending_i++) {
+            if (!any_region)
+                rollup_start = pending[pending_i].start;
+            any_region = true;
+            proc_smaps_reservation(buf, &pending[pending_i], !rollup);
+        }
         if (!any_region)
             rollup_start = start;
         rollup_end = end;
@@ -1198,12 +1608,23 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
             strncpy(path, data->name, sizeof(path) - 1);
             path[sizeof(path) - 1] = '\0';
         } else if (data->fd != NULL) {
-            generic_getpath(data->fd, path);
+            bool unreachable;
+            generic_getpath_shown(data->fd, path, &unreachable);
+            maps_mark_deleted(data->fd, path, unreachable, &mark);
         }
 
-        proc_smaps_region(buf, start, end, start_pt, data, path, !rollup, swapped_pages, &totals);
+        proc_smaps_region(buf, mem, start, end, start_pt, runs, nruns, path, !rollup,
+                          &totals);
+    }
+    for (; pending_i < pending_n; pending_i++) {
+        if (!any_region)
+            rollup_start = pending[pending_i].start;
+        any_region = true;
+        rollup_end = pending[pending_i].end;
+        proc_smaps_reservation(buf, &pending[pending_i], !rollup);
     }
     mem_read_unlock_quiesce_aware(mem);
+    free(runs);
 
     if (rollup && any_region) {
         proc_printf(buf, "%08llx-%08llx ---p 00000000 00:00 0                          [rollup]\n",
@@ -1217,7 +1638,7 @@ static void proc_smaps_walk(struct task *task, struct proc_data *buf, bool rollu
         proc_printf(buf, "Referenced:     %8"PRIu64" kB\n", totals.rss_kb);
         proc_printf(buf, "Anonymous:      %8"PRIu64" kB\n", totals.anonymous_kb);
         proc_printf(buf, "Swap:           %8"PRIu64" kB\n", totals.swap_kb);
-        proc_printf(buf, "Locked:         %8d kB\n", 0);
+        proc_printf(buf, "Locked:         %8"PRIu64" kB\n", totals.locked_kb);
     }
 
     mm_release(mm);
@@ -1261,10 +1682,16 @@ static ssize_t proc_pid_mem_pread(struct proc_entry *entry, struct proc_data *bu
         proc_put_task(task);
         return _ESRCH;
     }
-    int result = user_read_task_mem(task, &mm->mem, (guest_addr_t)offset, buf->data, buf->size);
+    int result = user_read_task_ptrace_mem(task, &mm->mem, (guest_addr_t)offset, buf->data, buf->size);
     mm_release(mm);
     proc_put_task(task);
-    return result ? -1 : buf->size;
+    // An address the target has not mapped is an I/O error, not a permission
+    // one -- mem_rw's access_remote_vm failure returns -EIO. The bare -1 this
+    // used to return is _EPERM, which reads as "you may not do this at all"
+    // and is what gdb reported when it probed an unmapped address.
+    // MEASURED on x86_64 Linux 6.12: pread of an unmapped address through
+    // /proc/<pid>/task/<tid>/mem gives EIO, at address 0 too.
+    return result ? _EIO : (ssize_t) buf->size;
 }
 
 static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *buf, off_t offset) {
@@ -1286,7 +1713,8 @@ static ssize_t proc_pid_mem_pwrite(struct proc_entry *entry, struct proc_data *b
     int result = user_write_task_ptrace_mem(task, &mm->mem, (guest_addr_t)offset, buf->data, buf->size);
     mm_release(mm);
     proc_put_task(task);
-    return result ? -1 : buf->size;
+    // See the read side: EIO, not the bare -1 that means EPERM.
+    return result ? _EIO : (ssize_t) buf->size;
 }
 
 
@@ -1343,6 +1771,45 @@ static bool proc_pid_fdinfo_readdir(struct proc_entry *entry, unsigned long *ind
     return any_left;
 }
 
+// The text of a /proc/<pid>/{fd/N,cwd,root,exe} link for `fd`. readlink(2)
+// is shown what Linux prints (generic_getpath_shown). A path walk through the
+// link -- open("/proc/self/cwd/f") -- follows this text, where Linux jumps
+// straight to the file (nd_jump_link), so it gets a path that reaches the
+// file (generic_getpath). The two differ only in a lazily unmounted bind,
+// where the shown path is from the bind's own root and walking it would land
+// on whatever that name means in the real root.
+//
+// Then rebased against the CALLING process's chroot root, not the target
+// task's -- readlink of these links is d_path() against current's root on
+// real Linux -- except for a path from a detached bind's root, which no root
+// contains and Linux prints as it is. The shown text and the walked text part
+// ways again outside the root: readlink(2) gets the global path, or a
+// "socket:[N]"-style name, as Linux prints them (fs_rebase_shown_link_path);
+// a walk gets text that cannot reach a different file inside the chroot
+// (fs_rebase_readlink_path).
+//
+// What is shown also says " (deleted)" after a name that no longer reaches the
+// file, as Linux's does; the walked text never does.
+static int proc_pid_link_path(struct proc_entry *entry, struct fd *fd, char *buf) {
+    bool unreachable = false;
+    int err = entry->shown ? generic_getpath_shown(fd, buf, &unreachable)
+                           : generic_getpath(fd, buf);
+    char mark[MAX_PATH + 1] = "";
+    if (err >= 0 && entry->shown && !unreachable) {
+        strcpy(mark, buf);
+        generic_mark_deleted(fd, mark, sizeof(mark));
+    }
+    if (err >= 0 && !unreachable)
+        err = entry->shown ? fs_rebase_shown_link_path(current->fs, buf)
+                           : fs_rebase_readlink_path(current->fs, buf);
+    // After the rebase, which works on the path alone.
+    size_t len = strlen(buf), mark_len = strlen(mark);
+    if (err >= 0 && mark_len > 10 && strcmp(mark + mark_len - 10, " (deleted)") == 0 &&
+            (len < 10 || strcmp(buf + len - 10, " (deleted)") != 0) && len + 10 <= MAX_PATH)
+        strcat(buf, " (deleted)");
+    return err;
+}
+
 static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
     if ((task == NULL) || (task->exiting == true)) {
@@ -1360,12 +1827,10 @@ static int proc_pid_fd_readlink(struct proc_entry *entry, char *buf) {
         fd = fd_retain(fd);
     unlock(&files->lock);
     fdtable_release(files);
-    int err = fd == NULL ? _ENOENT : generic_getpath(fd, buf);
+    int err = fd == NULL ? _ENOENT : proc_pid_link_path(entry, fd, buf);
     if (fd != NULL)
         fd_close(fd);
     proc_put_task(task);
-    if (err >= 0)
-        err = fs_rebase_readlink_path(current->fs, buf);
     return err;
 }
 
@@ -1393,14 +1858,21 @@ static int proc_pid_fdinfo_show(struct proc_entry *entry, struct proc_data *buf)
     fdtable_release(files);
     proc_printf(buf, "pos:\t%lu\n", fd->offset);
     proc_printf(buf, "flags:\t0%o\n", fd_getflags(fd));
-    proc_printf(buf, "mnt_id:\t1\n");
+    // The mount the file is on, by the same ID mountinfo and statx give it.
+    // This was a constant 1, which named whatever mount happened to be first
+    // in the list. Sockets, pipes and the other anonymous inodes are on no
+    // listed mount, as Linux's sockfs and pipefs are not.
+    // fd->mnt_id first: for a file opened through a bind, fd->mount is the
+    // origin the bind aliases, not the mount it was opened on.
+    proc_printf(buf, "mnt_id:\t%d\n", fd->mnt_id != 0 ? fd->mnt_id
+                                   : fd->mount != NULL ? mount_id(fd->mount) : MOUNT_ID_HIDDEN);
     // Real Linux appends a "Pid:" line for pidfds (fs/proc/fd.c's
     // pidfd_show_fdinfo); glibc's pidfd_get_pid() reads exactly this as its
     // fallback when the PIDFD_GET_INFO ioctl isn't supported, and treats a
     // missing line as "not a pidfd" (-ENOTTY). See fd_pidfd_pid's comment.
     pid_t_ pidfd_pid = fd_pidfd_pid(fd);
     if (pidfd_pid != -1)
-        proc_printf(buf, "Pid:\t%d\n", pidfd_pid);
+        proc_printf(buf, "Pid:\t%d\n", current_pid_shown(pidfd_pid));
     fd_close(fd);
     proc_put_task(task);
     return 0;
@@ -1412,7 +1884,10 @@ static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
         proc_put_task(task);
         return _ESRCH;
     }
-    lock(&task->general_lock, 0);
+    if (!task_lock_unless_exiting(task)) {
+        proc_put_task(task);
+        return _ESRCH;
+    }
     struct fd *fd = NULL;
     if (task->mm != NULL && task->mm->exefile != NULL)
         fd = fd_retain(task->mm->exefile);
@@ -1421,19 +1896,14 @@ static int proc_pid_exe_readlink(struct proc_entry *entry, char *buf) {
         proc_put_task(task);
         return _ESRCH;
     }
-    int err = generic_getpath(fd, buf);
+    int err = proc_pid_link_path(entry, fd, buf);
     fd_close(fd);
     proc_put_task(task);
-    // Rebase against the CALLING process's chroot root, not the target
-    // task's -- readlink of /proc/*/{exe,cwd,root,fd/N} is d_path() against
-    // current's root on real Linux (see fs_rebase_readlink_path).
-    if (err >= 0)
-        err = fs_rebase_readlink_path(current->fs, buf);
     return err;
 }
 
 static void proc_pid_task_getname(struct proc_entry *entry, char *buf) {
-    snprintf(buf, 256, "%d", entry->pid);
+    snprintf(buf, 256, "%d", current_pid_shown(entry->pid));
 }
 
 static struct proc_dir_entry proc_pid_task;
@@ -1516,15 +1986,26 @@ struct proc_ns_type {
     unsigned nstype;
 };
 
+// "net" is here because a network namespace can be made (kernel/net_ns.h),
+// and only because of that: systemd's ns_type_supported() reads this file
+// to decide whether to unshare for a PrivateNetwork=yes unit. While it was
+// listed and unshare(CLONE_NEWNET) was ENOSYS, systemd-hostnamed, -localed,
+// shadow and coredump all failed at step NETWORK. The two change together;
+// tests/manual/namespace_errno.c holds them to it.
+//
+// The same goes for every other kind: what is listed here can be made. So
+// there is no "cgroup" and no "time" (nor "time_for_children") -- AOK has
+// neither kind, and a kernel built without them has no file for them. While
+// they were listed, bubblewrap's --unshare-cgroup-try (and so --unshare-all)
+// read ns/cgroup as "supported", asked for CLONE_NEWCGROUP and stopped at
+// "Creating new namespace failed"; systemd's ProtectControlGroups=private
+// reads it the same way.
 static const struct proc_ns_type proc_ns_types[] = {
-    {"cgroup", 4026531835, CLONE_NEWCGROUP_},
     {"ipc", 4026531839, CLONE_NEWIPC_},
     {"mnt", 4026531840, CLONE_NEWNS_},
-    {"net", 4026531956, CLONE_NEWNET_},
+    {"net", 4026531992, CLONE_NEWNET_},
     {"pid", 4026531836, CLONE_NEWPID_},
     {"pid_for_children", 4026531836, CLONE_NEWPID_},
-    {"time", 4026531834, CLONE_NEWTIME_},
-    {"time_for_children", 4026531834, CLONE_NEWTIME_},
     {"user", 4026531837, CLONE_NEWUSER_},
     {"uts", 4026531838, CLONE_NEWUTS_},
 };
@@ -1550,20 +2031,114 @@ static void proc_pid_ns_getname(struct proc_entry *entry, char *buf) {
     snprintf(buf, 256, "%s", proc_ns_types[entry->fd].name);
 }
 
+// The inode number of `task`'s namespace of the kind at `index`. UTS and IPC
+// namespaces are real, and each has its own; for every other kind there is
+// only the initial one, and Linux's number for it. 0 when the task is in
+// do_exit's teardown, which is releasing its namespaces. With `ns_out`, a
+// real namespace is also retained and returned through it (NULL for the
+// other kinds), taken under the same lock as its number so the two agree.
+static unsigned long proc_ns_inode_retain(struct task *task, unsigned index, void **ns_out) {
+    unsigned long inode = proc_ns_types[index].inode;
+    unsigned nstype = proc_ns_types[index].nstype;
+    if (ns_out != NULL)
+        *ns_out = NULL;
+    if (nstype != CLONE_NEWUTS_ && nstype != CLONE_NEWIPC_ && nstype != CLONE_NEWNS_ &&
+            nstype != CLONE_NEWUSER_ && nstype != CLONE_NEWPID_ && nstype != CLONE_NEWNET_)
+        return inode;
+    // Not a plain lock: see task_lock_unless_exiting.
+    if (!task_lock_unless_exiting(task))
+        return 0;
+    if (nstype == CLONE_NEWNS_) {
+        // A task's NULL is the initial namespace, and so is a descriptor's:
+        // only another one is held.
+        inode = mnt_ns_or_init(task->mnt_ns)->inode;
+        if (ns_out != NULL)
+            *ns_out = mnt_ns_retain(task->mnt_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    if (nstype == CLONE_NEWPID_) {
+        // "pid" is the namespace the task is in; "pid_for_children" the one
+        // its next child will be, when an unshare has set one aside.
+        struct pid_namespace *pid_ns = task->pid_ns;
+        if (strcmp(proc_ns_types[index].name, "pid_for_children") == 0 && task->pid_ns_for_children != NULL)
+            pid_ns = task->pid_ns_for_children;
+        if (pid_ns != NULL)
+            inode = pid_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = pid_ns_retain(pid_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    if (nstype == CLONE_NEWNET_) {
+        if (task->net_ns != NULL)
+            inode = task->net_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = net_ns_retain(task->net_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    if (nstype == CLONE_NEWUSER_) {
+        // NULL is the initial one here too, with the number it has always had.
+        if (task->user_ns != NULL)
+            inode = task->user_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = user_ns_retain(task->user_ns);
+        unlock(&task->general_lock);
+        return inode;
+    }
+    inode = 0;
+    if (nstype == CLONE_NEWUTS_ && task->uts_ns != NULL) {
+        inode = task->uts_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = uts_ns_retain(task->uts_ns);
+    }
+    if (nstype == CLONE_NEWIPC_ && task->ipc_ns != NULL) {
+        inode = task->ipc_ns->inode;
+        if (ns_out != NULL)
+            *ns_out = ipc_ns_retain(task->ipc_ns);
+    }
+    unlock(&task->general_lock);
+    return inode;
+}
+
+static unsigned long proc_ns_inode(struct task *task, unsigned index) {
+    return proc_ns_inode_retain(task, index, NULL);
+}
+
+static void proc_ns_release(unsigned index, void *ns) {
+    if (ns == NULL)
+        return;
+    if (proc_ns_types[index].nstype == CLONE_NEWUTS_)
+        uts_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWIPC_)
+        ipc_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWNS_)
+        mnt_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWUSER_)
+        user_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWPID_)
+        pid_ns_release(ns);
+    else if (proc_ns_types[index].nstype == CLONE_NEWNET_)
+        net_ns_release(ns);
+}
+
 static int proc_pid_ns_readlink(struct proc_entry *entry, char *buf) {
     struct task *task = proc_get_task(entry);
     if ((task == NULL) || (task->exiting == true)) {
         proc_put_task(task);
         return _ESRCH;
     }
+    unsigned long inode = proc_ns_inode(task, (unsigned) entry->fd);
     proc_put_task(task);
-    snprintf(buf, MAX_PATH, "%s:[%lu]", proc_ns_types[entry->fd].name, proc_ns_types[entry->fd].inode);
+    if (inode == 0)
+        return _ESRCH;
+    snprintf(buf, MAX_PATH, "%s:[%lu]", proc_ns_types[entry->fd].name, inode);
     return 0;
 }
 
-// A namespace fd does no I/O of its own; it exists to be handed to setns().
-// (Our setns is an ENOSYS stub, which savers like nix tolerate at restore
-// time -- it's the failure to OPEN the fd that they treat as fatal.)
+// A namespace fd does no I/O of its own; it exists to be handed to setns()
+// (kernel/fork.c). Savers like nix treat a failure to OPEN one as fatal.
 // Linux fails reads on an nsfs fd with EINVAL (no read op in nsfs), not
 // EBADF, even though the fd was opened readable.
 static ssize_t proc_ns_read(struct fd *UNUSED(fd), void *UNUSED(buf), size_t UNUSED(bufsize)) {
@@ -1575,9 +2150,10 @@ static ssize_t proc_ns_read(struct fd *UNUSED(fd), void *UNUSED(buf), size_t UNU
 // namespaces by owner. Answering ENOTTY made it give up with "Unsupported
 // ioctl NS_GET_USERNS" and print nothing at all.
 //
-// Every answer below is what Devuan gives for the INITIAL namespaces, which
-// is the situation AOK is permanently in -- one namespace of each kind, owned
-// by root, with no parent anybody may look at. Measured, not assumed:
+// For the INITIAL namespaces every answer below is what Devuan gives -- owned
+// by root, with no parent anybody may look at. A user or pid namespace made
+// since then answers for itself: its own owner, and its parent when the
+// caller may see it. Measured, not assumed:
 //
 //   NS_GET_USERNS     an fd for the owning user namespace; EPERM when asked
 //                     of a user namespace that is its own owner
@@ -1605,7 +2181,16 @@ static ssize_t proc_ns_ioctl_size(int cmd) {
     return 0;
 }
 
-static struct fd *proc_ns_fd_for_index(unsigned index);
+static struct fd *proc_ns_fd_for_index(unsigned index, unsigned long inode, void *ns);
+
+// The first entry of a kind in the table: the one that carries its plain name.
+static unsigned proc_ns_index_of(unsigned nstype) {
+    unsigned index;
+    for (index = 0; index < PROC_NS_TYPES_LEN; index++)
+        if (proc_ns_types[index].nstype == nstype)
+            break;
+    return index;
+}
 
 static int proc_ns_ioctl(struct fd *fd, int cmd, void *arg) {
     unsigned index = fd->nsfs.type_index;
@@ -1618,33 +2203,80 @@ static int proc_ns_ioctl(struct fd *fd, int cmd, void *arg) {
 
         case NS_GET_OWNER_UID_:
             // A user namespace is owned by the uid that created it, and the
-            // initial one is root's. Asking any other kind is EINVAL -- the
-            // question only means something about a user namespace.
+            // initial one is root's: as the caller's user namespace names
+            // that uid. Asking any other kind is EINVAL -- the question only
+            // means something about a user namespace.
             if (nstype != CLONE_NEWUSER_)
                 return _EINVAL;
-            *(uid_t_ *) arg = 0;
+            *(uid_t_ *) arg = current_uid_shown(fd->nsfs.ns != NULL ?
+                    ((struct user_namespace *) fd->nsfs.ns)->owner : 0);
             return 0;
 
-        case NS_GET_PARENT_:
-            // Only user and pid namespaces nest. For the rest the question is
-            // malformed; for these two the parent of the initial namespace is
-            // itself, which the caller is not permitted to be handed.
+        case NS_GET_PARENT_: {
+            // Only user and pid namespaces nest; for the rest the question is
+            // malformed. The parent is handed over only when it is the
+            // caller's own namespace or one inside it: the parent of the
+            // caller's own, and of the initial one, is EPERM.
             if (nstype != CLONE_NEWUSER_ && nstype != CLONE_NEWPID_)
                 return _EINVAL;
-            return _EPERM;
+            if (fd->nsfs.ns == NULL)
+                return _EPERM;
+            unsigned parent_index = proc_ns_index_of(nstype);
+            if (parent_index == PROC_NS_TYPES_LEN)
+                return _EINVAL;
+            unsigned long inode = proc_ns_types[parent_index].inode;
+            void *parent;
+            if (nstype == CLONE_NEWUSER_) {
+                struct user_namespace *up = ((struct user_namespace *) fd->nsfs.ns)->parent;
+                if (!user_ns_in(up, current_user_ns()))
+                    return _EPERM;
+                if (up != NULL)
+                    inode = up->inode;
+                parent = user_ns_retain(up);
+            } else {
+                struct pid_namespace *up = ((struct pid_namespace *) fd->nsfs.ns)->parent;
+                if (!pid_ns_in(up, current_pid_ns()))
+                    return _EPERM;
+                if (up != NULL)
+                    inode = up->inode;
+                parent = pid_ns_retain(up);
+            }
+            struct fd *parent_fd = proc_ns_fd_for_index(parent_index, inode, parent);
+            if (IS_ERR(parent_fd))
+                return PTR_ERR(parent_fd);
+            return f_install(parent_fd, O_CLOEXEC_);
+        }
 
         case NS_GET_USERNS_: {
-            // Everything here is owned by the one user namespace. Asking that
-            // namespace who owns IT walks off the top, which Linux refuses.
-            if (nstype == CLONE_NEWUSER_)
+            // The user namespace that owns this one: the one it was made in,
+            // and for a user namespace its parent. Handed over only when it
+            // is the caller's own user namespace or one inside it; asking
+            // the initial user namespace who owns IT walks off the top.
+            struct user_namespace *owner = NULL;
+            void *ns = fd->nsfs.ns;
+            if (nstype == CLONE_NEWUSER_) {
+                if (ns == NULL)
+                    return _EPERM;
+                owner = ((struct user_namespace *) ns)->parent;
+            } else if (ns != NULL) {
+                if (nstype == CLONE_NEWNS_)
+                    owner = ((struct mnt_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWUTS_)
+                    owner = ((struct uts_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWIPC_)
+                    owner = ((struct ipc_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWPID_)
+                    owner = ((struct pid_namespace *) ns)->user_ns;
+                else if (nstype == CLONE_NEWNET_)
+                    owner = ((struct net_namespace *) ns)->user_ns;
+            }
+            if (!user_ns_in(owner, current_user_ns()))
                 return _EPERM;
-            unsigned user_index;
-            for (user_index = 0; user_index < PROC_NS_TYPES_LEN; user_index++)
-                if (proc_ns_types[user_index].nstype == CLONE_NEWUSER_)
-                    break;
+            unsigned user_index = proc_ns_index_of(CLONE_NEWUSER_);
             if (user_index == PROC_NS_TYPES_LEN)
                 return _EINVAL;
-            struct fd *userns = proc_ns_fd_for_index(user_index);
+            struct fd *userns = proc_ns_fd_for_index(user_index,
+                    owner != NULL ? owner->inode : proc_ns_types[user_index].inode, user_ns_retain(owner));
             if (IS_ERR(userns))
                 return PTR_ERR(userns);
             // A namespace fd handed out by an ioctl is close-on-exec on
@@ -1655,24 +2287,96 @@ static int proc_ns_ioctl(struct fd *fd, int cmd, void *arg) {
     return _ENOTTY;
 }
 
+static int proc_ns_close(struct fd *fd) {
+    proc_ns_release(fd->nsfs.type_index, fd->nsfs.ns);
+    fd->nsfs.ns = NULL;
+    return 0;
+}
+
 static const struct fd_ops proc_ns_fdops = {
     .read = proc_ns_read,
+    .close = proc_ns_close,
     .ioctl_size = proc_ns_ioctl_size,
     .ioctl = proc_ns_ioctl,
     .anon_inode_class = "nsfs",
 };
 
-// One namespace fd, for the kind at `index`. The fd carries nothing but which
-// kind it is: there is exactly one namespace of each, so the kind IS the
-// identity, and its inode number is the one Linux gives the initial namespace.
-static struct fd *proc_ns_fd_for_index(unsigned index) {
+// One namespace fd, for the kind at `index`, whose namespace is numbered
+// `inode`. The fd carries nothing else: the number is what tells two
+// namespaces of a kind apart (stat's st_ino), and the kind is all the nsfs
+// ioctls ask about. `ns` is the reference to a real (UTS or IPC) namespace
+// that setns() installs; the fd takes it over, and it is released even when
+// the fd cannot be made.
+static struct fd *proc_ns_fd_for_index(unsigned index, unsigned long inode, void *ns) {
     struct fd *fd = adhoc_fd_create(&proc_ns_fdops);
-    if (fd == NULL)
+    if (fd == NULL) {
+        proc_ns_release(index, ns);
         return ERR_PTR(_ENOMEM);
+    }
     fd->stat.mode = S_IFREG | 0444;
-    fd->stat.inode = proc_ns_types[index].inode;
+    fd->stat.inode = inode;
     fd->nsfs.type_index = index;
+    fd->nsfs.ns = ns;
     return fd;
+}
+
+bool proc_ns_fd_link(struct fd *fd, char *buf, size_t size) {
+    if (fd->ops != &proc_ns_fdops || fd->nsfs.type_index >= PROC_NS_TYPES_LEN)
+        return false;
+    // Named by the KIND, so pid_for_children's fd reads "pid:", as on Linux:
+    // the first entry of each kind in the table carries its plain name.
+    unsigned nstype = proc_ns_types[fd->nsfs.type_index].nstype;
+    const char *name = proc_ns_types[fd->nsfs.type_index].name;
+    for (unsigned i = 0; i < PROC_NS_TYPES_LEN; i++) {
+        if (proc_ns_types[i].nstype == nstype) {
+            name = proc_ns_types[i].name;
+            break;
+        }
+    }
+    snprintf(buf, size, "%s:[%lu]", name, (unsigned long) fd->stat.inode);
+    return true;
+}
+
+bool proc_ns_fd_is_initial(struct fd *fd) {
+    unsigned nstype;
+    void *ns;
+    if (!proc_ns_fd_info(fd, &nstype, &ns))
+        return false;
+    if (nstype == CLONE_NEWUTS_)
+        return ns == NULL || ns == &init_uts_ns;
+    if (nstype == CLONE_NEWIPC_)
+        return ns == NULL || ns == &init_ipc_ns;
+    if (nstype == CLONE_NEWNS_)
+        return ns == NULL || ns == &init_mnt_ns;
+    if (nstype == CLONE_NEWUSER_ || nstype == CLONE_NEWPID_ || nstype == CLONE_NEWNET_)
+        return ns == NULL;
+    return true;
+}
+
+struct fd *proc_ns_fd_initial(unsigned nstype) {
+    for (unsigned index = 0; index < PROC_NS_TYPES_LEN; index++) {
+        if (proc_ns_types[index].nstype != nstype)
+            continue;
+        void *ns = NULL;
+        unsigned long inode = proc_ns_types[index].inode;
+        if (nstype == CLONE_NEWUTS_) {
+            ns = uts_ns_retain(&init_uts_ns);
+            inode = init_uts_ns.inode;
+        } else if (nstype == CLONE_NEWIPC_) {
+            ns = ipc_ns_retain(&init_ipc_ns);
+            inode = init_ipc_ns.inode;
+        }
+        return proc_ns_fd_for_index(index, inode, ns);
+    }
+    return ERR_PTR(_EINVAL);
+}
+
+bool proc_ns_fd_info(struct fd *fd, unsigned *nstype, void **ns) {
+    if (fd->ops != &proc_ns_fdops || fd->nsfs.type_index >= PROC_NS_TYPES_LEN)
+        return false;
+    *nstype = proc_ns_types[fd->nsfs.type_index].nstype;
+    *ns = fd->nsfs.ns;
+    return true;
 }
 
 // On Linux the /proc/pid/ns/* entries are nsfs magic links: following them
@@ -1691,8 +2395,19 @@ struct fd *proc_ns_open(int pid, const char *name) {
     struct task *task = pid_get_task_ref(pid);
     if (task == NULL)
         return ERR_PTR(_ENOENT);
+    // Linux's proc_ns_get_link asks ptrace_may_access(READ_FSCREDS) before
+    // it hands out a namespace fd -- the thing setns() takes.
+    bool ok = task_ptrace_may_access(task, PTRACE_MODE_READ_ | PTRACE_MODE_FSCREDS_);
+    void *ns = NULL;
+    unsigned long inode = ok ? proc_ns_inode_retain(task, (unsigned) i, &ns) : 0;
     task_ref_cnt_mod(task, -1);
-    return proc_ns_fd_for_index((unsigned) i);
+    if (!ok)
+        return ERR_PTR(_EACCES);
+    // Linux's ns_get_path: a task whose namespaces are already gone has none
+    // to hand out.
+    if (inode == 0)
+        return ERR_PTR(_ENOENT);
+    return proc_ns_fd_for_index((unsigned) i, inode, ns);
 }
 
 static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
@@ -1710,12 +2425,10 @@ static int proc_pid_cwd_readlink(struct proc_entry *entry, char *buf) {
     struct fd *pwd = fs->pwd ? fd_retain(fs->pwd) : NULL;
     unlock(&fs->lock);
     fs_info_release(fs);
-    int err = pwd == NULL ? _ESRCH : generic_getpath(pwd, buf);
+    int err = pwd == NULL ? _ESRCH : proc_pid_link_path(entry, pwd, buf);
     if (pwd != NULL)
         fd_close(pwd);
     proc_put_task(task);
-    if (err >= 0)
-        err = fs_rebase_readlink_path(current->fs, buf);
     return err;
 }
 
@@ -1734,12 +2447,10 @@ static int proc_pid_root_readlink(struct proc_entry *entry, char *buf) {
     struct fd *root = fs->root ? fd_retain(fs->root) : NULL;
     unlock(&fs->lock);
     fs_info_release(fs);
-    int err = root == NULL ? _ESRCH : generic_getpath(root, buf);
+    int err = root == NULL ? _ESRCH : proc_pid_link_path(entry, root, buf);
     if (root != NULL)
         fd_close(root);
     proc_put_task(task);
-    if (err >= 0)
-        err = fs_rebase_readlink_path(current->fs, buf);
     return err;
 }
 
@@ -1885,40 +2596,54 @@ static int proc_pid_attr_update(struct proc_entry *entry, struct proc_data *data
     return 0;
 }
 
+// .ptrace_read marks what only a caller that may inspect the process gets to
+// see: its address space (auxv, environ, maps, mem, smaps), its open files
+// (fd, fdinfo), where it is (cwd, root, exe) and its I/O counters (io). Linux
+// gates exactly these on ptrace_may_access; status, stat and cmdline stay
+// public, with stat's addresses blanked for anyone else (proc_pid_stat_show).
+// Before this, any user could read root's memory map and list and open the
+// files of every process on the system.
 struct proc_children proc_pid_children = PROC_CHILDREN({
     {"attr", S_IFDIR, .readdir = proc_pid_attr_readdir},
     // 0400 like Linux, not the 0444 default.
-    {"auxv", S_IFREG | 0400, .show = proc_pid_auxv_show},
+    {"auxv", S_IFREG | 0400, .show = proc_pid_auxv_show, .ptrace_read = true},
     {"cgroup", .show = proc_pid_cgroup_show},
     {"cmdline", .show = proc_pid_cmdline_show},
     {"comm", .show = proc_pid_comm_show},
-    {"cwd", S_IFLNK, .readlink = proc_pid_cwd_readlink},
+    {"cwd", S_IFLNK, .readlink = proc_pid_cwd_readlink, .ptrace_read = true},
     // 0400 like Linux, not the 0444 default.
-    {"environ", S_IFREG | 0400, .show = proc_pid_environ_show},
-    {"exe", S_IFLNK, .readlink = proc_pid_exe_readlink},
-    {"fd", S_IFDIR, .readdir = proc_pid_fd_readdir},
-    {"fdinfo", S_IFDIR, .readdir = proc_pid_fdinfo_readdir},
-    {"io", .show = proc_pid_io_show},
-    {"maps", .show = proc_pid_maps_show},
+    {"environ", S_IFREG | 0400, .show = proc_pid_environ_show, .ptrace_read = true},
+    {"exe", S_IFLNK, .readlink = proc_pid_exe_readlink, .ptrace_read = true},
+    // 0500 like Linux: listing and searching it is the owner's.
+    {"fd", S_IFDIR | 0500, .readdir = proc_pid_fd_readdir, .ptrace_read = true},
+    {"fdinfo", S_IFDIR, .readdir = proc_pid_fdinfo_readdir, .ptrace_read = true},
+    // 0400 like Linux, not the 0444 default.
+    {"gid_map", S_IFREG | 0644, .show = proc_pid_gid_map_show, .update = proc_pid_gid_map_update},
+    {"io", S_IFREG | 0400, .show = proc_pid_io_show, .ptrace_read = true},
+    {"maps", .show = proc_pid_maps_show, .ptrace_read = true},
     // 0600 like Linux, not the 0444 default: the mode is the first gate, and
     // the credential check in the handlers is the second.
-    {"mem", S_IFREG | 0600, .pread = proc_pid_mem_pread, .pwrite = proc_pid_mem_pwrite},
+    {"mem", S_IFREG | 0600, .pread = proc_pid_mem_pread, .pwrite = proc_pid_mem_pwrite,
+        .ptrace_read = true},
     {"mountinfo", .show = proc_show_mountinfo},
     {"mounts", .show = proc_show_mounts},
-    {"ns", S_IFDIR, .readdir = proc_pid_ns_readdir},
+    // 0511 like Linux: anyone may pass through, only the owner may list.
+    {"ns", S_IFDIR | 0511, .readdir = proc_pid_ns_readdir},
     // 0644, as Linux has it: writing is how a process lowers its own OOM
     // score, and the update handler below has always worked -- only the
     // advertised mode said read-only, so anything that checked before writing
     // gave up without trying.
     {"oom_score_adj", S_IFREG | 0644, .show = proc_pid_oom_score_adj_show, .update = proc_pid_oom_score_adj_update},
-    {"root", S_IFLNK, .readlink = proc_pid_root_readlink},
+    {"root", S_IFLNK, .readlink = proc_pid_root_readlink, .ptrace_read = true},
     {"sched", .show = proc_pid_sched_show},
-    {"smaps", .show = proc_pid_smaps_show},
-    {"smaps_rollup", .show = proc_pid_smaps_rollup_show},
+    {"setgroups", S_IFREG | 0644, .show = proc_pid_setgroups_show, .update = proc_pid_setgroups_update},
+    {"smaps", .show = proc_pid_smaps_show, .ptrace_read = true},
+    {"smaps_rollup", .show = proc_pid_smaps_rollup_show, .ptrace_read = true},
     {"stat", .show = proc_pid_stat_show},
     {"statm", .show = proc_pid_statm_show},
     {"status", .show = proc_pid_status_show},
     {"task", S_IFDIR, .readdir = proc_pid_task_readdir},
+    {"uid_map", S_IFREG | 0644, .show = proc_pid_uid_map_show, .update = proc_pid_uid_map_update},
 });
 
 struct proc_dir_entry proc_pid = {NULL, S_IFDIR,
@@ -1942,7 +2667,7 @@ static struct proc_dir_entry proc_pid_fdinfo_entry = {NULL, S_IFREG,
     .getname = proc_pid_fd_getname, .show = proc_pid_fdinfo_show};
 
 static struct proc_dir_entry proc_pid_ns_entry = {NULL, S_IFLNK,
-    .getname = proc_pid_ns_getname, .readlink = proc_pid_ns_readlink};
+    .getname = proc_pid_ns_getname, .readlink = proc_pid_ns_readlink, .ptrace_read = true};
 
 static struct proc_dir_entry proc_pid_task = {NULL, S_IFDIR,
     .readdir = proc_pid_task_dir_readdir, .getname = proc_pid_task_getname};

@@ -12,10 +12,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "util/timer.h"
 #include "kernel/errno.h"
 #include "kernel/sysvipc.h"
+#include "kernel/ipc_ns.h"
 #include "fs/proc.h"
 #include "kernel/task.h"
 #include "util/list.h"
@@ -75,27 +78,25 @@ struct sem_set {
     cond_t cond;   // any semaphore in the set changed
 };
 
-static struct list sem_sets = LIST_INITIALIZER(sem_sets);
-
-static lock_t sem_lock = LOCK_INITIALIZER;
-static int sem_next_id = 1;
+// The semaphore sets, their lock and the next id are the calling task's IPC
+// namespace's (kernel/ipc_ns.h).
 
 static time_t_ sem_now(void) {
     return (time_t_) time(NULL);
 }
 
-static struct sem_set *sem_find_by_key(dword_t key) {
+static struct sem_set *sem_find_by_key(struct ipc_namespace *ns, dword_t key) {
     struct sem_set *set;
-    list_for_each_entry(&sem_sets, set, slist) {
+    list_for_each_entry(&ns->sem_sets, set, slist) {
         if (!set->removed && set->key == key)
             return set;
     }
     return NULL;
 }
 
-static struct sem_set *sem_find_by_id(int id) {
+static struct sem_set *sem_find_by_id(struct ipc_namespace *ns, int id) {
     struct sem_set *set;
-    list_for_each_entry(&sem_sets, set, slist) {
+    list_for_each_entry(&ns->sem_sets, set, slist) {
         if (!set->removed && set->id == id)
             return set;
     }
@@ -120,29 +121,30 @@ static void sem_set_maybe_free(struct sem_set *set) {
 }
 
 int_t sys_semget_guest(dword_t key, int_t nsems, int_t semflg) {
+    struct ipc_namespace *ns = ipc_ns_current();
     if (nsems < 0 || nsems > SEMMSL_)
         return _EINVAL;
-    lock(&sem_lock, 0);
-    struct sem_set *set = key == IPC_PRIVATE_ ? NULL : sem_find_by_key(key);
+    lock(&ns->sem_lock, 0);
+    struct sem_set *set = key == IPC_PRIVATE_ ? NULL : sem_find_by_key(ns, key);
     if (set != NULL) {
         if ((semflg & IPC_CREAT_) && (semflg & IPC_EXCL_)) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EEXIST;
         }
         if (nsems != 0 && (unsigned) nsems > set->nsems) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EINVAL;
         }
         int id = set->id;
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return id;
     }
     if (!(semflg & IPC_CREAT_) && key != IPC_PRIVATE_) {
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return _ENOENT;
     }
     if (nsems == 0) {
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return _EINVAL;
     }
 
@@ -150,10 +152,10 @@ int_t sys_semget_guest(dword_t key, int_t nsems, int_t semflg) {
     struct sem_entry *sems = set == NULL ? NULL : calloc(nsems, sizeof(*sems));
     if (sems == NULL) {
         free(set);
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return _ENOMEM;
     }
-    set->id = sem_next_id++;
+    set->id = ns->sem_next_id++;
     set->key = key;
     set->uid = set->cuid = current->euid;
     set->gid = set->cgid = current->egid;
@@ -163,9 +165,9 @@ int_t sys_semget_guest(dword_t key, int_t nsems, int_t semflg) {
     set->sems = sems;
     list_init(&set->undos);
     cond_init(&set->cond);
-    list_add_tail(&sem_sets, &set->slist);
+    list_add_tail(&ns->sem_sets, &set->slist);
     int id = set->id;
-    unlock(&sem_lock);
+    unlock(&ns->sem_lock);
     return id;
 }
 
@@ -206,6 +208,7 @@ static_assert(sizeof(struct sembuf_) == 6, "sembuf size");
 // timeout unbounded in exactly the contended case it exists for.
 static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
                           const struct timespec *deadline) {
+    struct ipc_namespace *ns = ipc_ns_current();
     if (nsops == 0)
         return _EINVAL;
     if (nsops > SEMOPM_)
@@ -214,22 +217,22 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
     if (user_read(sops_addr, sops, nsops * sizeof(*sops)))
         return _EFAULT;
 
-    lock(&sem_lock, 0);
-    struct sem_set *set = sem_find_by_id(semid);
+    lock(&ns->sem_lock, 0);
+    struct sem_set *set = sem_find_by_id(ns, semid);
     if (set == NULL) {
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return _EINVAL;
     }
 
     // semop alters the set, so it needs write permission. Without this any uid
     // could operate on another user's private semaphores.
     if (!ipc_access_ok(set->uid, set->gid, set->cuid, set->cgid, set->mode, 2)) {
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return _EACCES;
     }
     for (unsigned i = 0; i < nsops; i++) {
         if (sops[i].sem_num >= set->nsems) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EFBIG;
         }
     }
@@ -246,7 +249,7 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
                     blocked = (int) i; // ERANGE, but treat as hard error
                     for (unsigned j = 0; j < i; j++)
                         set->sems[sops[j].sem_num].val -= sops[j].sem_op;
-                    unlock(&sem_lock);
+                    unlock(&ns->sem_lock);
                     return _ERANGE;
                 }
                 sem->val += op;
@@ -276,7 +279,7 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
             }
             set->otime = sem_now();
             notify(&set->cond);
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return 0;
         }
 
@@ -284,7 +287,7 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
         for (int j = 0; j < blocked; j++)
             set->sems[sops[j].sem_num].val -= sops[j].sem_op;
         if (sops[blocked].sem_flg & IPC_NOWAIT_) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EAGAIN;
         }
         struct sem_entry *bsem = &set->sems[sops[blocked].sem_num];
@@ -300,10 +303,18 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
             if (!timespec_positive(remaining)) {
                 err = _ETIMEDOUT;
             } else {
-                err = wait_for(&set->cond, &sem_lock, &remaining);
+                err = wait_for_blocked(&set->cond, &ns->sem_lock, &remaining);
+                // Out of time -- but the semaphores may have changed just
+                // before it ran out, with this waiter getting the lock back
+                // after. Linux's semop completes a sleeper's operation for it
+                // as it changes the values, so that is a success there. Go
+                // round and look once more: the check above says EAGAIN if
+                // it still cannot proceed.
+                if (err == _ETIMEDOUT)
+                    err = 0;
             }
         } else {
-            err = wait_for(&set->cond, &sem_lock, NULL);
+            err = wait_for_blocked(&set->cond, &ns->sem_lock, NULL);
         }
         set->waiters--;
         if (for_zero)
@@ -312,18 +323,18 @@ static int_t semop_common(int_t semid, guest_addr_t sops_addr, uint_t nsops,
             bsem->ncnt--;
         if (set->removed) {
             sem_set_maybe_free(set);
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EIDRM;
         }
         if (err == _ETIMEDOUT) {
             // The operation never became possible in the time allowed. Linux
             // answers EAGAIN, the same as IPC_NOWAIT would have.
             sem_set_maybe_free(set);
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EAGAIN;
         }
         if (err < 0) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EINTR;
         }
     }
@@ -389,15 +400,16 @@ struct semid64_ds_amd64_ {
 static_assert(sizeof(struct semid64_ds_amd64_) == 104, "amd64 semid64_ds size");
 
 int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
+    struct ipc_namespace *ns = ipc_ns_current();
     int cmd_base = cmd & ~IPC_64_;
 
     if (cmd_base == IPC_INFO_)
         return _EINVAL;
 
-    lock(&sem_lock, 0);
-    struct sem_set *set = sem_find_by_id(semid);
+    lock(&ns->sem_lock, 0);
+    struct sem_set *set = sem_find_by_id(ns, semid);
     if (set == NULL) {
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return _EINVAL;
     }
 
@@ -405,37 +417,37 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
     case IPC_RMID_:
         // Owner or creator only, like Linux.
         if (!ipc_owner_ok(set->uid, set->cuid)) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EPERM;
         }
         set->removed = true;
         notify(&set->cond);
         sem_set_maybe_free(set);
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return 0;
 
     case GETVAL_: case GETPID_: case GETNCNT_: case GETZCNT_: {
         if (semnum < 0 || (unsigned) semnum >= set->nsems) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EINVAL;
         }
         struct sem_entry *sem = &set->sems[semnum];
         int_t result = cmd_base == GETVAL_ ? sem->val :
-                       cmd_base == GETPID_ ? sem->last_pid :
+                       cmd_base == GETPID_ ? current_pid_shown(sem->last_pid) :
                        cmd_base == GETNCNT_ ? (int_t) sem->ncnt : (int_t) sem->zcnt;
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return result;
     }
 
     case SETVAL_: {
         if (semnum < 0 || (unsigned) semnum >= set->nsems) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EINVAL;
         }
         // arg is union semun's int val: the register/low word itself.
         sdword_t val = (sdword_t) arg;
         if (val < 0 || val > SEMVMX_) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _ERANGE;
         }
         set->sems[semnum].val = (word_t) val;
@@ -445,7 +457,7 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             undo->adj[semnum] = 0;
         set->ctime = sem_now();
         notify(&set->cond);
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return 0;
     }
 
@@ -453,24 +465,24 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
         unsigned nsems = set->nsems;
         word_t vals[SEMMSL_ < 4096 ? SEMMSL_ : 4096];
         if (nsems > sizeof(vals) / sizeof(vals[0])) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EINVAL;
         }
         if (cmd_base == GETALL_) {
             for (unsigned i = 0; i < nsems; i++)
                 vals[i] = set->sems[i].val;
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             if (user_write(arg, vals, nsems * sizeof(word_t)))
                 return _EFAULT;
             return 0;
         }
         if (user_read(arg, vals, nsems * sizeof(word_t))) {
-            unlock(&sem_lock);
+            unlock(&ns->sem_lock);
             return _EFAULT;
         }
         for (unsigned i = 0; i < nsems; i++) {
             if (vals[i] > SEMVMX_) {
-                unlock(&sem_lock);
+                unlock(&ns->sem_lock);
                 return _ERANGE;
             }
         }
@@ -481,7 +493,7 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             memset(undo->adj, 0, nsems * sizeof(*undo->adj));
         set->ctime = sem_now();
         notify(&set->cond);
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return 0;
     }
 
@@ -492,23 +504,30 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
         if (task_is_64bit(current)) {
             struct ipc_perm_amd64_ perm;
             if (user_read(arg, &perm, sizeof(perm))) {
-                unlock(&sem_lock);
+                unlock(&ns->sem_lock);
                 return _EFAULT;
             }
             uid = perm.uid; gid = perm.gid; mode = (mode_t_) perm.mode;
         } else {
             struct ipc_perm_i386_ perm;
             if (user_read(arg, &perm, sizeof(perm))) {
-                unlock(&sem_lock);
+                unlock(&ns->sem_lock);
                 return _EFAULT;
             }
             uid = perm.uid; gid = perm.gid; mode = (mode_t_) perm.mode;
+        }
+        // The caller's user namespace's ids; one with no mapping is EINVAL.
+        uid = current_make_kuid(uid);
+        gid = current_make_kgid(gid);
+        if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID) {
+            unlock(&ns->sem_lock);
+            return _EINVAL;
         }
         set->uid = uid;
         set->gid = gid;
         set->mode = mode & 0777;
         set->ctime = sem_now();
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return 0;
     }
 
@@ -518,8 +537,8 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             struct semid64_ds_amd64_ info = {
                 .sem_perm = {
                     .key = set->key,
-                    .uid = set->uid, .gid = set->gid,
-                    .cuid = set->cuid, .cgid = set->cgid,
+                    .uid = current_uid_shown(set->uid), .gid = current_gid_shown(set->gid),
+                    .cuid = current_uid_shown(set->cuid), .cgid = current_gid_shown(set->cgid),
                     .mode = (word_t) set->mode,
                 },
                 .sem_otime = set->otime,
@@ -532,8 +551,8 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             struct semid64_ds_generic_ info = {
                 .sem_perm = {
                     .key = set->key,
-                    .uid = set->uid, .gid = set->gid,
-                    .cuid = set->cuid, .cgid = set->cgid,
+                    .uid = current_uid_shown(set->uid), .gid = current_gid_shown(set->gid),
+                    .cuid = current_uid_shown(set->cuid), .cgid = current_gid_shown(set->cgid),
                     .mode = (word_t) set->mode,
                 },
                 .sem_otime = set->otime,
@@ -546,8 +565,8 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             struct semid64_ds_i386_ info = {
                 .sem_perm = {
                     .key = set->key,
-                    .uid = set->uid, .gid = set->gid,
-                    .cuid = set->cuid, .cgid = set->cgid,
+                    .uid = current_uid_shown(set->uid), .gid = current_gid_shown(set->gid),
+                    .cuid = current_uid_shown(set->cuid), .cgid = current_gid_shown(set->cgid),
                     .mode = set->mode,
                 },
                 .sem_otime = (dword_t) set->otime,
@@ -557,21 +576,22 @@ int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg) {
             if (user_write(arg, &info, sizeof(info)))
                 err = _EFAULT;
         }
-        unlock(&sem_lock);
+        unlock(&ns->sem_lock);
         return err;
     }
     }
 
-    unlock(&sem_lock);
+    unlock(&ns->sem_lock);
     return _EINVAL;
 }
 
-// Applies and drops a thread group's SEM_UNDO adjustments. Called from
-// exit_tgroup() when the last thread of the group exits.
-void sysv_sem_exit(struct tgroup *group) {
-    lock(&sem_lock, 0);
+// Applies and drops a thread group's SEM_UNDO adjustments to the semaphores of
+// `ns`. Called from exit_tgroup() when the last thread of the group exits, and
+// from unshare(CLONE_SYSVSEM or CLONE_NEWIPC).
+void sysv_sem_exit(struct ipc_namespace *ns, struct tgroup *group) {
+    lock(&ns->sem_lock, 0);
     struct sem_set *set, *stmp;
-    list_for_each_entry_safe(&sem_sets, set, stmp, slist) {
+    list_for_each_entry_safe(&ns->sem_sets, set, stmp, slist) {
         struct sem_undo *undo, *utmp;
         bool changed = false;
         list_for_each_entry_safe(&set->undos, undo, utmp, ulist) {
@@ -595,7 +615,7 @@ void sysv_sem_exit(struct tgroup *group) {
         if (changed)
             notify(&set->cond);
     }
-    unlock(&sem_lock);
+    unlock(&ns->sem_lock);
 }
 
 // i386 direct-syscall entry points (semget=393, semtimedop=394; semop has
@@ -616,18 +636,34 @@ int_t sys_semctl(int_t semid, int_t semnum, int_t cmd, addr_t arg) {
 // many semaphore sets existed, which is the one answer that makes the tool
 // useless for finding a leak.
 void proc_sysvipc_show_sem(struct proc_data *buf) {
+    struct ipc_namespace *ns = ipc_ns_current();
     proc_printf(buf, "%10s %10s %-10s %10s %5s %5s %5s %5s %10s %10s\n",
                 "key", "semid", "perms", "nsems", "uid", "gid", "cuid", "cgid",
                 "otime", "ctime");
-    lock(&sem_lock, 0);
+    lock(&ns->sem_lock, 0);
     struct sem_set *set;
-    list_for_each_entry(&sem_sets, set, slist) {
+    list_for_each_entry(&ns->sem_sets, set, slist) {
         if (set->removed)
             continue;
         proc_printf(buf, "%10d %10d %-10o %10u %5u %5u %5u %5u %10lld %10lld\n",
                     (int) set->key, set->id, set->mode & 0777, set->nsems,
-                    set->uid, set->gid, set->cuid, set->cgid,
+                    current_uid_shown(set->uid), current_gid_shown(set->gid),
+                    current_uid_shown(set->cuid), current_gid_shown(set->cgid),
                     (long long) set->otime, (long long) set->ctime);
     }
-    unlock(&sem_lock);
+    unlock(&ns->sem_lock);
+}
+
+// The namespace is going (kernel/ipc_ns.c): every set in it is removed, as
+// IPC_RMID would remove it. Nothing can be blocked on one -- a task in the
+// namespace keeps it alive -- so each is freed here.
+void sem_ns_teardown(struct ipc_namespace *ns) {
+    lock(&ns->sem_lock, 0);
+    struct sem_set *set, *tmp;
+    list_for_each_entry_safe(&ns->sem_sets, set, tmp, slist) {
+        set->removed = true;
+        notify(&set->cond);
+        sem_set_maybe_free(set);
+    }
+    unlock(&ns->sem_lock);
 }

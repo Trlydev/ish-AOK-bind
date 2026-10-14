@@ -17,6 +17,7 @@
 #import "ShortcutActivityBridge.h"
 #import "UserPreferences.h"
 #import "WorkspaceViewController.h"
+#include "fs/virtgpu.h"
 
 TerminalViewController *currentTerminalViewController = NULL;
 
@@ -49,7 +50,7 @@ static UIViewController *CreateRootSelectionViewController(BOOL choosesRootOnSel
         rootsTableViewController.choosesRootOnSelection = choosesRootOnSelection;
         rootsTableViewController.rootSelectionHandler = rootSelectionHandler;
         if (choosesRootOnSelection)
-            rootsTableViewController.title = @"Choose Filesystem";
+            rootsTableViewController.title = NSLocalizedString(@"Choose Filesystem", @"Root picker navigation title");
     }
     return navigationController;
 }
@@ -158,6 +159,13 @@ void ISHWindowShowSessionShell(UIWindow *window) {
         [terminal startNewSession];
 }
 
+void ISHWindowShowWaylandDisplay(UIWindow *window) {
+    if (window == nil)
+        return;
+    [ISHDiagnosticsStore recordBreadcrumb:@"scene.mode.waylandDisplay" details:@{}];
+    ISHWindowTransitionToRoot(window, CreateStandaloneDisplayViewController());
+}
+
 static NSUserActivity *SceneRequestedActivity(UISceneSession *session, UISceneConnectionOptions *connectionOptions) API_AVAILABLE(ios(13.0));
 static NSUserActivity *SceneRequestedActivity(UISceneSession *session, UISceneConnectionOptions *connectionOptions) {
     NSUserActivity *activity = connectionOptions.userActivities.anyObject;
@@ -166,11 +174,68 @@ static NSUserActivity *SceneRequestedActivity(UISceneSession *session, UISceneCo
     return session.stateRestorationActivity;
 }
 
+// ---- Home Screen quick actions (#577) -------------------------------------
+// A long press on the app's icon offers the places iSH-AOK can open, for this
+// once and over whatever Startup Mode is set to. Each is one of the
+// destinations the Shortcuts intent already has (ISHAppShortcuts.swift) and is
+// routed the same way: as that destination's activity, to the scene being
+// connected on a cold start and to the window already there otherwise.
+// Set from code and not Info.plist so that the titles are the app's ordinary
+// localised strings; the list appears once the app has run.
+static NSString *const ISHQuickActionWorkspaceType = @"app.ish.quickaction.workspace";
+static NSString *const ISHQuickActionWaylandType = @"app.ish.quickaction.wayland";
+static NSString *const ISHQuickActionSessionShellType = @"app.ish.quickaction.session-shell";
+static NSString *const ISHQuickActionSystemConsoleType = @"app.ish.quickaction.system-console";
+
+void ISHInstallHomeScreenQuickActions(void) {
+    UIApplicationShortcutItem *(^item)(NSString *, NSString *, NSString *) = ^(NSString *type, NSString *title, NSString *symbol) {
+        return [[UIApplicationShortcutItem alloc] initWithType:type
+                                                localizedTitle:title
+                                             localizedSubtitle:nil
+                                                          icon:[UIApplicationShortcutIcon iconWithSystemImageName:symbol]
+                                                      userInfo:nil];
+    };
+    UIApplication.sharedApplication.shortcutItems = @[
+        item(ISHQuickActionWorkspaceType, NSLocalizedString(@"Workspace", @"Startup Mode option"), @"square.grid.2x2"),
+        item(ISHQuickActionWaylandType, NSLocalizedString(@"Wayland Display", @"Startup Mode option"), @"display"),
+        item(ISHQuickActionSessionShellType, NSLocalizedString(@"Session Shell", @"Home Screen quick action"), @"terminal"),
+        item(ISHQuickActionSystemConsoleType, NSLocalizedString(@"System Console", @"Home Screen quick action"), @"list.bullet.rectangle"),
+    ];
+}
+
+// The destination a quick action stands for; nil for anything else.
+static NSUserActivity *ISHActivityForQuickAction(UIApplicationShortcutItem *item) {
+    NSString *type = item.type;
+    if (type.length == 0)
+        return nil;
+    NSUserActivity *activity = nil;
+    if ([type isEqualToString:ISHQuickActionWorkspaceType]) {
+        activity = [[NSUserActivity alloc] initWithActivityType:ISHSceneActivityTypeWorkspace];
+    } else if ([type isEqualToString:ISHQuickActionWaylandType]) {
+        // The Wayland applet in the Workspace: it opens beside a session that
+        // is already running, which the standalone display of the Startup
+        // Mode cannot.
+        activity = [[NSUserActivity alloc] initWithActivityType:ISHSceneActivityTypeWorkspace];
+        activity.userInfo = @{ISHSceneWorkspaceToolUserInfoKey: @"display"};
+    } else if ([type isEqualToString:ISHQuickActionSessionShellType]) {
+        activity = [[NSUserActivity alloc] initWithActivityType:ISHSceneActivityTypeTerminal];
+        activity.userInfo = @{ISHSceneTerminalDisplayModeUserInfoKey: ISHSceneTerminalDisplayModeSessionShellValue};
+    } else if ([type isEqualToString:ISHQuickActionSystemConsoleType]) {
+        activity = [[NSUserActivity alloc] initWithActivityType:ISHSceneActivityTypeTerminal];
+        activity.userInfo = @{ISHSceneTerminalDisplayModeUserInfoKey: ISHSceneTerminalDisplayModeSystemConsoleValue};
+    }
+    return activity;
+}
+
 static NSUserActivity *SceneEffectiveRequestedActivity(UISceneSession *session, UISceneConnectionOptions *connectionOptions) API_AVAILABLE(ios(13.0));
 static NSUserActivity *SceneEffectiveRequestedActivity(UISceneSession *session, UISceneConnectionOptions *connectionOptions) {
     NSUserActivity *explicitActivity = connectionOptions.userActivities.anyObject;
     if (explicitActivity != nil)
         return explicitActivity;
+    // The app was opened from its Home Screen menu: that choice, this once.
+    NSUserActivity *quickAction = ISHActivityForQuickAction(connectionOptions.shortcutItem);
+    if (quickAction != nil)
+        return quickAction;
 
     if (ISHShouldChooseFilesystemAtStartup())
         return nil;
@@ -299,7 +364,17 @@ static void ConfigureTerminalViewController(SceneDelegate *delegate, TerminalVie
     EnsureSceneWindow(self, scene);
     NSUserActivity *requestedActivity = SceneEffectiveRequestedActivity(session, connectionOptions);
 
-    if ([NSUserDefaults.standardUserDefaults boolForKey:kPreferenceOpenDiagnosticsOnLaunchKey]) {
+    BOOL wantsDiagnostics =
+        [NSUserDefaults.standardUserDefaults boolForKey:kPreferenceOpenDiagnosticsOnLaunchKey];
+    // Recorded either way. "I set Open Diagnostics On Launch and got the shell"
+    // is otherwise unanswerable: the preference is written by the iOS Settings
+    // app and read here, and nothing in between says what this launch actually
+    // saw. A crash during willFinishLaunching (the boot, and the restore) also
+    // means this line is never reached at all -- which is itself the answer,
+    // and shows up as this stage being absent.
+    [ISHDiagnosticsStore recordLaunchStage:@"scene.diagnosticsPreference"
+                                   details:@{@"openDiagnosticsOnLaunch": @(wantsDiagnostics)}];
+    if (wantsDiagnostics) {
         [ISHDiagnosticsStore recordLaunchStage:@"scene.rootController.diagnostics"
                                        details:@{@"session": session.persistentIdentifier ?: @""}];
         self.window.rootViewController = ISHCreateAboutNavigationController(NO, YES);
@@ -349,6 +424,19 @@ static void ConfigureTerminalViewController(SceneDelegate *delegate, TerminalVie
                                              @"session": session.persistentIdentifier ?: @""});
         return;
     }
+
+    // Every root below is one a person is looking at, so every one of them can
+    // be asked which session to resume -- and until one of them is, nothing may
+    // boot. ensureBooted is dispatch_once: an applet or the Wayland display
+    // reaching the guest first would settle the launch as a fresh boot while
+    // the question was still on screen, which is exactly the blank restore that
+    // was reported from Workspace-at-start mode.
+    //
+    // Above this point are the roots that never boot anything (diagnostics,
+    // recovery, the root pickers), and a launch with no scene at all -- a
+    // Shortcut, say -- never reaches here and keeps the old behaviour of
+    // resuming the newest slot unasked.
+    ISHSessionHoldBootUntilResumeChoice();
 
     NSString *activityType = requestedActivity.activityType;
     BOOL wantsWorkspace = [activityType isEqualToString:ISHSceneActivityTypeWorkspace];
@@ -528,6 +616,17 @@ BOOL ISHApplyShortcutActivityToConnectedScene(NSUserActivity *activity) {
     ISHWindowApplyShortcutActivity(self.window, userActivity);
 }
 
+// A Home Screen quick action chosen while the app is already running (a cold
+// start has it in the connection options instead: SceneEffectiveRequestedActivity).
+- (void)windowScene:(UIWindowScene *)windowScene performActionForShortcutItem:(UIApplicationShortcutItem *)shortcutItem completionHandler:(void (^)(BOOL))completionHandler {
+    NSUserActivity *activity = ISHActivityForQuickAction(shortcutItem);
+    [ISHDiagnosticsStore recordBreadcrumb:@"scene.quickAction"
+                                  details:@{@"type": shortcutItem.type ?: @"", @"known": @(activity != nil)}];
+    if (activity != nil && self.window != nil)
+        ISHWindowApplyShortcutActivity(self.window, activity);
+    completionHandler(activity != nil);
+}
+
 - (NSUserActivity *)stateRestorationActivityForScene:(UIScene *)scene {
     UIViewController *rootViewController = self.window.rootViewController;
     // A standalone Wayland Display root isn't a workspace scene: its launch is
@@ -578,6 +677,8 @@ BOOL ISHApplyShortcutActivityToConnectedScene(NSUserActivity *activity) {
 }
 
 - (void)sceneDidBecomeActive:(UIScene *)scene {
+    extern void ISHApplyIdleTimerPreference(void);
+    ISHApplyIdleTimerPreference();
     [ISHDiagnosticsStore recordLaunchStage:@"scene.didBecomeActive"
                                    details:@{@"session": scene.session.persistentIdentifier ?: @""}];
     [ISHDiagnosticsStore recordBreadcrumb:@"scene.didBecomeActive"
@@ -606,6 +707,16 @@ BOOL ISHApplyShortcutActivityToConnectedScene(NSUserActivity *activity) {
     }
 }
 
+// A full-screen Wayland window that is closed ends its desktop: without this
+// it ended only when its view controller was freed, which nothing promises.
+- (void)sceneDidDisconnect:(UIScene *)scene {
+    [ISHDiagnosticsStore recordBreadcrumb:@"scene.didDisconnect"
+                                  details:@{@"session": scene.session.persistentIdentifier ?: @""}];
+    UIViewController *root = self.window.rootViewController;
+    if ([root isKindOfClass:DisplayViewController.class])
+        [(DisplayViewController *) root endSession];
+}
+
 - (void)sceneDidEnterBackground:(UIScene *)scene {
     [ISHDiagnosticsStore recordBreadcrumb:@"scene.didEnterBackground"
                                   details:@{@"session": scene.session.persistentIdentifier ?: @""}];
@@ -617,12 +728,16 @@ BOOL ISHApplyShortcutActivityToConnectedScene(NSUserActivity *activity) {
         if (other.activationState != UISceneActivationStateBackground)
             return;
     }
+    // iOS refuses GPU work from here on, and MoltenVK took a refusal for a
+    // lost GPU: hold the guest's GPU work until a window comes back.
+    virtgpu_set_background(true);
     ISHSuspendGuardEnterBackground();
 }
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {
     [ISHDiagnosticsStore recordBreadcrumb:@"scene.willEnterForeground"
                                   details:@{@"session": scene.session.persistentIdentifier ?: @""}];
+    virtgpu_set_background(false);
     ISHSuspendGuardEnterForeground();
 }
 

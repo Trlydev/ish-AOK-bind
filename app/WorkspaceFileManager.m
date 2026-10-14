@@ -18,6 +18,7 @@ static const CGFloat kFileManagerSidebarWidth = 180.0;
 static const CGFloat kFileManagerSidebarCollapseThreshold = 520.0;
 static const CGFloat kFileManagerToolbarHeight = 44.0;
 static const CGFloat kFileManagerStatusBarHeight = 28.0;
+static const CGFloat kFileManagerSidebarRowHeight = 36.0;
 static const CGFloat kFileManagerDividerThickness = 1.0 / 3.0;  // hairline; UIView doesn't need device-scale awareness here
 
 static NSString *const kFileManagerSortModeDefaultsKey = @"WorkspaceFileManagerSortMode";
@@ -52,7 +53,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     return nil;
 }
 
-@interface WorkspaceFileManagerToolViewController () <UITableViewDataSource, UITableViewDelegate>
+@interface WorkspaceFileManagerToolViewController () <UITableViewDataSource, UITableViewDelegate, WorkspaceTextScalable>
 @end
 
 @implementation WorkspaceFileManagerToolViewController {
@@ -64,6 +65,9 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     UIView *_dividerView;
 
     UIView *_toolbarView;
+    NSLayoutConstraint *_toolbarHeightConstraint;
+    NSLayoutConstraint *_pathScrollHeightConstraint;
+    NSLayoutConstraint *_statusBarHeightConstraint;
     UIButton *_backButton;
     UIButton *_forwardButton;
     UIButton *_upButton;
@@ -95,20 +99,28 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     BOOL _navigationPinned;  // a restore or user action happened; the async default-directory kick must not override it
 
     NSString *_homeDirectoryPath;  // sidebar "Home" target; resolved from /etc/passwd, see -resolveHomeDirectoryPath
+
+    // The file rows' fonts are UIKit's Subtitle-cell defaults; nothing here set
+    // one. These are those defaults, read off a fresh cell, and whether any row
+    // has been given a scaled font since (see -applyTextScaleToFileCell:).
+    UIFont *_fileRowBaseTextFont;
+    UIFont *_fileRowBaseDetailFont;
+    BOOL _fileRowFontsScaled;
 }
 
 // Fixed, non-editable sidebar rows for v1 -- the plan's "user-editable Favorites" is a
 // later-phase nicety; this covers the seed locations that matter today.
 - (NSArray<NSDictionary *> *)sidebarRows {
     return @[
-        @{@"title": @"Home", @"path": _homeDirectoryPath ?: @"/root", @"symbol": @"house"},
+        @{@"title": NSLocalizedString(@"Home", @"File Manager sidebar: home folder"), @"path": _homeDirectoryPath ?: @"/root", @"symbol": @"house"},
         // /AOK itself, not just /AOK/persist: docs, tools, tests, native
         // programs and the other roots all hang off it, and it is the same on
         // every root, so it is the one path a user can always be pointed at.
         @{@"title": @"/AOK", @"path": @"/AOK", @"symbol": @"shippingbox"},
-        @{@"title": @"Persist", @"path": @"/AOK/persist", @"symbol": @"externaldrive"},
+        @{@"title": NSLocalizedString(@"Docs", @"File Manager sidebar: documentation folder"), @"path": @"/AOK/docs", @"symbol": @"book"},
+        @{@"title": NSLocalizedString(@"Persist", @"File Manager sidebar: persistent storage folder"), @"path": @"/AOK/persist", @"symbol": @"externaldrive"},
         @{@"title": @"/tmp", @"path": @"/tmp", @"symbol": @"clock"},
-        @{@"title": @"Root (/)", @"path": @"/", @"symbol": @"internaldrive"},
+        @{@"title": NSLocalizedString(@"Root (/)", @"File Manager sidebar: filesystem root"), @"path": @"/", @"symbol": @"internaldrive"},
     ];
 }
 
@@ -136,7 +148,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"File Manager";
+    self.title = NSLocalizedString(@"File Manager", @"Window title of the File Manager tool");
 
     _backHistory = [NSMutableArray array];
     _forwardHistory = [NSMutableArray array];
@@ -225,17 +237,17 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 // with multi-select.
 - (NSArray<UIKeyCommand *> *)keyCommands {
     UIKeyCommand *up = [UIKeyCommand keyCommandWithInput:UIKeyInputUpArrow modifierFlags:UIKeyModifierCommand action:@selector(navigateUp)];
-    up.discoverabilityTitle = @"Enclosing Folder";
+    up.discoverabilityTitle = NSLocalizedString(@"Enclosing Folder", @"Keyboard shortcut title: go to parent folder");
     UIKeyCommand *back = [UIKeyCommand keyCommandWithInput:@"[" modifierFlags:UIKeyModifierCommand action:@selector(navigateBack)];
-    back.discoverabilityTitle = @"Back";
+    back.discoverabilityTitle = NSLocalizedString(@"Back", @"Keyboard shortcut title: previous folder");
     UIKeyCommand *forward = [UIKeyCommand keyCommandWithInput:@"]" modifierFlags:UIKeyModifierCommand action:@selector(navigateForward)];
-    forward.discoverabilityTitle = @"Forward";
+    forward.discoverabilityTitle = NSLocalizedString(@"Forward", @"Keyboard shortcut title: next folder in history");
     UIKeyCommand *hidden = [UIKeyCommand keyCommandWithInput:@"." modifierFlags:UIKeyModifierCommand | UIKeyModifierShift action:@selector(toggleHiddenFiles)];
-    hidden.discoverabilityTitle = @"Show/Hide Hidden Files";
+    hidden.discoverabilityTitle = NSLocalizedString(@"Show/Hide Hidden Files", @"Keyboard shortcut title");
     UIKeyCommand *refresh = [UIKeyCommand keyCommandWithInput:@"r" modifierFlags:UIKeyModifierCommand action:@selector(reload)];
-    refresh.discoverabilityTitle = @"Refresh";
+    refresh.discoverabilityTitle = NSLocalizedString(@"Refresh", @"Keyboard shortcut title");
     UIKeyCommand *newWindow = [UIKeyCommand keyCommandWithInput:@"n" modifierFlags:UIKeyModifierCommand action:@selector(openNewWindowHere)];
-    newWindow.discoverabilityTitle = @"New File Manager Window";
+    newWindow.discoverabilityTitle = NSLocalizedString(@"New File Manager Window", @"Keyboard shortcut title");
     return @[up, back, forward, hidden, refresh, newWindow];
 }
 
@@ -264,7 +276,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     _sidebarTableView.translatesAutoresizingMaskIntoConstraints = NO;
     _sidebarTableView.dataSource = self;
     _sidebarTableView.delegate = self;
-    _sidebarTableView.rowHeight = 36.0;
+    _sidebarTableView.rowHeight = [self scaledHeight:kFileManagerSidebarRowHeight];
     [_sidebarContainerView addSubview:_sidebarTableView];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -287,13 +299,17 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     [self.toolContentView addSubview:_toolbarView];
 
     _backButton = [self toolbarIconButtonNamed:@"chevron.left" action:@selector(navigateBack)];
-    _backButton.accessibilityLabel = @"Back";
+    _backButton.accessibilityLabel = NSLocalizedString(@"Back", @"Accessibility label for the back button");
+    _backButton.accessibilityHint = NSLocalizedString(@"Navigates to the previously visited folder.", @"Accessibility hint for the back button");
     _forwardButton = [self toolbarIconButtonNamed:@"chevron.right" action:@selector(navigateForward)];
-    _forwardButton.accessibilityLabel = @"Forward";
+    _forwardButton.accessibilityLabel = NSLocalizedString(@"Forward", @"Accessibility label for the forward button");
+    _forwardButton.accessibilityHint = NSLocalizedString(@"Navigates forward in your folder history.", @"Accessibility hint for the forward button");
     _upButton = [self toolbarIconButtonNamed:@"arrow.up" action:@selector(navigateUp)];
-    _upButton.accessibilityLabel = @"Up";
+    _upButton.accessibilityLabel = NSLocalizedString(@"Up", @"Accessibility label for the parent-folder button");
+    _upButton.accessibilityHint = NSLocalizedString(@"Navigates to the parent folder.", @"Accessibility hint for the parent-folder button");
     _moreButton = [self toolbarIconButtonNamed:@"ellipsis.circle" action:nil];
-    _moreButton.accessibilityLabel = @"More Actions";
+    _moreButton.accessibilityLabel = NSLocalizedString(@"More Actions", @"Accessibility label for the overflow menu button");
+    _moreButton.accessibilityHint = NSLocalizedString(@"Shows additional file manager options.", @"Accessibility hint for the overflow menu button");
     _moreButton.showsMenuAsPrimaryAction = YES;
 
     // Finder-style breadcrumb: one button per path component inside a
@@ -313,13 +329,14 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     _pathStack.spacing = 2.0;
     [_pathScrollView addSubview:_pathStack];
 
+    _pathScrollHeightConstraint = [_pathScrollView.heightAnchor constraintEqualToConstant:[self pathScrollHeight]];
     [NSLayoutConstraint activateConstraints:@[
         [_pathStack.leadingAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.leadingAnchor],
         [_pathStack.trailingAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.trailingAnchor],
         [_pathStack.topAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.topAnchor],
         [_pathStack.bottomAnchor constraintEqualToAnchor:_pathScrollView.contentLayoutGuide.bottomAnchor],
         [_pathStack.heightAnchor constraintEqualToAnchor:_pathScrollView.frameLayoutGuide.heightAnchor],
-        [_pathScrollView.heightAnchor constraintEqualToConstant:kFileManagerToolbarHeight - 12.0],
+        _pathScrollHeightConstraint,
     ]];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[_backButton, _forwardButton, _upButton, _pathScrollView, _moreButton]];
@@ -362,16 +379,20 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         if (i > 0) {
             UILabel *separator = [UILabel new];
             separator.text = @"›";
-            separator.font = [UIFont systemFontOfSize:12.0];
+            separator.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:12.0]];
             separator.textColor = theme[@"secondary"];
             [_pathStack addArrangedSubview:separator];
         }
         UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-        button.titleLabel.font = [UIFont systemFontOfSize:13.0 weight:(isLast ? UIFontWeightSemibold : UIFontWeightRegular)];
+        button.titleLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:13.0]
+                                                   weight:(isLast ? UIFontWeightSemibold : UIFontWeightRegular)];
         [button setTitle:titles[i] forState:UIControlStateNormal];
+        if ([titles[i] isEqualToString:@"/"]) {
+            button.accessibilityLabel = NSLocalizedString(@"Root Directory", @"Accessibility label for the root directory breadcrumb");
+        }
         [button setTitleColor:(isLast ? theme[@"primary"] : theme[@"accent"]) forState:UIControlStateNormal];
         button.enabled = !isLast;  // the current location isn't a link anywhere
-        button.accessibilityHint = isLast ? nil : @"Go to this folder";
+        button.accessibilityHint = isLast ? nil : NSLocalizedString(@"Go to this folder", @"Accessibility hint for a breadcrumb path button");
         NSString *targetPath = prefixes[i];
         __weak typeof(self) weakSelf = self;
         [button addAction:[UIAction actionWithHandler:^(UIAction *action) {
@@ -413,7 +434,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
     _statusLabel = [UILabel new];
     _statusLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    _statusLabel.font = [UIFont systemFontOfSize:11.0];
+    _statusLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:11.0]];
     [_statusBarView addSubview:_statusLabel];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -431,6 +452,8 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 - (void)activateRegionConstraints {
     UIView *content = self.toolContentView;
     _sidebarWidthConstraint = [_sidebarContainerView.widthAnchor constraintEqualToConstant:kFileManagerSidebarWidth];
+    _toolbarHeightConstraint = [_toolbarView.heightAnchor constraintEqualToConstant:[self pathScrollHeight] + 12.0];
+    _statusBarHeightConstraint = [_statusBarView.heightAnchor constraintEqualToConstant:[self scaledHeight:kFileManagerStatusBarHeight]];
     [NSLayoutConstraint activateConstraints:@[
         [_sidebarContainerView.topAnchor constraintEqualToAnchor:content.topAnchor],
         [_sidebarContainerView.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
@@ -445,7 +468,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         [_toolbarView.topAnchor constraintEqualToAnchor:content.topAnchor],
         [_toolbarView.leadingAnchor constraintEqualToAnchor:_dividerView.trailingAnchor],
         [_toolbarView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
-        [_toolbarView.heightAnchor constraintEqualToConstant:kFileManagerToolbarHeight],
+        _toolbarHeightConstraint,
 
         [_tableView.topAnchor constraintEqualToAnchor:_toolbarView.bottomAnchor],
         [_tableView.leadingAnchor constraintEqualToAnchor:_dividerView.trailingAnchor],
@@ -455,8 +478,65 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         [_statusBarView.leadingAnchor constraintEqualToAnchor:_dividerView.trailingAnchor],
         [_statusBarView.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
         [_statusBarView.bottomAnchor constraintEqualToAnchor:content.bottomAnchor],
-        [_statusBarView.heightAnchor constraintEqualToConstant:kFileManagerStatusBarHeight],
+        _statusBarHeightConstraint,
     ]];
+}
+
+#pragma mark WorkspaceTextScalable
+
+// Cmd+= / Cmd+- / Cmd+0. What scales is what a person reads: file names and
+// their size/date line, the sidebar's place names, the breadcrumb path and the
+// status line. The toolbar's icon buttons, the row icons and the sidebar's
+// width stay as they are. Each font below is built from its unscaled size
+// wherever the view already builds it -- the breadcrumb and the empty state on
+// every rebuild, the cells on every dequeue -- so a theme change or a reload
+// keeps the scale rather than compounding it.
+- (void)workspaceApplyTextScale {
+    [super workspaceApplyTextScale];
+    // The base class can call this before -viewDidLoad here has built anything.
+    if (_toolbarView == nil)
+        return;
+    if (fabs(self.workspaceTextScale - 1.0) > 0.001)
+        _fileRowFontsScaled = YES;
+    _sidebarTableView.rowHeight = [self scaledHeight:kFileManagerSidebarRowHeight];
+    _pathScrollHeightConstraint.constant = [self pathScrollHeight];
+    _toolbarHeightConstraint.constant = [self pathScrollHeight] + 12.0;
+    _statusBarHeightConstraint.constant = [self scaledHeight:kFileManagerStatusBarHeight];
+    _statusLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:11.0]];
+    [self rebuildBreadcrumb];
+    [_tableView reloadData];
+    [_sidebarTableView reloadData];
+    [self updateEmptyState];
+}
+
+// Whole points, and exactly `height` at scale 1.0.
+- (CGFloat)scaledHeight:(CGFloat)height {
+    return ceil(height * self.workspaceTextScale);
+}
+
+// The breadcrumb grows with its text, and the toolbar with it. Neither shrinks
+// below its default: the back/forward/up buttons beside the path do not scale,
+// and a smaller bar would crowd them.
+- (CGFloat)pathScrollHeight {
+    CGFloat unscaled = kFileManagerToolbarHeight - 12.0;
+    return MAX(unscaled, [self scaledHeight:unscaled]);
+}
+
+// `font` at this window's text scale; `font` itself at 1.0.
+- (UIFont *)scaledFont:(UIFont *)font {
+    CGFloat size = [self workspaceScaledFontSize:font.pointSize];
+    return size == font.pointSize ? font : [font fontWithSize:size];
+}
+
+// Until the text is first scaled a file row keeps UIKit's own fonts, untouched.
+// After that every row is given one, even back at 1.0, because a dequeued cell
+// still carries whatever font its last row had.
+- (void)applyTextScaleToFileCell:(UITableViewCell *)cell {
+    if (!_fileRowFontsScaled || _fileRowBaseTextFont == nil)
+        return;
+    cell.textLabel.font = [self scaledFont:_fileRowBaseTextFont];
+    if (_fileRowBaseDetailFont != nil)
+        cell.detailTextLabel.font = [self scaledFont:_fileRowBaseDetailFont];
 }
 
 #pragma mark Theme
@@ -670,21 +750,21 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     label.textAlignment = NSTextAlignmentCenter;
     label.numberOfLines = 0;
     label.textColor = self.workspaceTheme[@"secondary"] ?: UIColor.secondaryLabelColor;
-    label.font = [UIFont systemFontOfSize:15.0];
+    label.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:15.0]];
     if (_loadError != nil)
-        label.text = _loadError.localizedDescription.length ? _loadError.localizedDescription : @"Couldn’t load this folder.";
+        label.text = _loadError.localizedDescription.length ? _loadError.localizedDescription : NSLocalizedString(@"Couldn’t load this folder.", @"File Manager empty-state text when listing failed");
     else if (![ISHGuestFileBridge.sharedBridge isGuestAvailable])
-        label.text = @"The guest filesystem isn’t ready yet.";
+        label.text = NSLocalizedString(@"The guest filesystem isn’t ready yet.", @"File Manager empty-state text");
     else
-        label.text = @"This folder is empty.";
+        label.text = NSLocalizedString(@"This folder is empty.", @"File Manager empty-state text");
     _tableView.backgroundView = label;
 }
 
 - (void)updateStatusLabel {
-    NSString *countText = _items.count == 1 ? @"1 item" : [NSString stringWithFormat:@"%lu items", (unsigned long)_items.count];
+    NSString *countText = _items.count == 1 ? NSLocalizedString(@"1 item", @"File Manager status bar item count") : [NSString stringWithFormat:NSLocalizedString(@"%lu items", @"File Manager status bar item count"), (unsigned long)_items.count];
     // 0 means "the filesystem reports no figure" (proc, devpts), not "full".
     if (_availableBytes > 0)
-        countText = [countText stringByAppendingFormat:@" · %@ available", [self formattedSize:(unsigned long long)_availableBytes]];
+        countText = [NSString stringWithFormat:NSLocalizedString(@"%@ · %@ available", @"File Manager status bar: item count, then free space"), countText, [self formattedSize:(unsigned long long)_availableBytes]];
     _statusLabel.text = countText;
 }
 
@@ -706,7 +786,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:kFileManagerSidebarCellReuseID];
     NSDictionary *row = [self sidebarRows][(NSUInteger)indexPath.row];
     cell.textLabel.text = row[@"title"];
-    cell.textLabel.font = [UIFont systemFontOfSize:13.0];
+    cell.textLabel.font = [UIFont systemFontOfSize:[self workspaceScaledFontSize:13.0]];
     cell.textLabel.textColor = self.workspaceTheme[@"primary"];
     cell.imageView.image = [UIImage systemImageNamed:row[@"symbol"]];
     cell.imageView.tintColor = self.workspaceTheme[@"accent"];
@@ -717,8 +797,16 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
 - (UITableViewCell *)fileCellForRowAtIndexPath:(NSIndexPath *)indexPath inTableView:(UITableView *)tableView {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:kFileManagerCellReuseID];
-    if (cell == nil)
+    if (cell == nil) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:kFileManagerCellReuseID];
+        // A new cell has had nothing set on it, so its fonts are the defaults
+        // the text scale multiplies.
+        if (_fileRowBaseTextFont == nil) {
+            _fileRowBaseTextFont = cell.textLabel.font;
+            _fileRowBaseDetailFont = cell.detailTextLabel.font;
+        }
+    }
+    [self applyTextScaleToFileCell:cell];
     if ((NSUInteger)indexPath.row >= _items.count)
         return cell;
 
@@ -775,7 +863,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     __weak typeof(self) weakSelf = self;
 
     if ([self itemIsOpenable:item]) {
-        [actions addObject:[UIAction actionWithTitle:@"Open" image:[UIImage systemImageNamed:@"arrow.up.forward.square"]
+        [actions addObject:[UIAction actionWithTitle:NSLocalizedString(@"Open", @"File context menu action") image:[UIImage systemImageNamed:@"arrow.up.forward.square"]
                                            identifier:nil handler:^(UIAction *action) {
             typeof(self) strongSelf = weakSelf;
             if (strongSelf == nil) return;
@@ -784,26 +872,26 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
         }]];
     }
     if (item.kind == ISHGuestFileKindRegular) {
-        [actions addObject:[UIAction actionWithTitle:@"Duplicate" image:[UIImage systemImageNamed:@"plus.square.on.square"]
+        [actions addObject:[UIAction actionWithTitle:NSLocalizedString(@"Duplicate", @"File context menu action") image:[UIImage systemImageNamed:@"plus.square.on.square"]
                                            identifier:nil handler:^(UIAction *action) {
             [weakSelf duplicateItem:item];
         }]];
     }
     if (item.kind == ISHGuestFileKindDirectory) {
-        [actions addObject:[UIAction actionWithTitle:@"Add Folder to Music" image:[UIImage systemImageNamed:@"music.note.list"]
+        [actions addObject:[UIAction actionWithTitle:NSLocalizedString(@"Add Folder to Music", @"Folder context menu action: queue its audio files") image:[UIImage systemImageNamed:@"music.note.list"]
                                            identifier:nil handler:^(UIAction *action) {
             [weakSelf addFolderToMusic:item];
         }]];
     }
-    [actions addObject:[UIAction actionWithTitle:@"Rename…" image:[UIImage systemImageNamed:@"pencil"]
+    [actions addObject:[UIAction actionWithTitle:NSLocalizedString(@"Rename…", @"File context menu action") image:[UIImage systemImageNamed:@"pencil"]
                                        identifier:nil handler:^(UIAction *action) {
         [weakSelf promptRenameItem:item];
     }]];
-    [actions addObject:[UIAction actionWithTitle:@"Get Info" image:[UIImage systemImageNamed:@"info.circle"]
+    [actions addObject:[UIAction actionWithTitle:NSLocalizedString(@"Get Info", @"File context menu action") image:[UIImage systemImageNamed:@"info.circle"]
                                        identifier:nil handler:^(UIAction *action) {
         [weakSelf presentInfoForItem:item];
     }]];
-    UIAction *deleteAction = [UIAction actionWithTitle:@"Delete" image:[UIImage systemImageNamed:@"trash"]
+    UIAction *deleteAction = [UIAction actionWithTitle:NSLocalizedString(@"Delete", @"File context menu action") image:[UIImage systemImageNamed:@"trash"]
                                              identifier:nil handler:^(UIAction *action) {
         [weakSelf confirmDeleteItem:item];
     }];
@@ -819,7 +907,7 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
     ISHGuestFileItem *item = _items[(NSUInteger)indexPath.row];
     __weak typeof(self) weakSelf = self;
     UIContextualAction *delete = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
-                                                                          title:@"Delete"
+                                                                          title:NSLocalizedString(@"Delete", @"Swipe action that deletes a file")
                                                                         handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
         [weakSelf confirmDeleteItem:item];
         completionHandler(YES);  // dismiss the swipe row now; the confirm alert handles the actual delete
@@ -855,9 +943,9 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
 - (nullable NSString *)subtitleForItem:(ISHGuestFileItem *)item {
     if (item.isBrokenSymlink)
-        return [NSString stringWithFormat:@"Broken alias → %@", item.symlinkTarget];
+        return [NSString stringWithFormat:NSLocalizedString(@"Broken alias → %@", @"File list subtitle; %@ is the missing link target"), item.symlinkTarget];
     if (item.kind == ISHGuestFileKindDirectory)
-        return item.isSymlink ? [NSString stringWithFormat:@"Alias → %@", item.symlinkTarget] : nil;
+        return item.isSymlink ? [NSString stringWithFormat:NSLocalizedString(@"Alias → %@", @"File list subtitle; %@ is the link target"), item.symlinkTarget] : nil;
     NSString *size = [self formattedSize:item.size];
     NSString *date = item.modificationDate ? [self formattedDate:item.modificationDate] : nil;
     return date ? [NSString stringWithFormat:@"%@ · %@", size, date] : size;
@@ -886,14 +974,14 @@ static NSString *ISHHomeDirectoryForUID(NSData *passwdData, uid_t targetUID) {
 
 - (NSString *)kindDisplayNameForItem:(ISHGuestFileItem *)item {
     switch (item.kind) {
-        case ISHGuestFileKindDirectory: return @"Folder";
-        case ISHGuestFileKindRegular: return @"File";
-        case ISHGuestFileKindSymlink: return @"Broken Alias";
-        case ISHGuestFileKindFIFO: return @"Named Pipe";
-        case ISHGuestFileKindSocket: return @"Socket";
-        case ISHGuestFileKindCharDevice: return @"Character Device";
-        case ISHGuestFileKindBlockDevice: return @"Block Device";
-        case ISHGuestFileKindOther: default: return @"Item";
+        case ISHGuestFileKindDirectory: return NSLocalizedString(@"Folder", @"File kind");
+        case ISHGuestFileKindRegular: return NSLocalizedString(@"File", @"File kind: regular file");
+        case ISHGuestFileKindSymlink: return NSLocalizedString(@"Broken Alias", @"File kind: symbolic link whose target is missing");
+        case ISHGuestFileKindFIFO: return NSLocalizedString(@"Named Pipe", @"File kind: FIFO");
+        case ISHGuestFileKindSocket: return NSLocalizedString(@"Socket", @"File kind: Unix socket");
+        case ISHGuestFileKindCharDevice: return NSLocalizedString(@"Character Device", @"File kind");
+        case ISHGuestFileKindBlockDevice: return NSLocalizedString(@"Block Device", @"File kind");
+        case ISHGuestFileKindOther: default: return NSLocalizedString(@"Item", @"File kind: unknown type");
     }
 }
 
@@ -921,8 +1009,14 @@ static NSSet<NSString *> *ISHFileManagerMarkdownExtensions(void) {
 
 // Matches WorkspaceImageViewer.m's ISHImageViewerSupportedExtensions() --
 // deliberately excludes svg (not rasterizable by the ImageIO decode path the
-// viewer uses) and stays routed to nil until the Browser applet is wired for
-// file-open.
+// viewer uses); svg goes to the Browser instead.
+static NSSet<NSString *> *ISHFileManagerBrowserExtensions(void) {
+    static NSSet<NSString *> *set;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ set = [NSSet setWithArray:@[@"html", @"htm", @"xhtml", @"svg", @"pdf"]]; });
+    return set;
+}
+
 static NSSet<NSString *> *ISHFileManagerImageExtensions(void) {
     static NSSet<NSString *> *set;
     static dispatch_once_t once;
@@ -937,11 +1031,12 @@ static NSSet<NSString *> *ISHFileManagerImageExtensions(void) {
 // reports), but the file manager still needs a list to decide whether a tap
 // should open the player at all -- includes containers AVFoundation may not
 // actually support (mkv/webm) so those get a real in-player error instead of
-// a flat "no viewer" from here.
+// a flat "no viewer" from here. m3u and m3u8 are playlists, which the player
+// reads and lists.
 static NSSet<NSString *> *ISHFileManagerVideoExtensions(void) {
     static NSSet<NSString *> *set;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ set = [NSSet setWithArray:@[@"mp4", @"mov", @"m4v", @"avi", @"mkv", @"webm"]]; });
+    dispatch_once(&once, ^{ set = [NSSet setWithArray:@[@"mp4", @"mov", @"m4v", @"avi", @"mkv", @"webm", @"m3u", @"m3u8"]]; });
     return set;
 }
 
@@ -965,13 +1060,11 @@ static NSSet<NSString *> *ISHFileManagerKnownBinaryExtensions(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         set = [NSSet setWithArray:@[
-            @"svg",
             @"zip", @"tar", @"gz", @"bz2", @"xz", @"7z", @"rar",
-            @"pdf", @"doc", @"docx", @"xls", @"xlsx", @"ppt", @"pptx",
+            @"doc", @"docx", @"xls", @"xlsx", @"ppt", @"pptx",
             @"so", @"dylib", @"dll", @"exe", @"o", @"a", @"bin",
             @"db", @"sqlite", @"sqlite3",
             @"ttf", @"otf", @"woff", @"woff2",
-            @"html", @"htm",
         ]];
     });
     return set;
@@ -994,6 +1087,11 @@ static NSSet<NSString *> *ISHFileManagerKnownBinaryExtensions(void) {
     }
     if (ext.length > 0 && [ISHFileManagerVideoExtensions() containsObject:ext]) {
         completion(@"videoplayer");
+        return;
+    }
+    // Web pages, SVG and PDF: WebKit renders all three.
+    if (ext.length > 0 && [ISHFileManagerBrowserExtensions() containsObject:ext]) {
+        completion(@"browser");
         return;
     }
     if ([ISHAudioLibrary isSupportedAudioFileName:item.name]) {
@@ -1044,8 +1142,8 @@ static NSString *ISHShellQuotedPath(NSString *path) {
         typeof(self) strongSelf = weakSelf;
         if (strongSelf == nil) return;
         if (toolIdentifier == nil) {
-            [strongSelf presentSimpleAlertWithTitle:@"Can’t Open"
-                                             message:[NSString stringWithFormat:@"There’s no app to open “%@” yet.", item.name]];
+            [strongSelf presentSimpleAlertWithTitle:NSLocalizedString(@"Can’t Open", @"Alert title when no viewer handles a file")
+                                             message:[NSString stringWithFormat:NSLocalizedString(@"There’s no app to open “%@” yet.", @"Alert message; %@ is the file name"), item.name]];
             return;
         }
         [strongSelf.workspaceHostViewController openWorkspaceToolWithIdentifier:toolIdentifier fileGuestPath:item.guestPath];
@@ -1062,21 +1160,21 @@ static NSString *ISHShellQuotedPath(NSString *path) {
 }
 
 - (void)promptNewFolder {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"New Folder" message:nil
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"New Folder", @"Alert title when creating a folder") message:nil
                                                               preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-        textField.text = @"untitled folder";
-        textField.placeholder = @"Name";
+        textField.text = NSLocalizedString(@"untitled folder", @"Default name for a new folder");
+        textField.placeholder = NSLocalizedString(@"Name", @"Placeholder for a file name field");
     }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"Alert button") style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) weakSelf = self;
     __weak UIAlertController *weakAlert = alert;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Create" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Create", @"Alert button that creates a new folder") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         typeof(self) strongSelf = weakSelf;
         if (strongSelf == nil) return;
         NSString *name = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
         if (![strongSelf validateItemName:name]) {
-            [strongSelf presentSimpleAlertWithTitle:@"Invalid Name" message:@"That name isn’t valid."];
+            [strongSelf presentSimpleAlertWithTitle:NSLocalizedString(@"Invalid Name", @"Alert title") message:NSLocalizedString(@"That name isn’t valid.", @"Alert message for an invalid file name")];
             return;
         }
         NSString *path = [strongSelf->_currentPath stringByAppendingPathComponent:name];
@@ -1084,7 +1182,7 @@ static NSString *ISHShellQuotedPath(NSString *path) {
             typeof(self) strongSelf2 = weakSelf;
             if (strongSelf2 == nil) return;
             if (!ok) {
-                [strongSelf2 presentSimpleAlertWithTitle:@"Couldn’t Create Folder" message:error.localizedDescription];
+                [strongSelf2 presentSimpleAlertWithTitle:NSLocalizedString(@"Couldn’t Create Folder", @"Error alert title") message:error.localizedDescription];
                 return;
             }
             [strongSelf2 reload];
@@ -1094,16 +1192,16 @@ static NSString *ISHShellQuotedPath(NSString *path) {
 }
 
 - (void)promptRenameItem:(ISHGuestFileItem *)item {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Rename" message:nil
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Rename", @"Alert title when renaming a file") message:nil
                                                               preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.text = item.name;
-        textField.placeholder = @"Name";
+        textField.placeholder = NSLocalizedString(@"Name", @"Placeholder for a file name field");
     }];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"Alert button") style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) weakSelf = self;
     __weak UIAlertController *weakAlert = alert;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Rename" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Rename", @"Alert button that renames a file") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         typeof(self) strongSelf = weakSelf;
         if (strongSelf == nil) return;
         NSString *newName = [weakAlert.textFields.firstObject.text stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
@@ -1115,7 +1213,7 @@ static NSString *ISHShellQuotedPath(NSString *path) {
             typeof(self) strongSelf2 = weakSelf;
             if (strongSelf2 == nil) return;
             if (!ok) {
-                [strongSelf2 presentSimpleAlertWithTitle:@"Couldn’t Rename" message:error.localizedDescription];
+                [strongSelf2 presentSimpleAlertWithTitle:NSLocalizedString(@"Couldn’t Rename", @"Error alert title") message:error.localizedDescription];
                 return;
             }
             [strongSelf2 reload];
@@ -1128,11 +1226,11 @@ static NSString *ISHShellQuotedPath(NSString *path) {
     NSString *base = item.name.stringByDeletingPathExtension;
     NSString *ext = item.name.pathExtension;
     NSSet<NSString *> *existingNames = [NSSet setWithArray:[_allItems valueForKey:@"name"]];
-    NSString *candidate = ext.length ? [[base stringByAppendingString:@" copy"] stringByAppendingPathExtension:ext]
-                                      : [base stringByAppendingString:@" copy"];
+    NSString *candidate = ext.length ? [[NSString stringWithFormat:NSLocalizedString(@"%@ copy", @"Name of a duplicated file; %@ is the original name"), base] stringByAppendingPathExtension:ext]
+                                      : [NSString stringWithFormat:NSLocalizedString(@"%@ copy", @"Name of a duplicated file; %@ is the original name"), base];
     NSUInteger suffix = 2;
     while ([existingNames containsObject:candidate]) {
-        NSString *stem = [NSString stringWithFormat:@"%@ copy %lu", base, (unsigned long)suffix];
+        NSString *stem = [NSString stringWithFormat:NSLocalizedString(@"%@ copy %lu", @"Name of a duplicated file; %@ is the original name, %lu the copy number"), base, (unsigned long)suffix];
         candidate = ext.length ? [stem stringByAppendingPathExtension:ext] : stem;
         suffix++;
     }
@@ -1141,7 +1239,7 @@ static NSString *ISHShellQuotedPath(NSString *path) {
 
 - (void)duplicateItem:(ISHGuestFileItem *)item {
     if (item.kind != ISHGuestFileKindRegular) {
-        [self presentSimpleAlertWithTitle:@"Can’t Duplicate" message:@"Duplicating folders isn’t supported yet."];
+        [self presentSimpleAlertWithTitle:NSLocalizedString(@"Can’t Duplicate", @"Alert title") message:NSLocalizedString(@"Duplicating folders isn’t supported yet.", @"Alert message")];
         return;
     }
     NSString *destinationPath = [_currentPath stringByAppendingPathComponent:[self uniqueDuplicateNameForItem:item]];
@@ -1151,7 +1249,7 @@ static NSString *ISHShellQuotedPath(NSString *path) {
         typeof(self) strongSelf = weakSelf;
         if (strongSelf == nil) return;
         if (!ok) {
-            [strongSelf presentSimpleAlertWithTitle:@"Couldn’t Duplicate" message:error.localizedDescription];
+            [strongSelf presentSimpleAlertWithTitle:NSLocalizedString(@"Couldn’t Duplicate", @"Error alert title") message:error.localizedDescription];
             return;
         }
         [strongSelf reload];
@@ -1170,14 +1268,16 @@ static NSString *ISHShellQuotedPath(NSString *path) {
             typeof(self) strongSelf = weakSelf;
             if (strongSelf == nil) return;
             if (tracks.count == 0) {
-                [strongSelf presentSimpleAlertWithTitle:@"No Audio Found"
-                                                 message:[NSString stringWithFormat:@"“%@” doesn’t contain any supported audio files.", item.name]];
+                [strongSelf presentSimpleAlertWithTitle:NSLocalizedString(@"No Audio Found", @"Alert title")
+                                                 message:[NSString stringWithFormat:NSLocalizedString(@"“%@” doesn’t contain any supported audio files.", @"Alert message; %@ is the folder name"), item.name]];
                 return;
             }
             [ISHAudioPlayerEngine.sharedEngine enqueueTracks:tracks];
-            [strongSelf presentSimpleAlertWithTitle:@"Added to Music"
-                                             message:[NSString stringWithFormat:@"Added %lu track%@ to the Music queue.",
-                                                       (unsigned long)tracks.count, tracks.count == 1 ? @"" : @"s"]];
+            [strongSelf presentSimpleAlertWithTitle:NSLocalizedString(@"Added to Music", @"Alert title after queueing audio files")
+                                             message:(tracks.count == 1
+                                                      ? NSLocalizedString(@"Added 1 track to the Music queue.", @"Alert message after queueing one audio file")
+                                                      : [NSString stringWithFormat:NSLocalizedString(@"Added %lu tracks to the Music queue.", @"Alert message after queueing audio files; %lu is the count"),
+                                                         (unsigned long)tracks.count])];
         });
     });
 }
@@ -1185,20 +1285,20 @@ static NSString *ISHShellQuotedPath(NSString *path) {
 - (void)confirmDeleteItem:(ISHGuestFileItem *)item {
     BOOL isDirectory = item.kind == ISHGuestFileKindDirectory;
     UIAlertController *alert = [UIAlertController
-        alertControllerWithTitle:[NSString stringWithFormat:@"Delete “%@”?", item.name]
-                          message:(isDirectory ? @"This will permanently delete the folder and everything inside it."
-                                                : @"This will permanently delete the file.")
+        alertControllerWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Delete “%@”?", @"Delete confirmation title; %@ is the file name"), item.name]
+                          message:(isDirectory ? NSLocalizedString(@"This will permanently delete the folder and everything inside it.", @"Delete confirmation message for a folder")
+                                                : NSLocalizedString(@"This will permanently delete the file.", @"Delete confirmation message for a file"))
                    preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"Alert button") style:UIAlertActionStyleCancel handler:nil]];
     __weak typeof(self) weakSelf = self;
-    [alert addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Delete", @"Alert button that deletes a file") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         typeof(self) strongSelf = weakSelf;
         if (strongSelf == nil) return;
         [ISHGuestFileBridge.sharedBridge removeItemAtGuestPath:item.guestPath recursive:YES completion:^(BOOL ok, NSError *error) {
             typeof(self) strongSelf2 = weakSelf;
             if (strongSelf2 == nil) return;
             if (!ok) {
-                [strongSelf2 presentSimpleAlertWithTitle:@"Couldn’t Delete" message:error.localizedDescription];
+                [strongSelf2 presentSimpleAlertWithTitle:NSLocalizedString(@"Couldn’t Delete", @"Error alert title") message:error.localizedDescription];
                 return;
             }
             [strongSelf2 reload];
@@ -1209,16 +1309,16 @@ static NSString *ISHShellQuotedPath(NSString *path) {
 
 - (void)presentInfoForItem:(ISHGuestFileItem *)item {
     NSMutableString *message = [NSMutableString string];
-    [message appendFormat:@"Kind: %@\n", [self kindDisplayNameForItem:item]];
+    [message appendFormat:NSLocalizedString(@"Kind: %@\n", @"Get Info line: file kind"), [self kindDisplayNameForItem:item]];
     if (item.kind != ISHGuestFileKindDirectory)
-        [message appendFormat:@"Size: %@\n", [self formattedSize:item.size]];
+        [message appendFormat:NSLocalizedString(@"Size: %@\n", @"Get Info line: file size"), [self formattedSize:item.size]];
     if (item.modificationDate != nil)
-        [message appendFormat:@"Modified: %@\n", [self formattedDate:item.modificationDate]];
-    [message appendFormat:@"Permissions: %@\n", [self formattedPosixMode:item.posixMode]];
-    [message appendFormat:@"Owner: %u:%u\n", item.uid, item.gid];
+        [message appendFormat:NSLocalizedString(@"Modified: %@\n", @"Get Info line: modification date"), [self formattedDate:item.modificationDate]];
+    [message appendFormat:NSLocalizedString(@"Permissions: %@\n", @"Get Info line: Unix permissions"), [self formattedPosixMode:item.posixMode]];
+    [message appendFormat:NSLocalizedString(@"Owner: %u:%u\n", @"Get Info line: numeric user and group id"), item.uid, item.gid];
     if (item.isSymlink)
-        [message appendFormat:@"%@ → %@\n", (item.isBrokenSymlink ? @"Broken link" : @"Alias"), item.symlinkTarget];
-    [message appendFormat:@"Path: %@", item.guestPath];
+        [message appendFormat:@"%@ → %@\n", (item.isBrokenSymlink ? NSLocalizedString(@"Broken link", @"Get Info label for a symbolic link whose target is missing") : NSLocalizedString(@"Alias", @"Get Info label for a symbolic link")), item.symlinkTarget];
+    [message appendFormat:NSLocalizedString(@"Path: %@", @"Get Info line: full path"), item.guestPath];
     [self presentSimpleAlertWithTitle:item.name message:message];
 }
 
@@ -1226,7 +1326,7 @@ static NSString *ISHShellQuotedPath(NSString *path) {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
                                                                      message:message.length ? message : nil
                                                               preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"Alert button") style:UIAlertActionStyleDefault handler:nil]];
     [self presentViewController:alert animated:YES completion:nil];
 }
 
@@ -1239,14 +1339,14 @@ static NSString *ISHShellQuotedPath(NSString *path) {
 - (UIMenu *)buildMoreMenu {
     __weak typeof(self) weakSelf = self;
 
-    UIAction *newFolder = [UIAction actionWithTitle:@"New Folder" image:[UIImage systemImageNamed:@"folder.badge.plus"]
+    UIAction *newFolder = [UIAction actionWithTitle:NSLocalizedString(@"New Folder", @"File Manager menu action") image:[UIImage systemImageNamed:@"folder.badge.plus"]
                                           identifier:nil handler:^(UIAction *action) {
         [weakSelf promptNewFolder];
     }];
 
     NSArray<NSNumber *> *sortModes = @[@(WorkspaceFileManagerSortName), @(WorkspaceFileManagerSortSize),
                                         @(WorkspaceFileManagerSortDate), @(WorkspaceFileManagerSortKind)];
-    NSArray<NSString *> *sortTitles = @[@"Name", @"Size", @"Date Modified", @"Kind"];
+    NSArray<NSString *> *sortTitles = @[NSLocalizedString(@"Name", @"Sort option"), NSLocalizedString(@"Size", @"Sort option"), NSLocalizedString(@"Date Modified", @"Sort option"), NSLocalizedString(@"Kind", @"Sort option")];
     NSMutableArray<UIAction *> *sortActions = [NSMutableArray array];
     for (NSUInteger i = 0; i < sortModes.count; i++) {
         WorkspaceFileManagerSortMode mode = (WorkspaceFileManagerSortMode)sortModes[i].integerValue;
@@ -1261,16 +1361,16 @@ static NSString *ISHShellQuotedPath(NSString *path) {
         sortAction.state = (_sortMode == mode) ? UIMenuElementStateOn : UIMenuElementStateOff;
         [sortActions addObject:sortAction];
     }
-    UIMenu *sortMenu = [UIMenu menuWithTitle:@"Sort By" image:[UIImage systemImageNamed:@"arrow.up.arrow.down"]
+    UIMenu *sortMenu = [UIMenu menuWithTitle:NSLocalizedString(@"Sort By", @"File Manager submenu title") image:[UIImage systemImageNamed:@"arrow.up.arrow.down"]
                                    identifier:nil options:0 children:sortActions];
 
-    UIAction *hiddenToggle = [UIAction actionWithTitle:@"Show Hidden Files" image:nil identifier:nil
+    UIAction *hiddenToggle = [UIAction actionWithTitle:NSLocalizedString(@"Show Hidden Files", @"File Manager menu action") image:nil identifier:nil
                                                 handler:^(UIAction *action) {
         [weakSelf toggleHiddenFiles];
     }];
     hiddenToggle.state = _showHidden ? UIMenuElementStateOn : UIMenuElementStateOff;
 
-    UIAction *refresh = [UIAction actionWithTitle:@"Refresh" image:[UIImage systemImageNamed:@"arrow.clockwise"]
+    UIAction *refresh = [UIAction actionWithTitle:NSLocalizedString(@"Refresh", @"File Manager menu action") image:[UIImage systemImageNamed:@"arrow.clockwise"]
                                         identifier:nil handler:^(UIAction *action) {
         [weakSelf reload];
     }];

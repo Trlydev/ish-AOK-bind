@@ -198,6 +198,18 @@ an inclusive subtree; its self time was ~12%.
 **Check which build produced a signal.** A diagnostic from one build directory
 attributed to another is a whole afternoon.
 
+**If cost is a count, count.** Sampling the guest's program counter cannot say
+how many of each instruction a workload ran, because the PC is published only
+when execution returns to the dispatcher. So 557 added `ISH_JIT_PROFILE=<file>`,
+which starts every translated block, on all four guests, with a gadget that
+bumps the block's own counter, and `tools/jitprof-report.py`, which turns the
+counts into the instruction mix, the adjacent pairs, and the runs that one
+dispatch per run would collapse. Its first answer for RISC-V was the model's
+answer: 1.2–6.3x arm64's instruction count on identical C, at the same cost per
+instruction. Translation itself is measured the same way, from inside the app:
+write 1 to `/proc/ish/jit_timing` and read back blocks and nanoseconds per
+guest architecture.
+
 ## 38.8 Where the non-CPU time goes
 
 Dispatch explains compute. It does not explain a system, and the other half is
@@ -238,6 +250,16 @@ almost nothing. It does not matter which ARM core you are on for the dispatch
 cost, within a factor. And it explains, in one number, why the same effort spent
 on the amd64 engine's fusion would be worth more today than any amount of
 further work on arm64's.
+
+559 found the one exception to the first of those, and it is about
+dependencies, not length. Every gadget reads its operands through the stream
+pointer, so each update of that pointer is a cycle no core can overlap, and a
+guest instruction that uses the one before it waits out a store and a load of
+the same register slot. Updating the pointer once per gadget instead of twice,
+and handing a fused pair's first result to the second in a host register, made
+the arm64 guest's 7-Zip about 10% faster on the M4 between them — while a
+change that only cut host instructions made it slower. Count the chain, not the
+instructions.
 
 ---
 

@@ -4,14 +4,6 @@
     movl %_addr, %_tmp
     gret
 
-.gadget load16_gs
-    movw CPU_gs(%_cpu), %r10w
-    gret
-
-.gadget store16_gs
-    movw %r10w, CPU_gs(%_cpu)
-    gret
-
 .gadget amd64_set_rip
     movq (%_ip), %r10
     movq %r10, CPU_amd64_rip(%_cpu)
@@ -840,8 +832,22 @@
         clearf_a
         clearf_oc
     .endifin
+    # CF is an INPUT to adc/sbb, and there are two ways to lose it before the
+    # adc/sbb below executes, so snapshot it onto the host stack once, out here,
+    # and load it into the host CF right before the operation on every pass:
+    #   - setf_a's `orl` rewrites the host flags, and it runs between any load
+    #     placed up here and the operation. This macro used to `btw` CPU_cf here,
+    #     so every `lock adc`/`lock sbb` ran with carry-in 0: `stc; lock sbbl $1`
+    #     subtracted 1 instead of 2 on every one of atomic_lock_contended's
+    #     80000 ops (measured on a Linux x86_64 host: got=80000 want=0).
+    #   - setf_oc below overwrites CPU_cf with the carry the operation PRODUCES,
+    #     and a contended CAS jumps back to 1b, so reloading from CPU_cf inside
+    #     the loop would read that result as the input on a retry.
+    # pushq reads 8 bytes from CPU_cf (cf, of and what follows in cpu_state);
+    # only bit 0, cf, is ever tested. The aarch64 gadgets keep the same snapshot
+    # in w14.
     .ifin(\op, adc,sbb)
-        btw $0, CPU_cf(%_cpu)
+        pushq CPU_cf(%_cpu)
     .endifin
 
     mov\ss \arg, %r15\s
@@ -861,6 +867,15 @@
     .ifin(\op, inc,dec)
         setf_a src=$1, dst=%r14\s, ss=\ss
     .endifin
+    # neg is 0 - operand: the operand is op1 and 0 is op2, the same pair the
+    # unlocked NEG hands the sub gadget.
+    .ifc \op,neg
+        setf_a src=%r14\s, dst=DOLLAR(0), ss=\ss
+    .endif
+    # Nothing between this and the adc/sbb may touch the host flags.
+    .ifin(\op, adc,sbb)
+        btw $0, (%rsp)
+    .endifin
 
     .ifin(\op, add,sub,adc,sbb,and,or,xor)
         \op\ss %tmp\s, %r14\s
@@ -868,7 +883,7 @@
     .ifc \op,xadd
         add\ss %tmp\s, %r14\s
     .endif
-    .ifin(\op, inc,dec)
+    .ifin(\op, inc,dec,not,neg)
         \op\ss %r14\s
     .endifin
 
@@ -888,7 +903,7 @@
     #
     # ZF/SF/PF need no such move: setf_zsp below recomputes them from the RESULT
     # VALUE in r14 rather than from live host flags.
-    .ifin(\op, add,sub,adc,sbb,xadd)
+    .ifin(\op, add,sub,adc,sbb,xadd,neg)
         setf_oc
     .endifin
     .ifin(\op, inc,dec)
@@ -898,14 +913,17 @@
     lock cmpxchg\ss %r14\s, \arg
     jnz 1b
     mov %r15, %rax
-    .ifc \op,xadd
+    .ifin(\op, xadd,adc,sbb)
         add $8, %rsp
-    .endif
+    .endifin
 
-    # setf_zsp is apparently broken in such a way that it can only use _tmp
-    xchg %r14, %r10
-    setf_zsp %tmp\s, \ss
-    xchg %r14, %r10
+    # not changes no flags at all, so it must leave the lazy result alone too.
+    .ifnc \op,not
+        # setf_zsp is apparently broken in such a way that it can only use _tmp
+        xchg %r14, %r10
+        setf_zsp %tmp\s, \ss
+        xchg %r14, %r10
+    .endif
 .endm
 .macro do_op_atomic op, size, arg
     ss \size, _do_op_atomic, \op, \arg
@@ -919,7 +937,7 @@
         gret 1
 .endm
 
-.irp op, add,sub,adc,sbb,and,or,xor,inc,dec,xadd
+.irp op, add,sub,adc,sbb,and,or,xor,inc,dec,xadd,not,neg
     .irp size, SIZE_LIST
         do_op_size_atomic \op, \size
     .endr

@@ -39,7 +39,8 @@ changes, not footnotes:
   write lock a lockless walker does not hold, at a measured 267-457 frees per
   second from one dull single-threaded guest. The clock hand must walk under
   `mem_read_lock_quiesce_aware` in bounded chunks, exactly as
-  `collect_mem_page_stats` already does (fs/proc/root.c:400-418).
+  `collect_mem_page_stats` then did (fs/proc/root.c:400-418; it reads
+  per-address-space counters now and takes no mem lock).
 - **Eviction throughput is 100-200 MiB/s per victim process, not 1 GB/s.** The
   barrier is scheduler-bound, its cost is a per-busy-sibling scheduling latency,
   and each barrier also costs every sibling about 109 us of its own CPU that the
@@ -218,9 +219,9 @@ pointer") does not save it: libmalloc returns the same address for a new
 
 **The repair.** The clock hand runs under `mem_read_lock_quiesce_aware`, in
 bounded chunks (one leaf, or one 4 MiB granule, per acquisition, dropping and
-re-taking between chunks). This is the pattern `collect_mem_page_stats` already
-uses (fs/proc/root.c:400 lock, :418 unlock, with the `mm_retain` from
-`task_snapshot_collect`). The read lock is shared with running guest threads, so
+re-taking between chunks). This is the pattern `collect_mem_page_stats` then
+used (fs/proc/root.c:400 lock, :418 unlock, with the `mm_retain` from
+`task_snapshot_collect`; since 2026-09-25 it reads counters instead). The read lock is shared with running guest threads, so
 it does not stop them; it only delays a concurrent barrier writer, and only for
 the length of one chunk. Nothing else in the design changes: the `accessed`/`age`
 bytes still live in the leaf, and the barrier re-validation still runs.
@@ -2052,10 +2053,16 @@ independent of whether swap is ever built. Line numbers are at `e12aeae36`.
     memory, `mlock` becomes a promise AOK breaks. The comment is a promissory note the
     design has to redeem, and it is on the phase 2 list.
 
-15. **Two unchased observations.** On the amd64 guest, `prefetchw` and/or `clflush`
-    appear to kill the process (probably SIGILL on an unimplemented opcode);
-    `prefetchw` is what GCC emits for `__builtin_prefetch(p, 1)` and `-march=znver*`.
-    Which of the two was not isolated, so this is **unverified**. And
+15. **Two observations from the experiments; the first is resolved.** On the amd64
+    guest, `prefetchw` and/or `clflush` appeared to kill the process. Isolated
+    2026-09-25: it was PREFETCHW, not CLFLUSH. CLFLUSH is advertised in CPUID and
+    runs as a no-op (`cpuid_xsave`'s clflush probe). PREFETCHW, and the rest of
+    the `0F 0D` prefetch group, raised #UD on both x86 engines, so a program built
+    with PRFCHW enabled died with SIGILL (rc 132) at its first write prefetch. That
+    is `__builtin_prefetch(p, 1)` under `-march=broadwell` and later, and under
+    every `-march=znver*`. **Fixed:** every memory form now runs as a no-op on
+    both engines. The register form and LOCK stay #UD, as on hardware. The test is
+    `tests/manual/x86/x86_prefetch.c`. The second observation is still open:
     `ISH_QUIESCE_STATS` is read in `main.c` `cli_halt` but produced no output for
     `./build/ish -f <root> /bin/sh -c ...`, so the CLI's `-c` path may not reach the
     halt hook.

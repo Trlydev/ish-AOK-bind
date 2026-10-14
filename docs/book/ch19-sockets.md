@@ -10,6 +10,9 @@ in a simulated way. `apk` downloads packages over the device's LTE connection.
 `ssh` reaches a real host. TLS negotiates against real servers with real
 certificates. Nothing in AOK implements TCP, and nothing needs to.
 
+(The exception, since 559, is a process in a network namespace of its own,
+whose TCP and UDP never reach the host; Chapter 41 says what it gets instead.)
+
 It also means AOK inherits Darwin's networking, and Darwin is not Linux. This
 chapter is about the seams: the places where a forwarded answer is the wrong
 answer, and the one subsystem that exists purely because iOS takes sockets away
@@ -136,6 +139,19 @@ it consumed the very thing the guest was about to ask for, and it did so only on
 the path where the guest had polled first — which is why the behaviour looked
 like an intermittent, poll-dependent mystery rather than a missing stash.
 
+The stash was still keeping one wrong answer, found in 559
+([#631](https://github.com/emkey1/ish-AOK/issues/631)): an `ssh` session left
+idle until the screen locked came back to "Read from remote host: Bad file
+descriptor". A locked device reclaims a suspended app's TCP connections, and
+XNU leaves `EBADF` as the pending error of a socket it has taken. A client
+that sat in `poll()` across the suspension — every `ssh` session — had AOK
+read that error and keep it, and its next read was handed `EBADF`, which in
+Linux's vocabulary means "your bug". A `recv` with no `poll` before it
+already said `ECONNRESET`, which is what Linux says of a connection the
+network took and what a client that reconnects is waiting for. Every read of
+the host's `SO_ERROR` now goes through one function, and there `EBADF`
+becomes `ECONNRESET`.
+
 ## 19.5 sockrestart, or: iOS takes your sockets
 
 Some code exists because of a platform decision rather than a design one. The
@@ -181,7 +197,10 @@ filesystem.
 The feature that matters most is `SCM_RIGHTS`: sending a file descriptor over a
 socket. In AOK that means duplicating a `struct fd` reference into another
 task's descriptor table — an operation entirely internal to the emulator, with
-no host equivalent involved.
+no host equivalent involved. A number that names nothing — a closed
+descriptor, or the -1 a failed `open` just returned — is `EBADF` and nothing
+is sent, as in Linux's `scm_fp_copy`; until 559 it was a NULL handed to the
+reference count, and the emulator's own `SIGSEGV`.
 
 It matters because it is a prerequisite for a whole class of modern software.
 Wayland passes buffers as descriptors. systemd passes activated sockets to
@@ -199,11 +218,24 @@ freshly created root has *no* resolver configuration at all and every lookup
 fails with "Temporary failure in name resolution" while networking itself works
 perfectly — a confusing first ten minutes for anyone building a root by hand.
 
+The app writes the file itself, from the device's own servers, and since 557
+lists first a relay the app runs, reached at `127.0.0.53:53` — the stub address
+systemd-resolved uses — through the same loopback translation that maps other
+guest endpoints. The relay binds an ephemeral host port, because port 53 on an
+iPad's loopback is iOS's to hold, and it forwards the guest's own packet
+unchanged: an early version rebuilt each query, gave the reply a new ID, and
+sent nothing at all for a missing name. musl asks every nameserver at once and
+never noticed; glibc asks them in order, so every lookup on Devuan sat out a
+5-second timeout first, and `sshd` came up 67 seconds after boot.
+
 `fs/net_route.c` and the `/proc/net` files report interfaces, addresses and
 routes, built from the host's own interface list. Because the guest sees the
 host's interface names unchanged, `en0` in the guest is `en0` on the device,
 which keeps `SO_BINDTODEVICE`, `ping -I`, and everything that reads
-`/sys/class/net` (Chapter 18) consistent without a translation table.
+`/sys/class/net` (Chapter 18) consistent without a translation table. Those
+links are the host's, so `ip link add` there is `EOPNOTSUPP`; inside a private
+network namespace the links are AOK's own — `lo`, and the veth pairs and dummy
+links of `fs/net_vif.c` — and the same files list those instead.
 
 ## 19.8 What the host gives and what it costs
 

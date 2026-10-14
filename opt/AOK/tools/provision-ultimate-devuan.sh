@@ -2,12 +2,15 @@
 # provision-ultimate-devuan.sh
 # ---------------------------------------------------------------------------
 # Turn a fresh Devuan 6 "Excalibur" minirootfs (i386 OR amd64) running under
-# iSH-AOK into a full-featured, terminal-only Linux system. This is the Devuan
+# iSH-AOK into a full-featured, terminal-only Linux system. (It provisions a
+# Devuan machine with a kernel of its own as well -- a virtual machine, any
+# architecture -- leaving out what only the app can do: see IN_AOK below.)
+# This is the Devuan
 # twin of provision-ultimate-alpine.sh -- same end result, translated to
 # apt/dpkg + sysvinit instead of apk + OpenRC:
 #   * generous "ultimate terminal" CLI tool set
 #   * services enabled on boot via sysvinit (sshd, rsyslog, cron, chrony, ...)
-#   * US/Pacific timezone (configurable)
+#   * the device's timezone, kept following the device (configurable)
 #   * chrony in iSH-aware monitoring mode (the guest clock is the host clock)
 #   * shell niceties: bash login shells, colour prompt, MOTD, login summary,
 #     fzf/dircolors integration, machine-id, periodic maintenance via cron
@@ -20,10 +23,11 @@
 # When run on a terminal it PROMPTS for the timezone and the primary login
 # (creating that user if it does not exist). Pre-set any tunable via the
 # environment to skip its prompt / run non-interactively:
-#       TZ_NAME=America/Los_Angeles    # timezone (else prompted)
+#       TZ_NAME=America/Los_Angeles    # timezone (else prompted, offering the device's)
 #       TARGET_USER=mke                # primary login to set up (else prompted)
 #       NEW_HOSTNAME=                  # hostname to set (else prompted)
-#       SUDO_NOPASSWD=0                # 1 = passwordless sudo-group sudo
+#       NATIVE_LINKS=1                 # 0 = skip linking /AOK/native (native-links.sh)
+#       SUDO_NOPASSWD=1                # 0 = sudo-group sudo asks for a password (else prompted)
 #
 # Arch note: every package below is arch-independent in Devuan, so the same
 # script provisions an i386 and an amd64 rootfs identically.
@@ -40,12 +44,30 @@ fi
 log()  { printf '\n\033[1;36m==>\033[0m \033[1m%s\033[0m\n' "$*"; }
 note() { printf '    %s\n' "$*"; }
 
+# ---- under iSH-AOK, or on a kernel of its own? ----------------------------
+# The same script provisions a virtual machine (the UTM images of
+# the AOK VM project ship it) or any machine running this distribution. What
+# differs there is what the app does for a root under iSH-AOK and nobody does
+# for a machine: the clock is the machine's own, so chrony keeps the
+# distribution's configuration and disciplines it; nothing names the device's
+# timezone; and there are no native programs to link.
+IN_AOK=0
+[ -d /proc/ish ] && IN_AOK=1
+
 # ---- config (env overrides; prompts interactively when run on a TTY) ------
 NEW_HOSTNAME="${NEW_HOSTNAME:-}"
-SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"
+SUDO_NOPASSWD="${SUDO_NOPASSWD:-}"
 
-# Defaults offered at the prompts.
-DEF_TZ="${TZ_NAME:-America/Los_Angeles}"
+# Defaults offered at the prompts. The timezone offered is the device's own, as
+# the app reports it; a build too old to report one offers the old default.
+HOST_TZ="$(cat /proc/ish/timezone 2>/dev/null)"
+TZ_PRESET="${TZ_NAME:+1}"
+DEF_TZ="${TZ_NAME:-${HOST_TZ:-America/Los_Angeles}}"
+# (a machine of its own: the zone it already has, else UTC)
+if [ "$IN_AOK" = 0 ] && [ -z "${TZ_NAME:-}" ]; then
+    DEF_TZ="$(cat /etc/timezone 2>/dev/null)"
+    [ -n "$DEF_TZ" ] && [ -f "/usr/share/zoneinfo/$DEF_TZ" ] || DEF_TZ=UTC
+fi
 DEF_USER="${TARGET_USER:-${SUDO_USER:-}}"
 if [ -z "$DEF_USER" ] || [ "$DEF_USER" = root ]; then
     DEF_USER="$(awk -F: '$3>=1000 && $3<2000 {print $1; exit}' /etc/passwd)"
@@ -53,6 +75,11 @@ fi
 [ -n "$DEF_USER" ] || DEF_USER="aok"
 DEF_HOSTNAME="$(cat /etc/hostname 2>/dev/null)"
 [ -n "$DEF_HOSTNAME" ] && [ "$DEF_HOSTNAME" != localhost ] || DEF_HOSTNAME="devuan-ish"
+WHERE="iSH-AOK  (terminal-only userspace)"
+if [ "$IN_AOK" = 0 ]; then
+    [ "$DEF_HOSTNAME" = "devuan-ish" ] && DEF_HOSTNAME="devuan-vm"
+    WHERE="$(uname -m), on a kernel of its own"
+fi
 
 # ask <var> <prompt> <default>: keep an env-provided value; else prompt on a
 # TTY; else use the default (so piped/ssh runs never block).
@@ -71,6 +98,10 @@ ask() {
 ask TZ_NAME     "Timezone (e.g. America/New_York, UTC)" "$DEF_TZ"
 ask TARGET_USER "Primary login username to set up"      "$DEF_USER"
 ask NEW_HOSTNAME "Hostname"                              "$DEF_HOSTNAME"
+# Passwordless unless you say otherwise: the login above is created with no
+# password, so a rule that asks for one would leave it unable to use sudo.
+ask SUDO_NOPASSWD "Passwordless sudo for ${TARGET_USER:-the admin group}? (y/n)" "y"
+case "$SUDO_NOPASSWD" in [Yy]*|1) SUDO_NOPASSWD=1 ;; *) SUDO_NOPASSWD=0 ;; esac
 
 # Create the chosen login if it does not exist yet (fresh rootfs).
 if [ -n "$TARGET_USER" ] && [ "$TARGET_USER" != root ] && ! id "$TARGET_USER" >/dev/null 2>&1; then
@@ -151,6 +182,19 @@ log "Timezone -> $TZ_NAME"
 if [ -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
     ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
     echo "$TZ_NAME" > /etc/timezone
+    # Taking the device's own zone leaves the choice with iSH-AOK, which moves
+    # /etc/localtime along with the device at each boot for as long as
+    # /etc/aok-localtime names the zone it holds (see /AOK/docs/roots.md). A
+    # zone set in TZ_NAME, or a different one typed at the prompt, stays put.
+    if [ -z "$TZ_PRESET" ] && [ "$TZ_NAME" = "$HOST_TZ" ]; then
+        printf '%s\n' \
+            "# /etc/localtime names this zone because it is the device's. iSH-AOK" \
+            "# moves it along with the device, at boot, for as long as it still names" \
+            "# this zone; choose any other and it is left alone from then on. Keep this" \
+            "# file: without it a UTC /etc/localtime looks like the distribution's own." \
+            "$TZ_NAME" > /etc/aok-localtime
+        note "following the device's zone from boot to boot (/etc/aok-localtime)"
+    fi
     dpkg-reconfigure -f noninteractive tzdata >/dev/null 2>&1 || true
     note "$(date)"
 else
@@ -220,7 +264,7 @@ log "Hostname"
 if [ -n "$NEW_HOSTNAME" ]; then
     echo "$NEW_HOSTNAME" > /etc/hostname
 elif [ ! -s /etc/hostname ] || [ "$(cat /etc/hostname 2>/dev/null)" = localhost ]; then
-    echo "devuan-ish" > /etc/hostname
+    echo "$DEF_HOSTNAME" > /etc/hostname
 fi
 hostname "$(cat /etc/hostname)" 2>/dev/null || true
 # Make sure the hostname resolves (Debian expects a 127.0.1.1 line).
@@ -236,17 +280,26 @@ log "sudo for the sudo group"
 # Devuan/Debian use the 'sudo' group (not Alpine's 'wheel'). The stock
 # /etc/sudoers already has '#includedir /etc/sudoers.d'; we drop a file there.
 getent group sudo >/dev/null 2>&1 || groupadd sudo 2>/dev/null || true
+# Named to sort FIRST: sudo reads /etc/sudoers.d in name order and the LAST
+# matching rule wins, so a fragment the user adds (zz-me-nopasswd, 90-me, ...)
+# must come after this one to be able to override it. AOK's earlier name,
+# aok-sudo, sorted after the common ones -- a user's NOPASSWD file was silently
+# beaten by its password rule -- so that file goes, if it is still ours.
+_old=/etc/sudoers.d/aok-sudo
+if [ -f "$_old" ] && { [ "$(cat "$_old")" = '%sudo ALL=(ALL:ALL) NOPASSWD: ALL' ] || [ "$(cat "$_old")" = '%sudo ALL=(ALL:ALL) ALL' ]; }; then
+    rm -f "$_old"
+fi
 if [ "$SUDO_NOPASSWD" = 1 ]; then
-    echo '%sudo ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/aok-sudo
+    echo '%sudo ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-aok-sudo
     note "passwordless sudo for the sudo group"
 else
-    echo '%sudo ALL=(ALL:ALL) ALL' > /etc/sudoers.d/aok-sudo
-    note "sudo-group sudo (password required; set SUDO_NOPASSWD=1 for passwordless)"
+    echo '%sudo ALL=(ALL:ALL) ALL' > /etc/sudoers.d/00-aok-sudo
+    note "sudo-group sudo (password required -- the login needs one: passwd ${TARGET_USER:-<user>})"
 fi
-chmod 0440 /etc/sudoers.d/aok-sudo
+chmod 0440 /etc/sudoers.d/00-aok-sudo
 # Refuse to leave an invalid sudoers fragment in place.
-if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/aok-sudo >/dev/null 2>&1; then
-    rm -f /etc/sudoers.d/aok-sudo
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/00-aok-sudo >/dev/null 2>&1; then
+    rm -f /etc/sudoers.d/00-aok-sudo
     note "WARNING: generated sudoers fragment failed validation; removed it"
 fi
 if [ -n "$TARGET_USER" ] && id "$TARGET_USER" >/dev/null 2>&1; then
@@ -267,9 +320,9 @@ note "root + ${TARGET_USER:-} now use bash"
 # ===========================================================================
 log "MOTD"
 # ===========================================================================
-cat > /etc/motd <<'MOTD'
+cat > /etc/motd <<MOTD
 
-   Devuan GNU/Linux 6 (excalibur)  .  iSH-AOK  (terminal-only userspace)
+   Devuan GNU/Linux 6 (excalibur)  .  $WHERE
    ------------------------------------------------------------
    services :  service <name> {start|stop|status}
    on boot  :  update-rc.d <name> {enable|disable}
@@ -356,13 +409,14 @@ chmod 0644 /etc/profile.d/40-aok-tools.sh
 note "wrote /etc/profile.d/30-aok-niceties.sh and 40-aok-tools.sh"
 
 # ===========================================================================
-log "chrony (iSH-aware: monitor only, host owns the clock)"
+[ "$IN_AOK" = 1 ] && log "chrony (iSH-aware: monitor only, host owns the clock)"
+[ "$IN_AOK" = 1 ] || log "chrony (the distribution's configuration: this machine's clock is its own)"
 # ===========================================================================
 # In iSH the guest system clock IS the host (iOS) clock, already NTP-synced by
 # iOS. chronyd therefore runs with -x (no clock control). Under iSH the unix
 # command socket does not work, so reach chronyc over the localhost UDP port if
 # needed:  chronyc -h 127.0.0.1 tracking
-if [ -d /etc/chrony ]; then
+if [ "$IN_AOK" = 1 ] && [ -d /etc/chrony ]; then
     cat > /etc/chrony/chrony.conf <<'CHRONYCONF'
 # chrony.conf -- tuned for iSH-AOK (monitoring mode; chronyd runs with -x)
 pool pool.ntp.org iburst
@@ -611,6 +665,31 @@ write_tmux /root root
 [ -n "$TARGET_HOME" ] && write_tmux "$TARGET_HOME" "$TARGET_USER"
 
 # ===========================================================================
+log "iSH-AOK native programs"
+# ===========================================================================
+# native-links.sh links the app's native programs -- SmallCLUE's applets, zsh,
+# dash as `sh`, motepad and the rest of /AOK/native -- into
+# /usr/local/native-bin, put first on PATH for login shells, and into
+# /usr/local/bin, which every default PATH has ahead of /bin. --no-shell,
+# because this script chose the login shells above. persist-links.sh links your
+# own /AOK/persist/bin into /usr/local/bin, for the sessions that never read
+# /etc/profile.d (`ssh host cmd`, cron, services). NATIVE_LINKS=0 skips both.
+if [ "$IN_AOK" = 0 ]; then
+    note "not under iSH-AOK: there are no native programs to link"
+elif [ "${NATIVE_LINKS:-1}" = 1 ]; then
+    if [ -f /AOK/tools/native-links.sh ] && [ -x /AOK/native/smallclue ]; then
+        sh /AOK/tools/native-links.sh --no-shell 2>&1 | sed 's/^/    /'
+    else
+        note "this iSH-AOK has no /AOK/native; native links skipped"
+    fi
+    if [ -f /AOK/tools/persist-links.sh ] && [ -d /AOK/persist/bin ]; then
+        sh /AOK/tools/persist-links.sh 2>&1 | sed 's/^/    /'
+    fi
+else
+    note "NATIVE_LINKS=0: native links skipped"
+fi
+
+# ===========================================================================
 log "Enable + start services"
 # ===========================================================================
 # sysvinit equivalents of the Alpine OpenRC handling. update-rc.d enables a
@@ -645,6 +724,7 @@ cat <<EOF
     Next:
       * Re-login (or relaunch the app) to pick up bash + the new prompt/MOTD,
         and to boot real sysvinit (sysvinit-core was just installed).
-      * 'chronyc -h 127.0.0.1 tracking' / '... sources' to see NTP status.
+      * 'chronyc -h 127.0.0.1 tracking' / '... sources' to see NTP status
+        (plain 'chronyc tracking' on a machine of its own).
       * 'service --status-all' for service health;  logs in /var/log/syslog.
 EOF

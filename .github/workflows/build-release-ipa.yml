@@ -53,6 +53,11 @@ jobs:
           submodules: true
           fetch-depth: 0
 
+      # See build-dev-ipa.yml: without these two, the release IPA shipped an
+      # ssh that says "not built into this iSH-AOK" and a stub vi.
+      - name: Check out smallclue's openssh, nextvi and libgit2
+        run: git -C deps/smallclue submodule update --init third-party/openssh third-party/nextvi third-party/libgit2
+
       - name: Select newest available Xcode
         run: |
           LATEST_XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
@@ -112,7 +117,25 @@ jobs:
               print("tools/meson.build already has the fix, no patch needed")
           PYEOF
 
+      # deps/dash needs its config.h, which the fork does not commit (the
+      # generated sources are committed; see tools/configure-dash.sh). Configure
+      # ONLY: `make` fails from a clean checkout and can regenerate nodes.c
+      # without the __thread conversion.
+      - name: Configure deps/dash
+        # A re-spin of a tag from before 555 has no deps/dash.
+        run: |
+          if [ -f deps/dash/src/aok_mksignames.c ]; then
+            cd deps/dash && ../../tools/configure-dash.sh --quiet
+          fi
+
       - name: Build unsigned .app
+        # tools/build-rust-native.sh sets this itself, so helix-term's build.rs
+        # does not clone 301 grammars AOK never uses. Set here as well for a
+        # re-spin: tags 550-555 build helix with the script from before that
+        # export, and without this they need github, gitlab, codeberg and sr.ht
+        # all up to build at all (codeberg's outage failed CI on 2026-09-23).
+        env:
+          HELIX_DISABLE_AUTO_GRAMMAR_BUILD: 1
         run: |
           # ISH_ARM64_GRET picks the arm64-guest gadget dispatch sequence
           # (jit/guest-arm64/gadgets.h). Upstream defaults it to dmb, which is
@@ -177,8 +200,10 @@ jobs:
           # looked for docs-less "release-notes-since-iSH-AOK_$((N-1)).md" in the
           # checkout root, which has matched nothing since the notes moved into
           # docs/ (60b9b8285) -- so builds 544 through 548 all published with the
-          # placeholder body below instead of their notes.
-          NOTES_FILE="docs/release-notes-since-iSH-AOK_${BUILD_N}.md"
+          # placeholder body below instead of their notes. Moved again, into
+          # docs/release-notes/, on 2026-09-27 -- update this path if it moves
+          # again, or history repeats a third time.
+          NOTES_FILE="docs/release-notes/release-notes-since-iSH-AOK_${BUILD_N}.md"
           if [ -f "$NOTES_FILE" ]; then
             NOTES_ARGS=(--notes-file "$NOTES_FILE")
           else

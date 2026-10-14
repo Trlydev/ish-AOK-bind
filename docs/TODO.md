@@ -1,14 +1,245 @@
 # iSH-AOK TODO
 
-Open work: bugs that are diagnosed but not fixed, reported issues, and features
-deferred on purpose. Each entry says what is already **established**, so nobody
-re-derives it, and what the **next step** actually is.
+Open work: bugs that are diagnosed but not fixed, reported issues, features
+deferred on purpose, and host capabilities worth exposing. Each entry says what
+is already **established**, so nobody re-derives it, and what the **next step**
+actually is.
 
-Started 2026-08-19, after the 549 release run.
+This is a lab notebook, not a task list. It records what is *known* about work
+that is not done; it does not say what will be done next or in what order.
+That is [docs/roadmap.md](roadmap.md), and the near-term commitments for the
+release being prepared are in `docs/build_<N>_musts.md`.
+
+Started 2026-08-19, after the 549 release run. Closed entries from the 549 and
+550 cycles moved to
+[docs/historical/todo-closed-549-550.md](historical/todo-closed-549-550.md) on
+2026-09-07.
 
 ---
 
+## Queued for a future release
+
+The one queue for follow-up work. Sessions add a bullet here instead of
+raising task chips (the maintainer's rule, 2026-09-26): what was seen, the
+evidence, and the proposed fix. Check here, and `git log origin/working`,
+before starting anything. When a session, chip or subagent takes an item,
+put `**[in progress: <who>, <date>]**` at the start of its bullet and commit
+that before the work; when the work lands, delete the bullet, since the
+commit is the record. The first ten were chips not started before the 556
+freeze (2026-09-25); their full text is in
+[future-release-queue.md](future-release-queue.md).
+
+- **AOK VM (the UTM SE fork, the QEMU gadget plug-in, its benchmarks) left this repository on 2026-10-14.** Its twelve entries are in emkey1/aok-vm, `aok/TODO.md`, with everything that was under `tests/bench-utm` and `docs/utm_engine_study.md`. What stays here of it: `tests/bench-utm/utm/vm-update.sh` (installed machines fetch it from this address), and the shared gadget sources as copies of emkey1/aok-gadgets (`jit/guest-riscv64/{alu.S,frag.h,pairs.h}`, `jit/guest-arm64/{frag.h,alu_spec.S}`, `jit/gadgets-aarch64/x87-{arith,stack,reg,trans}.S`): **edit those there, not here**, then `aok-gadgets/tools/sync.sh ish-aok .` and run this repository's tests; `sync.sh --check` says whether a copy drifted. While that repository is private the copies cannot be a submodule.
+
+- **A session with a namespaced process cannot be saved at all, and Save Anyway does not help (found in the 559 docs audit, 2026-10-14).** The save refuses while any process is in a namespace of its own, or while a mount has another mounted over it (restored outside its namespaces it would no longer be confined), but `ckpt_task_unsaveable` (kernel/checkpoint.c) looks only at descriptors, so Save Anyway and the automatic save do not leave such processes out -- they refuse too. On a systemd root (Arch), where logind and other services run with `PrivateTmp=` and friends, no session can be saved. Devuan and Alpine (sysvinit/OpenRC) are not affected unless the user runs a sandbox. Proposed: Save Anyway drops a namespaced process like any other unsaveable one, and the automatic save does the same and says so. opt/AOK/docs/suspend.md documents the current behaviour.
+- **The A10X wedged until a forced restart, 2026-10-12 12:00 BST, during a benchmark's reinstall.** The forced-reset report (`idevicecrashreport -k -u <udid> dir`, `forceReset-full-*.ips`) has the system as it was: iSH-AOK (pid 4766) was a terminated process with one thread left, uninterruptible in the kernel, waiting to read a kernel rwlock **owned by a launchd thread**, itself uninterruptible in the kernel -- so nothing could be launched. It coincides with tests/bench-ab's step `devicectl install` + `launch --terminate-existing` (the last result before it was 11:00:45 UTC). Memory was tight but not out: UTM SE 587 MB and AOKQemuBench 393 MB suspended (another session's), the compressor at 650 MB, five swapfiles; iSH-AOK had been 1.3-1.5 GB earlier that morning. "Cache Translated Code" was on, which the maintainer suspects; nothing in the reports involves it, and nothing rules it out -- it is one wedge in some thirty relaunches that day. Next, if it recurs: note whether the cache was on, and symbolicate the two kernel stacks (the report has them as kernelcache offsets). Until then: do not run reinstall loops on the A10X with other heavy apps suspended, prefer `abf.sh`'s one-install switching there, and wait for the old process to be gone before launching. Also: **the device was in Low Power Mode** (yellow battery) for an unknown part of that day's A10X timings -- the timing itself had run the battery down to 20%, on a charger -- which throttles the CPU and pins Auto-Lock. tests/bench-ab now refuses a device below 40% or in Low Power Mode and records the battery with every result (lib.sh, bench.sh's power_ok; `/proc/ish/BAT0` had the reading all along).
+- **`x86_unaligned_lock` on MBP5's i386 root, and the misaligned-LOCK starvation behind it: fixed 2026-10-13.** It was the starvation (the suite leg printed `dword_at_14: a thread never ran (4707 increments, 0 stores)`; one rerun in two failed alone). On this laptop the i386 split cases had been passing with 1-2 plain stores per 1.5 s against ~700 increments: one scheduling step from the failure. Three things, found in that order. (1) *The pause, made conditional.* A thread that does a split LOCK operation while a sibling that is NOT itself doing them is running guest code stands aside for 100us afterwards -- it pokes itself, leaves the JIT at the next block boundary as any poked thread does, and the run loop sleeps there holding nothing (kernel/task.c; emu/tlb.c x86_lock_split_begin; a sibling counts as "doing them" for 50ms after its last one). Threads that are all splitters never pause, which is what sank the 2026-10-09 attempt -- and they got faster, not slower: amd64_xchg_mem 19-528 s -> 1-3 s, because a splitter that has not had a turn for 50ms counts as a sibling to stand aside for. The pause is a budget, 200us of split operations between quanta, not one per operation: i386's 64-bit atomics are cmpxchg8b in a loop, and a quantum between a failed attempt and its retry let the sibling change the value every time (2 increments in 1.5 s). Leaving through the instruction's own retry fault instead of a poke was 20-50x slower (it goes through the fault path's write lock, and on i386 discards and recompiles the block). (2) *The upgrade's wake.* read_to_write_lock_timed waits for the reader count to reach one -- its own -- and _read_unlock only broadcast at zero, so an upgrade whose sibling was still in guest code slept its whole 20ms (util/rw_locks.h). (3) *Found in the samples, and nothing to do with LOCK:* handle_interrupt's last line (RDTSCP's CPU number, 558) called task_current_cpu on every return to guest code, which for a thread with no rseq area -- every musl program -- did a sysctl and three getenv()s: a system call cost 960 ns on the Alpine roots of all four architectures and costs 335 now (glibc, which registers rseq, was 310 and is). kernel/rseq.c caches the count. Numbers, 1.5 s per case, split cases only: amd64 before 1100-1900 increments / 6-51000 stores, after 3900-5100 / 1.0-1.5M; i386 before ~700 / 1-2, after 4100-6800 / 0.7-1.2M; a two-thread probe (lock incl across a block against plain stores elsewhere) 1734 -> 5900 ops/s and 4.2M -> 105M stores/s on amd64. 8 runs under setsid on each root, none failed. Still true: a split LOCK operation is slow by construction (the address space, exclusively).
+- **arm64 guest, after the fused pairs (2026-10-11, docs/build_559_musts.md item 5).** (1) *7-Zip's real TLB misses:* a fixed 7-Zip compression (`-md22`) makes 55 million REAL misses, 420 host instructions each, about 8% of its time -- the table reaches 4 MB and the dictionary is 4 MB. A cheaper miss path or more reach is worth that much there; a bigger table costs every flush. Only there, though: counted in the optimised CLI (2026-10-12, a miss ~183 instructions at -O2), real misses are 3.4% of 7-Zip's instructions, 0.4% of a gcc compile's, 0.2% of the Python benchmark's and nothing in the sqlite query -- so a second-level table would be for one benchmark's dictionary size, and is not planned. (The x86 guests' assembly does not look at the TLB victims, and does not need to: 14 starts each of the same Python loop, optimised CLI, 2026-10-12, spread 0.7% on amd64 and 0.45% on i386 -- `tlb_handle_miss`'s own swap is enough there.) (2) *The riscv64 pair table's gaps:* the hand-fused gadgets (ld_ld, sd_sd, add_l*, sll_add as a forwarder), mulh/div, and the Zbb singles have no bodies in frag.h. (3) *Generic gadgets still doing real work* (each decodes its fields at run time; adcsbc and dp3src were 37% of an RSA key generation until 2026-10-12 and RSA signing doubled when they got slot-fed forms): the generic add_imm/sub_imm (SP forms), single-register writeback loads and stores, cond/csel, dp1src/dp2src, and what is left of addsub_ext and addsub_reg (the flag-setting extended and LSR/ASR forms, the 32-bit UXTW/SXTW ones); `extr` with two different sources. (Done 2026-10-12: rotates, shifted and inverted logic, extended and LSR/ASR add/sub, carry with XZR -- `extr` was 17.8% of the gadgets the coreutils digests run; b2sum takes 22% less time on the M4.) Profile something new (`ISH_JIT_PROFILE`, `tools/jitprof-gadget-pairs.py`) and look for a two-word gadget near the top. The riscv64 guest had the same look with digests and Python big numbers (2026-10-12; its test root has no openssl): it has no generic gadgets to find -- the hot ones are xor/addw/add/srlw/sllw, already one instruction each -- and what it lacked was those pairs in its list. A rotate there is three instructions (srlw, sllw, or: no Zbb in a distribution's binaries) and would be one gadget as a triple, see (5). Each needs a body macro in frag.h and a line in pairs.h, then `jitprof-gadget-pairs.py --fuse` again. (4) *More workloads in the profile set* -- arm64 done 2026-10-12, from ten (pairs.h's header names them). riscv64 the same day, from seven (535 pairs; M4 mixed; A10X digests 10-14% less time, the usual benchmarks 0.4-2.6% faster -- docs/build_559_musts.md). *Choosing pairs for their forwards* is the related idea, and it is measured (2026-10-12, `jitprof-gadget-pairs.py --fused`, which also prints this): jit_pair_fuse fuses the first pair it comes to, which already makes as many pairs as can be made; choosing among the ways of making that many for the most forwards (a pass over the whole block at gen_end, not step by step) would forward 1-2 more points of the gadgets run -- arm64 Python 9.4 -> 11.6%, 7-Zip 18.0 -> 19.2, gcc 8.1 -> 8.9, perl 9.1 -> 11.0; riscv64 Python 9.7 -> 11.3, gcc 9.9 -> 12.1, gzip 11.0 -> 15.8, digests 13.2 -> 15.9. At what a forwarded point has been worth (0.2-0.5% on the M4, a quarter of that on the A10X) that is under 1%, for moving the whole pass. The same pass would pick up the pairs lost across a step that emits nothing (a NOP, BTI, PACIASP resets pair_prev: 0.3-0.8 points of dispatches on sqlite, perl and the shell script). (4a) *arm64 pairs are near their ceiling:* by simulation, bodies for the remaining families (cmp with csel/cset, writeback loads/stores, SP stores, movk, generic add/sub immediate) take dispatches removed from 34.2% to 36.5%, under 1% of time on the M4. (5) *Triples and quads:* a pair is never the head of another. Simulated on the arm64 profiles (2026-10-12): after the pair pass 68-71% of the dispatches are left, and the 400 commonest pair+single and pair+pair sequences are 30-39% of those (17% for gcc), overlapping -- perhaps a tenth of the original dispatches, a third of what the pairs removed, and much more particular to the workload (sqlite's single hottest is one switch).
+- **Waiting, after 2026-10-11's work: what is left.** A wait now tries again for up to 25 us before it sleeps (util/wait_spin.h: realfs_read retries its read, a blocking socket call its recv or send, a queued FUTEX_WAIT watches for its dequeue; a wait that finds nothing makes the next 1, 3 ... 63 skip the trying). Round trips of two tasks passing a byte each way, before -> after, tests/bench-ab/ctx.c best of 3-5: M5 MacBook Pro guest pipe 8.9 -> 2.9 us (native 4.0), unix socket 9.6 -> 3.2 (native 5.3), condvar 8.3 -> 6.1 (native 3.1); M4 iPad 9.4 -> 2.4, 11.3 -> 2.7, 9.0 -> 2.9; A10X 39.5 -> 24.8, 53.1 -> 19.4, 29.2 -> 9.9. **It did not move the databases or a build** (MBP: MariaDB 114/267 tps at 1/4 threads before and after, PostgreSQL 181/417 vs 183/416-445, 48-file gcc build 13.4 vs 13.6 s at 4 jobs): those are bound by guest code, and a query's round trip was ~1% of it. Left: (1) the slow path is unchanged -- a read that really sleeps still does fcntl (one now, was two), read, pthread_sigmask twice, poll, read, and a socket wait still makes and closes a pipe (a pipe kept per task was tried and reverted: on a host allowing 256 descriptors it ran out); the sigmask pair needs the lost-poke history read first (c5692489); (2) the condvar round trip is still 2x native on the Mac, so the futex wake path is worth a profile of its own; (3) other waits are untouched: poll/epoll_wait, accept, pipes written by a full writer, wait4, sigtimedwait; (4) 25 us and the back-off were chosen, not tuned -- the A10X's pipe case gains least and may want longer.
+- **Databases, a baseline (2026-10-11, Mac -O2 CLI, Devuan arm64, nothing attached).** SQLite 3.54 against the Mac's own: bulk insert of 200k rows + index 3889 ms vs 205, 300k point lookups 3070 vs 298, range scan + group by 491 vs 32, 1500 commit-per-insert 315 vs 53. sysbench oltp_read_write (2 tables x 10k rows): MariaDB 47-90 tps at 1 client thread, 77 at 2, 111-184 at 4, 174 at 8 (the host was noisy: the same run twice differs up to 2x); PostgreSQL 17 174 tps at 1, 339 at 4. Where the busy time goes (host `sample`): SQLite 87% guest code, arm64_chain the top symbol at ~12% of it and gadget_arm64_load64_fast next; MariaDB 78-88% guest code and, at 4 threads, 7% waiting on a mutex inside cpu_step_to_interrupt_arm64 -- the per-address-space JIT lock, which every thread of one process shares; PostgreSQL 79% guest code and ~12% in the per-wait host calls of the entry above, no lock waits (its backends are processes). **Do not read throughput from a run `sample` is attached to:** with ~50 threads it slowed MariaDB 3-6x and made 4 threads look slower than 1. Root: build/devuan-arm64-db (a clone of the test root with the packages unpacked; dpkg's configure step hangs in postgresql-common's postinst under debconf, so the servers are initialised by hand -- mariadb-install-db, initdb -- and that hang is itself unexplored).
+- **Done 2026-10-13: a bad descriptor number in SCM_RIGHTS is EBADF, and the host's descriptor limit is raised.** sendmsg retained whatever `f_get` returned for each number, NULL included, so any guest that passed a closed descriptor or a failed open's -1 crashed the emulator (exit 139; seen as three suite legs dying on a host out of descriptors). It is EBADF now and nothing is sent, on all three AF_UNIX transports (tests/manual/scm_rights_bad_fd.c; passes on Linux 6.12). And nothing raised the host's soft RLIMIT_NOFILE: mount_root does now (platform host_raise_fd_limit; to kern.maxfilesperproc on Darwin), `/proc/ish/host_fds` reports the count by kind, the limits and the one the process started with, and tests/manual/host_fd_limit.c opens 700 files under a 256 start. **On an iPhone 12 (build of 2026-10-13, Devuan arm64): the app starts at 2560 and is raised to 10240, and host_fd_limit, scm_rights_bad_fd, fault_report_policy, native_net_options, native_abort, fcvt_half and cpu_identity all pass there; ping -W/-i and wget -T and its 404 status behave as on the Mac. That phone's root has no GPU drivers, so nullDescriptor is still unseen on a device.** **What the readout showed on the M4 (follow-up):** the app starts at 4864 and is raised to 10240; one minute after a Devuan boot with 50 guest processes it holds 1249 host descriptors, 1028 of them regular files (57 sockets, 121 pipes, 40 directories). About 20 files per process is what mapped libraries would cost if each mapping keeps a descriptor of its own, which would put a desktop of 250 processes over the old 4864 and one of 500 over the new limit too. **Confirmed the same day, on the M4 with a Wayfire desktop up (47 processes, 1088 host files):** distinct mapped paths counted per process sum to 963, and there are 88 open descriptors on paths; across all processes the distinct mapped files number 316. So it is the mappings: `data->fd = fd_retain(fd)` (kernel/mmap.c, kernel/exec.c) keeps the mapper's own open file description, and so its host descriptor, for the life of the mapping, one per process per library. The raise takes the urgency out (1,300 of 10,240). To share: one backing description per file for PRIVATE mappings, held in a table the last unmap empties. It must not be the first mapper's own description (its flock and OFD locks would then outlive it for as long as anyone else maps the file), so it needs a way to make a second description of an open file per filesystem (fakefs/realfs: dup the host descriptor, retain inode and mount); keep the shown path the same (hard links: 59575749a), leave SHARED mappings and memfds alone. Test with N processes mapping one file through their own opens and `/proc/ish/host_fds`. *Also seen:* `/proc/<pid>/maps` prints `00:00 0` for the device and inode of every file mapping, where Linux prints the file's.
+- **Done 2026-10-13: the kernel log reports a guest fault only when it kills its program.** Every fault got a full report -- line, registers, opcode window, stack -- and a distro's rsyslogd wrote it to disk twice: tests/manual/x86/amd64_evex_ud's 61,440 handled #UDs left 142 MB in each of kern.log and syslog, and three suite runs filled a phone. Now (kernel/calls.c guest_fault_reported) a fault whose signal has a handler, or a tracer to go to, is not reported, as Linux's unhandled_signal() has it; one that kills is, in full as before, ten in any five seconds at most, with a count of the rest. `/proc/ish/fault_reports` (`unhandled`, `all`, `none`; `ISH_FAULT_REPORTS` for the CLI) brings everything back for emulator work. The full report was kept for the killing fault rather than Linux's single line: it is what a user's pasted dmesg has been triaged from. amd64_evex_ud now adds 0 bytes to the log. tests/manual/fault_report_policy.c. A device suite run no longer needs /var/log emptied after it for this reason.
+- **A POSIX timer on CLOCK_PROCESS_CPUTIME_ID runs on the whole emulator's CPU clock, not the process's** (found 2026-10-11 on bip, behind timer_missed_periods). sys_timer_create gives it `timer_new(CLOCK_PROCESS_CPUTIME_ID, ...)` with no clock source (kernel/time.c: "the timer thread is in the same process, so reading it on any thread gives the same number"), and the host's process is every guest process and the app besides; the guest's own `clock_gettime` reads its thread group (rusage). So with anything else busy the timer runs fast: on bip with the Wayland desktop up, a 1 ms timer counted 930-958 expiries while the process's clock ran 593-645 ms (6 runs of 7; the 7th and every suite run printed "not checked" for want of parallelism, which is how a 2-core device hid it), and on the Mac with two `while :` shells beside it, 558's binary counted 1745 for 1150 ms. Fix: a clock source as the thread clock has (posix_timer_thread_cpu_now), reading the group's CPU -- but sys_timer_settime calls timer_set under group->lock and group_usage takes pids_lock then group->lock, so the arming's "now" has to be taken before that lock (or the source must not take it), and the timer thread's path checked for timer->lock -> group->lock against the syscall's group->lock -> timer->lock. timer_gettime and TIMER_ABSTIME (guest_clock_now) need the same clock. Test: timer_missed_periods's process-clock case with a busy sibling process, which makes it fail everywhere. *Looked at again 2026-10-13, not started:* the timer thread calls the clock source with timer->lock held (util/timer.c timer_now), and timer_settime calls timer_set with group->lock held, so a source that takes group->lock is an ABBA deadlock whichever way the arming's "now" is taken. Two ways out: a source that reads the group's CPU without group->lock (a per-group seqlock-published sum, refreshed where threads exit and where the vprof sampler already runs), or drive the process-clock timer from a wall-clock sampler whose callback runs unlocked, as ITIMER_VIRTUAL/PROF are (itimer_vprof_sampler) -- which then owes timer_gettime, overruns, TIMER_ABSTIME and the checkpoint image the same answers. A day's work with the suite; process-clock POSIX timers are rare in the field (profilers use ITIMER_PROF or the thread clock), so it waits.
+- **Native programs and the host C library's process-wide state: what the basename fix left** (2026-10-11). Native programs are threads of one host process, so any libc function that keeps its state or its answer in one static place is shared between them. basename was the proven case (an applet starting beside another ran as the other: tests/manual/native_applet_race.c), and basename, dirname, strtok, gmtime and asctime are per thread in the shim now, with the shim's own ttyname, ptsname, getmntinfo, getservent and getprotoent buffers. Not done: `inet_ntoa` (SmallCLUE calls it twice; one buffer on Darwin), `strsignal`, `strerror` for an unknown number, `ether_ntoa`, `devname`, `getbsize`, `nl_langinfo`, `tmpnam`, `rand`/`random` (one stream for everyone), and kernel/native_tz.c's one-zone cache (`ntz_zone`, `ntz_key`), which two programs with different TZ values write over each other's. Method: `nm -u` each native archive (libsmallclue, libzsh, libdash, libopenssh, libgit2, libnextvi, libmotepad, libktop) for imports the header does not route, and check each against Darwin's man page for "static" or "not thread-safe".
+- **Native zsh: a forked command's expanded words travel as ONE argv string, so past 128 KB it is E2BIG** (found 2026-10-10 on the M4 with the 558 build). `zsh -c 'a=$(seq 1 30000); /bin/true $a'` fails "subshell failed: argument list too long" where /bin/sh, guest bash and native dash all run it (558's execve takes 2 MB with the default stack, fd70bb30b). aok_spawn_subshell (deps/zsh/Src/aok_fork.c) re-launches `zsh -f -c -- <cmd>`, and for a simple command exec.c builds <cmd> with aok_quote_words(args): every expanded word quoted into one string, argv[4]. Linux caps a single argument string at MAX_ARG_STRLEN (128 KB), so `rm *` in a directory of a few thousand files fails in the user's login shell though Linux zsh, which execs the words as separate arguments, would run it. Not new in 558 (557 capped the whole argument space at 128 KB). Fix: send the command text through the state pipe the re-launch already reads (it carries the positional parameters for the same reason) and keep argv short; deps/zsh is the emkey1 fork, so land it there and bump the submodule.
+- **The RISC guests are at the threaded-code floor; get creative (user, 2026-10-10).** 557 -> 558 benchmarks (7z b 1 -mmt1 -md22 MIPS; the Python microbench fib/method/dict/str in ms; app builds alternated, 2-3 rounds each, medians): M4 x86_64 165 -> 817, i386 349 -> 599, arm64 997 -> 979, riscv64 913 -> 886; A10X x86_64 69 -> 211, i386 119 -> 187, arm64 318 -> 323, riscv64 290 -> 288. So x86 caught up by getting what arm64/riscv64 already had (register-specialised gadgets, fused pairs, dead flags), and both RISC guests sit at ~1.5-2 ns per guest instruction. iOS gives no writable-executable memory, so the room is more work per dispatch: (1) look first at the small 557 -> 558 slips that held across every round -- riscv64 7-Zip -3% (M4), arm64 Python str +7% (M4), riscv64 method +8% (A10X) -- they may name one gadget change; (2) profile-driven superinstructions: count the hottest gadget pairs/triples in 7-Zip and Python (ISH_JIT_PROFILE, the guest PC sampler) and fuse them, as the i386 fusions did (+68%); (3) cheaper block transitions -- chain_ip's poke check and chain-budget load/store on every chained branch (lost-poke history, c5692489: measure first); (4) guest registers resident in host registers across chained blocks, which lost on amd64 but maps more directly arm64-on-arm64. The kit is tests/bench-ab/ (ab.sh alternates two app builds per device; summarise.py gives the medians).
+- **execve, three small gaps left by fd70bb30b:** native `sysconf(_SC_ARG_MAX)` (kernel/native_libc.c nlibc_sysconf) returns EINVAL, so native tools get no ARG_MAX; a guest execve with argv == NULL is EFAULT where Linux 5.10 runs it with an empty argv; and execveat on a bad fd reports E2BIG/EBADF in a slightly different order from Linux.
+- **The standalone `virgl_render_server` no longer links** (`ninja -C build` all targets): `_mvkAOKSetNextImageRowPitch`, the MoltenVK hook from the 557 cycle's dumb-buffer pitch fix, is referenced by libvirglrenderer's vkCreateImage but not linked into the server. The app runs virglrenderer in process and is unaffected; give the server the hook (or a weak no-op) so a bare `ninja` passes again.
+- **GH #631, what is left (2026-10-12).** The drop itself is iOS (the app is suspended when the screen locks, and a locked device reclaims a suspended app's TCP connections); what keeps a session is what keeps the app running, `cat /dev/location > /dev/null &` or audio, and the reporter has been told. Ours was the errno, fixed: a socket iOS took away has EBADF as its pending error, AOK read that ahead of the guest on every poll, and ssh's next read got "Bad file descriptor"; it is ECONNRESET now (fs/sock.c sock_host_so_error, tests/manual/tcp_suspend_reset.sh). Not done: such a connection polls IN|OUT|HUP with no POLLERR (measured), where Linux's tcp_poll sets POLLERR while an error is pending (from its source, not checked on a Linux box); and the keep-alive was described from the code, not timed on a locked device.
+- **Done 2026-10-13: the theme rows have accessibility labels.** The rows of the Workspace's theme list are custom UIButtons, which VoiceOver announced as "button"; each now carries its theme's name as its label, "Built-in theme" or "Saved custom theme" as its value, and the selected trait when applied (app/WorkspaceViewController.m). No new strings. Built; not listened to with VoiceOver on a device.
+- **Done 2026-10-13: the File Provider is "iSH-AOK" in Files** (app/FileProvider/Info.plist CFBundleDisplayName; files-app-integration.md with it). Checked in the built extension's Info.plist, not yet looked at in Files on a device.
+- **Settings.bundle: the Swap Size picker sits after the Suspend group** in app/Settings.bundle/Root.plist, so it may appear under the wrong header. Check in Settings on a device and move it.
+- **README and book ch41 quote ~6.8 ns per dispatch.** That figure predates this cycle's gadget work and may be stale; re-measure before the next release's docs pass.
+- **networking.md's advice to bind ports >= 1024** rests on hosts refusing privileged binds; one M4 iPad allowed one (tests/manual/inaddr_any_iface.c). Check what iOS 26/27 devices do and narrow the advice to the evidence.
+- **Two local branches hold unlanded work** (sweep for 558, nothing deleted): `claude/jovial-dhawan-96001a` (6c0568e83, 2026-08-22) -- the #523 "Go heap-growth stall" diagnosis, which docs/TODO.md's #523 entry does not contain (an `alloc` probe: growing the Go heap by 256 MB took 0.2 s best, 12 s typically); and `worktree-external-display-540` (6156597ee, 2026-07-30), the parked external display mirroring (GH #540). Decide whether to land the #523 text and when to raise #540.
+- **Appendix F has 27 tests with a blank description** -- their sources start `/*` with the text on the next line, which docs/book/appendices/generate.py's first_comment() does not read. Shipped ones: eventfd_interrupt, futex_core, process_lifecycle, pthread_sync, signal_altstack, signal_core, signal_poll, signal_realtime, signal_restart, x86/amd64_regress, x86/atomic_cmpxchg32, x86/atomic_cmpxchg8b, x86/atomic_logic32, x86/atomic_xadd32, x86/atomics32. Give each a one-line `//` header, or teach first_comment() the two-line form.
+
+- **Guest instructions still implemented in C (inventory 2026-10-05; the maintainer's rule is 100% gadgets).** riscv64: its gadgets call C for infrastructure (tlb_handle_miss, tlb_write_ptr_slow, cross-page access, hle_call, fence.i's flush) and, through call_helper, for AOK_VCLOCK (the vDSO's clock read, a kernel service as a system call is); fclass and fcvtmod.w.d are gadgets since 2026-10-05, and since 2026-10-07 the FP CSRs fflags/frm/fcsr (fp.S csr_fp, emu/fpenv.c's model in asm), the cycle/time/instret counters (csr_counter, the host counter as ns; counter_ns.c covers riscv64 too) and the vendor-extension pack (jit/riscv64_vendor_ext.c now rewrites a registered custom-0..3 word into the ratified instruction it equals, compiled with that instruction's gadgets; riscv64_vendor_ext_dispatch and its C handlers are deleted; opt/AOK/docs/riscv64-vendor-extensions.md updated). arm64: MRS/MSR FPCR/FPSR are gadgets since 2026-10-07 (jit/guest-arm64/dpextra.S; fpenv_arm64_sysreg deleted; arm64_fp_env catches a mutated one), so no arm64 instruction runs in C. Atomics are gadgets since 5680ff71, LD1-4/ST1-4 since 8e4937bc, the SHA512 and CRC32 fallbacks since 076e3744, MOPS since 2026-10-06; the pair helpers remain only for emu/arm64_interp.c. x86, inventoried 2026-10-06 (~25k lines of run-time C semantics; on Python/sed/sort/gzip workloads it is 2-4% of host time, so this is coverage, not speed). Mechanisms: misc.S's helper_*/fhelper_*/vec_helper_* gadgets (blr to a C pointer from gen.c's h()/hh()/h_read()/fh()/v() macros), amd64's helper_tlb_N_retint bridges to amd64_jit_* (emu/amd64_interp.c), direct `bl`s, and the amd64 interpreter fallback. **amd64, gadgets since 2026-10-06:** POPCNT, CMPXCHG to memory (32/64), PUSHF/POPF (16/64; TF now traps after the next instruction), RET imm16, POP r/m, MOV moffs, 16-bit PUSH/POP/PUSH imm/LEAVE and REX.W PUSH/POP (were interpreter-only), LOOP/JECXZ with 0x67, MOVS/STOS/LODS/SCAS/CMPS (every size, REP/REPE/REPNE, 0x67, FS/GS, page-span bulk path), CPUID (asm lookup in emu/cpuid.h's tables) and XGETBV (#GP at the instruction now). Also since 2026-10-06: CMPXCHG and XADD to memory (every size, high byte, LOCK), the whole ALU family (add/or/adc/sbb/and/sub/xor/cmp, TEST and MOV reg-reg: every size, high bytes, r/m-reg, reg-r/m, imm, memory, LOCK -- jit/gadgets-aarch64/math.S amd64_gen_alu_mem/amd64_gen_alu_rr), every shift and rotate including RCL/RCR (memory, register, 1/CL/imm), MUL/IMUL/DIV/IDIV r/m at every width (128-bit DIV in asm, #DE; 8/16-bit AX/DX:AX forms too), INC/DEC and NOT/NEG at every width with LOCK (the general ALU gadgets: ops 10 NEG, 11 NOT, a keep-CF bit), IMUL r, r/m, imm at 16 bits, MOVZX/MOVSX into any register at any width (amd64_movx_any), PUSH r/m, XCHG with memory, and the whole 0F r/m group (CMOVcc, SETcc, BT/BTS/BTR/BTC with LOCK, SHLD/SHRD, IMUL r,r/m, BSF/BSR/TZCNT/LZCNT, CMPXCHG/XADD register forms, the hint NOPs: every width; amd64_jit_0f_rm is down to 0F AE, and the C it replaced had SHRD-by-1's OF and the 32-bit SHLD/SHRD zero-extension wrong); misaligned LOCK goes through emu/tlb.c's x86_atomic_* (infrastructure, as tlb_handle_miss is). Tests: tests/manual/x86/amd64_{alu_mem,shift,0f_rm,misc_rm,muldiv,xadd,xchg_mem,push_rm,cmpxchg}.c, the first four generated by tools/gen-amd64-{alu,shift,0f-rm,misc-rm}-test.py; C deleted: amd64_jit_grp3_muldiv, locked_alu_slow, locked_xchg_slow, imul_imm, movx, fe_group, grp3_op, and amd64_jit_0f_rm down to 0F AE; all pass on camd. ISH_TRACE_AMD64_BRIDGES=1 lists the C bridge sites a run compiles (now dumped on every new site). **amd64 SSE/SSE2/SSE3 and MMX, gadgets since 2026-10-06:** all of it in the JIT -- the integer ops (amd64_vi_*), packed shifts (amd64_vsh_*), MMX moves and odds (amd64_mmx_*), data moves (amd64_xm_*), and floating point exact to x86 (amd64_xf_*: arithmetic, MIN/MAX, SQRT, CMPcc, (U)COMIS, ADDSUB/HADD/HSUB, every conversion, RCP/RSQRT, MOVMSK; DAZ, FTZ, DE and x86's NaN rules done in the gadget, host FZ off for amd64 -- matched case by case against an AMD Ryzen under seven MXCSR modes, tests/manual/x86/amd64_sse_float.c); an encoding x86 does not have is #UD from a gadget arm (amd64_sse_ud.c checks all 1332 forms against the hardware). amd64_jit_0f_vec_rm and amd64_sse3_haddsub remain only as the interpreter's. **SSSE3/SSE4.1/SSE4.2 too, since 2026-10-06** (the 0F 38 and 0F 3A maps, MMX forms included -- those were SIGILL): amd64_vi_* kinds, PMOVSX/ZX, PALIGNR/PBLENDW/BLENDPS/PD/MPSADBW (amd64_v3a_*), PTEST/PEXTR*/PINSR*/EXTRACTPS/INSERTPS/CRC32 (amd64_s4_*; CRC32C native or bitwise without FEAT_CRC32), ROUND* and DPPS/DPPD exact to the hardware, PCMPESTRI/ESTRM/ISTRI/ISTRM as the SDM's algorithm on NEON column masks (amd64_pcmp*str*), LDMXCSR/STMXCSR (a reserved bit is #GP now; fpenv's FPCR cache compares the live register); what the maps hold that AOK does not advertise (AES, PCLMULQDQ, SHA, MOVBE, ADX) is #UD. amd64_jit_0f38 and the C string helpers are deleted. **The x87, both guests, gadgets since 2026-10-06** (jit/gadgets-aarch64/x87.S; one register-form gadget set serves i386 and amd64): every D8-DF form, FXSAVE/FXRSTOR, FWAIT, EMMS -- 80-bit arithmetic in integer registers with precision and rounding control, the real tag word (cpu->x87_valid; stack overflow and underflow), x86's NaN rules, denormal and pseudo-denormal handling, unmasked exceptions (no result for IE/DE/ZE, the 24576 exponent bias for OE/UE into a register, no store into memory) and #MF at the next waiting instruction (INT_MF, SIGFPE with Linux's si_code), FPREM's partial remainder (an AMD reduces to a multiple of 32), the environment and save images (FNSTENV masks and clears ES; FXSAVE writes only what hardware writes). Matched case by case against an AMD Ryzen: tests/manual/x86/x87_kat.c (122,880 cases, every rounding mode x precision), x87_kat_unmasked.c (27,648), x87_env.c, x87_mf.c; tools/gen-x87-test.py. 1.3-1.7x faster than the C it replaced. amd64_jit_x87, amd64_jit_x87_mem and the i386 fhelper calls for x87 are gone; emu/fpu.c remains for the amd64 interpreter and the x86_64-host backend. **The transcendentals too, since 2026-10-06** (F2XM1 FYL2X FYL2XP1 FPTAN FPATAN FSIN FCOS FSINCOS): 128-bit integer arithmetic, a leading term plus a fixed-point series with the tail joined by a sticky bit, so every result is the correctly rounded one; the x87's own 66-bit-pi argument reduction, C2 at 2^63, every special operand, stack fault and unmasked exception as an AMD Ryzen does them. The Ryzen itself is a unit off in ~2% of cases (its internal approximation, not reproducible), so tests/manual/x86/x87_trans.c (16,989 cases, tools/gen-x87-trans-test.py) allows that unit and C1 with it; the old C failed 12,083 of them. Speed about the old inexact C's (fsin 78 ns vs 66; FYL2X/FYL2XP1 4-7x faster). amd64_jit_x87_reg is deleted. Unmasked UE's tininess is now after rounding, as the hardware's (an FMUL rounding up into the smallest normal raised UE before). **VEX, both guests, gadgets since 2026-10-07** (jit/gadgets-aarch64/vex.inc, included by math.S; jit/gen.c vex_table/vex_plan, one table for gen_amd64_vex and gen_vex32): AVX/AVX2 integer, float, shuffles/permutes/blends, moves and broadcasts, widen/narrow, GPR in/out, VTEST/VPTEST/(U)COMIS, VMASKMOV/VPMASKMOV, LDMXCSR/STMXCSR/PCMPxSTRx/MASKMOVDQU, VZEROUPPER/ALL, BMI1/BMI2, FMA3 (single rounding; x86's NaN order per form, IE over DE in an invalid lane) and F16C (VCVTPS2PH's imm8 rounding; a memory destination goes write probe -> convert into VEX_STAGE -> store, so a fault leaves MXCSR untouched). x86 tininess (after rounding) is now exact in the SSE/AVX MUL/DIV/CVT/DP bodies too (math.S xf_tiny: a result that came out +-minnorm is redone scaled by 2^64), FTZ included. Tests, generated by tools/gen-vex-{int,float,imm,move,width,gpr,misc,mask,bmi,fma,f16c}-test.py and tools/gen-sse-tiny-test.py, hashed against camd: tests/manual/x86/{amd64,i386}_vex_*.c and *_sse_tiny.c (F16C: every half, all eight imm8 roundings, #UD for W1/vvvv, the fault ordering read from the signal frame). VSIB gathers too (vex.inc vex_gather_*: restartable per element, a fault leaves the elements below it done and their mask elements zeroed, as camd does; {amd64,i386}_vex_gather.c). **The VEX cutover, done 2026-10-08:** every VEX instruction is gadgets or #UD -- the amd64 C4/C5 bridge to amd64_vex_step is gone (bytes that will not decode, a 0x67 address, go to the interpreter as any undecodable instruction does) and the i386 vec_avx32 fallback is the x86_64-host backend's only. The gate, tests/manual/x86/{amd64,i386}_vex_ud.c (tools/gen-vex-ud-test.py): every VEX encoding of maps 1-3 (each opcode, pp, L, W; register, memory, and vvvv != 1111b) against an Intel CPU's answer (SDE -spr with its chip check; AOK is GenuineIntel -- an AMD Ryzen differs in the opmask instructions, AVX-VNNI, VEX GFNI/VAES/VPCLMULQDQ, which it lacks, and VPERMQ/PD W0 and FMA4, which it runs). It found: W1 forms Intel #UDs that the bridge ran (VBROADCAST*, VPBROADCAST*, VTESTPS/PD, VPERMD, VPBLENDD, VPERMILPS/PD imm, the 128-bit lane ops, VBLENDV*), FMA4, VZEROUPPER/ALL and RORX with vvvv != 1111b (RORX's check returned a runnable plan), map 1 0x43, i386 KMOVD with W1 (the SDM's N.E.: it is KMOVD), AVX-VNNI missing (now through the EVEX table), and on i386 ~4000 encodings vec_avx32 ran with the wrong pp. **The EVEX cutover, done 2026-10-08:** every EVEX instruction is gadgets or #UD too -- amd64_jit_vex, the last C bridge for VEX/EVEX, is gone (it aborted the host on EVEX 0F 54 W1 [mem]); EVEX bytes that will not read go to the interpreter as any undecodable instruction does. The gate, tests/manual/x86/{amd64,i386}_evex_ud.c (tools/gen-evex-ud-test.py): every EVEX encoding of maps 1-3, 5 and 6 (each opcode, pp, L'L, W; register and memory) against SDE -spr with its chip check, AVX512-FP16 (maps 5/6 and its map 3 rows; SPR has it, AOK neither implements nor advertises it) made #UD, and three later parts' encodings SDE's chip check lets through (3.07 pp1 TILEMOVROW, 3.08/3.26 pp3 VRNDSCALEBF16/VGETMANTBF16) made #UD. Its sweep found only gaps, now all gadgets: VMOVSS/SD, VMOVLPS/HPS/LPD/HPD/HLPS/LHPS and stores, VMOVSLDUP/SHDUP/DDUP, (V)(U)COMISS/SD, VANDPS..VXORPD, VMOVD/Q, VPINSRB/W/D/Q, VPEXTRB/W/D/Q, VEXTRACTPS, VINSERTPS, VPBROADCASTMB2Q/MW2D, VDBPSADBW, VRCP14/VRSQRT14 (Intel's published reference algorithm, recip14.c: a 64-entry table and a truncated linear step on the top 16/15 fraction bits; checked exhaustively against the reference for all 2^32 floats and against SDE), and BF16 (VCVTNEPS2BF16, VCVTNE2PS2BF16, VDPBF16PS: each product fused into the sum, DAZ, FTZ after rounding, s1's NaN first). i386 found VPINSRB/W (WIG) and VPBROADCASTD/Q r (N.E.: as W0) with W1 #UD -- fixed. **Advertised since 2026-10-08** (emu/cpuid.h CPUID_ADVERTISE_VECTOR_STATE, on for aarch64 hosts): AVX, AVX2, FMA, F16C, AVX-512 F/DQ/BW/VL/CD/IFMA/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ, AVX512_BF16, AVX-VNNI (leaf 7 subleaf 1), GFNI, VAES, VPCLMULQDQ, AES-NI, PCLMULQDQ, XSAVE/OSXSAVE, and MOVBE, LZCNT and LAHF_LM -- glibc rates AOK x86-64-v4 (its hwcaps levels v2-v4 all "supported"), and its EVEX/AVX2 string routines measure faster under AOK than the SSE2 ones they replace (memcpy 16K ~2x, memset 2-3x). What held it back is done: XSAVE/XRSTOR as gadgets, XSAVEOPT as XSAVE (x87.S; standard format at Intel's offsets -- leaf 0x0D's table was AMD Zen 4's packing, ZMM_Hi256 sized 1024, now Sapphire Rapids': opmask 1088, ZMM_Hi256 1152, Hi16 1664, 2688 bytes; XINUSE by value), the XSAVE math frame in amd64 and i386 signal frames with Linux's magics, sigreturn's XRSTOR rules (FXSAVE-only frames, XSTATE_BV, SIGSEGV on a bad header; i386 takes x87 from the FNSAVE header, as convert_to_fxsr), handlers starting from the initial configuration, ptrace NT_X86_XSTATE (and i386's FNSAVE NT_PRFPREG/GETFPREGS, FXSAVE GETFPXREGS/NT_PRXFPREG, which were zeros), exec's reset of every vector register, AT_MINSIGSTKSZ, Linux's red zone (not on the altstack) and SIGSEGV for a frame that overruns its altstack, and MOVBE as gadgets. The i386 JIT stages operands in xmm15, so a 32-bit task's XINUSE, frame and regset cover registers 0-7 only. Tests: x86/x86_xsave.c (both ABIs; XSAVE/XRSTOR against SDE for the AVX-512 components and an AMD Ryzen, -DNO512, for x87/SSE/AVX -- SDE runs those parts on its host and loses x87 state, its MXCSR_MASK is the host's 0x2ffff), x86/x86_movbe.c (Ryzen), cpuid_xsave.c (a probe per bit, both ABIs). Still to do: device legs for the new tests (the M4 and SE2 were unavailable 2026-10-07). **AVX-512 (EVEX), decided 2026-10-07: gadgets, checked against Intel SDE 10.13.1 (-spr) on camd** (no real AVX-512 here; SDE runs 32-bit freestanding int $0x80 probes too). Done: the opmask instructions (VEX), the EVEX framework (jit/gadgets-aarch64/evex.inc: zmm0-31 by quarters, merge/zero masking, {1toN}, disp8*N, masked loads/stores with fault suppression, both decoders), the moves, the integer ops, compares/tests into k, shifts/rotates, the qword ops, VPTERNLOG, VPBLENDM, the broadcasts, the non-temporal moves, the float arithmetic and compares (masked-off lanes raise nothing; {er}/{sae}; scalar element-0 masking), and the lane-crossing ops on a whole-vector frame (VPERM*, VPERMI2/T2*, VALIGN, VSHUF*x*, VINSERT/VEXTRACT) with the in-lane imm8 shuffles; since 2026-10-08 VPMOVSX/ZX, the truncating and saturating VPMOV* down-converts (to a register, or masked to memory: only the narrow result is touched), VPCOMPRESS*/VPEXPAND* (scalar pass; register and memory), VPCONFLICT, VPLZCNT, VPOPCNT, VPMOVM2*/VPMOV*2M; and VBMI's VPMULTISHIFTQB, VBMI2's VPSHLD/VPSHRD(V), VNNI, IFMA, BITALG (VPOPCNTB/W, VPSHUFBITQMB), and GFNI, AES (AESENC/ENCLAST/DEC/DECLAST, AESIMC, AESKEYGENASSIST: ARM's AESE/AESD/AESMC/AESIMC with the round key added after) and PCLMULQDQ (PMULL) in all three encodings (EVEX; VEX and legacy SSE through the EVEX table: gen.c vex_to_evex, word bit 63 keeping an SSE form's upper bits; the SSE and VEX.128 AES/PCLMULQDQ also match camd's hardware); the gathers and scatters (evex.inc evg_*: restartable per element, as the VEX gathers); since 2026-10-08 FMA (VF[N]MADD/VF[N]MSUB 132/213/231 PS/PD/SS/SD, VFMADDSUB/VFMSUBADD: vex.inc's fma_body on the lane frame, {er}, the destination an operand), VGETEXP, VGETMANT, VRNDSCALE and VREDUCE (each {sae}), VSCALEF ({er}; musl scalbn's exact steps, one rounding), VRANGE, VFPCLASS, VFIXUPIMM, and every conversion: the same-width ones, the widening and narrowing ones (evex_cvtw/cvtn frames), VCVTSS2SD/SD2SS, to and from general registers (evex_cvt2gpr; the unsigned too), VCVTPH2PS/PS2PH (the float harness has them all) (tests/manual/x86/{amd64,i386}_avx512_{kmask,int,cmp,misc,float,perm,xform,ext,gather}.c; the float harness is the maintainer's). Two places AOK does not copy SDE: zero-masked VSUBPS/PD under round-down at 256/512 bits, where SDE writes -0.0 and the SDM 0 (the float harness checks those elements itself); and EVEX VCMP's constant predicates (0x0b/0x0f/0x1b/0x1f) raise no DE in SDE though VEX VCMP's do (SDE and an AMD Ryzen alike) -- AOK follows SDE for EVEX. A compress store / expand load faults as SDE has it, by the enabled elements' own positions, though only the packed ones are touched; AOK faults on the union of those and the packed bytes (a packed element on an unmapped page whose enabled position is mapped faults in AOK, where SDE aborts with "Could not write memory" -- the xform test skips that case under "sde"). SDE zeroes the bits above 128 for the legacy SSE GF2P8MULB/AFFINEQB (not for PADDB, PSHUFB or AESENC; -spr and -icl alike); the SDM leaves them unmodified and AOK follows it (the ext test checks them itself). SDE keeps nothing across a gather's or scatter's fault (after the restart it re-reads every element; at the fault a scatter has written nothing); the SDM has every element below the faulting one done and its opmask bit clear, as camd does for the VEX gathers, and AOK follows the SDM (the gather test checks that itself, skipped under "sde"). The legacy SSE GFNI, AES and PCLMULQDQ forms run (amd64_sse_ud expects them to; camd #UDs GFNI, having none). AES and PCLMULQDQ are advertised with the vector switch (emu/cpuid.h), and their gadgets no longer need emu/avx.c. SDE evaluates an EVEX.128 FMA's elements 128-255 too and raises their flags (VADDPS does not; nor VL 256 past 256): the float harness puts 1.0 there for its 128-bit FMA forms. SDE raises PE (and DE for a denormal) for VRNDSCALEPD/SD with imm8 bit 3, which suppresses PE (PS/SS and ROUNDSD honour it): the harness checks PE and DE clear there itself. VREDUCE as SDE has it: x - rndscale(x) rounded in the imm8 (or MXCSR) mode, inf -> +0, no PE, FTZ flushes with no flag; VGETMANT: a NaN first, then 0 and inf (1.0), then imm8 bit 3's negative NaN (IE, no DE). VSCALEF follows the SDM's table (a QNaN s1 with s2 +-inf gives +inf/+0) and sets flags as a multiply; SDE raises no OE/UE/PE under DAZ and no DE for a denormal s1 under FTZ or with OE/UE -- no AVX-512 hardware here to settle it, so the harness hashes those flags clear there. VRANGE as SDE has it: a QNaN passed over, an SNaN quieted with no sign control, two QNaNs s1's, DE beside a QNaN but not an SNaN, equal magnitudes by sign. VFPCLASS applies DAZ (SDE); negative finite excludes -0. VFIXUPIMM's "QNaN(src)" response ORs the NaN bits into whatever s1 is, and DAZ keeps the sign (SDE). Found on the way and FIXED: math.S xf_f2i_scalar raised PE beside IE for an out-of-range CVT(T)SS/SD2SI whose truncation landed in range (-2147483648.5 rounded down; camd and SDE raise IE alone) -- SSE, VEX and EVEX alike. The generated AVX-512 tests build at -O1 in the suite (-O2 took an hour in the guest for avx512_float). Device leg (iPhone SE, 2026-10-09): x86_xsave, movbe, rdtscp, cpuid_xsave, cpuid_xgetbv (both ABIs), amd64_addr32, amd64_0fae, amd64_sse_ud, the EVEX #UD and the float/gather/ext AVX-512 tests all pass; dmesg holds only their deliberate faults. Found on the way and FIXED: the tininess fix's FTZ path stored MXCSR = 0x30 for a double op (xf_lanebits_sign clobbered x9), losing the rounding, FTZ/DAZ and every mask -- sse_tiny now hashes all of MXCSR. Gaps noted: a masked fixed-size memory operand (an element broadcast's, a 128/256-bit broadcast's) is read whole, so a fully masked-off one on a bad page faults. Also found and fixed on the way: the i386 guest #UD'd any VEX with vvvv's bit 3 clear (it is ignored as a register in 32-bit mode; i386_vex_vvvv3.c). **amd64 residual bridges, deleted 2026-10-06:** amd64_jit_ff_group, reg_reg_op, reg_imm_op, modrm_imm, mem_op, shift, xchg_rm, grp3_test, cmpxchg8b and 0f_rm -- every shape they still took is a gadget arm or #UD now, checked against camd: CALL/JMP through memory with 0x66 (the TLS general-dynamic `data16 rex.W call *__tls_get_addr@GOTPCREL(%rip)`, the one real-workload hit) or FS/GS; ALU-immediate, shift and TEST register forms with a segment prefix or REX.R; MOV $imm8 to AH..BH and XCHG with AH..BH (were whole-block interpreter fallbacks); MOVSXD without REX.W (a MOV), from memory with FS/GS or 0x66; LEA with a segment prefix (ignored); CMPXCHG8B/16B (math.S amd64_cmpxchg8b_mem/16b_mem: exclusive CAS, x86_atomic_cas misaligned, 16B's #GP, only ZF); CLFLUSH/CLFLUSHOPT now fault on an unreadable line; and #UD where the C executed: LOCK on CALL/JMP/PUSH/MOV/LEA/MOVSXD/TEST/XCHG/shift and every register form, 0x66 on the fences/FXSAVE/LDMXCSR/STMXCSR, C6/C7 /1-/7. Tests amd64_ff_indirect, amd64_odd_shapes, amd64_cmpxchg16b, amd64_0fae (the old JIT failed each). Also fixed: the x86_64-host i386 CPUID/XGETBV/POPF macros (cece091f5 broke Linux CI's e2e; 43e1ce988). The segment-register moves too (MOV r/m, Sreg; MOV Sreg, r/m; PUSH/POP FS/GS: math.S amd64_sreg_*, amd64_jit_sreg deleted; amd64_segment_regs catches a mutated gadget). IRET too (amd64_iret8/4/2; it now takes TF as hardware does; amd64_iret covers IRETD/IRETW). Left in C: port_io (#GP), VEX; syscall, vmcall and ud2 are kernel entries. **amd64 interpreter only (measured 2026-10-08, every candidate probed; 0F 01 and 0x67 on a VSIB gather/scatter with a segment override closed 2026-10-09 -- amd64-mem.h amd64_vsib_addr32 truncates the element address before the segment base, amd64_addr32.c):** INT 0x80 (#UD: Linux's 32-bit compat syscall gate from 64-bit code is not provided) -- and a fallback interprets until the next syscall or 1024 steps, not one instruction. **System-descriptor instructions, gadgets since 2026-10-09 (both guests; they were #UD):** SGDT, SIDT, SMSW, SLDT and STR as Linux 5.10 spoofs them on a UMIP processor (umip.c: zero limit, bases 0xfffffffffffe0000 / 0xffffffffffff0000 or their low 32 bits, CR0_STATE 0x80050033, 0, 0x40; two bytes to memory, the operand size's memcpy'd into a register -- so a 32-bit one keeps the upper half -- a faulting store SIGSEGV/SEGV_MAPERR at the operand with the first page's bytes written; the ratelimited "umip:" kernel-log warning, kernel/calls.c x86_umip_warn), with UMIP advertised (leaf 7 ECX bit 2, cpuinfo "umip"); LAR, LSL, VERR and VERW from Linux's GDT (math.S x86_seg_desc: entries 4/5/6, the TLS entries, CPUNODE 0x7b whose limit is getcpu's; LAR returns limit 19:16 as hardware does); SWAPGS #GP; every other 0F 01 form (MONITOR, MWAIT, CLAC/STAC, XTEST, SERIALIZE, RDPKRU/WRPKRU, VMX/SVM, the AMD-only ones -- none advertised) a #UD gadget. tests/manual/x86/x86_sys_desc.c (camd for the hardware semantics and the GDT; umip.c for the spoof). **Gadgets since 2026-10-08:** XLAT (math.S amd64_xlat), HLT/INT3/INT n and every #UD and port-I/O/privileged #GP (math.S amd64_raise; amd64_jit_ud2 and amd64_jit_port_io deleted), RDTSCP and RDPID (both guests, advertised: IA32_TSC_AUX = getcpu's (node << 12) | cpu, cpu_state tsc_aux, kept current after every interrupt and by rseq_fork/rseq_exec; tests/manual/x86/x86_rdtscp.c, camd), and 0x67: on MASKMOV* ([edi]) and VSIB gathers/scatters (each element's address truncated), inert on 0F 01's register forms but MONITOR's kind, and inert where nothing has an effective address (the linker's `addr32 call` relaxation -- libcrypt has 220 -- and OpenSSL's register-only padding sent each block to the interpreter), and on a ModRM memory operand a 32-bit address (meta AMD64_JIT_MEM_ADDR32, truncated in amd64_vmem_addr and the LEA gadgets) -- the interpreter had not truncated, so an addr32 load through a pointer with bits above 31 was SIGSEGV; also MAP_32BIT, which mmap ignored (tests/manual/x86/amd64_addr32.c, camd). On the glibc root's Python/Perl/gcc/openssl/coreutils run: no fallbacks, and no C bridge but syscall and vmcall (ISH_TRACE_AMD64_JIT_STATS, ISH_TRACE_AMD64_BRIDGES). **The cycle counters, gadgets since 2026-10-06:** x86 RDTSC (i386, amd64) and arm64 MRS CNTVCT_EL0 read the host counter as ns (gadgets-generic.h host_counter_ns: ISB, CNTVCT*1e9/CNTFRQ) instead of calling clock_gettime -- the host counter does not run while the device sleeps, as CLOCK_MONOTONIC does on Darwin; tests/manual/counter_ns.c. **Misaligned LOCK, gadgets since 2026-10-09 (both guests):** math.S x86_lock_rmw does the operation -- a 16-byte block compare-exchange (ldaxp/stlxp) inside a block, the split lock across two, where only taking and releasing it (emu/tlb.c x86_lock_split_begin/_end) is C -- and each gadget takes its flags from the old value; jit/helpers.c helper_atomic_unaligned/cmpxchg8b and emu/tlb.c x86_atomic_alu/xadd are deleted (x86_atomic_rmw/cas/xchg stay for the amd64 interpreter). tests/manual/x86/x86_lock_ops.c: every locked form at every block offset and across a page against the unlocked form, camd's hash (it caught two register clobbers on the split path). Found on the way and FIXED: the i386 memory BT/BTS/BTR/BTC shifted a register bit index unsigned (a negative one faulted 512 MB away; a 16-bit one was not sign-extended) and used an imm8 index unreduced -- the x86_64-host backend too (x86_bt_mem_index.c, camd). **i386:** CPUID/XGETBV and the PUSHF/POPF/SAHF/LAHF flag collapse are asm since 2026-10-06; the x86_64-host backend jit/gadgets-x86_64 still calls helper_cpuid/xgetbv/collapse/expand. Bit ops, shifts, mul/div and push/pop are gadgets on i386, and since 2026-10-06 the BCD adjusts (exact to AMD's "undefined" flags now, i386_bcd.c; the x86_64-host helpers in jit/helpers.c are not), LOOP's ECX step, the segment-register moves (memory.S sreg_*, emu/i386_sreg.c's rules in asm; i386_jit_sreg stays for the x86_64 host), the REP MOVS/STOS page-span path (string.S, math.S's x86_str_copy/fill; jit/helpers.c rep_string_fast deleted; F2 on MOVS/STOS/LODS is REP now, was #UD; i386_string_ops.c), every SSE/MMX op and LDMXCSR/STMXCSR (math.S i386_ldmxcsr: a reserved bit is #GP now, not masked off) on an aarch64 host: the amd64 engine's gadgets through gen.c's i386_vec_map / gen_i386_vec_special / gen_i386_vec_move, a memory source staged in xmm15 or amd64_regs[0], the C path #UD there (tests/manual/x86/i386_sse_{int,shift,mov,float}.c, i386_sse4_{int,misc}.c, i386_pcmpstr.c, i386_mxcsr.c, against camd; the decoder gaps they found -- CVTPS2DQ, CVTPD2DQ, RCP/RSQRT, MASKMOVQ/DQU, MMX PEXTRW, 0F 7F to a register, the SSSE3 MMX forms, a plain 0F C2 taken as CMPPD -- are fixed). An x86_64 host still runs emu/vec.c and mmx.c. Convert family by family as V was (jit/guest-riscv64/vector.S, tools/gen-rvv-gadget-test.py): a generated test against a spec model or compiler-built scalar code, a positive control per family, then delete the C. Profile first (ISH_JIT_PROFILE / host sample) to order the x86 families by time.
+- **riscv64 V at VLEN 256 (an option, not planned).** AOK's V is VLEN 128, the RVA23 minimum; vector gadgets cost a dispatch per instruction whatever the vl, so twice the elements per instruction would halve the per-element cost of long loops (Ubuntu Python spends ~3% in vector code; OpenSSL's ChaCha20 is the visible user). It touches cpu_state (riscv64_v), the signal frame's V record and the NT_RISCV_VECTOR regset (both sized by vlenb), checkpoints, vlenb, and every gadget's 128-bit mask handling (vlmask, the compare packers, vmsbf, vcpop, vfirst). Measure ChaCha20 and the vbench kernels first.
+- **Native Python, so native mode can `pip install` (after 558).** Native mode (docs/native_mode_plan.md, the first 558 feature) has no package manager by design; the maintainer's answer to "I need X" there is a distro root alongside it. A CPython built as a native program (like zsh/hx, on the shim) would let `pip` fill much of that gap for pure-Python packages. **Established:** nothing yet; a native program is a function call on the guest task's thread (no fork, fork-by-relaunch only), so CPython's `os.fork`/`subprocess` need the same spawn treatment the shells got, and C-extension wheels cannot be loaded (no unsigned code on iOS), so only pure-Python packages and extensions compiled into the app would work. **Next step:** measure CPython 3.x embedded under the shim (`python -c pass`, stdlib import, `pip --version`) on the Mac CLI in a native-mode root, and list which stdlib C modules it needs built in.
+- **Full code review and refactor (558 or later; not for 557).** Too many source files have grown far past a size anyone can review or hold in their head. Largest at 2026-10-01: emu/amd64_interp.c 18.0k lines, app/WorkspaceViewController.m 17.1k (one file holds the Workspace, every applet's view controller, layouts, suspend capture and more), jit/gen.c 15.8k, fs/sock.c 12.0k (inet, unix, netlink and the poll glue in one file), jit/guest-riscv64/rcache.S 10.2k, kernel/native_libc.c 9.8k, jit/gadgets-aarch64/math.S 7.7k, kernel/calls.c 7.3k, kernel/checkpoint.c 6.2k, emu/memory.c and app/AppDelegate.m 5.7k each. Plan: review each for dead code and duplicated logic first, then split along the seams already there (one applet per file; netlink and unix sockets out of sock.c; syscall tables out of calls.c), keeping behaviour identical -- moves in their own commits, separate from any change, so a bisect can tell them apart. Needs the full five-root suite and both device legs before and after.
+- **Done 2026-10-13 (#639, split from #604): a desktop is installed and chosen from Settings.** See the #639 row of the issue table below. Left: the display's two failure messages still say to run `sudo sh /AOK/tools/setup-wayland.sh` in a terminal (true, and translated nine times; they could name the menu action instead), and Wayfire's panel choice is always `stock` from the page.
+- **Done 2026-10-09: native dash matches an unmatched `[` literally.** It matched with Darwin's fnmatch, which returns an error for any pattern holding a `[` that opens no bracket expression (glibc and POSIX: the `[` matches itself), so `${t#socket:[}`, `case 'a[b' in a[b)` and `${u%[y}` all failed. kernel/dash_config_aok.h, force-included after deps/dash/config.h, undefines HAVE_FNMATCH so dash's own pmatch is used -- configured trees need no re-run. tests/manual/native_dash_patterns.c: 13 lines identical to Devuan's dash 0.5.12 (negation, classes, escapes, quoted metacharacters, globbing). start-wayland.sh's `socket:\[` workaround is harmless and stays.
+- **Done 2026-10-09: native programs' fnmatch is glibc's.** kernel/native_fnmatch.c, reached through kernel/native_libc.h's `#define fnmatch nlibc_fnmatch`, follows glibc's fnmatch_loop for the C locale's collation and agrees with glibc 2.41 on all 14,960 cases of a 55-pattern x 34-name x 8-flag-set table in both C and UTF-8 locales, where Darwin's differed on 2,340 (an unclosed `[`, a trailing `\`, `[]`, `[[:bogus:]]`, an unclosed class). In a UTF-8 locale it matches by characters and then, as glibc 2.41 does, by bytes, so an invalid sequence matches rather than erroring. SmallCLUE's find, ls, grep, du, diff, tar and git, and scp, all called Darwin's; tests/manual/native_fnmatch_applets.c holds 19 GNU answers (the build before fails 13). tools/check-native-libc.py no longer lists fnmatch as pure-host.
+- **SmallCLUE tar -t prints a backslash in a name bare; GNU tar escapes it** (`d/b\\` for the file `b\`, its default --quoting-style=escape). Found 2026-10-09 beside the fnmatch work; check the other quoting GNU tar applies to listed names (control characters) at the same time.
+- **Done 2026-10-13: nullDescriptor in the MoltenVK fork (3352fee8), so OpenGL reaches the GPU on Mesa 25.2 and later.** Upstream still reports it false (checked at 67b26826, 2026-10-08), though its descriptor writes already take VK_NULL_HANDLE everywhere; what was missing was vkCmdBindVertexBuffers (dereferenced a null buffer; now binds 64 KiB of zeros) and the bit. From an Alpine 3.24 guest (Mesa 26.1.6) on the Mac CLI: `setup-gpu.sh --check` is all ok ("OpenGL through zink: 2.1 ... ES 2.0"), and tests/manual/gles_null_bindings.c -- a buffer-fed attribute, a constant attribute, an unbound sampler, a textured quad -- reads back the same pixels on zink as on llvmpipe. setup-wayfire.sh no longer refuses a newer Mesa. **Not done:** a real GL program (Alpine has no glmark2 package), a desktop compositing on it, any device, Arch. *Two emulator bugs came out of using llvmpipe as the oracle, both fixed the same day:* (1) the arm64 guest called itself an Apple M1 (/proc/cpuinfo implementer 0x61, part 0x023), so LLVM's JIT -- llvmpipe, and anything else built on it -- generated M1 instructions the guest lacks and died of SIGILL on a half-precision FADD; it is implementer 0x00 (software), part 0xa0c now, MIDR_EL1/MPIDR_EL1/REVIDR_EL1 read from EL0 as Linux emulates them, and AT_HWCAP has the CPUID bit cpuinfo always named (tests/manual/arm64/cpu_identity.c). (2) FCVTL/FCVTN between half and single precision on vectors, base ARMv8, were undefined instructions (tests/manual/arm64/fcvt_half.c, which also passes natively on the Mac). **Follow-ups:** Mesa caches llvmpipe's compiled code under ~/.cache/mesa_shader_cache, keyed by a CPU description that did not change with the identity, so a root that ran llvmpipe on 558 keeps M1 code there -- it still faulted here until the cache was moved away; tell users, or bump something Mesa keys on. `/sys/devices/system/cpu/cpu*/regs/identification/midr_el1` does not exist (newer LLVM and lscpu read it first). FEAT_FP16 itself (fphp/asimdhp) and DotProd remain unimplemented and unadvertised.
+- **Wayfire on Alpine 3.24 (goal set 2026-10-03).** Two blockers, in this order. (1) The GPU: Alpine 3.24.2 ships Mesa 26.1.6, and since Mesa 25.2 zink refuses to start without Vulkan robustness2's nullDescriptor, which iSH-AOK's GPU (Venus on MoltenVK) does not offer -- setup-gpu.sh detects it -- and Wayfire draws only through OpenGL ES, so nothing can render until that feature exists in AOK's Venus/MoltenVK path (fixing it also unblocks Arch). (2) Packaging: Alpine has no wayfire, wf-config or wf-shell, and its wlroots is 0.19/0.20 (Devuan's Wayfire 0.9 uses 0.18). Build Wayfire 0.10 + wf-config + wf-shell 0.10 (with the menu patch, tools/wayland/build-wf-panel.sh's) against wlroots0.19 and musl in the CLI's Alpine roots (tools/build-bundled.sh), and ship them as /AOK/bundled/alpine3.24-aarch64 and -x86_64 with setup-wayfire.sh linking them on Alpine. Already musl-ready: the release guard and pixman shim (musl-aarch64/x86_64), the waybar panel option, select-desktop.sh.
+- **wf-panel's menu still takes ~2 s to open on an A10X iPad (bip, 2026-10-03).** The bundled faster wf-panel (tools/wayland/build-wf-panel.sh's patch) stops the rebuild on every open: interleaved on one session, 2.1 s against stock's 4.7 s. What is left is GTK sizing and drawing the ~100-button flowbox each time the popover maps (~1.5 s of panel CPU per open; the release guard and pixman shim make no difference, A/B). Next steps if it matters: profile one open with the guest PC sampler; try keeping the popover's contents realized, smaller icons, or `menu_list` mode; waybar + wofi is the alternative today.
+- **waybar logs `basic_string::_M_create` at start-up (bip, Wayfire, 2026-10-03).** A caught C++ length_error, printed between "Using CSS file" and "Output detection done: HEADLESS-1 ()" in `waybar -l debug`; the bar, its modules and the Apps/wofi button all work. Find which call throws (lldb `break set -E c++` on the CLI, or `catch throw` in gdb on device): the empty output description is the first suspect, a /proc or /sys read with a size AOK reports differently the second. Check whether labwc's waybar logs it too.
+- **/AOK/bundled for the native rootfs: a Wayland desktop with no distro under it (asked 2026-10-03).** /AOK/bundled (tools/build-bundled.sh, fs/aok-bundled.manifest) now carries guest binaries built ahead of time, per distro release + CPU (devuan6-aarch64: the faster wf-panel) and per libc + CPU (glibc-/musl-aarch64/x86_64: the release guard and pixman shim), which setup scripts link instead of compiling. The same mechanism could give the AOK Native rootfs a Wayland stack it cannot install itself: a target whose programs and libraries are self-contained (built against musl and linked statically, or shipped with their own libraries under one /AOK/bundled/<target>/ prefix with RUNPATH set to it) -- compositor (labwc), foot, wayvnc, wl-present's needs, fonts and an icon theme -- and start-wayland.sh taught to find them there. Questions to settle first: app size (the generated tables embed every byte; compress?), how native-mode PATH/LD_LIBRARY_PATH reach a guest program, and whether GPU (Mesa/Venus) is in scope or software rendering only. Related (user, 2026-10-03): bundle arm64 builds only -- arm64 is the fastest guest -- and carry the libraries they need, so no root has to compile anything; then an x86_64 (or other) root could run the arm64 build too, if a guest can exec an arm64 program from a non-arm64 root (check how AOK picks the emulator per exec, and what ld.so/libc the program finds). Today x86_64 roots build the faster wf-panel themselves or pick waybar.
+- **Done 2026-10-09: a pty hangup signals the session leader alone**, as Linux's tty_signal_session_leader does (SIGHUP then SIGCONT to the leader's process, send_tgid_signal); the foreground group hears at the leader's exit, SIGHUP and SIGCONT both when the terminal was already hung up (disassociate_ctty's tty_old_pgrp branch). TIOCNOTTY still signals the foreground group. tests/manual/tty_hangup_leader_only.c: a leader blocking SIGHUP has it pending and its child in the same group lives, then dies of SIGHUP when the leader exits (camd 64/32-bit; the build before fails both).
+- **A native-dash background job held its caller's ssh session open (2026-10-02).** On bip, `setsid wf-panel > log 2>&1 < /dev/null &` inside a script run by `ssh host 'sh script'` (native dash) kept the ssh connection open after the script exited: the job's fork-handoff child (`script --aok-fork N`, now an exec stand-in for setsid) was still alive and evidently held the session's stdout pipe, though the job's own stdout was redirected. On Linux the connection closes when the script exits. Suspect fds the relaunched child inherits from the parent dash beyond 0-2 (its saved copies at 10+, or descriptors not marked close-on-exec). Repro: the above against any native-dash guest over ssh; `ls -l /proc/<child>/fd` shows which.
+- **Done 2026-10-09: anon_inode link names are spelled as Linux spells them**: fs/adhoc.c prints `anon_inode:<class>` as given, with the brackets in the classes that have them on Linux 6.12 (`[eventfd]`, `[eventpoll]`, `[signalfd]`, `[timerfd]`, `[pidfd]`, `[fscontext]`) and not in `inotify` and `sync_file`; a dma-buf reads `/dmabuf:` (its d_dname with no name set). tests/manual/anon_inode_names.c (camd), and virtgpu_node.c no longer accepts the bracketed sync_file.
+- **`finger`, `w` and `last` in SmallCLUE (asked 2026-10-02); `who` and `users` are done.** SmallCLUE 5a6c4bb added utmp_rec.c (the guest's Linux utmp/wtmp layout by offset -- 384 bytes on x86, 400 on aarch64/riscv64, chosen by uname), who (-b -r -q -H -u -m, `who am i`, FILE) and users; login records sessions, init records boot, runlevel, logouts on reap, and shutdown. Still to write, all reading through utmp_rec.c: finger -- no argument lists logged-in users (Login, Name, Tty, Idle from the tty's atime, Login Time, Where); `finger user` gives the long form (login, GECOS name and office fields, home, shell, each session, last login from wtmp, mail status, ~/.plan, ~/.project, ~/.pgpkey when readable); -l -s -m -p; no network finger (not wanted). w -- uptime's header line, then USER TTY FROM LOGIN@ IDLE JCPU PCPU WHAT (JCPU/PCPU and WHAT from /proc/<pid>/stat of the tty's foreground process group). last -- wtmp backwards: user, tty, host, login time, logout time or "still logged in"/"down"/"crash", duration; reboot entries; -n, -x (shutdown/runlevel), a FILE (-f); pair a USER_PROCESS with the next DEAD_PROCESS on the same line, as util-linux does. Note Debian 13's own `last` reads wtmpdb (sqlite), not /var/log/wtmp, unless given -f. Oracle: Debian procps w, util-linux last, Debian finger.
+- **Distro roots lose the app terminal's utmp record to the guest's boot.** Found 2026-10-02 on the M4's Devuan6-arm64: util-linux login (the app's `login -- mke`, pid 3, pts/1) did write USER_PROCESS to utmp and wtmp at 16:38:50, and the guest's early boot reset utmp four seconds later (bootmisc truncates /var/run/utmp, and /run can be a fresh tmpfs), so `who` showed only the Wayland foot terminal. The app opens its terminal before the guest's early boot runs -- the same race start-wayland.sh repairs for /tmp (aok_repair_after_early_boot). Native roots are not affected (SmallCLUE's init keeps logins newer than the boot). Options: (a) once the early boot is over, restore live sessions to utmp from wtmp -- a USER_PROCESS since boot whose pid is alive and has no later DEAD_PROCESS on its line -- run by something that outlives early boot (a small native helper the app starts with the terminal, or a profile.d snippet AOK writes per boot that checks once and exits); (b) have the app's terminal login re-record itself after early boot. Whatever is chosen must write the guest's layout (utmp_rec.c's rules) and take the same fcntl lock glibc does.
+- **Xfce's desktop draws no backdrop (setup-xfce.sh, 2026-10-02).** In the Xfce 4.20 Wayland session (labwc --session xfce4-session, start-wayland.sh) xfdesktop draws its icons but no background at all: black behind them, on the M4 and in the CLI. Established: not the image -- an SVG (with librsvg2-common's loader registered), a JPEG (xfce-blue.jpg) and a solid colour (image-style 0, rgba1 set) all stay black, set live with xfconf-query; the settings are read (xfconf-query lists /backdrop/screen0/monitorHEADLESS-1/workspace0/... as set, single-workspace-mode true), and wlr-randr names the output HEADLESS-1 with "Make: (null)". xfdesktop never wrote monitor keys of its own, which suggests libxfce4windowing found no monitor it could match (null make/model on the headless output). Separately, Debian's xfdesktop defaults to /usr/share/backgrounds/xfce/xfce-x.svg, which Debian does not ship. Next: run xfdesktop with G_MESSAGES_DEBUG=all and XFDESKTOP_DEBUG, check what XfwScreen reports for monitors under labwc headless, and compare labwc on camd (real Linux) with the same headless output; if it is the null make/model, the headless backend's output description (or the app's wlr-randr call) may be where to give it one.
+- **Shortcuts Run Command: seven defects found documenting it (2026-10-02).** Found while rewriting opt/AOK/docs/shortcuts.md from the code; the doc describes today's behaviour. (1) **Output over 256 KB fails the action instead of returning it:** the reader stops at kISHShortcutOutputLimitKB (app/GuestCommandRunner.m:18), kernel/init.c run_guest_command_capture_shell then kills the child because it stopped short of EOF (~:896), the reap records SIGKILL, and ISHRunCommandIntent.swift throws "killed by signal 9" before anything looks at `outcome.truncated` (set at GuestCommandRunner.m:153, read nowhere). Fix: check truncated first and return the output with a truncation note. (2) **Output that is not valid UTF-8 returns as empty text** (GuestCommandRunner.m:155-157 `?: @""`), which a 256 KB cut through a multibyte character also triggers; decode lossily (NSString stringEncodingForData with AllowLossy and UTF-8 suggested). (3) **"Run as default user" with no uid-1000 account runs commands as root** (headlessCommandAccountName returns nil, AppDelegate.m:3026-3031); the intent's description overstates it, though the Settings footer covers it. (4) The su error text promises failure "if that account cannot log in" (GuestCommandRunner.m:124-127), but only a missing /bin/su fails; su's own refusal comes back as output. (5) A reap that gives up after 3 s leaves exited=0 and termSignal=0 (init.c:910-934), which counts as success even with Fail on Non-Zero Exit on. (6) A failed headless boot is cached by ensureBooted's dispatch_once (AppDelegate.m:3762-3790) until the app relaunches; the error text should say so. (7) Background boot resumes the newest saved session without asking (AppDelegate.m:4391-4407): intended, now documented. Verifying (1)-(5) needs the action run from the Shortcuts app on a signed device build (an unsigned simulator cannot resolve the intent's metadata).
+- **Other roots appear under /AOK/roots after boot has started.** AppDelegate mounts them in ISHDispatchBootWork("boot.secondary-mounts") so a slow fakefs mount cannot trip the launch watchdog, which means /etc/rc, rc.d scripts and runit services race them: on the M4 (2026-10-02) an rc.local at uptime 0.3 s found /AOK/roots/Devuan6-arm64 empty, and it was there 1 s later. Documented in native-mode.md with a wait loop. If boot services that use other roots become common, either have init's /etc/rc wait for a "secondary mounts done" flag (a /proc/ish file), or mount the roots before the guest's pid 1 runs when there are few of them.
+- **#620, what is left (2026-10-12).** Air Traffic Controller and BSD Tetris are fixed (bsdgames writes `Terminal=True`; start-wayland.sh now gives such entries a corrected copy under XDG_DATA_HOME), VLC and Pi-Apps refuse to run as root and that is theirs. Still unverified: Synaptic "freezing the display" on x86_64, which did not reproduce on arm64 and is probably a slow package-list load starving the desktop; the reporter was asked on 2026-09-30 whether it recovers and has not said. Not checked on a display: that fuzzel reads `Terminal=True` as no (GLib does, measured); the corrected copy covers both either way.
+- **Done 2026-10-01: native sudo takes the target's groups.** The shim's initgroups was a no-op returning success, so `sudo -u root id` from uid 1500 kept groups=0(root),1500(tester). nlibc_initgroups now sets the guest /etc/group memberships (matches `setpriv --init-groups`), and SmallCLUE's sudo treats a failure as fatal (149170a). Checked in native_coreutils.
+- **Done 2026-10-01: native stdout is fully buffered off a terminal**, as glibc has it (kernel/native_libc.c nlibc_std_stream). Line-buffering every stdout made `seq 1 300000 >f` one write per line -- 0.546 s, now 0.024 s -- and put stdout ahead of stderr in a `2>&1` file. The shim flushes stdout before exec, posix_spawn, system and popen so a child's output still lands after what was printed first, and system/popen now pass argv[0] "sh" as glibc and musl do. Checked: all native_* tests on devuan-amd64 and alpine-arm64, and an 18-case ordering survey against GNU (find -exec/-ok, xargs, awk pipes and system, sed e).
+- **Done 2026-10-09: file times are signed 64-bit.** struct statbuf's atime/mtime/ctime (fs/stat.h) and the tty's are sqword_t; the narrowing casts in adhoc, fuse and statx went, tmpfs's relatime comparison is signed, and i386's utime/utimes/timeval read their time_t as signed 32-bit. `touch -d @-1` reads back as -1, 2^33 survives, and i386's stat64 keeps the low 32 bits as Linux's does. tests/manual/stat_time_range.c (utimensat, utimes, utime; statx and stat; /tmp and /dev/shm), checked on camd 64- and 32-bit; the build before fails 24-42 of its checks.
+- **SmallCLUE size: -Os for its cold applets (decide; measured 2026-10-01).** The redundancy pass (shared GNU helpers compiled once in src/gnu_util.c instead of per-applet static inline copies; dead code; duplicated join/buffer/write-all/filevercmp folded) took SmallCLUE's src/ from 877 KB to 788 KB at -O2. The next lever is the optimisation level: the whole of src/ at -Os was 761 KB against 877 KB at -O2 before that pass (-13%), but the biggest per-file gains are in the hot applets (sed -11.6 KB, awk -17.7 KB, grep -6 KB, tr -4.3 KB), where -O2's inlining is the point. The cold set -- core.c (top, ps, pager, markdown, dns...) -21 KB, tar -9 KB, ls -5 KB, date, stty, openssh, find, diff -- could take -Os through a per-file meson static_library split with no speed anyone would notice. Needs an A/B on ls -lR and find over a large tree first (interleaved samples), then the split in meson.build's smallclue section.
+- **Check the other shadowing applets against GNU, as was done for sed.** native-links.sh puts every SmallCLUE applet ahead of the distro's, maintainer scripts included, and tools/native-applet-audit.py only checks that an applet runs, not its flags. Done: sed (9822c561, tests/manual/native_sed.c), stty (68ea706a, native_stty.c, with the pty recipe: GNU and native side by side under script(1)), ln (b07e1600, native_ln.c), rm, wc, head, tail (smallclue d1861d0), sort (652ff72), xargs (eb63922), find (d11a238), grep (31b5281), cp and mv (e97ea71), date (2c38034), chmod (8694831), ls (27544c7), diff (77189f2, every output style including -y; 8670 fuzzed pairs match), cmp and uniq (b30e26a), sed's e command (b30e26a), tr and nl (9c1f9c8), seq, touch and stat (e259192), realpath, readlink and env (0927a2c), cat, rmdir and sum (ef7a5d5), dd, od, fold and tac (7648c8f), split and du (aaba67d), gzip/gunzip/zcat (b355476), tar (6893f77), awk (92cb234, against mawk 1.3.4, Devuan's awk), all in native_coreutils.c. The 530-case survey against GNU coreutils/grep/findutils/mawk in build/devuan-amd64-test (2026-10-01) now leaves only accepted differences: Darwin's long double is double (`printf %a`, `seq 1e-400`), mawk's time-based srand seed and its odd substr() with a start below 0, x86's NaN sign (`5%0` is -nan there), env's "=x", and mawk's second message after a syntax error. Method: a TSV of commands run under PATH=GNU links and PATH=native links from the same fixture, comparing stdout, status and the tree; then a golden C test generated from GNU's results, as native_coreutils.c is. Fix each gap in smallclue upstream, then bump. Also keep in mind that a native program cannot exec in place, so a script that tracks a child's pid through `env`/`sh` gets the wrapper's pid: call /usr/bin/env and /bin/sh by path there.
+- **Done 2026-10-01: native programs convert local time in the guest's zone.** kernel/native_tz.c routes localtime(_r), mktime/timelocal, ctime(_r) and tzset: TZ (zoneinfo name, path or POSIX rule) else /etc/localtime else UTC, TZif v2+ with its footer, glibc's quirks (empty TZ is "Universal", rules before 1970 use 1970's transitions, the doubled hour by glibc's offset search), without touching the host's TZ. Against GNU date in build/devuan-amd64-test: 482/483 zone/instant pairs (left: a rule string without rules before 1970, where glibc borrows posixrules). Native `ls -l` now agrees with /usr/bin/ls. The gate no longer lists those names as pure. Checked in native_coreutils.
+- **GNU `tail -f` misses changes in the guest. FIXED 2026-10-01.** In build/devuan-amd64-test, `tail -f` on two files missed the second append, and `tail -F` missed a truncate-then-append and a `mv` over the followed name. The cause was not inotify: fakefs reported statfs f_type 0x66616b65 ('fake'), which GNU tail does not know, so it took the file system for a remote one and fell back to its own polling path. fakefs now reports EXT4_SUPER_MAGIC (fs/fake.c; the name in /proc/mounts stays "fake"); tail uses inotify (strace: inotify_add_watch IN_MODIFY), and its -f and -F output matches Linux on camd. realfs keeps its own type on purpose, so tail polls a host directory, which changes without inotify events.
+- **Done 2026-10-01: native sudo takes leading NAME=value arguments** into the command's environment (`sudo DEBIAN_FRONTEND=noninteractive apt-get ...`), refusing LD_*, BASH_FUNC_*, IFS, ENV and BASH_ENV with real sudo's message (smallclue 149170a). Checked in native_coreutils.
+- **#484: Venus readback on the A10X differs run to run.** zink itself now runs there (MoltenVK 67d3f726: extendedDynamicState was advertised although Apple3 GPUs cannot do its dynamic vertex stride, so every zink pipeline failed and binding one killed the context; Freedoom and Beneath a Steel Sky now draw correctly on bip's GPU, Doom's timedemo 79 fps). What remains from the original report: `tools/vkbench.c` (640x360, 2000 tris, 10 frames) gave a different checksum on every Venus run on the A10X (228652566, 293168948, 243401375) against lavapipe's 475822382, where the M4's Venus gives 475749031 every time. Re-measure with the current MoltenVK first; if it still varies, find which readback path (linear row alignment, a missing barrier, a fence retiring early) differs on Apple3. It reproduces in seconds with no desktop.
+- **Idiom translation for code built without the newer instructions (musl, rv64gc distros) -- measured, mostly covered by HLE.** glibc picks MOPS through ifuncs; musl has no ifuncs and distro RISC-V is fixed at rv64gc, so the idea was to recognise their copy/fill loops as the JIT translates and run each as one operation. Sized 2026-09-30 with ISH_JIT_PROFILE (which now records fusion-consumed words, so loops no longer look like they end in their compare): with HLE off, pure copy/fill self-loops are 9-17% of the kernel mixes but 1.2-1.7% of a gcc compile, and nearly all of them are inside musl's own memcpy/memset -- which HLE intercepts at the function entry. With HLE on (now the default) what remains is <=0.9% everywhere (riscv64 gcc 0.6%, arm64 gcc 0.9%, riscv64 kernels 0.3%). hle.c already recognises arm64 post-index copy/fill loops (ISH_HLE_LOOPS; tests/manual/arm64/hle_loop.c); a riscv64 twin is not worth it at these numbers. Revisit only if a real workload shows open-coded copy loops outside libc. Suggested 2026-09-29.
+- **Take the specialised-gadget approach to i386/amd64 (after riscv64).** The gadget stream is effectively an intermediate architecture tuned for the aarch64 host, and MOPS showed that giving it bigger operations pays off; the offset-fed arm64 gadgets showed that decoding operands at run time was most of a gadget's body. For the x86 engines the levers differ and need measuring first (ISH_JIT_PROFILE covers only arm64/riscv64 today -- extend it): flag computation (lazy flags vs the host's own NZCV), ModRM operand decode, x86's own MOPS (`rep movs`/`rep stos` -- check they already run as one span copy), and the i386 segment/16-bit paths. Suggested 2026-09-30. The natural unit to fuse on these engines is the x86 instruction itself: one i386/amd64 instruction becomes a chain of gadgets today (address, load, op, flags, store), and a gadget per common chain is the intermediate-architecture idea applied at the guest's own granularity. ISH_JIT_PROFILE now covers both x86 engines; rank the gadget chains per guest instruction first, then fuse the hot ones. Suggested 2026-09-30. **Measured 2026-09-30** (Devuan i386 python/gzip/xz profiles; tools/jitprof-report.py's x86 disassembly was misaligning chunks after any undecodable one -- fixed with ud2 separators, and the "9.5% SSE" it had shown is really <0.2%): memory-operand movs are 26-41% of instructions (already fused), ALU with a memory operand 7-10%, lea 1-7%, scaled-index operands 2-6%, push/pop 4-8%, x87 up to 3%, SSE <0.2% (so the i386 SSE memory/packed port is not worth doing). Per instruction on the A10X: mov reg 1.3 ns, load 2.4, store 3.0, add imm 5.3 -> 3.4 and cmp 5.3 -> 4.4 after the lazy-flag deposit stopped doing two load-or-store rounds on flags_res per op (constant byte store; logic ops keep AF lazy as op1 = res, op2 = 0; tests/manual/x86/alu_flags.c, checked against camd and mint), push+pop 5.7, lea with index 5.2, add reg,mem 7.5. Next: ALU reg,mem (three dispatches), lea/operands with a scaled index (four), push/pop. **Done:** 8-bit cmp/test + jcc fused (fused_cmp8/fused_test8, `jcc8` in /proc/ish/i386_jit_fuse); the ALU-with-memory class turned out to be mostly compares (cmpl imm/reg vs mem, cmpb reg vs mem -- 4.4% of gzip), and the byte forms had no jcc fusion. A10X: cmpb reg,mem+jcc 8.1 -> 6.9 ns/insn, cmpb imm+jcc 7.1 -> 6.3; gzip -6 on Devuan i386 12.79 -> 12.61 s. **Done:** the per-gadget `dmb ishld` is gone from i386 gadgets that read no guest memory (gret_nomem: register ALU/moves, immediates, address arithmetic, lea). It cannot simply move to the chain entries as it did for arm64/riscv64 (caf403bb): on x86 guests that barrier is also what orders each guest load before later accesses (x86 TSO's load->load/load->store), and removing it everywhere made atomic_lock_contended's xchg spinlock lose updates. A10X: addl imm 3.4 -> 1.75 ns, cmpl 4.4 -> 2.3, mov reg 1.35 -> 0.95, gzip -3..5%, python strings flat; M4: addl 1.08 -> 0.68, cmpl 1.46 -> 1.03. **Done:** jit_ret_chain inlined into each branch gadget (chain_ip, gadgets.h) so the chained dispatch has one indirect-branch site per gadget: A10X gzip -1.8%, xz -2.5% (3/3 interleaved), python flat; taken cmp+jcc 5.1 -> 3.9 ns but plain jmp 2.5 -> 3.0 and not-taken jcc 4.0 -> 5.0 in the microbenchmark, and call+ret unchanged. Still open: call+ret ~14 ns per instruction on the A10X (the ret-cache path works; the cost is the gadgets and chain entries), push/pop latency chains through esp and the TLB.
+- **Stream layout: separate operand words, not one packed word (DONE 2026-09-30).** The vspec/ospec/lspec gadgets read each cpu_state offset as its own stream word (ldp) instead of unpacking one packed word with ubfx, which sat on the critical path. A10X per instruction 7-29% faster (add #imm 1.42 -> 1.04 ns, ldr 2.84 -> 2.63). Two app builds alternated on both iPads (same code, only the layout differs): unpacked wins or ties everywhere -- A10X kernels -2..-6%, gzip -3.5%, xz tie; M4 python -5%, column drawer -13%. The M4 register-only microbenchmark still reads 0.53 ns where the packed build read ~0.33, which real code does not show; at ~2 host cycles it is sensitive to layout, worth understanding if the M4 becomes the target. The older fusion gadgets (rmw/ldld/ldcmp, fast LDP/STP's rt|rt2 word) still pack.
+- **HLE default: ON since 2026-09-30.** HLE was off by default because each intercepted call exited to the C dispatcher, so small calls got slower (PSCAL hello 46 -> 83 ms, bitwise 61 -> 190 ms). Since the success path returns through the ret/jalr cache (2026-09-30) the per-call cost halved (A10X musl memcpy 16 B: 97.6 -> 45.9 ns) and HLE wins at every size on both iPads for arm64 and riscv64 musl (A10X riscv64 memcpy 4 KiB: 10968 -> 160 ns). Whole programs, HLE off -> on: M4 Alpine arm64 shell loop -11%, sort -4%; M4 Alpine riscv64 shell loop -18%, sort -9%, sed/tr -7.5%; A10X Devuan riscv64 shell loop -15%, sort -14%; Devuan arm64 (glibc, memcpy already MOPS) and PSCAL neutral; nothing got slower. `/proc/ish/hle` switches it live. Musl/riscv64 get the most: their string functions are plain C loops.
+- **riscv64 against real silicon (a RISC-V board with RVV is on order, 2026-10-06; usable in ~1-2 weeks).** Every riscv64 result so far -- the RVV gadgets (jit/guest-riscv64/vector.S, tools/gen-rvv-gadget-test.py), scalar FP, the CSRs -- is checked against spec models or compiler-built scalar code, never hardware. Once the board is set up: run the riscv64 tests natively there, and turn the model-based expectations into hardware known-answer tests, as camd does for x86 (tools/gen-x87-test.py is the pattern).
+- **x87 after the gadget port (2026-10-06): what is left.** (1) Done (f992e7b54): the transcendentals are gadgets, correctly rounded, camd's answer in ~98% of cases and a unit away otherwise (x87.S). (2) FIP, FCS, FOP, FDP and FDS are not kept: FNSTENV/FNSAVE write 0 where an AMD writes the last instruction's (FXSAVE matches, as AMD drops them with no exception pending). (3) Done 2026-10-09: MMX and the x87 alias -- MMn is fp[n]'s significand (emu/cpu.h CPU_MMX; cpu_state has no mm[] any more), and every MMX instruction but EMMS first takes a pending x87 exception (x87.S mmx_wait, before it), then, once it has run, makes TOP 0 and all registers valid and gives the register it wrote an all-ones exponent (mmx_touch, after it; both emitted from one byte-level classifier, gen.c x86_mmx_dst, for both guests). So FXSAVE/XSAVE, FNSAVE/FRSTOR, the signal frame and ptrace carry MMX state, and a signal handler's MMX no longer leaks into the interrupted code (tests/manual/x86/x86_mmx_x87_alias.c, camd; 41 of its 50 checks failed before). An MMX instruction whose memory operand faults changes none of it, as on the hardware (the touch is after; checked in the same test from the signal frame). (4) The x86_64-host backend keeps the old decode.h x87 cases and emu/fpu.c (FUCOMPP catching all of DA E8-EF, FFREE a no-op, the reserved aliases missing). (5) Done (52b23a4b7): i386 PTRACE_GETFPREGS/SETFPREGS and NT_PRFPREG use the FNSAVE layout from the real state (kernel/ptrace.c get/set_user_fpregs_i386). On (2), measured 2026-10-09: an AMD (camd) stores FIP/FOP/FDP in FNSTENV/FNSAVE always and in FXSAVE/XSAVE only with an exception pending; AOK says GenuineIntel, whose SDM keeps FOP and (with FDP_EXCPTN_ONLY, which Sapphire Rapids reports) FDP only for an unmasked exception and deprecates FCS/FDS -- so the one value AOK lacks in the normal case is FIP, the last non-control x87 instruction's address. SDE is no oracle for it (it reports its own code-cache addresses). Keeping it costs a store in every non-control x87 gadget or a dispatch per instruction; the known reader is the GetPC idiom (`fldz; fnstenv [esp-12]; pop`) of shellcode and old packers. Not done for that reason. The 2026-09-30 notes below predate the port:
+  **(2026-09-30)** Exact round-to-nearest fast paths for add/sub/mul/div (float80.c), amd64 x87 decoded at translation (register forms direct, memory forms from gen_amd64_decode_mem_meta), i386 scalar SSE register ops on the amd64 native gadgets. Device per-instruction now ~25-30 ns (A10X) / ~11-13 ns (M4) for fadd/fmul on both engines, fdiv 78-81 / 32-34, SSE 5.1 / 0.64. The C-call path is trimmed: i386 x87 ops call through fhelper gadgets without the eight-register spill/reload, and amd64 x87 register forms keep the register cache live across the call (memory forms store it when dirty but keep it); on the A10X that took i386 fadd 25.5 -> 23.7 ns and amd64 fadd 30.4 -> 27.0, fmul 34.2 -> 29.1, fldl+fstp 39.3 -> 34.2 (tests/manual/x86/amd64_x87_cache.c). amd64 memory forms are still ~12 ns behind i386 (EA and TLB lookup in C: move the address into the gadget, as the i386 path does). FSQRT (cb8b71a8): integer root from a double estimate, A10X 280 -> 79 ns, and C1 now clear as on AMD and Intel hardware (tests/manual/x86/x87_fsqrt.c hashes 36000 results against camd/mint). What remains beyond that is the transcendentals (fsin/fcos/fpatan already use host libm; fyl2x/f2xm1 are cheap); i386 SSE memory forms and packed ops still go through vec_helper C calls, but SSE is <0.2% of real i386 instructions (see the x86 entry above), so that is parked.
+- **Revisit caching translated code across runs. Measured 2026-10-01 on the A10X, M4 and Mac.** **A setting since 2026-10-12** ("Cache Translated Code (arm64)", off by default; `/proc/ish/jit_cache`; on turns the guest's ASLR off -- docs/build_559_musts.md section 4 has what is still open: the other guests, eviction, a distribution's own sysctl, one base per file per boot). **Prototype 2026-10-11:** `ISH_JIT_XCACHE=1` (arm64 guest, in memory, same address only) -- 100 `/bin/true` -23%, 100 `dash -c :` -26%, 30 `perl -e 1` -21% on the Mac with ASLR held still; what it waits on, and the numbers, are in docs/build_559_musts.md section 4. Translations belong to one address space: threads share them, but a fork child and every exec start with none, so each process re-translates libc, ld.so and its program, and a fork child even re-translates the code its parent already had. Tool: `echo 1 > /proc/ish/jit_timing`, run, read (875e7f5c); ISH_JIT_TIMING in the CLI. The counter is global: a running Wayland desktop translates in the background (bip ~69k blocks/s idle, the M4 ~9k), so the driver samples the idle rate before each run and subtracts it -- after that both iPads translate the same block counts for the same work. Driver: guest python (root) measuring wall, children's CPU and translation time, median of 3 after a warm-up. Translation as a share of CPU, A10X (Devuan arm64, ~0.9-1.0 us a block) / M4 (~0.25-0.6 us) / Mac -O2 CLI: `sh -c true` 21% / 23% / 10-13%; 100 `( : )` forks (no exec) 14% / 19% / 26-29%; 100 fork+exec of /bin/true 19% / 19% / 21-28%; 100 `sed q` 8% / 8.5% / 24%; 100 `echo|sed|tr` pipelines 9% / 10% / 31-33%; gcc -O2 -c of a small file 4.8% / 4.3% / 5%; gcc link 7.7% / 7.8% / 10%; python3 -c pass 9.0% / 9.5% / 7%; nine stdlib imports 2.4% / 2.3% / 1.6%; apt-get -s install 0.7% / 0.8% / 0.5%; perl with four modules 3.0% / 2.8% / 3%. A real build (AOK's dash: `./configure`, then `make -jN` of 34 files; the final link fails on AOK shim symbols, which does not matter here), A10X 2 CPUs / M4 6 CPUs: configure 83 s with 9.0% translating / 23.6 s with 9.1%; make -j1 182 s, 3.9% / 63 s, 3.1%; make -jN 103 s, 3.8% / 22.9 s, 3.1%; make -j2N 82 s, 4.5% / 20.5 s, 3.5%. Parallel jobs make each translation dearer (A10X -j4: 1.22 us a block against 0.90 at -j1), but everything else slows as much, so the share barely moves. A cached block still has to be found, copied and rebased (gadget addresses change per app launch, guest addresses per ASLR), maybe 50-100 ns against 250 ns (M4) to 1 us (A10X) to translate, so a cache recovers roughly 60-90% of these shares: ~3-4% on builds, ~6-8% on configure scripts and python start-up, ~10-17% on scripts that spawn many short processes. The July Phase 0 (jit_code_cache_plan.md) set a 30% bar for building it; that bar was its own choice, and 10-20% on common shell work is worth having -- the decision is open, not closed. **Fork inheritance DONE (9e28a5f9):** a forked child copies its parent's block when the pages under it are still the same memory in both; arm64/riscv64 children also donate their own blocks back, so siblings share the paths the parent never runs (94% of a subshell's blocks copied). Interleaved A/B, inheritance off -> on, M4 / A10X / A9 (ip5): 100 `( : )` -14% / -20% / -7%; 100 `$(echo x)` -15% / noise / -5%; 100 fork+exec of /bin/true 0% / -17% / +1%; 100 `echo|sed|tr` +1% / -0.5% / -4%; dash ./configure +0.6% / -0.2% / +1.5% (noise level, 3-5 rounds). So it pays where a shell forks without exec'ing; configure and builds exec nearly every process, and those still translate from scratch -- only a cache keyed by file (across exec and across runs) reaches them, and their translation share is the ~3-9% above. A9 (ip5, Devuan arm64) shares, for the low-water mark: sh -c true 19%, fork+exec /bin/true 18%, gcc -c 5.1%, python3 start-up 9.2%, nine imports 2.4%, apt 0.7%, perl 3.1%; dash ./configure 117 s with 8.3% translating; make -j1 275 s, 4.1%; make -j2 167 s, 4.3%; make -j4 (2 CPUs) 8.5% -- oversubscribed, the per-block time includes being descheduled mid-translation, since the timer is wall clock. (ip5's native `nl` lacked -v, which broke dash's mkbuiltins under the default PATH; reported to the SmallCLUE session 2026-10-01, the runs above put /usr/bin first.)
+- **Native translation of straight register-only runs (arm64 and riscv64 guests).** **Prototype 2026-10-01 (riscv64 `rcache`, off by default):** iOS forbids generating host code, so a "native run" can only be built from precompiled gadgets: every instruction still dispatches, and the lever is the gadget body. A straight run of RV64I/M ALU instructions keeps up to four guest registers in host x23-x26 -- one load gadget, per-instruction gadgets specialised by host register (`add x23, x24, x25` + dispatch; jit/guest-riscv64/rcache.S, 2214 gadgets from tools/gen-rv-rcache.py), one store gadget -- chosen per run by a cost model of A10X timings. A10X: a dependent add 2.28 -> 0.99 ns, a dependent 3-op chain 8.4 -> 4.2 ns, an independent add 1.34 -> 1.01 (the bare dispatch is ~1.0 ns). Whole programs, though: gzip -1.5..-3%, xz -1%, gcc +0.5..1%, python3 flat. Lessons: (1) runs that took apart fused pairs made them 2x slower -> the cost model counts fusions; (2) scanning ahead of every instruction made gcc ~1% slower in translation alone (a scan-only build showed it) -> the scan now starts after gen_step's own fetch and never rescans a rejected window; (3) runs in real riscv64 code are short (17% of a gcc compile's instructions sit in runs >= 3 that fit four registers, mostly 3-4 long), so the load/store gadgets eat most of the gain. Next levers: more cache registers (no gadget outside a run uses them, so x19-x22/x27 and caller-saved x3-x17 are available; six registers = ~5.6k gadgets) for longer runs, and the arm64 NEON runs in llvmpipe. **Measured 2026-10-01, NEON not worth it either:** on the M4 a dependent NEON op does pay the round trip (add .4s 1.44 ns dependent vs 0.53 independent; a dependent fmul/fadd/fmax chain 3.19 vs 1.63), but V-register-only forms are 28.6% of llvmpipe and their runs are short -- element moves, SIMD loads/stores and scalar code break them: runs >= 3 cover 5.2% of instructions with 4 cached V registers (mostly 3-4 long) and 18.4% with 8 (mostly <= 8). The 'dozens long' figure counted every SIMD/FP instruction, loads and element moves included, which a register cache cannot hold without cached-operand load/store and GPR variants (and fault paths that write the cache back). Without host code generation, the register-cache approach tops out at a few percent on both guests; not pursued further. tests/manual/riscv64/rcache_run.c (generated with its own RV64 model as the oracle) turns the bit on itself; the riscv64 suite passes with rcache on for the whole session. Found on the way and FIXED (7656ac5d): PTRACE_SINGLESTEP over any fused pair ran both instructions, on arm64 and riscv64.
+   Measured 2026-09-29 (M5 Mac, build-games-o2): every guest instruction costs ~1.5-2.0 ns under the gadget JIT whatever it does -- add, ldr, umov, dup, vector fmul alike -- on BOTH engines, so time follows dynamic instruction count. `ISH_JIT_PROFILE=<file>` (jit/jitprof.c) + `tools/jitprof-report.py` give the exact mix. Findings: (1) RISC-V runs the same C source at the same per-instruction cost but needs 1.2-1.5x the instructions on scalar code and 4.9-6.3x where arm64 GCC used NEON/ldp (swizzle, audio mix, memcpy without HLE) -- the RISC-V gap is instruction count; (2) Doom on the GPU is scalar (loads 36%, SIMD 2.8%); SIMD-heavy phases are software GL (llvmpipe: blocks average 239 instructions, 61% SIMD, 41% of it in runs over 32) and sound pre-conversion at start-up; (3) register-only data processing (no memory, no branch) in straight runs is 52-73% of instructions, and one dispatch per run would remove 27% (Doom), 34% (arm64 kernels), 47% (riscv64 kernels, 64% on the swizzle) and 56% (llvmpipe) of dispatches -- more for RISC-V than arm64, so this closes the gap rather than widening it, unlike NEON-only native translation (distro RISC-V has no vectors). (4) HLE (off by default; `ISH_HLE=1`, app toggle) already takes memcpy to near native on both guests (riscv64 4.86 -> 0.24 ms per 4 MiB) -- worth reconsidering the default. Next: prototype a run translator (load the run's guest registers from cpu_state into host registers, the run's host instructions, store back) for riscv64 ALU ops and arm64 scalar+NEON, and measure against these profiles. Host `sample` is misleading for this: a stale link register after a miss handler's `bl` files later gadgets under it, and a sampling window can land on start-up. **Done since:** riscv64 ld/sd pair fusion (7772d034; a fused access ~15% cheaper, ~2% on a gcc compile) and the dispatch barrier moved from every gret to the chain entry (caf403bb). On devices (static CPU-time benchmarks, 2026-09-29): the M4 is unchanged either way (an arm64 `add` costs 0.42 ns there); the A10X, 3 alternating rounds, has register-only instructions 6-9% slower and memory instructions 7-11% faster, realistic kernels -7% to +5% -- a small net gain, far from the 10-25% a loaded Mac suggested. Measure on the devices, not the shared Mac. Remaining lever: the gadget body (operand fetch + memory-resident guest registers), about two thirds of an instruction's cost. **FEAT_MOPS (2026-09-29):** arm64 guests now get HWCAP2_MOPS and the CPY/CPYF/SET triples run as one gadget each (jit/arm64_mops.c; <=64-byte one-page cases inside the gadget, the rest in C, page span by span, fault-restartable), so Devuan glibc 2.41's memcpy/memmove/memset use them. Devuan glibc memcpy, MOPS vs NEON: Mac CLI (HLE off) 16-64 B 1.5x, 1 KiB 4x, 4 KiB 7x, 64 KiB memset 13x; M4 (HLE on) 16-64 B 21 -> 12 ns, larger equal; A10X (HLE on) 16 B-1 KiB 110 -> 53 ns, 4 KiB 1.25x, larger equal. `/proc/ish/arm64_mops` (or ISH_MOPS=0) switches the advertisement for later execs. **Next, NEON gadget bodies:** the hot SIMD instructions in llvmpipe are element moves (umov/ins/dup/mov by element, ~20% of its instructions) and three-same arithmetic, all through generic gadgets that decode register numbers, size and Q at run time (vext_to_gpr ~25 host instructions for a umov); per-arrangement gadgets fed precomputed cpu_state offsets would be ~6. **Done (vspec):** element moves (jit/guest-arm64/simd_spec.S) and every three-same/bitwise op (simd_spec3.S, generated by tools/gen-simd-spec3.py) now use such gadgets; `echo vspec=0 > /proc/ish/arm64_jit_fuse` for A/B. A10X: element moves 59-75% cheaper (umov 4.0 -> 1.06 ns), three-same 47-56% (add .4s 3.05 -> 1.34); M4: 26-68% and up to 41%. A specialised move now costs less than a scalar `add` on the A10X (2.38 ns), then the scalar side. **Done (ospec, lspec):** add/sub/cmp/logical immediate and register (+LSL add/sub) through offset-fed gadgets with SP as a plain slot (jit/guest-arm64/alu_spec.S, "ospec"): A10X 20-37% per instruction, 0-4% on kernels (dependent chains pay the in-memory register store->load round trip, which this cannot touch). Post/pre-index and register-offset loads/stores got fast gadgets ("lspec", memory.S): they cost 2x the [x, #imm] form before; now 42-50% cheaper on the A10X, palette blit -14%. End to end on both iPads, all three on vs off: xz -9..-10%, gzip -8..-9%, python -4% (A10X). By-element multiplies and LDP/STP writeback landed in 46e558a1. **Done 2026-09-30 (SIMD memory and permutes):** offset-fed fast gadgets ("lspec") for SIMD/FP loads/stores -- [xn, #imm] and LDUR/STUR (S/D/Q), register offset (LSL/SXTW/UXTW), LDP/STP/LDNP/STNP offset form, and LD1/ST1 of one lane -- plus UZP/TRN/ZIP by arrangement in simd_spec3.S and UXTL/SXTL (USHLL/SSHLL #0) in simd_spec.S ("vspec"). A10X, fast paths off -> on: ld1 {v.s}[i] 24.2 -> 2.5 ns, ldr q 4.8 -> 2.7, ldp q 5.4 -> 3.1, ldr q reg-offset 7.2 -> 4.0, zip1/uzp1 2.9 -> 1.25, ushll #0 2.2 -> 0.96; kernels palette_blit -23%, resample -23%, mix -21%, swizzle -17% (those include the earlier lspec/vspec passes). M4 flat on the memory forms. Tests: tests/manual/arm64/vldst_lspec.c, simd_three_same.c (541 cases). **Next:** EXT (0.94% of llvmpipe; tbl with a per-imm index), XTN, MOVI/FMOV #imm, vector BIC #imm, ADDV; LD1R and multi-register LD1/ST1; then the same treatment for riscv64 (keep it close to arm64). The dependency round trip through cpu_state is now the floor for scalar code. **Done 2026-09-30 (riscv64 ALU pairs, `alu` in /proc/ish/riscv64_jit_fuse):** slli+srli/srai, slli+add (shNadd) and add+load (indexed load) run as one gadget each -- the pairs rv64gc spells where arm64 has one instruction. Per pair, off -> on: A10X add;ld 11.0 -> 3.05 ns, slli;srli 2.69 -> 1.15, slli;add 2.87 -> 1.45; M4 add;ld 1.25 -> 0.90, slli;srli 0.82 -> 0.52, slli;add 0.89 -> 0.48. A10X Devuan riscv64, best of 3: gzip -9 11.25 -> 9.81 s (-13%), python3 -9%, gcc -O2 -4%, xz -1%. **Open (A10X only):** an unfused `ld a5, 8(a5)` (destination = base) costs ~11 ns there against ~4 for `ld a4, 8(a5)`, with the gadget identical in both -- apparently a host memory-ordering replay between the two in-flight stores to the same cpu_state slot (the load's writeback and the next writer's). The M4 does not show it. It also likely affects arm64 guests' `ldr x0, [x0]`; measure pointer-chasing loops there before deciding whether a register-cached destination is worth it. **Done 2026-09-30 (riscv64 constant branches, `br`):** li t,K + b<cond> on t (either operand order) and andi t,rs,K + beqz/bnez t run as one compare-and-branch gadget. A10X, off -> on: not-taken li;beq 4.36 -> 3.04 ns and andi;bnez 4.69 -> 3.01 (now the cost of a bare branch); taken pairs flat, because a lone taken branch already costs 4.4 ns against 3.0 not taken -- the taken path (b.cond taken, then the chain dispatch) is the next thing to look at for branchy code. Devuan riscv64 workloads: gcc -1%, xz -0.5%, gzip and python3 flat (python re-measured 8 rounds; a best-of-3 +8% was noise). **Then (`btfn`):** the in-gadget jump is the cost, not the chain -- flipping the gadget layout flipped it (lone beq taken 4.4 -> 3.1 ns, not-taken 3.0 -> 4.4), and a branchless csel select was slower on both paths (5.1-5.5 ns). So each riscv64 conditional branch now has both layouts and gen picks by direction: backward branches (loops) keep the taken path straight-line. A10X, interleaved: gcc -2..3%, xz -1..2%, gzip and python3 flat, a 4-iteration counted loop -1.5%. **Done for arm64 cbz/cbnz/tbz/tbnz** (4-8% of arm64 instructions: gcc 6.4%, Doom 4.2%): offset-fed gadgets under `ospec` and the two layouts under arm64 `btfn`. A10X per body (two movs + branch): not-taken 5.21 -> 4.30 ns, taken 5.21 -> 4.74, cbnz w 5.59 -> 4.30, a 4-iteration cbnz loop 22.3 -> 19.0 (ospec) -> 18.1 (btfn). Arch arm64 workloads, btfn off -> on (medians of 4): xz -1%, python3 -1%, gcc and gzip flat. Still branchy and runtime-decoded: B.cond (bcond/bcond_nf) and the fused compare+branch gadgets (fused_cmpi/cmpr/subsi/andsi/andsr decode packed register numbers) -- offset-fed forms and _bk layouts for those are next (but compare+B.cond pairs are only ~0.1% of the arm64 gcc profile -- most b.cond follow mov or ccmp -- so this is low value). **Done 2026-10-01 (small NEON items, vspec):** MOVI/MVNI/FMOV #imm, ORR/BIC #imm, TBL/TBX (every length, 8B/16B) and the across-lanes reductions through offset-fed gadgets. A10X: movi/fmov #imm 1.78 -> 0.94 ns, addv/uaddlv/umaxv/fmaxv 2.2-3.45 -> 0.94, tbl 1-reg 2.80 -> 1.22, 2-reg 3.32 -> 1.67; bic #imm and tbx flat in a dependent chain. Multi-register LD1/ST1 left generic (0.01% of llvmpipe). What remains of llvmpipe's mix already runs on specialised gadgets; the next lever is the run translator below.
+- **Bring Extreme Tux Racer back to setup-games.sh.** Taken out for 557 (2026-10-02): its race exhausted the GPU memory (fixed, MoltenVK 2cf5fc3), but two things are still wrong on the M4. The pointer is out of step with the game at the desktop's 2x UI scale (Xwayland is not scale-aware; check whether the error grows from the top-left, then try 1x), and the name boxes below. The aok-sdl-game wrapper still handles `etr` for anyone who installs it.
+- **Extreme Tux Racer's name boxes draw solid on zink.** On its first menu the "player name" and "character" boxes come out filled with their outline colour and without their text on the GPU (M5 Mac and M4, through Xwayland with zink); the same build in software draws them right, and so does software Tux Racer on the GPU-backed Xwayland, so it is the client's zink rendering, not Xwayland. Racing draws correctly. Likely an SFML legacy-GL path (client-side vertex arrays with per-vertex colour, or its RenderTexture) that zink or MoltenVK mistranslates; capture the frame's pipelines with MVK_CONFIG_DEBUG=1 and compare against llvmpipe.
+- **The i386 JIT is ~2.7x slower than the arm64 JIT on the same work (7-Zip benchmark, 2026-10-04).** `7z b -mmt1` (LZMA, single thread) in Alpine guests: i386 on the M5 Mac 390/367 overall MIPS, M5 Max 397/458, M4 iPad 370/370 (compress 427, decompress 312), A10X (bip) 123/122; arm64 guest on the M5 1034. Against 7-cpu.com's single-thread table the M5's i386 guest is about a 500 MHz Pentium III (P-III 1.4 GHz 1115, Atom N270 800, P4 3.0 GHz 1515, Core 2 2.0 GHz 2000) and the A10X about a Pentium MMX (125). The specialised-gadget work done for arm64/riscv64 (ospec/lspec/vspec, fused pairs, btfn) has no i386 counterpart; LZMA is memory- and branch-heavy, so profile it (ISH_JIT_PROFILE on alpine-i386-test) before choosing what to port. Re-run on the user's A20 iPhone Pro (arriving mid-October 2026; the M6 generation) -- ~/aok-bench on the M5 Max (192.168.8.123) holds the CLI and i386 root used here. **Profiled and partly done (2026-10-04):** ISH_JIT_PROFILE on 7-Zip (37.5G guest instructions) put register ALU at 34% of instructions and memory movs at 33% (base+disp, already fused; scaled index ~2%), and a host `sample` showed ~30% of the time in the load32_reg_*/store32_reg_* staging gadgets around register ALU ops -- so a reg,reg op cost three dispatches. A bigger TLB was tried and refuted (1024/4096/8192 entries: 417/425/427, 415/422/415). **Done:** fused ALU reg,reg (fused_<op>32_rr_<dst>_<src>, 448 gadgets), shl/shr/sar reg,imm and inc/dec reg, one dispatch each (`alurr`/`shift`/`incdec` in /proc/ish/i386_jit_fuse). Same binary, fusions off vs on, interleaved: M5 Max 421/420 -> 547/551, M4 iPad 355 -> 510 (+44%, 3/3), A10X 106/115/117 -> 145/151/153 (+33%, 3/3; the 448 new gadgets cost the older core nothing net). Checked by tests/manual/x86/fused_alu_regs.c (every register pair incl. ESP, identical output with the fusions off) and alu_flags. Applies to 32-bit programs on amd64 roots too (they run on the i386 engine). **Done, second round:** mov reg,imm32, movzx reg32 byte/word [base+disp], mov word [base+disp] (one gadget each) and imul reg,reg (`movimm`/`movx`/`imul`): M4 501 -> 561 (+12%, 3/3), so the M4's i386 7-Zip went 355 -> 561 in a day; M5 Max loaded and noisy (4/5 rounds up). A10X 151 -> 165 (+9%, 3/3). **Done, third round:** [base+index*scale+disp] addresses in one gadget (`addrsi`, 256 gadgets, scale baked in; every scaled-index operand paid addr_<base> + si_<index>) and cmp/test reg,reg + jcc in one (`cmprr`: cmp with c/z/cz/s/sxo/sxoz, test with z; gen_try_fuse_jcc rewrites [load32_reg_<dst>][fused_cmp32_<cond>_reg_<src>] after checking the load is the CMP's own via x86_fuse_start): M4 560 -> 595 (+6%, 3/3), A10X 152 -> 164 (+8%, 3/3) -- M4 i386 7-Zip 355 -> 595 (+68%) over the day. **call/ret is structural, left:** an empty call+ret is 4.7 ns on the M4 (plain loop iteration 2.1 ns); it is two block transitions, each paying chain_ip (poke check through cpu->poked_ptr -- required, the JIT runs on frame->cpu, a copy -- plus the chain-budget load/decrement/store and the last_block store). Cutting that needs a free host register for the budget or a different poke protocol; both touch the lost-poke history (c5692489), so measure-first territory. **Done, 2026-10-05 (Python, not 7-Zip):** a host profile of Alpine i386 Python put ~15% of the time in vec_helper C calls and ~7% in leaving the JIT for indirect jumps. Alpine's i386 gcc moves 64-bit values through SSE (movd r32 -> xmm, punpckldq, movq xmm -> m64; movsd for doubles), ~7% of Python's instructions, each a C call with every register spilled and reloaded around it -- the Devuan profile above has almost no SSE, which is why this was missed. Those moves are now gadgets (misc.S vec_movd_*, vec_ld*/vec_st*, vec_copy64z, vec_punpckldq; the 64-bit memory forms keep the helpers' dmb ish). And jmp/call through a register or memory (Python's computed-goto dispatch) enter the target straight from the dispatch loop's per-thread block cache (jit_frame.i386_cache, control.S i386_indir_chain) instead of returning to C every time. M4, Alpine 3.24.2 i386, app builds alternated 3/3: Python fib/method/dict/str 166/735/589/615 -> 118/585/517/456 ms, jit_bench ind 1830 -> 744 ms, 7-Zip flat (~595). Checked by tests/manual/x86/i386_sse_moves.c (random SSE-move runs, identical output to the C-helper build) and the i386 and amd64 suites. Then pshufd (register form), pxor, paddq and psrlq/psllq by an immediate the same way: Python dict 515 -> 454, str 466 -> 445 ms (M4, 3/3). **Measured, not done (2026-10-05):** i386 7-Zip's host profile is flat now; the visible remainder is ALU reg,[mem] (`addl d(%ebp), %eax`, `xorl d(%ecx,%ebx,4), %eax`) still staged through load32_reg/addr/op_mem/store32_reg, but it is ~3% of 7-Zip's instructions, so fusing it per (op, reg, base) is worth ~1-2%; the rest of the gap to amd64 (604 vs 812) is i386 code being register-starved (memory operands on the stack frame). **Tried and dropped:** no dmb ishld in the i386 branch gadgets that load no guest memory (jmp, jcc, call, loop, register-form fused jcc), as amd64's gret_nomem: flat on the M4 (3/3) and the A10X.
+- **Host an MCP server in the app (Discord suggestion, Rogue, 2026-10-03).** "You should add an mcp server hosted to the ish-aok app. That way we can connect an ai agent and control ish-aok from an external agent." AOK already has the client side (LLM Chat takes MCP servers as tool sources, 12e7f90be); this is the reverse. Shape to decide: (a) app-hosted, Streamable HTTP on a port, so it can reach app-level things a guest cannot -- Workspace (open applets, /proc/ish/workspace), settings (/proc/ish/defaults), roots (list/boot), terminals (send input, read the screen), checkpoints -- alongside guest commands and files; or (b) a guest-side stdio server reached over ssh (`ssh ipad aok-mcp`), simpler and already possible with sshd, but guest-only. Either way: off by default, a per-device token, bound to loopback/Tailscale unless the user widens it, every tool call logged, and a confirmation mode for destructive tools. Start with (b) plus a few app tools through /proc/ish, then decide whether (a) is worth an in-app HTTP server.
+- **Find out what "AOJIT" is in ish-arm64 / "open minis" (Discord, cacophonousStrife, 2026-10-03).** A user asked about "the new AOJIT thing introduced in ish-arm64/open minis" and could not find its release notes. Look it up (the ish-arm64 fork's repository and releases), say what it is in a reply if it helps the user, and note anything worth borrowing for AOK's JIT (compare with the run-translator and gadget-body items above).
+- **An arm64 desktop on any root: prototyped, measured, not worth it for speed (2026-10-03).** Mechanism that works: graft an installed arm64 root into the booted one with two symlinks -- `/usr/lib/aarch64-linux-gnu -> /AOK/roots/Devuan6-arm64/usr/lib/aarch64-linux-gnu` and `/usr/lib/ld-linux-aarch64.so.1 -> aarch64-linux-gnu/ld-linux-aarch64.so.1` -- and arm64 programs exec normally (no foreign_exec, whose ROOT mode would put the compositor's Wayland socket in the other root's home), with every compiled-in arm64 path (Mesa drivers, GBM, Wayfire plugins) resolving and no environment for native children to inherit; /usr/share data comes from the booted root. On bip's Devuan riscv64 root the arm64 labwc ran as the desktop on the GPU and the bundled aarch64 wayvnc ran too. Measured (bip, A10X; labwc CPU per displayed es2gears frame; 2 interleaved rounds): GPU native riscv64 4.99/4.68 ms vs arm64 4.70/4.33 ms (~7%); software native 579/546 ms vs arm64 605/572 ms (arm64 ~5% dearer). The compositor's cost is not guest-instruction bound, so an arm64 desktop buys little; revisit only for software GL clients (llvmpipe: NEON on arm64, plain C on rv64gc) or if a profile shows otherwise. Graft removed from bip afterwards.
+- **Software compositing at UI scale 2: fixed (2026-10-04).** bip (A10X), labwc in software, es2gears, 2732x1932 at scale 2: 1.6 fps and ~580 ms of compositor CPU per frame, now 19.8 fps and 10.7 ms. Two causes, both found with ISH_PIXMAN_STATS on labwc: es2gears' EGL picked 10-bit buffers, which pixman converts in floating point (start-wayland.sh exports allow_rgb10_configs=false: 8.7 fps, 75 ms), and the 2x bilinear stretch of every scale-1 client ran in pixman's C because the accelerator declined transforms (now ISH_PIX_OP_SCALE_BILINEAR on the host, byte-exact with pixman on riscv64 and aarch64; pixman_accel_plan.md). es2gears' own software rendering is now the limit. x86 guests done too (2026-10-04): pixman's SSE2/SSSE3 paths follow NEON's rule exactly; shim test PASS on Devuan x86_64, Alpine x86_64 and i386 with ~760 stretches accelerated. Left: OVER from x8r8g8b8 on aarch64/x86 (needs pixman's cover/opaque decision mirrored; pixman_accel_plan.md NEXT 0).
+- **Try the GPU on a Devuan i386 root (2026-10-03).** Debian 13's i386 Mesa ships the Venus driver (packages.debian.org filelist: libvulkan_virtio.so), and setup-gpu.sh now lets Devuan riscv64 and i386 through (riscv64 verified on bip: Venus on the A10X, zink GL 2.1/GLES 2.0, labwc composited natively with the bundled riscv64 wayvnc detached by wl-present 2/2). i386 is untested: there is no Devuan i386 root here or on the iPads, and a 32-bit guest's virtgpu ioctls (u64 fields, mmap of blobs) have never been exercised. Make a Devuan i386 root, run setup-gpu.sh, vulkaninfo --summary, then a desktop session.
+- **The arm64 Wayfire and wf-panel on a riscv64/x86 Devuan root get the root's shims (2026-10-03).** start-wayland.sh exports LD_PRELOAD with /AOK/bundled/glibc-<root arch>/libish-{pixman,wl-release-guard}.so; an arm64 compositor or panel (Wayfire everywhere, setup-wayfire.sh) cannot load them, so ld.so prints two "cannot be preloaded" errors at each start and they run without the pixman accelerator and the release guard. wayvnc is fixed (wl_preload_for gives it its own architecture's shims), but the compositor and panel cannot simply be given arm64 shims: the programs they launch inherit LD_PRELOAD and are native. Idea to check first: glibc expands `$LIB` in LD_PRELOAD per process (Debian: lib/<triplet>), so shims served at /AOK/bundled/glibc/lib/<triplet>/ and LD_PRELOAD=/AOK/bundled/glibc/$LIB/libish-pixman.so would give every process its own -- verify the expansion on Devuan arm64/riscv64/amd64 and on Alpine (musl does not expand it; musl roots have no foreign-arch compositor anyway).
+- **Doom games: start with no sound on fewer than four CPU cores (user request, 2026-10-03).** Chocolate Doom, Crispy Doom and Freedoom as setup-games.sh installs them should open with sound off (`-nosound`, or the launcher's equivalent) when the guest has fewer than four processor cores -- the A10X class, where mixing and the sound pipeline cost more than they are worth. Count the cores the way a program sees them (`nproc`, the cpuset, not cpuinfo's online count -- [[guest-cpu-count-cpuset-shape]]), decide in the launcher wrapper so the menu entries and a shell both get it, and leave a way to force sound on.
+- **Chocolate Doom still fails to start on bip with the current build (user report, 2026-10-03).** After the "No connection" / launch fixes of 2026-10-03 it worked on the M4 and the user's rebuilt app, but on bip (A10X, iPad Pro 12.9 2nd gen) it still does not start: ktop shows chocolate-doom running and using a whole CPU, and nothing appears on the display -- busy, not crashed, and no window mapped. Next: sample where it spins (guest PC sampler, ISH_GUEST_PROFILE, or a host backtrace of its thread) -- on bip, read dmesg first, then run the menu entry's exact command in a terminal in the Wayland session and capture its stderr; compare with the M4 (same root type? GPU vs software -- bip's zink/Venus path differs, see the #484 A10X entry above), and check whether sound start-up (the item above) is what hangs it.
+- **Games scouting follow-ups (2026-09-28, Devuan arm64, M5 Mac).** Run fine: ScummVM freeware (Flight of the Amazon Queen, Lure of the Temptress, Drascula -- the last asks for ripped CD audio), Crispy Doom, OpenTTD (with opengfx/opensfx/openmsx), SuperTux (zink's GL 2.1 fails its GL check, it falls back to SDL drawing), Pingus, LBreakoutHD, LTris 2, Powermanga, C-Dogs SDL, openMSX (C-BIOS, needs cartridges), DOSBox, and on the GPU after 524eac6a/7f9f01f8 Neverball, Armagetron Advanced, Teeworlds, Chromium B.S.U., SDL-Ball, LinCity-NG. Open: X-Moto exits at once with "Unable to get xmDb version" in software and on the GPU (its sqlite database -- a guest file-locking or mmap gap?); Frozen Bubble and Rocks'n'Diamonds sit on their loading screens past 45 s (measure whether it is slow or stuck); `apt-get install emutos` failed (Hatari has no TOS without it); dsda-doom's `-timedemo demo1` cannot find the lump. Then add the good ones to setup-games.sh as an optional second set.
+- **motepad (the native editor): close the gaps its own page lists.** `/AOK/docs/motepad.md` ("What it does not do") and `kernel/native_motepad.c` agree, checked 2026-09-28: no undo (Ctrl-Q twice is the only way back), no selection or clipboard (Ctrl-K deletes a line with nowhere to paste it back from), and no wcwidth (a double-width CJK glyph or emoji counts as one column, so the drawn cursor can sit a cell off the edit). Add an undo stack, a cut/copy/paste buffer that also reaches the iOS pasteboard where the app hosts the session, and wcwidth-aware column arithmetic; then update the page's list. The Workspace MotePad applet is a separate front end and was not reviewed here.
+- **x86_64-host builds: the amd64 interpreter lacks this cycle's x86 fixes, and x86_fp_env fails.** On an x86_64 Linux host (GCC build, as CI does; recipe below) the amd64 engine is the pure interpreter -- the amd64 JIT gadgets are aarch64-only -- and the 2026-09-30 fixes that live in jit/gen.c's amd64 arms are not there: priv_gp (ring-0 0F opcodes SIGILL instead of #GP), movnt_stores (MOVNTPS/MOVNTPD/MOVNTI SIGILL), sse_align_gp (misaligned MOVAPS etc. run silently) all fail under amd64 on that build. The i386 engine passes them (its x86_64 gadgets got vec_align16). x86_fp_env fails there too, on both engines: ucomisd qnan (ZF/PF 0x1 vs 0), divsd FTZ (0x5555555555555 vs 0), and on amd64 cvtsd2si 1e300 flags (0 vs 0x1). Fix in emu/amd64_interp.c (decode the same cases) and in the x86_64 SSE gadgets. Recipe (camd): rsync the tree minus /build*, /.git, /deps, /app (then add app/*.h and docs), /.claude, /e2e_out, /subprojects; `ln -s ~/ish-AOK/deps deps`; `meson setup build-x64 -Dgpu=disabled`; touch changed files after an rsync (the Mac's mtimes can be older than camd's objects); roots via `rsync -aS --exclude data/tmp/*` (the amd64 root's /tmp holds two 5 GiB sparse files).
+- **Make meminfo Shmem/AnonPages/Mapped Linux-shaped -- DEFERRED by the user 2026-10-09** (it is not small). AOK counts page-table entries per address space at mmap time; Linux counts resident pages once each from first touch (the measured table is under "`/proc/meminfo`'s Shmem, AnonPages and Mapped are not Linux's figures" below). What it takes, sized 2026-10-09: (1) move the class counters from entry publish/clear (mem_entries_published/mem_entry_cleared, emu/memory.c) to first touch/untouch (mem_pt_touch/mem_pt_untouch), which fixes the untouched rows; (2) count a frame once across address spaces -- a per-page touched-mapcount on struct data for anonymous pages shared after fork (pt_copy_on_write copies PT_TOUCHED, so a separate bit or count is needed: RSS must keep counting the child), and a global table keyed by mem_shared_page_id for file/memfd/shared-anon pages, since two mappings of one file are two struct datas; (3) Shmem from contents, not mappings: tmpfs and memfd allocated pages whether mapped or not (tmpfs keeps no such counter; memfd is an unlinked host file), plus touched shared-anon and SysV pages. Every site that moves an entry has to keep these right -- unmap, COW break, mremap (pt_move), swap-out/in, eviction -- so the risk is in the memory core. Update tests/manual/meminfo_scaling.c to Linux's table, and keep the read a counter load (ISH_MEM_CLASS_CHECK's walk becomes a frame walk).
+- **Done 2026-10-09: O_PATH through a /proc link to a pipe, socket, anonymous inode or removed directory** opens, as on Linux: an opath_held handle (fs/generic.c) holds the description, forwards fstat and getpath, reads EBADF, and reopens what it holds through its own link; a socket opens through /proc as ENXIO. tests/manual/opath_proc_nameless.c (26 checks, camd and AOK). Left: a non-O_PATH open of a pipe through /proc opens only the direction the descriptor already has (AOK's pipes are host pipes, and a read end holds no write end), and an open through the handle's link hands back the held description rather than a new one (its offset and flags are shared).
+- **Done 2026-10-01: F_GETFL reports what Linux reports.** realfs_getflags takes the guest-owned bits (O_APPEND, O_NONBLOCK, O_DIRECTORY, O_NOFOLLOW, O_LARGEFILE) from fd->flags and only the rest from the host; every open by a 64-bit task gets O_LARGEFILE (force_o_largefile; not O_PATH); fd_getflags drops O_CREAT/O_EXCL/O_NOCTTY/O_TRUNC/O_CLOEXEC; a by-path reopen stores the caller's flags, not its internal O_NOFOLLOW. Measured against Linux 6.12 x86_64 and -m32 first: 64-bit opens report O_LARGEFILE always, 32-bit only when asked (musl always asks). This also fixes the pipe O_NONBLOCK lie below. Test fcntl_getfl_flags (passes on Linux 64/32-bit).
+- **Done 2026-10-09: a /proc fd link to a target outside the caller's chroot leads there**, as Linux's nd_jump_link does: __path_normalize (fs/path.c) walks a magic link whose text is "(unreachable)..." from the real root with the marker dropped, so `/proc/self/fd/N`, `/proc/self/fd/N/below` and `/dev/fd/3/script` reach the file opened before the chroot, not the decoy at the same path inside. readlink still shows the global path. tests/manual/proc_link_chroot_escape.c (camd `unshare -rm`; the build before fails 2 checks).
+- **Done 2026-10-01: Alpine 3.24.2 promoted to official** (ish-AOK-rootfs b937aab; the app picks the catalogue up within its 10-minute refresh). Gate: the full suite on each 3.24.2 root (i386, x86_64, aarch64, riscv64) plus Devuan 6 arm64 (glibc), on the Mac CLI and on the M4 with each root BOOTED -- all pass; Mac-only inaddr_any_iface (link-local interfaces), and one i386 x86_unaligned_lock device run that passed alone (queued above). pixman_accel/pixman_shim pass on all ten legs once `pixman` is installed (CLI: ISH_PIX_ACCEL=1). The Mac test roots alpine-{i386,amd64,riscv64}-test are now 3.24.2 (old ones kept with their version suffix) and alpine-arm64-324 is a clean 3.24.2 arm64; alpine-arm64-test tracks edge (3.25 alpha). The M4's four 3.24.2 roots carry the toolchain and sshd on 1022 for booted legs; the compiled-test cache store was seeded from the Mac roots and pushed (2018 entries), which took the device legs from hours to minutes.
+- **Done 2026-10-01: pwritev2 honours its flags.** RWF_NOAPPEND writes at the offset on an O_APPEND description and RWF_APPEND appends (fd->pwrite_append, read by every fs pwrite through fd_pwrite_appends, FUSE included), RWF_DSYNC/SYNC sync after the write, RWF_NOWAIT/ATOMIC/unknown are EOPNOTSUPP; preadv2 refuses unknown bits. Two bugs: the flags were ignored, and the arm64/riscv64 entry read them from pos_h (always 0) instead of the sixth argument. With musl 1.2.6 (Alpine 3.24) a plain pwrite() on an O_APPEND file went to the end of the file instead of its offset. Test pwritev2_flags (matches Linux 6.12, 64- and 32-bit).
+- **Done 2026-10-01: clone() and unshare() agree on namespaces AOK lacks** -- both ENOSYS for CLONE_NEWNS/NEWPID/NEWNET/NEWUSER/NEWCGROUP (clone said EPERM). Linux built without a namespace type says EINVAL; ENOSYS is kept on purpose so `unshare -n` says "Function not implemented". Test clone_unshare_agree (root; passes on Linux, where both succeed); book ch41.1 updated.
+- **Done 2026-10-09: FUSE through fsopen() mounts.** sys_fsmount_guest (fs/mount.c) no longer opens a FUSE mount's root, a request to a daemon that mounts first and serves after: it hands back an opath_link handle naming the root, which is all move_mount wants. tests/manual/fuse_fsopen.c times fsmount with no daemon serving, then serves and stats/looks up through the mount (camd 64- and 32-bit; the build before hangs until the alarm). fs/fuse.c's header and book ch20/ch41.6 updated.
+- **Done 2026-10-01: book ch07 brought up to date** with the GNU `as` bypass removal (23edd81e), the interpreter's size (about 18,000 lines) and where the amd64 JIT runs (any aarch64 host, the Mac CLI included).
+- **Workspace LLM Chat toward OpenCode: what the phases left.** Chosen 2026-09-28 over embedding OpenCode natively. Done: phase 0 (the chat's own files, app/LLMChat*.m), phase 1 (read_file/write_file/edit_file/list_directory/glob/grep; allow/ask/deny per category plus shell rules, Settings -> LLM Client -> Tool Permissions; tests/unit/llm_permissions_test.m) and phase 2 (per-chat working directory in the chat menu, saved as the session's "workingDirectory"; the nearest AGENTS.md or CLAUDE.md sent with every tool request; todo_write; /compact and "Summarize Chat", automatic above 75% of a known context window; the empty chat names what the tools can do). Both phases were run end to end in the simulator against scripted OpenAI-compatible servers. Not yet exercised: the file tools under "Open Everything as Default User" (the mode-bit check in ISHLLMAccessProblem), the Working Directory menu item itself (injected taps do not open UIMenu buttons; the saved-setting path it writes was tested), and automatic compaction (it shares /compact's code). Apple Foundation Models still offers run_shell alone (4K context). Phase 3 done so far: API keys in the Keychain (cc0ca8a0; they were readable by any guest process under /proc/ish/defaults), change review with diffs and /undo (41b9c831), Anthropic's Messages API with prompt caching and refusal fallbacks (4abf8524; tested against an Anthropic-format mock, not yet the real API). Streaming inside the tool loop, both formats, with Stop (73196224). MCP servers as tool sources (2026-09-29): remote Streamable HTTP servers (bearer token in the Keychain) and stdio servers run in the guest as the tool account (kernel guest_process_spawn_user, 47ab754f); Settings -> LLM Client -> MCP Servers, or /mcp; calls go through the "MCP Tools" permission category; tests/unit/llm_mcp_test.m. Run end to end in the simulator against a mock remote server (session id, protocol header, paginated tools/list, SSE replies, isError, structuredContent, DELETE on disconnect) and a BusyBox sh stdio server in the guest (a ping from the server answered). Not yet exercised: a real npx/uvx server (first start downloads it: initialize waits 180 s), the real Anthropic API, and MCP resources, prompts and sampling (declined with -32601; only tools are used). A server that fails is not retried for five minutes unless its settings change or a Check succeeds. Background agents (2026-09-30): each chat is an agent (app/LLMChatAgent.m) that keeps working when another chat is shown or the window closes, on its own destination (set per thread for its requests) and tool queue; approvals wait until that chat is opened; spawn_agent/agent_result start sub-agents one level deep, at most four working per chat; a status panel shows phase, elapsed time, round, tool calls, context use and other chats; /new, /chats, /agents; prompts sent mid-reply queue. Run in the simulator against two mock servers; not yet exercised: the Anthropic, Gemini and Apple Foundation Models paths after the move (ported unchanged), and a sub-agent whose parent chat is reloaded after a relaunch.
+- **OpenCode in an arm64 guest: what the hang hunt left.** Not a kernel hang. On 2026-09-28 four `opencode serve` runs (1.18.33, `build/alpine-arm64-test`) did about 30 agent turns with the bash and write tools, three of them concurrently, and three `/etc/*` permission asks left pending for up to 37 minutes before a reply; every turn finished and the server kept answering. An in-guest busybox `wget` of a fresh `/doc` took 31-77 s against host curl's 26-35 s, not 937 s. The reported wedge came while this Mac was thrashing (18 GB of swap in use, a JetsamEvent, load 100-300, background CLIs at nice 5), and AOK made it worse: Bun's 64 GiB JavaScriptCore reservation was materialised whole by one mprotect, 1.1 GB of page tables built with every guest thread stopped (22dbee6d: VmPTE 1.08 GB -> 18 MB, server footprint 2.2 GB -> 1.1 GB). Left: `pt_copy_on_write` still materialises every reservation of a process that forks (read, not measured); a refused split (MEM_LAZY_SPLIT_LIMIT) still costs the smaller side; cold start is 60-150 s and a turn 13-60 s on this loaded Mac.
+- **Misaligned LOCK starves the process's other threads (diagnosed 2026-10-09): fixed 2026-10-13, see the `x86_unaligned_lock` entry above.** The history, for what was tried: Reproduces reliably on the M4 and on the Mac under `setsid` (6 runs in 30): host samples (Mac `sample`; the M4 through `xctrace record --template 'Time Profiler' --attach iSH-AOK`, which does not kill the app as lldb does) showed the other thread blocked in read_lock at the top of task_run_current -- a new thread got a block or two of glibc start-up between split ops, 1.5 s with not one store -- while the splitter waited in x86_lock_split_begin for it to leave the JIT: each split op re-queues as a writer a few instructions after the last, and readers yield to a queued writer. (Admitting queued readers before an op does nothing: the reader gets in and is poked straight back out.) A quantum fixes it -- after an op that found siblings in or near guest code (task_poke_shared_mem counting them), the next leaves the JIT with a yield interrupt and waits out 100 us with nothing held: Mac setsid 6/30 -> 0/30, M4 ~50% -> 0/20 -- but when every thread is a splitter it is ruinous: amd64_xchg_mem (four threads, misaligned xchg) went from 1-6 s to over ten minutes waiting every op (and livelocked when the wait was a sleep inside the JIT holding the read side, which held off the retries' mem_ptr_fault write_lock), and to 166-350 s waiting every eighth. The heavy part under contention is the retry itself (a lost trylock of x86_split_lock goes out as INT_PF, through mem_ptr_fault's blocking write_lock); a fix needs a cheaper hand-off between splitters before a quantum for non-splitters can be afforded. Tried the same day: the JIT's retries leaving through a plain yield exit (run loop: sched_yield, re-run) instead of the page-fault round trip -- worse, amd64_xchg_mem 28-47 s against the current 1-26 s (the losers re-try hot and keep poking the winner; mem_ptr_fault's write_lock at least parks them). Note the baseline's own spread. Split locks are slow and unfair under contention by construction here (they need the address space exclusively), much as on hardware, which takes a bus lock for them -- Linux 5.19 and later even penalise a user-mode split lock with a 10 ms sleep (split_lock_mitigate); real code avoids them. Left as is.
+- **i386 misaligned LOCK: starvation across a page (found 2026-10-01): fixed 2026-10-13, see the `x86_unaligned_lock` entry above.** The history: tests/manual/x86_unaligned_lock's interlock phase (a `lock incw` thread against a plain-store thread) on the i386 root. `word_at_15` -- crossing a page, so x86_atomic_split -- can starve the other thread: the M4 leg saw 0 stores against 6605 increments in 1.5 s (passes alone). mem->lock is writer-preferring, and each split op re-queues as a writer a few instructions after downgrading, before the poked sibling can take the read side back. A fix that admits queued readers before each upgrade (read_lock_admit_waiting; patch kept at the session scratch, rw_locks.h/tlb.c) removed the starvation but cut that case's throughput ~100x (thousands of ops per run to tens), so it was not committed; a cheaper hand-off is needed. The "rare lost store" at `word_at_1` reported alongside it was the test, not AOK (fixed 2026-10-01): every lost value it logged was the 16-bit counter wrapping past 0xffff while the storer was descheduled for a few ms (marker 0x8700 read 0x697), where a lost store reads the previous marker; the check now counts only values within one step below the marker, and the fixed test passes 10/10 on the AOK i386 root and on camd (64-bit and a static i386 build). The earlier camd losses at word_at_15 (4 of 8.8M) were most likely the same wrap. Seen once more 2026-10-07 at word_at_1 (1 of 237,036, i386 root, Mac load average ~30 during a two-suite run; passes alone): a wrap can still land one step below the marker by chance, so if it recurs, widen the counter or log the read value to tell a wrap from a loss. Also: a zig/clang-built i386 copy of the test fails every qword case on both AOK and Linux (its 64-bit path differs from gcc's); build it with the guest gcc. **amd64 too (557 device leg, M4, Alpine 3.23.3 x86_64 booted, 2026-10-02):** `qword_at_12: a thread never ran (10722 increments, 0 stores)` in the full suite, then 1 of 6 alone (`dword_at_14`, 6767 increments, 0 stores) -- not page-crossing cases, so the hand-off problem is not only x86_atomic_split's; the Mac legs passed it on all five roots. **Refuted 2026-10-09:** admitting queued readers every 16th split op (a readers_waiting count in wrlock_t, read_lock_admit_waiting) changed nothing -- the starved thread is not a reader queued on mem->lock -- and cost the incrementer 10x and the storer 4x on a word_at_15 probe; reverted. Seen on the Mac too now (x86_unaligned_lock at load 30-90: 1-3 in 10 runs on builds before and after x86_lock_rmw, at dword_at_14, qword_at_12, word_at_15, qword_across_page; a standalone word_at_15 probe never starved in 150 rounds). Next: catch it with a host `sample` while the storer is at 0 stores, to see where it waits (300 runs, six in parallel, did not reproduce it on 2026-10-09). **The word_at_1 "lost store" settled 2026-10-09:** the same parallel load gave 9 in 150 runs on the build before x86_lock_rmw and 15 on the build after -- the wrap, not AOK. The storer now counts a read only while fewer than 65536 - 2 steps of increments have landed since its store (x86_unaligned_lock.c); 90 runs then gave none, and a copy with the LOCK prefix removed still loses thousands natively on camd.
+- **i386 host SIGSEGV in concurrent_exec_tlb under load (found 2026-10-01) -- see "Stale TLB after exec" above: not reproducing.** The i386 root's `concurrent_exec_tlb` (8-way fork+exec of cc1, 32 rounds) killed the CLI with EXC_BAD_ACCESS in `fpu_ldm80 <- back_fhelper_read80 <- cpu_run_engine_to_interrupt`, always at a page-aligned host address (0x107758000, 0x104d24000, 0x11bfb8000). Not the cross-page check (read_prep sends offsets past 0x1000-10 to crosspage_load), so an x87 80-bit load went through a TLB entry whose host page was gone -- the #469 stale-TLB-after-exec class that test was written for, which was fixed for the arm64/riscv64 frontends. Repro: four copies at once of `bin/concurrent_exec_tlb` in build/alpine-i386-test, ~1 run in 16 dies; alone, 12/12 pass. Independent of fork inheritance (one crash each with ISH_JIT_INHERIT=0 and =1). Next: check how the i386 frontend revalidates its TLB after exec against the arm64 fix. (The fhelper path that crashed is gone since 2026-10-06 -- x87 m80 loads are x87.S gadgets through read_prep -- so re-run the repro; the stale entry, if it is that, would now show in an ordinary load.)
+- **TestFlight feedback is on disk too** (2026-10-13): Xcode's Organizer leaves it beside the crash logs, `~/Library/Developer/Xcode/Products/app.ish.iSH-AOK/Feedback/Points/*.xcfeedbackpoint/Filters/*/PointInfo.json` -- comment, build, device, OS, time, the tester's e-mail when given; screenshots are signed URLs that expire, and only a few are cached under `Images/`. 40 items, newest 2026-09-28. *Item of 2026-09-21 (iPhone12,1, iOS 15.4.1, anonymous): "works on 553; on 555 ping, ip and other network commands freeze" while running PoemMisty/CFData-WEB (a Go connect-scanner; read, not run).* 555 is the one build where netlink receives had started to block (f6509bc9b) and the two things that exposed had not yet been put right -- GETs nobody answered, and a dump's NLMSG_DONE handed over with the dump (56011760, first in 556) -- so a program that read once more for its DONE waited for ever. At head, on four roots, `ip addr/link/route/neigh/rule/route get`, ping, ping6, ss, netstat, curl, wget, Python's if_nameindex and fastfetch all return under a watchdog, and a Go scanner of the same shape (200 workers, 1000 dials answered and 1000 left to time out) finishes in 6 s with `ip addr` at worst 0.4 s and ping 0.2 s beside it. **Not done:** the tool itself was not run, and the hang was not reproduced on a 555 build. *Found on the way, fixed (smallclue 9a44449):* the native `ping` had no `-W` and the native `wget` no `-T` (usage error, not a hang), so a root with the native links installed failed scripts that pass either. Both take Linux's options now -- ping `-W -w -i -s -t(TTL) -I -q -D` with iputils' exit statuses and loss format, wget `-T -t -U -P -S --spider -o` and the long spellings -- and wget fails on an error status (exit 8) where it used to save the error page and exit 0. `tests/manual/native_net_options.c`, loopback only.
+- **TestFlight feedback triage 2026-10-13 (the six newest items that say anything; the rest are praise or screenshots alone, and every screenshot URL had expired on 2026-10-07 -- open the item in the Organizer to refresh one).** Old builds were rebuilt as CLIs to see what the tester saw: a local clone at `builds/iSH-AOK_<n>`, submodules cloned from `.git/modules/deps/*`, `meson setup -Dnative_rust=disabled -Dnative_bash=disabled`; they run today's (meta.db v9) roots. (1) *556, iPad Pro M2, "Codex CLI works until it tries to run a shell command"*: known, entry below -- bubblewrap needs user and mount namespaces; `/AOK/fixes/codex` has shipped since 557 and is still the answer at head (`codex sandbox -- /bin/echo x`: "Creating new namespace failed"). **Open**, the namespaces project; the feedback item itself is closed with that explanation (reply drafted for the tester 2026-10-13). (2) *553, iPhone 7 Plus, iOS 15.8.8, "Build 553 is Crash"*: the Organizer has that device's 553 log (2026-09-08); symbolicated against the 553 archive it is `jit_unmapped_guest_fault <- timer_set <- itimer_set <- sys_setitimer`, the iOS 15 setitimer abort, #595. **Fixed in 555** (de847adc). (3) *551, iPhone 12 Pro, "Something wrong with networkctl"* (screenshot gone): on Arch (systemd 260) with systemd as PID 1, 551 could not start systemd-networkd, so `networkctl` listed every link "unmanaged" and `networkctl status` said "systemd-networkd is not running ... Failed to connect to network service"; at head networkd is active and `networkctl status` gives state, addresses and per-link detail. **Fixed in 558** (a3f4f9c70, 6c3da7e20, with the netlink work of 555/556). With no systemd running both builds answer alike, and as Linux does in a container. (4) *550, iPhone 14 Pro Max, "pacman fails, tried putting DisableSandbox in pacman.conf, didn't help"*: the sandbox is one of three things; the dangling resolv.conf and the empty keyring are the other two, and `/AOK/fixes/arch/fix-pacman.sh` (first in 550 -- the build they were on) does all three. At head on the Arch root: `pacman -Sy` and an install work. **Answered by the fix script; nothing told the tester it exists.** Done 2026-10-13: a root with an /etc/pacman.conf gets /etc/profile.d/20-aok-arch-pacman.sh at boot (app/AppDelegate.m ProvisionGuestHostFiles), and an interactive login names the script until its three conditions hold. (5) *548, iPhone 7 Plus, "Running Gradle is Report JVM Internal Error"*: the same tester's #564, a duplicate of #542 (DC ZVA reported as prohibited, HotSpot's guarantee); **fixed in 550** (e81038c31), and their next stop, #572 (no usable wildcard IP; daemon dying in the heap reservation), **in 556**. At head, Gradle 8.14.4 on OpenJDK 21 in an Ubuntu 24.04 arm64 root: bare `gradle` starts its daemon and ends BUILD SUCCESSFUL (3 m 52 s cold on the Mac CLI, 41 s again). Not a test for an Alpine root: Gradle's own `libgradle-fileevents.so` is a glibc build (`strtoll_l: symbol not found` under musl, as on real Alpine). (6) *548, iPad Air M3, "launching Ubuntu... It's possible before. Bad update"*: **not reproduced, and not enough to go on** -- Ubuntu is not a root the app offers, so this is an archive the tester imported, version and architecture unknown. Canonical's ubuntu-base 22.04.5 and 24.04.5 (arm64, and 24.04.5 amd64) start, run coreutils and an interactive bash identically on 547, 548 and head; 25.10 and 26.04 ran on none before 558 (uutils coreutils named through hard links, 59575749a) and run at head, apt included. The one launch regression known from that week is the console that never gave a prompt on roots with an init and a getty (7ce86e801, first in 550), which would read exactly like this. **Closed 2026-10-13:** thanked, told we think it is fixed, and that the supported roots are Devuan and Alpine -- others may run but are not tested for.
+- **`systemctl poweroff` did not end the guest (seen once, 2026-10-13, unconfirmed).** Arch root on the Mac CLI with systemd as PID 1 (`ish -f <root> /usr/lib/systemd/systemd`): a oneshot unit wanted by multi-user.target ran `systemctl poweroff` as its last line, and the emulator was still running 240 s later (150 s on a 551 build too). The unit was part of the boot transaction (`is-system-running` said "starting"), so the poweroff may simply have queued behind it -- try it from a login after boot has finished before calling it a defect, and compare with `systemctl poweroff --force`.
+- **Older TestFlight comments, builds 533-547 (looked at 2026-10-13; eleven, none with a usable screenshot).** Checked at head: *neovim crashes on launch* (538, iPad Air 5, iOS 27) -- NVIM 0.12.2 on Alpine arm64 starts, edits and writes, headless and on a pty. *"Debian 12 does not support locale-gen"* (540) -- the minirootfs has no `locales` package, so there is no locale-gen to run; `/AOK/tools/setup-locale.sh` (558) is the answer. Matched to later work, not re-tested: *"Something wrong with D-Bus"* (547, the networkctl tester; the session bus of 556 and SO_PEERCRED before accept in 558); *Workspace has no way back to Settings* (534 and 542; the two-way Workspace/Shell switch, #546, in 546); *grok-linux-aarch64 page fault on 0x8* (537; the arm64 gadget fixes of 539-550, binary not fetched). Nothing to go on: *"the keyboard doesn't allow a space or comma"* (544, iPhone 16 Pro Max, iOS 18.0.1 -- if a third-party or IME keyboard, the marked-text fix 3557658e in 558 is the candidate), *"Restore layout didn't restore the window size"* (534, iPad), *"Segment Fault on list some directory files"* (534, iPhone 7 Plus), *"Debian crashes the app"* (533), *"Frozen"* (537). Ask for the next feedback download early: the screenshots are what these needed, and they last a week.
+- **Crash triage 2026-10-13 (Organizer download, 16 points; seven logs newer than the 558 pass, two of them from 558).** *558, fixed for 559:* **native Helix took the app down** (iPad13,18, iPadOS 26.1, 53 s after launch): a tokio worker panicked in `runtime::io::Driver::turn` -- "unexpected error when polling the I/O driver", the kevent shim (kernel/native_kqueue.c) having returned something other than EINTR -- and deps/rust-native is `panic = "abort"`, so the panic was the app's abort. The log cannot say which error. Fixed at every level it could be: abort() and Darwin's assert handler in a native program are the program's (it dies of SIGABRT; tests/manual/native_abort.c); the tokio fork retries a failed poll for about two seconds before panicking; and the shim itself had four faults, found by running its tokio probe -- queues were found by descriptor number across ALL programs (two hx sessions used each other's), a reported descriptor was not watched again until a later kevent() saw it drained, a descriptor registered while the reactor slept was never added to the sleeper's set, and two threads of one program could collect one signal at once (a kernel assertion). tests/manual/native_tokio_poll_error.sh, on a build with `-Dnative_rust_features=tokio-probe`. **Not shown:** that any of these is the exact route to the reported panic -- by number alone two programs at once HUNG in the probe rather than panicking. **Still true, and not fixed:** a native program's own threads share its one task, so they outlive it if it exits or is killed while they run (they are not stopped, only made harmless: every shim call fails for them, and the task struct is no longer freed under them), and two of them blocked in the kernel at once share one task's wait state. Helix is the only program with such threads; a real answer is a guest task per thread. *Open, 558, same class as 559's must 2:* **RUNNINGBOARD 0xdead10cc** (iPad17,4, iPadOS 27.2 beta, 15 min after launch): a guest close() was inside a fakefs transaction (`fd_close` -> `inode_release` -> `fakefs_inode_orphaned` -> `db_exec_reset`, in libsqlite3) when iOS suspended the app. That path takes the gate (`db_begin_write`), so this is the gate not being held at that moment -- what 559's fix addresses (lifted before the next assertion was taken) -- but the log does not show which lapse; watch for it from 559. *Already fixed:* 557's native zsh fault in pipecleanfilelist x3 (558, fedced07f), 557's proc_pread assert (558, 3296e248f), 557's sockrestart_on_resume SIGSEGV (559, 19cfa76df).
+- **Crash triage 2026-10-01 (Organizer download, 104 logs, 14 points, newest 2026-09-26; none from 556 yet).** Open: RUNNINGBOARD 0xdead10cc (iOS killed the suspended app holding the fakefs SQLite lock), 22 logs over 549-555, 9 of them on 555 -- 4 inside -[AppDelegate performDnsRefresh:] (fakefs_open, fd_close -> fakefs_inode_orphaned) and 5 in guest file syscalls (openat, fchownat, fsetattr, symlinkat, exit_group -> fakefs_inode_orphaned) racing suspension. Both are what 6de50726 (first in 556) targets: the DNS refresh holds its own background assertion and the quiesce gate no longer lapses. Next download: confirm no 0xdead10cc on 556; if any remain, classify the lock holder the same way (python over each log's threads for fakefs_/db_/sqlite frames). Fixed in shipped builds: checkpoint save SIGBUS on a past-EOF file page (555, iOS 27 beta, one iPhone 12; 1447dab9 in 556); macOS FileProvider __FILEPROVIDER_BAD_EXTENSION__ (548-554, one Mac on macOS 27 beta; c94e0054 in 555, af01f729 in 556); iOS 15 setitimer abort #595 (553; de847adc in 555, issue closed). The rest are 548 and older (tmpfs_write assert, FileProvider childItemCount/loadToURL, realfs_telldir, jit_crash_bus_fn on 538-542), triaged in earlier releases. **Refreshed 2026-10-02 (557 pass): 6 new logs, still none from 556.** Five are FileProvider RUNNINGBOARD 0xdead10cc on build 530 (one iPhone14,6, iOS 27.0/27.0.1, 2026-09-27..10-01) inside sqlite3WalClose from -[ISHFileProviderMount dealloc] -- the suspension-path close that the idle close (after 546) moved off it; that device is simply still on 530. One is an app 0xdead10cc on 555 (iPhone13,2, iOS 26.7), the class 6de50726 targets in 556. Nothing for 557.
+- **Codex CLI cannot run shell commands: bubblewrap needs user/mount namespaces (TestFlight feedback on 556, 2026-09-28).** "Codex CLI works until it tries to run a shell command" (iPad Pro M2, iOS 27). Codex 0.159 runs every command through its Linux sandbox, now bubblewrap (bundled bwrap; Landlock is only a hidden legacy fallback, which AOK also lacks), and has no fallback when bwrap cannot start. Reproduced on the Mac with `codex sandbox -- /bin/echo x` in build/alpine-arm64-test (npm i -g @openai/codex): first "bwrap: Can't read /proc/sys/kernel/overflowuid", and with those sysctls added (65534, as Linux) "bwrap: Creating new namespace failed: Function not implemented". Shipped for now: /AOK/fixes/codex/README.txt and fix-codex.sh, which puts `sandbox_mode = "danger-full-access"` at the top of ~/.codex/config.toml (codex doctor then reports unrestricted fs, approval OnRequest unchanged); `codex --sandbox danger-full-access` for one session. Note `codex sandbox` ignores sandbox_mode from config.toml by design (debug_sandbox.rs), so test the setting with codex doctor. Real fix, a project: enough CLONE_NEWUSER + CLONE_NEWNS (uid_map/gid_map/setgroups, per-namespace mount tables, tmpfs/bind/remount ro, pivot_root, a fresh /proc) and CLONE_NEWNET (loopback only; Codex unshares the network when it is disabled) for bwrap 0.11 to start -- also what Flatpak and other bwrap users need. Check bwrap's own test suite as the oracle. **Scoped 2026-10-13, not started** (bubblewrap 0.13.0 under strace on an Alpine root; scratch root with bwrap and strace was `old/roots/alpine-ns` in the session scratchpad): the first and only wall today is `clone(CLONE_NEWNS|CLONE_NEWUSER|CLONE_NEWPID|CLONE_NEWNET|SIGCHLD) = EINVAL`; everything before it (PR_CAPBSET_READ probes, capget, PR_SET_NO_NEW_PRIVS, overflowuid/gid, eventfd) already answers. Behind the wall, in bwrap's order: uid_map/gid_map/setgroups writes; `mount(NULL, "/", MS_SLAVE|MS_REC)`; a tmpfs, a recursive self-bind, `pivot_root` (twice), `umount2(MNT_DETACH)`; per-mount read-only binds remounted from a per-namespace /proc/self/mountinfo; a devpts `newinstance`; a procfs mounted inside a new pid namespace; loopback brought up over rtnetlink in a new network namespace. What that touches here: the mount table is one global list keyed by path string (57 `mount_find` call sites), credentials are plain uids with `superuser()` = euid 0 (82 uses), pids are global, and none of it is in the checkpoint image. Staging that keeps each step testable and truthful (nothing may claim a confinement it does not enforce): (1) mount namespaces alone -- a mount list per namespace, CLONE_NEWNS/unshare/setns, propagation flags accepted inside a private namespace, pivot_root, per-mount MS_RDONLY enforced, mountinfo per namespace -- oracle: util-linux `unshare -m` scripts against camd; (2) user namespaces with uid/gid maps and capabilities scoped to the namespace; (3) pid namespaces with a namespace's own procfs; (4) network namespaces with loopback only. bwrap starts after (4), or after (2) with `--unshare-user --bind` alone. Each stage is days, not hours, and (1) and (2) reach into path resolution and every permission check: a release's worth of risk by itself, so it wants a cycle of its own rather than the tail of 559. **Stage 1 done 2026-10-13 (mount namespaces; started the same day at the user's word).** `clone(CLONE_NEWNS)`, `unshare`, `setns` and `pivot_root` are real (kernel/mnt_ns.h, fs/mount.c): a namespace is a region of the one table under a staging point, its mounts bind copies of its parent's, its tasks rooted there; `task->mnt_ns == NULL` is the initial one. What bubblewrap then needed, each a wall in its own right, found with `bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp` under strace: `MS_MGC_VAL` in mount flags; `openat2(RESOLVE_IN_ROOT|RESOLVE_NO_MAGICLINKS)` (fs/path.c N_IN_ROOT, the chroot walk with the dirfd as root); `mount_setattr` (was a silent ENOSYS stub); an O_PATH handle on a device that will not open (/dev/tty with no controlling terminal); **covered mounts** -- a mount made over a directory now hides the mounts below it and unmounting it brings them back (struct mount `covered_by`: parked at a staging point, as a busy lazy unmount is), without which a fresh /dev came with the old /dev/pts in it and `pivot_root(".", ".")` + `umount2(".", MNT_DETACH)` took the new root's mounts with the old root. That bwrap command now runs: read-only root (EROFS), private /tmp, its own /dev, 17 mountinfo lines inside and the outside's 6 unchanged after. **systemd roots changed with it:** services with ProtectSystem/PrivateTmp/ProtectProc/... now get their mount namespace instead of having the setup skipped; on Arch (systemd 260) logind, resolved, networkd, timesyncd, udevd and userdbd all run in one after two further fixes (mount_setattr on an fsmount() mount not yet placed; `/proc/sys/kernel/domainname`, which was missing). Tests, each run on Linux 6.12 in a user namespace as the oracle and failing on the build before: mntns_basic, mount_cover_setattr, openat2_resolve (IN_ROOT, NO_MAGICLINKS), opath_open_flags (/dev/tty). **Not done, and known:** nothing propagates (every mount private; MS_SHARED accepted and not true); a mount covered at the time a namespace is copied is not in the copy, and covered mounts are not in /proc/self/mountinfo (Linux lists them); MS_MOVE and move_mount moved one mount, not its submounts (older than this work; fixed in the gap pass below); between `pivot_root(".", ".")` and the unmount the caller sees the old root at "/" where Linux shows it the new one; a session with a task in a private mount namespace, or with a covered mount, is refused a save (so a systemd root with sandboxed services running cannot be saved -- carrying namespaces in the image is its own piece of work); RESOLVE_BENEATH and RESOLVE_NO_XDEV were EINVAL until the gap pass below; realfs (host directories mounted in) opens a resolved path with the host following symlinks, so a component swapped for a link between resolution and open is followed there, for chroot and RESOLVE_IN_ROOT alike -- `O_NOFOLLOW_ANY` on Darwin would close it, unverified and unmeasured. **Stage 2 done 2026-10-13 (user namespaces, kernel/user_ns.h).** `clone(CLONE_NEWUSER)` and `unshare` for anyone; `/proc/<pid>/uid_map`, `gid_map`, `setgroups` with Linux's write rules (once; one own id without privilege, gid only after setgroups is denied; anything else needs the capability over the parent; denied setgroups is inherited). A task's ids stay kernel ids and are read and written through its namespace's maps (65534 for unmapped, EINVAL for an unmapped id asked for). **The privilege rule is the part to keep an eye on:** `superuser()` and `current_capable()` are false outside the initial user namespace, and what a namespace's root is given is asked with `ns_capable()` by name -- making mount/UTS/IPC namespaces, mount calls in a mount namespace its user namespace owns (new filesystems: tmpfs, proc, sysfs, devpts only; inherited mounts locked against unmount, move and losing ro/nosuid/nodev/noexec; a bind carries locked flags), the hostname of a UTS namespace it owns, set*id among mapped ids, setgroups where allowed, chown/chmod/DAC override on files whose uid AND gid it maps, CAP_KILL over tasks in the same namespace, PR_CAPBSET_DROP, and exec's root rule with "root" = the id that is 0 inside (set-id bits ignored unless owner and group are mapped; file capabilities ignored). `bwrap --unshare-user --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp` runs as root and as uid 1500 (with `--uid`/`--cap-drop ALL` too, which nests a second namespace); systemd's `PrivateUsers=` works. Test userns_basic (Linux 6.12 as uid 1000 is the oracle; its machine-root case needs root and has had no oracle run). **Not done:** acct and FUSE request ids are not namespace-aware (they show kernel ids); a save is refused. (The rest of what this list held -- `setns`, `chroot`, System V IPC, the nsfs ioctls, 340 map extents, file capabilities -- is in the gap pass below.) **Stage 3 done 2026-10-13 (pid namespaces, kernel/pid_ns.h).** Pid numbers stay the machine's: a namespace is a filter (a number names only a task in the namespace or below it) plus one exchange (its init is 1 inside). `pid_get`/`pid_get_task*` apply both for `current`, so a guest-supplied number is confined by default; 51 kernel-held lookups moved to `*_global`. clone(CLONE_NEWPID) makes the child the init, unshare sets the namespace aside for the caller's children. Inside: getpid/gettid 1, getppid 0 for a parent outside, ESRCH for outside pids, /proc lists and resolves only the namespace (reader-based, not per mount), kill(-1) stays inside, the init ignores from inside what it has no handler for (its own `kill -9 $$` too), si_pid is the receiver's view (0 from outside), orphans go to the init, and when the init exits everything left is killed and fork into it is ENOMEM. Numbers kept for later are stored as the machine's (setpgid, TIOCSPGRP, F_SETOWN, timer SIGEV_THREAD_ID); futex owner tids use the task's own view. bwrap with Codex's flags minus `--unshare-net` runs as root and as uid 1500. Test pidns_basic (Linux 6.12 as uid 1000 is the oracle; two of my expectations were wrong and Linux corrected them: pid_for_children has no target before the first child, and CLONE_NEWPID|CLONE_PARENT is allowed). **Not done:** acct, FUSE and taskstats report machine numbers; RLIMIT_NPROC and loadavg count the machine; a save is refused. (Per-namespace numbers, NSpid, `setns` and the other reporting sites are in the gap pass below.) **Stage 4 done 2026-10-13 (network namespaces, kernel/net_ns.h), and with it `codex sandbox -- /bin/echo x` prints `x`** (build/alpine-arm64-test, Codex 0.159, bubblewrap `--as-pid-1 --new-session --die-with-parent --tmpfs / --dev /dev --ro-bind ... --unshare-user --unshare-pid --unshare-ipc --unshare-net --proc /proc --cap-drop ALL`; inside: read-only files, four processes in /proc, no network; as root and as uid 1500). A private network namespace is "lo" (index 1) and sockets that never touch the host: a socket carries the namespace it was made in (`fd->socket.net_ns`, an accepted one its listener's); inet `bind` is recorded and not made on the host (loopback or wildcard only); a destination is ENETUNREACH, or ECONNREFUSED on loopback once lo is up; inet `listen` is EOPNOTSUPP; interface and multicast socket options stay off the host; abstract AF_UNIX names are keyed by namespace; rtnetlink answers for lo alone and takes RTM_NEWADDR/NEWLINK/SETLINK (and SIOCSIFFLAGS) for it with CAP_NET_ADMIN over the namespace; socket-diag and /proc/net/{tcp,udp,unix} list the reader's own namespace; the native curl/wget (host NSURLSession, not a guest socket) refuse from a private namespace. `/proc/self/ns/net` now exists, which is what tells systemd it may unshare for PrivateNetwork= units: on Arch they run with a private lo that systemd itself brings up, hostnamectl and localectl work. `/AOK/fixes/codex/fix-codex.sh` now REMOVES the `sandbox_mode = "danger-full-access"` line it used to add; README rewritten. Test netns_basic (Linux 6.12 as uid 1000 is the oracle; the EOPNOTSUPP on listen is AOK's alone and asked only there). **Loopback and the namespace's own view, done 2026-10-13:** a TCP or UDP socket in a private namespace is an AF_UNIX host socket behind the inet API (fs/sock.c "Loopback in a private network namespace": a table of (namespace, kind, port) bindings, each with a host path; bind/listen/connect/accept/sendto/recvfrom/getsockname/getpeername translate at the edges; TCP_NODELAY and the other IP/TCP options are accepted and do nothing), so a server in a sandbox listens and is connected to, datagrams are answered, a second bind of a port is EADDRINUSE, and none of it is reachable from outside or reaches a listener outside. `/proc/net/{dev,route,if_inet6,arp}`, `/sys/class/net` and native getifaddrs show the reader's namespace. Found on the way and fixed for everyone: a connect to a closed loopback port beside one just bound answered EINVAL (macOS's own connect does) where Linux says ECONNREFUSED -- tests/manual/connect_refused_adjacent.c. **Still not done there:** one port space for IPv4 and IPv6; raw and ICMP sockets send nothing (`ping 127.0.0.1` fails in a sandbox); no second interface (veth) can be made; libgit2's transport in the native git was assumed covered by the native_libc.h force-include and not traced; a save is refused. **All four stages are in 559.** Worth a longer soak than one day gave it: the changes reach every permission check (superuser/current_capable), every pid lookup, the mount table and the socket layer. Codex's bwrap line is `--unshare-user --unshare-pid --unshare-ipc --unshare-net --proc /proc --cap-drop ALL --as-pid-1 --new-session --die-with-parent --tmpfs / --dev /dev --ro-bind ...`, and `codex sandbox -- /bin/echo x` is still the end-to-end check. **Gap pass, 2026-10-13 (the "not done" lists above, worked through; each checked against Linux 6.12 as uid 1000 on camd).** *Pid numbers:* a namespace numbers its tasks from 1 (two arrays per namespace, machine pid <-> number, a task numbered in its namespace and every one above; `struct pid.numbered_ns`), so `ps` in a sandbox shows 1, 2, 3; `NStgid`/`NSpid`/`NSpgid`/`NSsid` in status; a group, session or sender outside reads 0; kill(0) finds the caller's group by its machine id; the reporting sites that only the init used to get wrong are translated (fork's return, SIGCHLD and stop notices, ptrace event messages and stop siginfo, pdeath, mq_notify, F_GETLK, pidfd fdinfo and waitid(P_PIDFD), SysV lspid/lrpid/cpid/lpid/GETPID -- which also store the tgid now, not the tid -- cgroup.procs, /proc/loadavg's last pid). *setns:* joins user, pid (children only, own namespace or below) and network namespaces by nsfs fd or pidfd, each with Linux's two capability checks; IPC namespaces have an owner (`ipc_namespace.user_ns`). *User namespaces:* `chroot` by the namespace's root; SysV IPC privilege by the IPC namespace's owner and `ipc_perm` ids through the maps (unmapped id to IPC_SET is EINVAL); NS_GET_USERNS / NS_GET_PARENT / NS_GET_OWNER_UID answer for the namespace asked about; maps take 340 extents; file capabilities: a namespace's root may write them on its own files, stored as a v3 naming that root's kernel uid, granted at exec to tasks whose namespace (or one above) that root is root of, and nothing to anyone else (the case that matters: uid 1000 outside gets 0 from a file a sandbox blessed). *openat2:* RESOLVE_BENEATH and RESOLVE_NO_XDEV (fs/path.c; NO_XDEV refuses every magic link, Linux only those that change mount). *Mounts:* MS_MOVE and move_mount carry what is mounted in the mount (fs/mount.c `mount_subtree_*`), and into one's own tree is ELOOP. Tests: pidns_basic (numbers, reported, NSpid), setns_sandbox (new), userns_basic (chroot, SysV, file caps), openat2_resolve, mntns_basic (move). By hand on a scratch Alpine: `ps` in a bwrap sandbox reads 1, 2, 3; `nsenter -t <pid> -U -m -p -n -u` into one works; `unshare -r chroot` works. **Still open after the pass:** acct/FUSE/taskstats ids and pids; RLIMIT_NPROC and loadavg per namespace; a group signal from inside skips members outside the namespace (Linux signals those the credentials allow); the view between `pivot_root(".", ".")` and its unmount, realfs `O_NOFOLLOW_ANY`; veth; and saving a session that has namespaces. **Mount propagation, same day (the user asked for it in 559):** shared/slave/private/unbindable are real (fs/mount.c "Propagation"; `struct mount.shared_id/master_id/unbindable`): `mount --make-[r]shared|slave|private|unbindable` and mount_setattr's propagation change the type; a bind of a shared mount is its peer and a namespace's copy is a peer too (a slave when the namespace is another user namespace's); a mount, a recursive bind's tree or a mount moved in under a shared mount appears at the same place under every peer and slave (down through shared slaves), and an unmount takes them, the set going as one since each copy holds the original; MS_MOVE out from under a shared mount and pivot_root with a shared parent or new root are EINVAL; mountinfo prints shared:N master:N unbindable (findmnt PROPAGATION works). tests/manual/mount_propagation.c, every expectation Linux 6.12's. systemd on the scratch Arch root boots to "running" with / shared and services as shared slaves, and a host mount made afterwards appears in and leaves logind's namespace. **Found with it:** the app's rename/delete of an installed root said "in use" whenever any mount namespace was alive (each has a copy of the root's mount, and a copy holds the root) -- every systemd service, any `unshare -m` left running; mount_detach_tree now takes unused copies with it and is busy only for a real user (CLI harness: ISH_TEST_DETACH_TREE with ISH_FAKE_MNT2). **Covered mounts, 2026-10-14:** a covered mount receives propagation (what arrives is parked with it, covered by the same mount, and in view when that goes -- and a receiver stacked beneath another at its own point counts as covered, or the copy would have shown through the lid); an unmount reaches such copies; a namespace copied while a mount is covered has it, covered by the copy of its cover; /proc/self/mounts and mountinfo list covered mounts at the point they are under, as Linux does (parent: the mount they were mounted on). mount_propagation "covered" and mntns_basic "covered", Linux's behaviour (which corrected the test's first setup: a lid on a peer goes onto the other peer too). **Not done in propagation:** no propagate_from; a saved session does not carry propagation types (restored mounts are private). **Network, same day:** IPv4 and IPv6 have their own ports in a sandbox (a server binds 0.0.0.0:P and [::]:P both; an IPv6 wildcard socket without IPV6_V6ONLY holds the port for both and takes IPv4 connects, as on Linux), and `ping 127.0.0.1` / `ping ::1` work there: a raw ICMP socket is a host AF_UNIX pair whose echo requests the kernel answers (request copy and reply, under an IP header for IPv4, checksums filled for IPv6 -- byte for byte what Linux delivers), a datagram ICMP socket is EACCES as in any new namespace. netns_basic has both ("ports", "ping"). The native `ping` (SmallCLUE, first in PATH on a device) used a ping socket only and so lost every packet in a sandbox; it falls back to a raw socket now, as iputils does (smallclue 83430a4). **veth and dummy links, 2026-10-14 (the user asked for the second interface in 559):** `ip link add va type veth peer name vb netns <pid>` and `ip link add d0 type dummy` work in a private network namespace (fs/net_vif.[ch]: a registry of links, each an index, name, up flag, MTU, MAC and addresses in its namespace; routes per namespace, the connected one each address on an up link brings); RTM_NEWLINK/SETLINK (up, name, MTU, MAC, IFLA_NET_NS_PID/FD to move one, which takes it down without its addresses, as Linux), RTM_DELLINK (a veth goes with its peer), RTM_NEWADDR/DELADDR, RTM_NEWROUTE/DELROUTE (main table only), and the dumps list them with IFLA_LINKINFO; the interface ioctls, /proc/net/dev, if_inet6, route, /sys/class/net and the native getifaddrs see them. Across a veth between two private namespaces a TCP connect reaches a listener at an address the far end has (getsockname/getpeername/accept report 10.x addresses, a listener on 127.0.0.1 is not reached at the veth address), UDP comes back from the far end's address, ping is answered from there (the reply only; the request went out on the link), an address with no route is ENETUNREACH; a bound emulated socket now knows its address (two specific addresses may share a port, the wildcard conflicts with both), and an autobound sender reads 0.0.0.0 until it connects, as on Linux. tests/manual/netns_veth.c, run as uid 1000 in a user+net namespace on Linux 6.12 first. **Not done there:** an end in the initial namespace (`ip link add` there, or a peer moved there, is EOPNOTSUPP -- it was a silent success before for the former; the host-side end would need host sockets converted on the fly and a bridge to the host loopback); no forwarding beyond one veth (no ip_forward, bridges, NAT); no RTNLGRP notifications for these links (`ip monitor`, networkd's link watch); /proc/net/dev counters are 0 for them; IPv6 across a veth has no DAD and no link-local address made on its own (assigned addresses work, untested by the suite); a dgram socket bound to the wildcard that sends to two places alternately may report the wrong source address to one of them (the binding remembers the last route); a save is refused.
+- **#625: fixed 2026-10-12, waiting on the reporter.** It was the "Browse Files" row on a filesystem's own screen, not the Import menu's "Browse Files..." that the 557 pass tested: with no File Provider storage directory (a copy re-signed without the shared App Group) NSURLComponents threw on a nil URL. The row now explains instead. The reporter's diagnostics do not say whether the App Group was missing -- **the diagnostics report should**: add ContainerIsSharedAppGroup() and the container path to it (app/Diagnostics), so the next report of this kind answers itself.
+- **riscv64_singlestep failed once under five-root load (557 Mac gate, 2026-10-02).** "counter ran ahead" (0x289f7 at the first step, limit 0xa0) and only one step, at load ~150-250; 9 of 9 runs alone pass on the same binary. Likely a stop-ordering race in the test, not the kernel: if the child's `raise(SIGSTOP)` lands before `PTRACE_SEIZE`, the parent can see the plain stop first and answer it with `PTRACE_CONT(SIGSTOP)`, which from a trap stop just resumes the loop until the next stop is taken as the first step. Check against camd (Linux) with a delay injected before the SEIZE; if Linux shows it too, synchronise the child with a pipe before it raises SIGSTOP.
+- **wayvnc 0.9.1 dies when wl-present detaches it (ip5 2026-10-02, M4 2026-10-03) -- mitigated; the cure is wayvnc 0.10.** Not AOK: wayvnc 0.9.1 frees its buffer pool on detach while neatvnc still holds a frame from it, and the frame's release then writes into the freed pool (`malloc_consolidate(): unaligned fastbin chunk detected` on the M4, a NULL-based store in libwayland-client on ip5). A resize just before the detach -- every session start, as wl-present sizes the output and then detaches -- makes it likely. Reproduced on the M4 with a streaming RFB client, a SetDesktopSize, and `wayvncctl detach` 0-120 ms later: 0.9.1 died 5 of 15 interleaved rounds, wayvnc 0.10.2 (neatvnc 1.0.2, aml 1.0.0) 0 of 35. Upstream fixed it in 0.10.0 (2897d15 "Unlink destroyed pool from inflight buffers", 5d7784d "Make wl_buffer inert on detach"). Done: start-wayland.sh restarts a wayvnc that dies (up to 5 times; the app's VNC retry window is 60 s), keeps a detached marker so a restart during wl-present stays detached, and starts a 0.10+ wayvnc with `--detached` then attaches it (0.10 exits on detach otherwise); `fix-neatvnc --version 1.0.2` builds the 0.10.2 chain (jansson added to its deps). Verified on the M4 with the app (2026-10-03): the build's start-wayland.sh writes the marker and keeps wayvnc 0.9.1 alive across 5 launches; after the tool, 4 launches with wayvnc 0.10.2 started `--detached`, attached, detached by wl-present, still up, app connected. **Then (2026-10-03, user's call): Devuan uses a bundled wayvnc.** /AOK/bundled/devuan6-{aarch64,x86_64} carry wayvnc 0.10.2 + neatvnc 1.0.2 + aml 1.0.0 (opt/AOK/tools/wayland/build-wayvnc.sh, tools/build-bundled.sh targets wayvnc-aarch64/wayvnc-x86_64; RUNPATH $ORIGIN, no TLS/PAM/H.264); start-wayland.sh links them into the session bin when `wayvnc -V` runs (else Devuan's, with the restart safety net); setup-wayland.sh installs wayvnc.depends; setup-wayfire.sh adds them as :arm64 on i386/riscv64. M4, /usr/local cleaned to Devuan's 0.9.1 only: 5 of 5 launches ran /AOK/bundled/devuan6-aarch64/wayvnc --detached, detached, alive, app connected. Alpine 3.24 ships 0.10.0 and needs nothing. HEAD (39df416a9) on devices: M4 Devuan arm64 2/2 and bip (A10X) Devuan arm64 Wayfire 4/4 on the bundled aarch64 wayvnc, detached by wl-present, alive, app connected; bip Devuan riscv64 (labwc in software, after setup-wayland.sh installed wayvnc.depends) 3/3 on the bundled riscv64 wayvnc, attached to HEADLESS-1, app connected. **557 users:** Devuan GPU desktops can lose wayvnc with no restart, and Alpine 3.24 GPU desktops should lose it at every session start (0.10.0 exits on a detach unless started --detached; derived from source, not seen on a device) -- both fixed only by the next build; candidate release note.
+- **Settled 2026-10-01: the device-only failures carried since 555.** Both were real kernel bugs. `mount_bind_rbind` (`rbind.self_mounted`): /proc/mounts and mountinfo printed global paths inside a chroot instead of paths relative to the task's root (and listed mounts outside it) -- FIXED 6540b7fb, test chroot_mountinfo. `futex_timeout_duration` (i386 FUTEX_WAIT_BITSET deadlines): a 32-bit guest's time64 timespec has a padding word after the 32-bit tv_nsec that libc never fills; AOK read it as the high half of tv_nsec, so any nonzero stack garbage there made the call EINVAL (futex, clock_nanosleep, ppoll, pselect6, rt_sigtimedwait, epoll_pwait2, timer/timerfd settime, clock_settime, utimensat) -- FIXED 3d542653, test time64_nsec_padding. Verified on the M4 with each Alpine 3.23.3 root BOOTED (ISH_BOOT_ROOT): all four archs pass both, i386 three runs out of three. Device setup for booted Alpine legs: the Alpine roots on the M4 now carry OpenSSH on port 1022 (busybox init respawns `sshd -D`; root login by key) -- each root has its own host key at the same link-local IP, so use a known_hosts file per root and `-l root` to the IP directly (the m4ll alias checks the Devuan host key).
+- **Chinese support follow-ups (feedback of 2026-10-04 done: 3557658e IME, 7fce57e7 UI in nine languages, 7f58bd40 setup-locale.sh + /proc/ish/languages, README/README_ZH/README_KO).** Still open: (1) on a device with a hardware keyboard (M4 iPad, 00008132-000948C93483001C), check that arrows, Esc and Return act inside a Pinyin composition rather than reaching the guest -- TerminalView narrows -keyCommands while composing, but the simulator tool cannot send those keys; also try the Japanese Romaji/Kana keyboards (same marked-text path, unverified) -- Korean does not use marked text on iOS (jamo, then Backspace + syllable; verified in the sim, unchanged behaviour). (2) A native speaker's pass over the machine translations, zh-Hans and zh-Hant first (app/*.xcstrings; Xcode's String Catalog editor works). (3) Strings left English because they double as keys (listed in this bullet's history, 7fce57e7): give the equalizer presets (AudioPlayerEngine) and theme names display-name maps; the LLM agent status words need a display/model split.
+- **Stale TLB after exec: not reproducing (2026-10-09), and one cause closed.** 48 runs of concurrent_exec_tlb (4 and 8 copies at once, i386 root, Mac) gave no unwinding heal on the build before or after; the 2026-10-04 rate is gone. One way in was real: each address space's change count was seeded with a consecutive id and counted up by one per change, so two counts met easily (seed 100 + 50 changes = seed 105 + 45), and a new mm at a freed one's address kept its TLB entries (tlb_refresh compares only mmu and count). The id now goes in the high 32 bits (emu/memory.c). The original notes:
+- **Find why exec leaves stale TLB entries so often.** concurrent_exec_tlb (8-way fork+exec of cc1, 32 rounds) takes ~1 unmapped guest-execution fault per run on the i386 CLI (36 in 40 runs, printk "guest-execution bad access ... unwinding", 2026-10-04). Each is healed by jit_unmapped_guest_fault's flush-and-retry, and since 1342669c8 that works on the CLI too (only SIGBUS used to reach the handler; these are SIGSEGV and killed the CLI ~1 run in 10). But a retry is a heal, not a cure: something hands a running task TLB entries for pages its new mm does not have. tlb_refresh skips the flush when tlb->mmu and its change count match -- the #469 shape (a new mm at the old mm's address, a colliding count). Next: log mmu pointer and changes at each unwind, and check whether the faulting task had just exec'd.
+- **The amd64 JIT is 3.6x slower than the i386 one on integer code; specialise it the way i386 is.** M4, 2026-10-04, same Alpine 3.24.2 7-Zip `7z b 1 -mmt1 -md22`: arm64 995, i386 596, amd64 164. Python microbench (fib/method/dict/str, ms): arm64 91/467/364/373, i386 166/731/592/613, amd64 333/1466/1292/1242. ISH_TRACE_AMD64_JIT shows no interpreter fallbacks in either, so it is structural. Host profile of 7-Zip on amd64: eager flag computation 28% (amd64_cached_set_addsub_flags builds CF/OF/AF/ZF/SF/PF with a branch per flag after every add/sub; i386 deposits lazy flags), memory ops 33%, low-8 register cache staging 7%, set_rip 4%. Every register operand is chosen at run time by a chain of up to eight `cmp`/`b.ne` (amd64_cached_read/_write) and every size by another chain -- data-dependent branches the host mispredicts. Plan, in order of payoff: (1) flag liveness in the amd64 frontend -- a flag-setting instruction whose flags the next flag writer overwrites before any reader in the block emits a no-flags gadget variant; (2) per-register (and per-size) gadgets for the hot shapes (mov load/store, arith reg,reg/imm, cmp+jcc, lea), as i386 has, instead of the decoded-operand gadgets; (3) then the i386 fusion playbook. Measure each with the same interleaved A/B (an `amd64_jit_fuse`-style /proc switch exists for incdec_reg). **Progress 2026-10-04/05 (M4 7-Zip 164 -> 795, 4.8x, past i386's 596; Python microbench 333/1466/1292/1242 -> 93/449/404/364 ms, level with the arm64 guest's 91/467/364/373):** (1) dead-flag elimination done (`deadflags`, +26%); (2) register moves, lea [base+disp]/[rip+disp], add/sub/or/and/xor reg,reg and reg,imm specialised per register (`movr` +7%, `arithr` +11%; CMP stays generic for the cmp+jcc fusion). **Tried and measured slower, not kept:** keeping the x20-x27 cache resident across chained blocks (block-entry gadget that loads only if not live, sync instead of flush at jmp/jcc, single-register reloads after memory writes, jit_exit write-back): 7-Zip 243 -> 228, Python -8% -- the extra dispatches (an entry gadget per block, a reload after every load) cost more than the eight-register load they saved. Also flat: a cache-preserving sync around in-block memory operands alone. **Then (M4 7-Zip 245 -> 389):** mov and add/sub/cmp with [cached base + disp] or [rip + disp] on the live register cache (`memr`, 245 -> 255, with a host-fault spill of the cache: jit_amd64_fault_spill), and the flag macros made branch-free (255 -> 389, Python -8-10%) -- the per-flag branches were mispredicting on data, which the 28% "eager flag computation" line above was really measuring. **Then (389 -> 578):** each branch gadget chains through its own dispatch copy (+2.5%); shifts per register, and dead-flag elision through a shift by a known nonzero count (+10%); every register-specialised family takes all sixteen registers, r8-r15 read and written in their CPU_amd64_regs slot so they no longer flush the cache (a third of 7-Zip's instructions touch r8-r15; +7%, then +3% for the memory families, which must still load the cache first -- their slow paths spill x20-x27 unconditionally); inc/dec per register (+2%); indexed addresses through an amd64_ea gadget that leaves base + index * scale in x3 for the next gadget, plus 16-bit and byte moves, byte cmp/test and lea on all sixteen (+17%). Families are assembler macros (amd64_r16_*); math.S's object grew 2.1 -> 2.9 MB of text. **Then (578 -> 651):** cmp with r8-r15 and cmp [m],reg on the cache (flat to +1%), push/pop and inc/dec [mem] on the cache (+2.5%), blocks start with the cache loaded (jit_enter_amd64; +4%, Python 3-9%), chained branches leave it unwritten -- blocks start dirty, the chain's exits to C spill it (+5%; jrcxz must still write back, it reads RCX from memory: missing that crashed cc1 while the suite passed) -- and ret enters its target through jit_frame.ret_cache as arm64's does (+1%, Python 4-6%). **Then (651 -> 795):** indirect jmp/call through the return cache and logic load-ops (+4%), imul per register and cmp+jcc fused per register pair (+11%), test/neg/not/cmp [m],imm and every cmp per register (+2%), movzx/movsx per register including ah..bh (Python's `movzbl %ah` was going to a C helper: Python 10-30%), mov/op [mem],imm on the cache, %fs:disp/%gs:disp operands (the stack-protector canary) on the cache (Python 3-4%). **Tried and reverted:** gret_nomem (no dmb ishld) for the amd64 gadgets that read no guest memory, as i386 has it -- flat on the M4 (770/769/769 vs 763-772) and on the A10X (bip, alternating app builds: 175/176/175 vs 188/171/174), so not worth a weaker barrier. bip's Alpine3.23.3-x86_64_2 root now has 7zip and python3 for device A/Bs; a `devicectl install` that hangs there wedges CoreDeviceService for every device (killing that service clears it; a power cycle fixed bip). What is left on 7-Zip: jcc (~12%, the branch itself), the amd64_ea dispatch for indexed operands (5%), the remaining mid-block flush/reload (~5%: op-to-memory reg RMW, cmov, setcc, string ops), set_rip (1%). **Then (2026-10-05, 790 -> 808, Python 93/447/404/370 -> 84/444/376/332):** test reg,imm, mov reg,imm (the lea table's movi gadgets), movsxd reg,reg and reg,[mem], rol/ror reg,imm, setcc (low byte and ah..bh), cmp/test m8,imm8 and xor reg,reg (as and reg,0, which keeps its _nf twin) per register on the cache; test+jcc fused per register pair like cmp+jcc (amd64_ftr/fti). Finding what still flushes: log a line from gen_amd64_flush_reg_cache under ISH_TRACE_AMD64_JIT and count the emitter traced just before it (the flushes after a jcc/jmp/call/ret are block ends that never run). cmov reg,reg in two gadgets on the cache, the condition into x3 (amd64_cc) then a select per register pair (amd64_csel), instead of a flush around the generic one: 7-Zip 808 -> 821, Python method 444 -> 428. cbw/cwde/cdqe/cwd/cdq/cqo, xchg rax,reg and bswap on the cache, and a write-back without dropping the cache (gen_amd64_writeback_reg_cache) before gadgets that read guest registers from memory but write none -- the SSE loads/stores, op m8,imm8, logic op [m],reg, bt: 7-Zip flat (822/813/813), Python method 428 -> 421.
+- **x87 is 3.8x slower than SSE on the i386 guest** (measured before the 2026-10-06 gadget port, which made the x87 1.3x faster on i386 and 1.7x on amd64; re-measure). M4 n-body double loop, ns per interaction: arm64 57, i386 SSE2 158, i386 x87 (-mfpmath=387) 600; amd64 SSE 105 since 1b952a7c4 (sqrtsd was interpreted: 2996). Alpine's i386 gcc emits SSE2 for new code, but Debian/Devuan i386 (no SSE2 baseline) and musl's i386 libm use x87, which runs as a C helper call per instruction (fhelper_*, emu/fpu.c, 80-bit). A gadget path for the double-precision common case (fld/fst m64, fadd/fmul/fsub/fdiv with precision control at double) is the lever; 80-bit exactness rules make it careful work. **Parked 2026-10-05:** Linux leaves the x87 control word at extended precision (0x37f) and neither glibc nor musl changes it, so a double-precision-control fast path would almost never apply; real x87 code is at most ~3% of i386 instructions (Devuan profiles), so even a full gadget x87 is worth ~1-2% there. The SSE moves above were the bigger i386 lever.
+- **Settled 2026-10-09: the NaN sign of SSE add/sub/mul/div invalid results is right.** inf-inf, 0*inf, 0/0 and NaN propagation in add/sub/mul/div sd/ss/pd/ps, min/max/sqrt sd and their VEX forms give camd's bits exactly, both ABIs (a probe hashing every result; the gadget port's float helpers already produce x86's indefinite QNaN, as sqrtsd's 1b952a7c4 did).
+- **Launcher shortcuts for GUI programs, and shortcuts defined from the guest (suggested by Rogue on Discord, 2026-10-13; to explore, not for 559).** The suggestion was a template for custom GUI-application shortcuts in the Workspace Launcher, built on the `ws-*` launchers. Established: the Launcher already takes user shortcuts (Add Shortcut…, Add Built-in…, Add Group…; `presentAddLauncher*` in app/WorkspaceViewController.m), stored as one tree under `ISHWorkspaceLauncherShortcuts` in NSUserDefaults, where a leaf is a name and a command run in a fresh terminal, or a `{token}` for a built-in. The Wayland desktop's own launcher and Applications menu already read a user's `.desktop` files (the freedesktop override rule in opt/AOK/docs/workspace.md). `/proc/ish/workspace` opens only the tools on `ISHWorkspaceOpenableToolIdentifiers`. Two gaps: (1) a leaf always opens a terminal window, where a GUI shortcut wants the program started in the running Wayland session and the Wayland window brought forward, with no terminal; (2) the tree lives in the app's preferences, so nothing in the guest can add a shortcut, and a template cannot install one. Not tested: how close a plain command shortcut (`some-app & ws-wayland`) already gets. Next step: try that on a device with a desktop running, then choose between a "GUI program" leaf type and a guest-readable shortcuts file (or a shortcut verb on `/proc/ish/workspace`), and decide whether the Launcher should list the root's `.desktop` entries itself. Rogue's `ws-open` (one launcher taking the tool name as an argument) is a faithful rewrite of the generated `ws-*` launchers and adds nothing the per-name ones lack.
+
 ## Diagnosed, not fixed
+
+### A native bash ignored SIGKILL (unconfirmed, seen once)
+
+While reproducing the above, a `/AOK/native/bash` at pid 16 survived
+`kill -9 16` and was still in `ps` a second later; it went away only on a cold
+boot. Not chased and not confirmed -- the kill's own exit status was not
+checked -- and it may be the known shape of a native program blocked in a host
+read rather than a regression of the fix in [[native-spawn-unkillable-task]].
+
+**Retry it before believing it.** That observation predates the blocking-path
+work later the same day: a task blocked reading a pipe or a socket was deaf to
+the checkpoint freeze (fs/sock.c and fs/real.c asked only about guest signals,
+bfbefefc8), and a long guest timeout left the host wait unbounded (251465dba).
+A native bash sitting in a host read was in exactly that state, so "ignored
+SIGKILL" may simply have been the same deafness seen through a different lens.
+Reproduce on a current build first; if it still happens, the freezer's host
+backtrace (ISH_CHECKPOINT_DEBUG, [[stuck-task-host-backtrace]]) will say where
+it actually is rather than leaving it a mystery.
+
+### EPOLLET and SOCK_SEQPACKET: what the 2026-09-25 fixes left
+
+The edge-triggered epoll fix (fs/poll.c `poll_drain_host_locked`) and the
+SEQPACKET framing (fs/sock.c `struct unix_seqpacket_hdr`) left three measured
+divergences, each judged not worth its cost yet.
+
+**Established**:
+- A read that leaves data behind in a host pipe or FIFO re-arms the host's read
+  event (Darwin's `pipe_read` and its fifofs both do it; measured with a bare
+  kqueue, sockets do not), so an `EPOLLET` reader that does a partial read is
+  told `EPOLLIN` once more with no new data. Linux says nothing. Harmless to a
+  reader that reads until `EAGAIN`, which an `EPOLLET` reader must;
+  `epoll_edge_triggered` checks partial reads on sockets and ptys only.
+  Filtering it means telling the re-arm from a real write, which needs a byte
+  count kept across every guest read of the pipe -- and getting that count wrong
+  loses a real edge, which hangs, where the re-arm only costs a wake.
+- dup'd fds registered in one epoll, one `EPOLLET` and one not, share a host
+  watch that has to be level-triggered for the level one, so the edge-triggered
+  one behaves level-triggered (`poll_fd.host_edges` stays false for both).
+- A SEQPACKET `MSG_PEEK` does not deliver the message's `SCM_RIGHTS`; the real
+  read does. Linux clones the descriptors for a peek. AOK's unix datagrams
+  behave the same way, on purpose (see the peek comment in
+  `sys_recvmsg_guest_abi`).
+
+**Next step**: none until a program is seen to need one of them.
+
+### The app's UI thread impersonates a guest process
+
+`current` is per-thread, and on the app's main thread it is whatever the last
+`TerminalViewController.startSession` left there -- the session's own first
+process -- or init after a boot. The thread is not that process, and kernel
+code it calls acts as one.
+
+**Established** (2026-09-11): clearing it is a one-line change and it does not
+work. Suspend to disk needed the UI thread not to be mistaken for a task
+(`ckpt_freeze_all` skips `current`, so the backgrounding save skipped the
+session leader). Clearing it in `startSession` fixed that and crashed
+Settings -> Appearance the same day: `pty_slave_init_inode` reads
+`current->euid`, and the appearance preview creates its pty from the UI thread.
+The audit that followed found the surface is wide -- `CurrentRoot`,
+`AudioLibrary` and `MotePadDocumentStore` all call `generic_open` /
+`generic_statat` / `generic_renameat` with `AT_PWD` from that thread, resolving
+paths through `current->fs` and checking permission as `current->fsuid`, none of
+them borrowing a task first.
+
+So the clearing was reverted and the checkpoint instead clears `current` for
+the duration of its own call (`checkpoint_save_external`), which is correct and
+scoped.
+
+**Next step**: give every app-side kernel caller on the UI thread
+`AppDelegate`'s `pushUsableInitTaskAsCurrent` / `popCurrentTask`, which two
+callers already use (`UpgradeRootViewController`, and `AboutAppearance` since
+this crash). Then clearing `current` in `startSession` becomes safe and the
+invariant is "the UI thread is not a process; borrow one if you need to be".
+Worth doing as its own change with the whole surface audited, not as a rider on
+something else.
+
+### Under `set -T`, some bash re-launches announce a command twice
+
+The last trap divergence between a re-launched subshell and a forked one, and
+the only one left after the 2026-09-07 work on `deps/bash/aok_fork.c` (the
+special traps emitted last, emitted DEBUG-last among themselves, and `$?` moved
+out of the state script into `AOK_BASH_STATUS`).
+
+A re-launch from `execute_simple_command` -- a pipeline element, an async simple
+command -- fires the DEBUG trap in the parent (that site runs the trap and *then*
+calls `make_child`) and again in the child, which re-parses the text it was
+handed. `set -T; trap 'echo T' DEBUG; : | cat` fires 5 times against a fork's 3.
+`( )` and `$( )` are exact, because the parent does not announce those, and
+`tests/manual/native_bash_fork_state.sh` asserts that agreement.
+
+Only reachable under `-T`, which is what a DEBUG-trap debugger sets. The obvious
+mechanism -- the child skipping a counted number of fires on a signal from the
+parent -- can *swallow* a real fire if the count is ever wrong, which is worse
+for a debugger than an extra one, so it has not been built. Anything that closes
+it has to work the other way round: the child would have to be told that the
+command it is about to parse has already been announced, which is a property of
+that one re-launch site rather than a count.
 
 ### atop's accounting daemon wedges boot, and nothing after it starts
 
@@ -43,62 +274,6 @@ boot and sshd. Implementing the `netatop` family is NOT the fix -- a guest
 that blocks forever on a family a real kernel also refuses is the bug.
 
 
-### A FUSE daemon on a thread of its own caller deadlocked -- FIXED 2026-09-01
-
-Found by writing the test that had been missing rather than by reading code:
-`tests/manual/fuse_basic.c` forks its daemon, and a daemon in a separate
-process shares neither an fd table nor an address space with its callers, so
-a whole class of bug was invisible to it. `tests/manual/fuse_threaded_daemon.c`
-runs the daemon on a **thread** of the process using the mount -- which is
-what libfuse's multi-threaded loop produces, and what any program that mounts
-a filesystem for its own use looks like. On the parent commit it hangs before
-printing its second line.
-
-The bug had nothing to do with the mmap work it was written to check. `f_close`
-held `files->lock` across the filesystem's `->close` (fs/fd.c). For a FUSE file
-that `->close` sends FUSE_FLUSH and waits for the daemon, and the daemon's next
-read of `/dev/fuse` needs that same lock to look its own descriptor up. Traced
-directly: the daemon answered the READ, never received the FLUSH, and both
-threads stopped for good. It predates the mmap work -- reproduced on
-e7f21f0b6 with no mapping involved at all.
-
-Fixed by splitting the slot from the work: `fdtable_detach` clears the table
-entry under the lock and hands the descriptor back, and `fdtable_finish_close`
-runs the filesystem's `->close` with the lock released. Applied at `f_close`,
-`dup2`'s replacement of an occupied slot, and `close_range`. The two remaining
-in-lock callers are safe by construction and say so: `fdtable_release` runs
-when the last reference to the table is gone, and `fdtable_do_cloexec` runs on
-execve after the other threads are reaped.
-
-**The rule: `table->lock` covers the SLOT, never the filesystem work behind
-it.** Any `->close` may block on something arbitrary, and FUSE is only the
-first filesystem here where "arbitrary" means a guest process. A socket close
-that lingers is the same shape.
-
-The address space has the same rule and got the same treatment: `pt_unmap`
-drops a mapping's reference to its descriptor, which after the guest's own
-`close(2)` is the last one, so `->close` ran from inside the page-table
-teardown under the write lock with the process's threads quiesced. Fixing it
-in `sys_munmap_guest` alone would have missed `MAP_FIXED`'s overwrite,
-`mremap`'s shrink and `brk`, so the deferral lives in `pt_unmap` itself
-(`struct mem`'s `deferred_fds`) and is drained by
-`mem_write_unlock_with_pokes`.
-
-### Still open: SEEK_DATA/SEEK_HOLE is EINVAL on tmpfs and realfs
-
-Noticed while giving fusefs a real implementation, and NOT fixed there.
-`generic_seek` (fs/generic.c) answers `_EINVAL` for any whence that is not
-SET/CUR/END, and tmpfs routes `SEEK_DATA`/`SEEK_HOLE` straight into it.
-
-Measured on Devuan for a 4096-byte file with no holes: `SEEK_DATA(1000)` is
-1000, `SEEK_HOLE(1000)` is 4096, a negative offset is `ENXIO`, and **both
-reposition the file offset** like any other whence. `EINVAL` tells a caller the
-interface does not exist at all, which is what the sparse-copy paths in `cp`,
-`tar` and `rsync` act on -- the same reasoning that made it worth fixing for
-FUSE. The fix is the same shape: answer from the file's size in
-`generic_seek`, and set `fd->offset`. Left out of the FUSE change to keep that
-one reviewable.
-
 ### FUSE has no attribute cache, and three absences follow from it
 
 Measured against Devuan (Linux 6.12) on 2026-09-01, when mmap, FUSE_FORGET and
@@ -117,6 +292,17 @@ currently absences rather than half-implementations:
 - **A path five components deep is six requests.** Same cause. The design note
   in `fs/fuse.c` argues the trade was right to make first, and it was, but the
   measured cost is real on a deep tree.
+- **A name that does not exist costs nine requests, not one.** Measured
+  2026-09-17 with the daemon in `tests/manual/blocked_wait_state.c`: one
+  `stat` of a missing name in the mount root sent READLINK and GETATTR of the
+  root, the LOOKUP, then READLINK, GETATTR, READLINK and GETATTR of the root
+  again and the LOOKUP twice more. Linux 6.12 (camd, as root) sent the one
+  LOOKUP. Two things are separable from the cache: READLINK of a node whose
+  attributes already say it is a directory, and the walk being repeated after
+  a failed lookup. The repeat is also what kept a poke's spurious EINTR on a
+  FUSE request from reaching the guest before `wait_for_blocked` (the daemon
+  still got the FUSE_INTERRUPT), so find out what it is for before removing
+  it.
 - **A mapping and `read()` are coherent only at sync points.** `mmap` is backed
   by a per-nodeid host stand-in for the page cache (see the chapter), while
   `read`/`write` go straight to the daemon. Linux's page cache makes the two
@@ -131,33 +317,658 @@ accounting that makes that safe now exists and is asserted by the test (no node
 is ever forgotten more times than it was handed out), so the groundwork is
 there; the cache is not.
 
-Two other absences are unrelated to this and are simply not worth it: **splice**
-on `/dev/fuse` (the transfers are not copy-bound) and the **`fsopen()`-based
-mount API** (a whole syscall family, and libfuse falls back cleanly).
+One other absence is unrelated to this and is simply not worth it: **splice**
+on `/dev/fuse` (the transfers are not copy-bound). (The **`fsopen()`-based
+mount API** works since 2026-10-09: tests/manual/fuse_fsopen.c.)
 
-### PI futexes are ENOSYS
+### Darwin compresses our memory already, and it buys us nothing
 
-Measured 2026-09-01 alongside the futex argument-validation work
-(`tests/manual/futex_validation.c`, which closed alignment, the expired
-absolute deadline, and the WAKE_OP encoding). FUTEX_LOCK_PI, FUTEX_UNLOCK_PI,
-FUTEX_TRYLOCK_PI and FUTEX_WAIT_REQUEUE_PI all return ENOSYS, so a glibc
-PTHREAD_PRIO_INHERIT mutex fails at `pthread_mutex_lock`. (musl does not
-implement PI mutexes at all -- `pthread_mutexattr_setprotocol` returns ENOSYS
-in userspace -- so this is only reachable from a glibc guest: Debian, Arch.)
+Measured 2026-09-09 on this Mac, because "should AOK compress guest memory?"
+turns on whether the host is already doing it for us. It is -- and the result is
+the opposite of the obvious one.
 
-The locking half is implementable and is what programs actually depend on:
-the word holds the owner's TID with FUTEX_WAITERS and FUTEX_OWNER_DIED as the
-top two bits, TRYLOCK_PI is a compare-exchange from 0 to the caller's TID,
-LOCK_PI sets FUTEX_WAITERS and blocks, UNLOCK_PI checks ownership and hands
-off. That needs an owner field per futex and interacts with the robust-list
-FUTEX_OWNER_DIED path already implemented here.
+**Darwin compresses idle anonymous memory with no memory pressure at all.** A
+process that dirties 1 GiB and then does nothing has essentially all of it in
+the compressor within ~25 seconds:
 
-The INHERITANCE half is not implementable and would not be even if it were
-written: iSH has no scheduler priority to donate -- realtime scheduling
-classes are already refused with EPERM (kernel/resource.c). So the honest
-shape is working mutual exclusion with the priority boost documented as a
-no-op, which is strictly better than a lock that cannot be taken at all --
-but it should be written knowing that, not discovered later.
+```
+COMPRESSIBLE (repeating byte)      INCOMPRESSIBLE (random)
+after dirtying  fp=1025.4 c=   0.0    after dirtying  fp=1025.4 c=   0.0
+after 25s idle  fp=1025.4 c=1024.2    after 25s idle  fp=1025.4 c=1023.9
+```
+
+(`fp` = `task_vm_info.phys_footprint`, `c` = `.compressed`, MB. Interleaved A/B,
+two rounds.)
+
+**And `phys_footprint` does not move.** 1025.4 MB in every arm -- whether the
+gigabyte compresses ~infinitely or not at all, whether the compressor has taken
+it or not. The ledger charges for the pages regardless of how well they
+compressed.
+
+**Why that matters more than it looks.** jetsam kills on `phys_footprint`
+(platform/darwin.c says so, and the swap budget is measured against it, not
+RSS). So the host's compression -- which is already happening, for free, to
+every cold guest page -- **buys AOK no headroom whatsoever**. It cannot be
+relied on to keep the app alive, and no amount of making guest memory more
+compressible will help by itself.
+
+**Which inverts the design question.** AOK-level compression is not redundant
+with the host's; it is the only kind that can help, because AOK would compress
+into its *own* smaller buffer and then actually release the originals -- and
+released pages do move the footprint. That is zram's model: hold N pages'
+worth of data in a pool of roughly N/ratio, and the footprint falls by the
+difference. It also composes with the pager: compress in RAM first, and only
+spend flash when the compressed pool is full, which cuts writes by the same
+ratio (see the swap write budget).
+
+**Not yet established, and needed before building anything:** the compression
+ratio and CPU cost on *real guest pages* rather than synthetic ones, the added
+latency on the fault path, and confirmation on a device that iOS's
+`phys_footprint` behaves as macOS's does here. The measurement above is macOS
+and uses `malloc`, not guest memory through AOK's page tables.
+
+### Guest-memory compression: BUILT (phases 1-2), and what is left
+
+**Phases 1 and 2 are in** as of 2026-09-09. `kernel/zpool.c` is a size-classed
+pool for compressed frames (host unit test, `meson test -C build zpool`), and
+`kernel/zswap.c` puts it in front of the swap area by intercepting
+`swap_slot_write`/`read`/`free`. Nothing about eviction eligibility, the fault
+path, fork/COW or the address-space barrier changed -- that seam was already a
+backing-store interface, which is why the integration is three call sites.
+
+Verified end to end by `tests/manual/zswap_roundtrip.c`: 24 MB survives a
+compressed round trip byte-for-byte, and the test FAILS rather than skips if no
+frame went through the tier. Run at a 1 MB cap it also covers the mixed case --
+640 frames held in RAM, 896 overflowed to flash, all correct.
+
+**UNDER A REAL DATABASE, WITH DECOMPRESSION ON THE CRITICAL PATH.** The runs
+above evicted memory and left it alone; nothing faulted back in any volume, so
+the decompress path was barely exercised (46 loads). This one puts it under
+sustained load. MariaDB 11.8.6 on the same iPad, 512 MB InnoDB buffer pool,
+sysbench 1.0.20 `oltp_read_write` over 2 tables x 394k rows (188 MB), two
+threads.
+
+Memory was pushed down until kswapd evicted part of the buffer pool -- reclaim
+fired at headroom 478 MB against the 482 MB watermark, **the second independent
+confirmation of that threshold** (nothing at 494, fired at 478) -- then sysbench
+was run against a buffer pool that was partly compressed:
+
+```
+                      TPS    avg ms   95th ms   errors   zswap loads
+cold baseline        3.48    571.89    787.74        0     64 ->  64
+partly compressed    4.42    452.25    707.07        0    162 -> 674
+```
+
+**512 frames were decompressed on the fault path during a 90-second run, with
+zero errors.** That is the correctness result: sysbench's point-selects and
+updates run against InnoDB pages that went out through the compressor and came
+back, and a decompression fault would surface as a query error or a wrong row,
+not silently. It did not.
+
+`declined` stayed 0 and `bytes_written` stayed 0 across the whole exercise, so
+real InnoDB pages compress as well as the synthetic ones did and none reached
+flash.
+
+**Do NOT read the TPS column as "compression makes it faster."** The two runs
+are not a controlled A/B: the baseline ran immediately after the data load with
+a cold buffer pool doing real disk I/O, and the second had a warmer one. The
+defensible claim is the weaker one -- **serving 512 faults from the compressed
+pool cost no measurable throughput or latency** -- and that is the question a
+user actually has.
+
+**Ratio on a mix including real InnoDB pages: 2.42x.** The reclaim added 7,278
+frames (113 MB of guest memory) for 46.8 MB of pool growth. That is close to the
+2.38x measured for cc1 on the Mac and above the 2.11x of the synthetic run, so
+database pages compress at least as well as the text records did.
+
+**THE CLEAN DEVICE RUN, 2026-09-09.** iPad 5th gen (A9, 1.45 GB), app in the
+foreground, no debugger attached, swap 1 GB, pool cap 128 MB, enabled from
+Settings. A single non-forking probe (`zprobe`) allocated 64 MB at a time and
+sampled after each step:
+
+```
++768MB   headroom=490MB  stores=0     poolKB=0      bytes_written=0
++832MB   headroom=453MB  stores=3754  poolKB=28960  bytes_written=0   <- engaged
+settle+10s  headroom=484MB stores=7874 poolKB=61744 bytes_written=0
+settle+180s headroom=483MB stores=8132 poolKB=63776 bytes_written=0
+```
+
+**Four things, and all four are what the feature promised:**
+
+1. **Reclaim engaged exactly where predicted.** The watermark is
+   `available < 2 x host_mem_headroom_floor` = 482 MB. Nothing happened at
+   490 MB; it fired at 453 MB. The threshold is not approximately right, it is
+   right.
+2. **Zero flash writes.** `bytes_written` stayed at 0 for the entire run, and
+   `declined` stayed at 0 -- every single evicted frame went to RAM. On a
+   feature whose headline objection is flash wear, that is the number.
+3. **THE FOOTPRINT ACTUALLY MOVED.** Headroom recovered 453 -> 484 MB and held
+   there for three minutes. This is the measurement the debugger would have
+   destroyed: `MADV_FREE_REUSABLE` returns success while moving no ledger under
+   an attached debugger, so a recovering headroom is the only proof the frames
+   were released rather than merely accounted for.
+4. **It reached equilibrium and stopped.** 484 MB is just above the 482 MB
+   watermark, and reclaim ceased there rather than continuing to evict. The
+   pool used 60 MB of its 128 MB cap. That is a pager doing the right amount of
+   work, not the most.
+
+**The effective ratio is 2.11x, with fragmentation counted.** 8132 frames x
+16 KiB = 127 MB of guest memory held in 61,744 KB of pool. That is the honest
+figure -- `poolKB` is what the slabs occupy, so size-class waste is already in
+it. It sits just below the raw 2.38x measured for cc1, which is what ~10%
+fragmentation predicts. The probe's data is structured text records, so it is
+somewhat more compressible than a binary heap; treat 2.11x as a good case and
+not a ceiling.
+
+**One number is not fully explained and should not be smoothed over.** 127 MB of
+frames released into 60 MB of pool should free about 67 MB, and headroom
+recovered 31 MB (memfree agrees: +32 MB). The gap may be `MADV_FREE_REUSABLE`
+pages counting as reusable-but-not-yet-free, or accounting differing between the
+two figures. Not chased, and flagged rather than averaged away.
+
+**IT WORKS ON A DEVICE, UNDER REAL PRESSURE.** Measured on the iPad 5th gen
+(A9, 1.45 GB) on 2026-09-09, with the tier enabled from Settings at a 128 MB cap
+and swap at 256 MB. Memory was consumed until the machine crossed kswapd's
+watermark -- which is `available < 2 x host_mem_headroom_floor`, so 482 MB
+against the 241 MB floor:
+
+```
+headroom 483 MB   pressure WARN (throttle engaged, growth still allowed)
+t+10s   stores=13419   bytes_written=0   headroom=482
+```
+
+kswapd engaged at the predicted threshold to the megabyte, evicted **13,419
+frames** -- 13419 x 16 KiB, about 210 MB of guest memory -- and
+**`bytes_written` stayed at 0**. Not one byte reached flash. That is the whole
+claim of the feature, on real hardware, under pressure that arrived on its own
+rather than being forced through a development control.
+
+**AND THEN THE DEVICE STOPPED ANSWERING -- BUT NOT, IT TURNS OUT, BECAUSE OF A
+JETSAM KILL.** An earlier version of this entry said it was one. That was not
+established and is probably wrong: the maintainer found the app **backgrounded,
+not dead**, and iOS destroys a backgrounded app's listening socket, which is
+already documented in this file. "Connection reset", then "timed out during
+banner exchange", is exactly what that looks like from the other end -- and it
+is a far better fit than the memory-pressure story I reached for, which was that
+fork was failing under pressure. Both readings explain the symptom; only one of
+them was checked, and it was not mine.
+
+**So no jetsam kill is confirmed at any point in this work.** What is confirmed
+is that the app stopped being reachable over ssh while under heavy memory
+pressure, twice. The practical consequence for anyone repeating this: keep the
+app in the FOREGROUND for the duration, or the guest is suspended out from under
+the measurement.
+
+There is still a design point worth keeping, and it does not depend on how the
+app stopped:
+
+**THE POOL IS RESIDENT MEMORY AND COMPETES WITH WHAT IT SAVES.** Compressing
+210 MB into a pool of at most 128 MB saves at most 82 MB; it does not save 210.
+The pool's own bytes are charged to `phys_footprint` exactly like the frames it
+replaced. So a cap that is generous relative to the device's RAM can make
+pressure worse rather than better, and the ceiling this shipped with -- 4 GB,
+chosen against swap's 16 GB -- is far too generous for a 1.5 GB device to be
+offered without guidance.
+
+**AND THE BINDING CONSTRAINT WAS THE SWAP AREA, NOT THE POOL.** ktop's last
+frame before the kill settles it:
+
+```
+Mem[  1.18G/1.42G ]      Swp[  208.2M/256.0M ]
+  827  /tmp/cold 400   VIRT 411728  RES 305232
+  882  /tmp/cold 450   VIRT 462928  RES 356432
+```
+
+208 of 256 MB of slots were consumed -- 81% -- with `bytes_written` still 0, so
+every one of those slots held its data in RAM. About 190 MB had genuinely left
+the two cold processes (VIRT minus RES). But **slots are allocated per evicted
+frame whether or not the bytes go to flash**, so the 256 MB area was about to
+run out, and when it does eviction stops completely however much pool is left.
+
+That is the sizing rule, and it is not the obvious one:
+
+- **The swap area size caps how much memory can be evicted at all.** It is the
+  address space of the pager.
+- **The pool size decides how much of that costs RAM instead of flash.**
+
+So the two are not alternatives and the area cannot be made small (which an
+earlier version of this entry wrongly suggested). Against 850 MB of demand, a
+256 MB area could never have kept up no matter what the pool did.
+
+**Open, and it is the next thing to settle**: whether the pool cap should be
+clamped against device RAM, and whether the UI should relate the two sizes at
+all rather than offering them as independent numbers. Unresolved here because
+the evidence does not distinguish "the pool made it worse" from "the area was
+too small and I allocated too much too fast" -- and picking one without the data
+is exactly the kind of story this file exists to prevent.
+
+**ZRAM VERIFIED ON A DEVICE, 2026-09-09.** Everything about the file-less mode
+had been proven on the CLI, where /proc/ish/swap_evict can force an eviction --
+a control that is EPERM on an installed app by design. So on the iPad 5th gen,
+with swap OFF and compressed memory ON from Settings, memory was consumed until
+kswapd engaged on its own and then every allocated region was read back:
+
+```
+loads      201 -> 11389     11,188 frames faulted back OUT OF THE POOL
+bad bytes  0                every one byte-for-byte correct
+stores   14038 -> 25373
+bytes_written  0            nothing reached storage, because there is no file
+```
+
+That is roughly 175 MB of guest memory compressed, released, and restored
+exactly, on the oldest hardware AOK supports, with no swap file in existence.
+
+**THE FIRST ATTEMPT REPORTED PASS AND PROVED NOTHING**, which is worth recording
+because it is the third instance of the same mistake in this feature's history.
+It verified only the region it had filled first, and reported `loads 70 -> 70` --
+the counter never moved, so the bytes it checked had never left RAM. 14,038
+frames had been evicted; none of them were the ones being checked. The pass
+condition was `bad == 0 && stores > 0 && bytes_written == 0`, which neglected the
+one thing that mattered.
+
+Fixed by verifying EVERY allocated region rather than one, and by requiring
+`loads` to move for a PASS -- it reports INCONCLUSIVE otherwise.
+
+**The rule, stated because it caught three separate green results here:** for a
+feature that only acts under a condition, the test must assert THE CONDITION WAS
+REACHED, not merely that nothing broke. `swap_roundtrip` passed with 4096 frames
+declined and 0 stored; a sysbench run showed 3.75 TPS with the tier never
+engaging; and this reported clean bytes that never left memory. In all three the
+counters, not the assertion, were what exposed it.
+
+**Also observed: reclaim lags a fast allocator.** `stores` stayed at 0 through an
+entire 896 MB allocation and only climbed once it stopped. That is the
+second-chance clock working as designed -- a frame must survive two sweeps
+untouched before the third may take it -- but it means the tier protects against
+sustained pressure rather than a burst that outruns kswapd. Worth saying in
+release notes, so a user who hits a limit during a fast allocation does not
+conclude the feature is broken.
+
+**RAM-ONLY IS BUILT** (2026-09-09), so there are two modes and both ship:
+
+| Settings | mode | storage cost |
+|---|---|---|
+| swap on + compressed memory on | **zswap** -- pool in front of the file | area preallocated, writes ~0 |
+| swap **off** + compressed memory on | **zram** -- pool is the only storage | **none, ever** |
+
+No new switch: "Enable Compressed Memory" works either way. The zram mode exists
+because requiring swap was an awkward ask -- enabling swap costs flash
+immediately, since the area is `F_PREALLOCATE`d and `ftruncate`d to full size
+before a page is written, so a user whose worry is wear or free space had to
+hand over a gigabyte of storage to turn on the feature whose point is not
+writing to storage.
+
+It was small because the eviction path was already right: a refused
+`swap_slot_write` frees the slot and leaves the frame resident
+(emu/memory.c:3669), so "pool full" and "does not compress" simply mean that
+frame stops being evictable. Nothing lost, nothing written. What made it
+invasive was `swap_fd >= 0` doing double duty as "does an area exist" -- six
+sites meant that and now ask `swap_area_live_locked()`, which tests the bitmap,
+allocated and freed with the area in both modes.
+
+**In zram mode an incompressible frame is simply never evicted.** There is
+nowhere for it to go, and that is correct rather than a limitation: it stays
+resident, exactly as it would with the feature off. Demonstrated by
+`swap_roundtrip` SKIPPING in that mode -- its pattern is a per-byte hash, so all
+4096 frames were declined and none moved.
+
+**All four configurations verified separately**, because they exercise different
+paths: default (201/201 guest suite, zpool unit test); swap only (round trip
+PASS with 67 MB genuinely written, so the file path still does real I/O); zswap
+(all three tests PASS); zram (round trip and fork invariant PASS, zero bytes
+written).
+
+**The Settings design follows from that**: the two sizes are separate knobs, and
+the swap-file one should be allowed to be small rather than implying a large
+area. Not yet wired -- `ISH_GUEST_ZSWAP_MB` is a launch variable, so the tier is
+reachable from the CLI and Xcode and not from an installed app.
+
+### 555: zram was lazy, because it inherited a swap file's caution
+
+**"It reached equilibrium and stopped" was recorded above as the fourth thing
+the feature got right. For a swap FILE it is. For RAM-only it was the bug.**
+
+Measured on the ip5 device on 2026-09-10, with compressed memory on, swap off,
+and the pool cap raised to its maximum from Settings:
+
+```
+kswapd   running, 864 passes, 0 bytes reclaimed
+pool     0 KB of a 494 MB cap        headroom 931 MB    ceiling 1450 MB
+write_window  0 of 4294967296 bytes used in the last 24h
+```
+
+**864 background passes, a half-gigabyte pool the user had deliberately asked
+for, and not one frame ever compressed.** The watermark was
+`available < floor * 2` = 482 MB, and the app sat at 931 MB.
+
+Every gate around eviction was designed for a file: reclaim writes to the user's
+flash, that is metered against a 24-hour budget, and flash wears out. Waiting
+until the app is nearly dead is right when each eviction costs a write. **In
+RAM-only mode none of that is true.** `swap_write_frame` takes the `ram_only`
+branch and returns `_ENOSPC` before it reaches a file descriptor -- which is
+what `write_window 0 of 4 GiB` after 864 passes actually says.
+
+**A watermark was the wrong SHAPE, not merely the wrong number.** Two attempts
+at one failed the same way, and both are worth recording because the second
+looked convincing:
+
+1. *Half the budget.* On the device that moves the trigger from 482 MB to
+   725 MB of headroom -- and the device was at 931 MB, so it still did nothing.
+2. *Half the budget with hysteresis*, a low/high pair so a run continues once
+   started. That fixed a real defect on the way past -- a bare threshold does
+   not shed memory, it hovers: measured with a 400 MB hog against an 800 MB
+   budget, headroom sat at **401 MB against a 400 MB mark** for a minute with
+   kswapd taking 24 passes and reclaiming 0 bytes. But it still begins with
+   "wait until enough is gone".
+
+Any threshold against remaining headroom encodes waiting, and there is nothing
+to wait for. **So RAM-only reclaim has no watermark at all: it runs while the
+pool has room and stops when it is full.** The cap is a size the user chose;
+filling it with cold frames is what choosing it asked for.
+
+What keeps that honest is not a headroom test but three things that already
+existed, plus one that did not:
+
+- the **aging clock**, which offers only frames that have read cold across
+  several sweeps, so hot memory is never a candidate;
+- the **thrash guard**, which pauses reclaim outright when evicted pages come
+  straight back, whatever the headroom says;
+- the **pool-full check**, because at capacity every further eviction
+  compresses, is declined for want of room, and leaves the frame resident --
+  CPU spent, nothing moved;
+- a **housekeeping cadence**, which is the new one and was not optional.
+
+**Why the cadence was needed.** A sweep is not free even when it reclaims
+nothing: it takes a task snapshot and an address-space barrier per mm, and that
+barrier is paid by the guest's own threads -- the same mechanism that makes
+mallocng's mmap/munmap churn expensive. An empty-sweep backoff was tried first
+and does not help, because the common case is not "nothing cold" but "a trickle
+of newly-cold memory": measured, **60 passes in 30 s for 12 frames**, with every
+productive pass resetting the backoff. So unpressured reclaim now sweeps on one
+pass in four, and under real pressure on every pass. Measured after:
+
+```
+over 30 s unpressured: passes=60 sweeps=6
+```
+
+**The cost of being wrong is small, and was measured** on that device against
+MariaDB's live 684 MB (175,209 pages):
+
+```
+lz4    compress   2.46 us/page   decompress   9.70 us/page
+```
+
+A 16 KiB frame costs ~10 us to compress, so the whole 494 MB pool is well under
+a second of CPU, once -- roughly 0.4 J against a ~7 Wh battery. A frame faulted
+back costs ~39 us: 0.4% of one core at 100 frames/s, 3.9% at 1,000. Compressing
+is close to free; picking hot frames is what would cost, and the clock and the
+thrash guard are what prevent that.
+
+`/proc/ish/swap` now reports **sweeps as well as passes**, because with a
+cadence those are different numbers and the gap between them is the policy.
+
+**`zswap_fork_cow` had to change, and the reason generalises.** It asserted that
+a forced sweep with a fork outstanding did not move the `stores` counter. That
+became unfalsifiable the moment reclaim stopped waiting for pressure: kswapd now
+runs continuously, so `stores` moves for reasons unrelated to the region under
+test, and it failed on a kernel whose COW handling was correct (stores
+545 -> 549, invariant intact). **A global counter cannot attribute a store to a
+particular frame.** It now does what its first version did and what the counter
+was only ever a proxy for: the child writes through the sharing and the parent's
+view must be untouched. Immune to background reclaim, and it fails for exactly
+one reason.
+
+`tests/manual/zram_idle_reclaim.c` locks the new behaviour in, and asserts it
+**where there is no pressure** -- it refuses to run unless headroom is well
+above the old file-backed mark, and fails if nothing is stored while it stays
+there. Testing under pressure would have passed before the fix and after it.
+Measured: `stores 288 -> 545 after 11 s, with headroom never below 982 MB
+against a 400 MB file-backed mark`.
+
+**Still open:** the pool cap default is a flat 128 MB, and the maximum is
+physical RAM / 4 -- which is why a device asking for 512 MB gets 494. The
+maximum scales; the default does not, and the clamp is silent.
+
+### Phase 0, the measurements the above rests on
+
+Follows the entry above -- the host's own compression buys AOK nothing, so only
+compression AOK does itself can help. `kernel/memcomp.c` and
+`/proc/ish/mem_compress` measure what it would buy, on real guest pages.
+Measured 2026-09-09 on an M4 Mac, every round trip decompressed and compared
+(`verify_failures 0` throughout, and that guard earned itself twice -- see
+below).
+
+**cc1 compiling 28 MB of C, 90 MB resident anonymous -- the representative one:**
+
+| algo  | ratio | compress | decompress | >=8x | >=4x | >=2x | >=1.33x | worse |
+|-------|------:|---------:|-----------:|-----:|-----:|-----:|--------:|------:|
+| lz4   | 2.23x |  7.06 us |    1.89 us | 3573 | 1666 | 5191 |   12732 |    22 |
+| lzfse | 3.23x | 55.56 us |    9.47 us | 4580 | 3078 |14885 |     641 |     0 |
+| zlib  | 3.60x | 70.90 us |   13.55 us | 5105 | 3355 |14712 |      12 |     0 |
+
+Two other workloads for shape, neither as representative: a synthetic
+malloc mix (64 MB) gave lz4 2.45x, and `sort` over repetitive text (41 MB) gave
+lz4 6.50x -- that last one is inflated by the input being `yes`-generated lines
+and should not be quoted as a result.
+
+**The decision.** `lz4` for an in-RAM pool. 2.23x on a real workload for
+**1.89 us to decompress on the fault path**, against the hundreds of
+microseconds a read from flash costs -- so holding a page compressed in RAM is
+roughly two orders of magnitude cheaper than having paged it out, which is the
+entire zram argument and it survives being quantified here.
+
+lzfse and zlib buy 45-60% more ratio for 5-7x the decompress cost. That is the
+wrong trade for a hot pool and possibly the right one for what is actually
+written to flash, where the cost is paid once and the ratio directly reduces
+the 24-hour write budget. A two-tier design (lz4 in RAM, something denser on the
+way out) is the shape the numbers point at.
+
+**A real server, measured on the A9: mariadbd with a 131k-row InnoDB table,
+293 MB resident anonymous** (out of 1.35 GB of *mapped* RSS -- the gap is
+AOK's RSS counting address space, and it is worth knowing that four fifths of
+what a database appears to hold is not resident at all). lz4 5.42x at 3.05 us
+compress and 8.45 us decompress; zlib 9.82x.
+
+**Read that ratio with care.** 55,760 of 75,106 pages land in the >=8x bucket,
+because InnoDB allocates a large buffer pool that is mostly untouched. That is
+not a measurement error -- a real server genuinely does hold that memory, and
+compressing it really is nearly free -- but it means 5.42x is an *expected
+benefit* number and not a *worst case* one. For CPU planning use the dense-data
+figures (python on the same device: 2.83x, 3.07 us), because a page that
+compresses to nothing costs almost nothing to compress. Note also that lz4's
+decompress there (8.45 us) exceeds its compress (3.05 us), which is backwards
+for lz4 and is the same near-empty-page effect: decompressing a trivial input
+still has to write 4 KB, and on an A9 that write is what is being timed.
+
+**Incompressible pages are a rounding error, not a design burden**: 0 pages
+failed to fit, and 22 of 23,184 got no smaller. A raw-storage fallback is still
+required for correctness, but it will not be a common path.
+
+**On-device, and the earlier inversion is explained -- it was not hardware.**
+Measured on an iPad 5th gen (iPad6,12, A9 at 1.07 GHz, the oldest part AOK
+supports) against a real Python heap, pid verified:
+
+| host | workload | resident | lz4 ratio | lz4 compress | lz4 decompress |
+|------|----------|---------:|----------:|-------------:|---------------:|
+| M4 Mac | cc1     |   138 MB |     2.38x |      6.30 us |        1.94 us |
+| A9 iPad| python  |    33 MB |     2.83x |      7.61 us |        3.07 us |
+
+**The A9 decompresses only 1.6x slower than an M4**, not the 2-3x guessed, and
+on real data the algorithm ordering is the same on both: lz4 fastest, zlib
+slowest. That closes the CPU gap, and it closes it favourably -- 3 us on the
+slowest supported device is still two orders of magnitude under a flash read.
+
+The inversion that prompted all this (lz4 11.41 us against zlib 5.64 on the
+same device) came from **degenerate input, not from the SoC**. Those earlier
+device samples were near-empty pages -- 4431 of 4500 in the >=8x bucket, ratios
+of 25x and 136x -- and when a page compresses to almost nothing the measurement
+is fixed API overhead rather than throughput, which does not rank the codecs the
+way real data does. The first device numbers should not have been quoted, and
+the lesson is the ordinary one: **a ratio of 136x is not a good result, it is a
+warning that the input is not representative.**
+
+The order-rotation added to the instrument is kept anyway. It is cheap, it makes
+position and algorithm independent, and it is the thing that would have
+distinguished these two explanations without needing a second workload.
+
+**Hardware acceleration remains a real consideration even though it was not the
+cause here** -- Apple's codecs are tuned per architecture and their relative
+speeds need not be constant -- so the runtime pick below is still the right
+design. It is now a cheap insurance policy rather than a necessity.
+
+**What is NOT established, and none of it should be skipped:**
+- **The pool allocator.** Compressed pages are variable-sized, so they need one;
+  Linux uses zsmalloc and it is not small. Fragmentation overhead is unmeasured
+  and eats directly into the ratio above.
+- ~~Device confirmation that iOS's `phys_footprint` ignores compression.~~
+  **CONFIRMED on an iPad 5th gen, 2026-09-09**, and it is the finding the whole
+  case rests on. `/proc/ish/mem_guard` headroom, while a guest process held
+  250 MB of a single repeating byte -- maximally compressible, the easiest
+  possible case for the compressor:
+
+  ```
+  baseline  890 MB
+  t+25s     722 MB   <- the 250 MB is charged
+  t+70s     723 MB
+  t+130s    723 MB
+  t+190s    726 MB   <- never comes back
+  ```
+
+  macOS compressed the equivalent buffer within 25 seconds. iOS charges for it
+  regardless, for at least three minutes of idle. **The host's compression buys
+  AOK no jetsam headroom on a device**, which is exactly what it does on the
+  Mac, and it means only compression AOK performs itself -- into its own
+  smaller buffer, releasing the originals -- can move the number that kills the
+  app.
+- Only two genuinely representative workloads. A JVM, a Python, and a Node
+  process would each have a different shape.
+
+**Two instrument bugs worth remembering**, both caught by the measurement's own
+guards rather than by review:
+- The first run reported exactly one verify failure per algorithm, all three
+  identical -- not how three independent compressors fail. The pages belong to a
+  RUNNING process and were written between the compress and the compare. Each
+  page is copied to a private buffer now, which also makes the three algorithms
+  measure the same bytes.
+- The second run **killed the emulator**: SIGBUS/KERN_MEMORY_ERROR reading a
+  file-backed page whose host bytes were not there. `mem_walk_resident_pages`
+  now yields only anonymous, host-readable pages. See the commit; that filter is
+  a safety requirement, not a preference.
+
+### Signals left over from moving kill() to the process queue
+
+Fixed 2026-09-23 ("signal: a thread takes its own signals first, and kill()
+queues on the process", tests/manual/signal_dequeue_order.c): a process's
+signal waits on the process's queue, and a thread takes its own queue before
+the process's, synchronous signals first. Found alongside, by reading, not
+measured:
+- A native program's handlers run in the order their signals are taken:
+  `nlibc_deliver_signals_count` calls each as it takes it. A translated
+  guest, like Linux, stacks a frame per signal, so the LAST one taken runs
+  first.
+- A stop or continue signal the kernel sends to one thread while holding
+  pids_lock (ptrace's attach SIGSTOP, a resume's signal) cancels the other
+  kind on that thread's queue and the process's, not on the other threads'
+  own queues: `send_signal` has no thread list. tkill, tgkill and
+  rt_tgsigqueueinfo do reach every thread (`signal_prepare_stop_cont_threads`).
+- kill(-1) skips only the calling thread (`kill_everything`); Linux skips
+  the caller's whole thread group, so a non-leader thread's kill(-1) also
+  signals its own process here.
+
+### Stop and continue notices: what is still open
+
+Fixed 2026-09-23 (tests/manual/notify_parent_cldstop.c): a stop, a continue
+and a ptrace stop are announced with SIGCHLD, not the exit signal, once, to
+the leader's parent or the tracer, as Linux's do_notify_parent_cldstop does;
+and a tracer's resume lifts a group-stop before the tracee wakes.
+
+Also fixed 2026-09-23 (tests/manual/reparent_zombie_disposition.c, measured
+on Linux 6.12 64-bit and -m32 first): zombies handed to a new parent at an
+exit were announced with one SIGCHLD whatever its disposition, and left for
+a wait a parent that disclaimed SIGCHLD never makes. do_exit's reparent loop
+now goes through exit_notify_process_locked, as Linux's reparent_leader goes
+through do_notify_parent: SIG_IGN or SA_NOCLDWAIT releases the zombie at
+once, SIG_IGN sends nothing even to a new parent that blocks SIGCHLD, and
+each zombie gets its own SIGCHLD, with its CPU times.
+
+Also fixed 2026-09-23 (tests/manual/wait_child_order.c, measured on Linux
+6.12 64-bit and -m32 first): AOK's children lists were newest-first, Linux's
+oldest-first. fork, CLONE_PARENT, exec's de-thread and the reparent loop all
+linked at the head, so wait(-1) reaped the youngest zombie first (Linux 1 2
+3, AOK 3 2 1), a subreaper reaped its orphans before its own children, and of
+three zombies reparented together the SIGCHLD a blocking new parent found
+named the youngest. Now a child goes at the end, as copy_process's
+list_add_tail puts it; an exit hands its children on after the new parent's
+own, in their order, as list_splice_tail_init does; and a thread's exec
+takes the old leader's place, as de_thread's list_replace_init does.
+reparent_zombie_disposition.c now requires the oldest. A checkpoint had its
+own copy of the bug: the restore builds each parent's children in image
+order, and the save wrote siblings in whatever order its placement left
+them (four zombies came back reaped 7 4 6 5). The save now walks the tree
+for its order (checkpoint_threads.sh, mode `order`). AOK has no
+/proc/<pid>/task/<tid>/children; the test checks it where it exists.
+
+Found alongside, by reading, not measured:
+- A group-stop is announced as soon as one thread takes the stop signal:
+  receive_signal stops the whole process at once, and the others stop at
+  their next pass through handle_interrupt -- one blocked in a syscall only
+  when that call returns. Linux stops every thread first and announces the
+  stop from the last (task_participate_group_stop), so a parent told
+  CLD_STOPPED can find threads here still in R or S where Linux shows T.
+- The notices carry si_utime and si_stime 0; Linux fills in the child's CPU
+  times.
+
+### The orphaned-group test has two copies, and neither skips what Linux does
+
+Found 2026-09-23 by reading, while adding the orphaned-group rule's
+per-child case; not measured. Linux has one test, `will_become_orphaned_pgrp`,
+for exit and for the terminal (`is_current_pgrp_orphaned`, which makes a
+background read or write EIO rather than a stop). AOK has two --
+`pgrp_is_orphaned_locked` in kernel/exit.c and `pgroup_is_orphaned` in
+kernel/group.c, which fs/tty.c's `tty_check_change_locked` calls -- and
+they differ from Linux and from each other:
+- The terminal's copy counts a zombie member, and one init has adopted, as a
+  way back into the session. Linux skips both (`exit_state &&
+  thread_group_empty`, `is_global_init`); only the exit copy skips init.
+- The exit copy skips a member whose leader thread is `exiting` even while
+  its other threads run. Linux counts that process until its whole thread
+  group is gone, so a group whose only way back is a process whose main
+  thread called `pthread_exit` is orphaned here and not there.
+
+**Next step:** one helper in kernel/group.c, walking the group's pgroup list
+(complete now that setpgid files a joiner there), with Linux's two skips,
+for both callers. Tests against camd: a background read from a group whose
+only way back is a zombie member (EIO on Linux), and the `pthread_exit`
+way back above.
+
+### PI futexes: the requeue half, and no inheritance
+
+FUTEX_LOCK_PI, LOCK_PI2, TRYLOCK_PI and UNLOCK_PI are implemented (kernel/
+futex.c, 2026-10-02; tests/manual/futex_pi.c, which Linux 6.12 passes on camd
+in 64- and 32-bit builds): the word protocol, direct hand-off to the first
+waiter, a dead owner's lock going to a waiter that was queued (marked
+FUTEX_OWNER_DIED and FUTEX_WAITERS, as Linux leaves it), ESRCH for an owner
+that is gone with nobody queued, the PI bit in robust-list links, and a signal
+restarting the lock (ERESTARTNOINTR: glibc takes an EINTR as having it).
+Before, glibc's probe -- `futex(&word, FUTEX_UNLOCK_PI_PRIVATE)`, EPERM on
+Linux -- got ENOSYS, so PTHREAD_PRIO_INHERIT mutexes were refused at init
+(PulseAudio's, in wf-panel, fell back to plain ones) and dmesg showed one
+`FIXME Unsupported futex FUTEX_UNLOCK_PI(..., 135, 0, ...)` per program.
+
+Left:
+
+- **FUTEX_WAIT_REQUEUE_PI is still ENOSYS, and FUTEX_CMP_REQUEUE_PI is wrong**
+  (seen 2026-09-25): it compares `*uaddr1` against `val`, the wake count,
+  where Linux compares `val3`, and it wakes no one where Linux takes the PI
+  lock for one waiter. Nothing current calls either -- glibc's condvars
+  stopped in 2.25, musl never did -- so rewrite them on futex_lock_pi's
+  waiter queue only when a caller turns up. Its waiters do keep their
+  futex's reference when moved (`futex_requeue_waiters`).
+- **No inheritance.** iSH has no scheduler priority to donate -- realtime
+  classes are refused with EPERM (kernel/resource.c) -- so the boost is a
+  no-op by design, not an omission.
+- A PI waiter re-checks its owner every 50 ms (and at once when the owner
+  exits, futex_exit_pi); Linux has the owner's task pin a pi_state instead.
 
 ### tmpfs size= is accepted and not enforced
 
@@ -193,6 +1004,36 @@ separately before changing anything: the audit files this as two findings (a
 quadratic telldir and an unindexed tmpfs directory scan) and the evidence so
 far does not clearly implicate either.
 
+### Address-space walks: what still costs per page or per region
+
+**Established (2026-09-25).** The hole finder, and every walk built on "next
+mapped page" / "next unmapped page", used to read the 56-byte entry of every
+page it passed -- and leaves are immortal, so also every entry of every leaf a
+process had ever used. One mmap(NULL, 4096) cost 11.8 ms beside a 2 GiB
+MAP_SHARED memfd mapping and 10.4 ms after it was unmapped, against 0.02 ms
+alone, and `dotnet --info` spent most of an hour there. Per-leaf occupancy
+bitmaps with per-chunk used/full summaries (emu/memory.c, "occupancy bitmaps")
+made both 0.012-0.014 ms; `tests/manual/mmap_hole_scaling` guards it, and
+`ISH_PT_OCCUPANCY_CHECK=1` verifies every bit and `vm_entries` after each
+structural change. Fault backpressure reads the resident-set counter instead of
+walking, and RLIMIT_AS reads VmSize's counter.
+
+**Still open, none of them measured as a problem yet:**
+- `pt_find_hole` is O(occupied runs between mmap_floor and mmap_ceiling), each
+  a few words. Linux is O(log n) with a gap-augmented VMA tree. An address
+  space fragmented into thousands of separate runs would still pay per run.
+- RLIMIT_DATA, when finite and the mapping is data, walks every mapped page's
+  flags per mmap/brk/mremap (`vm_may_expand`). A data-page counter would need
+  maintaining at every flags change, not just every entry change.
+- `/proc/<pid>/maps` and `smaps` compare flags page by page, and
+  `mem_resident_page_count` (VmSwap, `/proc/ish/swap_evict`) asks each mapped
+  entry's frame. Both skip unmapped pages and empty leaves now, but are still
+  linear in mapped pages.
+- fork copies entries one page at a time; that is the page-table design, not a
+  walk.
+
+**Next step:** only if a workload shows one of these in a `sample`.
+
 ### What is still missing from procfs
 
 Added 2026-09-01 alongside the procfs work in `tests/manual/proc_files.c`,
@@ -220,8 +1061,43 @@ pid table on every stat. Linux reports 219 for /proc and 9 for /proc/<pid>;
 2 is the honest floor, and no longer 0, which is what a deleted inode looks
 like.
 
-**System V shared memory is unimplemented**, so /proc/sysvipc/shm is its
-header alone. Semaphores and message queues are listed for real.
+**System V shared memory segments are not listed**: /proc/sysvipc/shm is its
+header alone and shmctl has no SHM_STAT/SHM_INFO, so `ipcs -m` shows nothing
+even while segments exist (kernel/ipc.c implements them). Semaphores and
+message queues are listed for real.
+
+**`/proc/meminfo`'s Shmem, AnonPages and Mapped are not Linux's figures.**
+Since 2026-09-25 they are counters (`class_entries` in struct mem), so a read no
+longer walks every page of every address space -- 0.5 ms alone and 54 ms beside
+a 2 GiB memfd mapped twice before, 0.05-0.06 ms both after, 0.011 ms on Linux.
+The counters kept the old walk's values exactly, and those differ from what
+Linux means. Measured with the same program on amd64 and on Linux 6.12 (camd),
+the change in kB as each step happens:
+
+| step (16 MiB unless said)          | Linux 6.12                     | AOK                         |
+|------------------------------------|--------------------------------|-----------------------------|
+| private anon mapped, untouched     | 0                              | AnonPages +16384            |
+| ...then touched                    | AnonPages +16384               | 0                           |
+| shared anon mapped, untouched      | 0                              | Shmem +16384                |
+| ...then touched                    | Shmem +16384, Mapped +16384    | 0                           |
+| memfd mapped RW and RX, untouched  | 0                              | Mapped +32768               |
+| ...touched through RW              | Shmem +16384, Mapped +16384    | 0                           |
+| ...read through RX too             | 0                              | 0                           |
+| ...unmapped, fd still open         | Mapped -16384 (Shmem stays)    | Mapped -32768               |
+| ...fd closed                       | Shmem -16384                   | 0                           |
+| file mapped private, then read     | Mapped + the pages not already mapped elsewhere | Mapped + all, at mmap |
+| 2 GiB memfd mapped twice, untouched| 0                              | Mapped +4194304             |
+| fork, child breaks half of 32 MiB  | AnonPages +16384               | AnonPages +32768            |
+
+So AOK counts page-table entries per address space at mmap time; Linux counts
+resident pages once each, from first touch: AnonPages is anonymous pages
+mapped anywhere, Mapped is file pages (shmem included) mapped anywhere, and
+Shmem is every shmem page -- memfd, shared anonymous, tmpfs, SysV -- mapped or
+not. Linux-shaped figures need per-page state rather than per-entry: a
+touched-and-first-mapping count on the frame (struct data already tracks its
+owners), a memfd/shared-anon page counted as Shmem, and tmpfs file pages
+counted whether mapped or not. `tests/manual/meminfo_scaling.c` asserts only
+what both agree on; its table would change with this.
 
 ### PIPE_BUF atomicity cannot be imposed on a HOST pipe
 
@@ -271,63 +1147,62 @@ needs the page's ORIGIN to still be reachable after the copy-on-write, and a
 `struct pt_entry` that has been written keeps only the private copy. Doing it
 properly means remembering the file-backed `struct data` per COW page.
 
-**A load or store wholly past EOF in a file mapping does not SIGBUS.** Linux
-faults both; AOK reads zeroes and lets stores land, and they become file
-content if the file later grows. The fault handler would have to know the
-backing file's current size at fault time, which means carrying the file
-identity into the page fault path rather than just the host memory.
+**A load or store past EOF does not SIGBUS if its host page holds any of the
+file.** Linux faults at guest-page granularity; the host pages a file in at its
+own, 16 KiB on Apple silicon. So a guest page past EOF that shares a host page
+with the file's last bytes reads zeroes and takes stores, which become file
+content if the file later grows: guest pages 2 and 3 of a 5000-byte file read
+as zeroes on alpine-arm64-test, and `write(2)` from one returns 16, where Linux
+6.12 gives SIGBUS and EFAULT (measured 2026-09-25). A host page WHOLLY past
+EOF does fault -- a guest SIGBUS from the JIT, and a failed syscall from the
+kernel (next section) -- and a host whose page is the guest's has no gap. The
+fault handler would have to know the backing file's current size at fault
+time, which means carrying the file identity into the page fault path rather
+than just the host memory.
 
 **`remap_file_pages` is ENOSYS.** Linux has emulated it over mmap since 3.16
-and a linear remap returns 0. Implementing the emulation means splitting a
-mapping into per-page mappings with independent offsets, which the reservation
-model (never split -- see `struct mem_lazy_map`) is built to avoid.
+and a linear remap returns 0. Linux's emulation is a `MAP_FIXED` shared mapping
+of the same backing over the subrange at the new offset. Lazy reservations are
+no obstacle: every page-table entry already carries its own `data` and
+`offset`, and a large shared anonymous mapping that is still reserved can be
+materialised first, as `mprotect` does. What is missing is the syscall itself.
 
-### PROT_EXEC is never enforced -- no NX for guest pages
+### File pages past EOF: what the guarded copies leave
 
-`emu/memory.h` says "P_READ and P_EXEC are ignored for now", and P_EXEC really
-is: it is stored, printed in `/proc/<pid>/maps`, reconstructed by mremap, and
-never once consulted. Measured against Linux 6.12 (arm64 `mov w0,#42; ret` in a
-PROT_READ|PROT_WRITE page):
+Fixed 2026-09-25: kernel C code that touched a host page of a file mapping
+holding no byte of the file -- `write()` from it, `read()` into it,
+`/proc/<pid>/mem`, `process_vm_readv`, `ptrace(PEEK/POKE)`, a futex word, the
+copy-on-write break after a fork -- took a host SIGBUS that ended the whole app
+(exit 138). Every such access to a page that is not anonymous now runs under a
+fault guard (emu/host_fault.h) that both host fault handlers resume at, so the
+syscall fails as Linux 6.12's does: EFAULT, or EIO from `/proc/<pid>/mem` and
+`ptrace`, and a store after a fork is a guest SIGBUS. (The forced accesses and
+the copy-on-write break were closed first, by "mem: a debugger's write leaves
+the page as protected as it was", through `mem_host_copy`, which now makes the
+same guarded copy.) `tests/manual/syscall_page_past_eof.c` takes every route,
+each beside a control inside the file. What is left:
 
-| | Linux | AOK |
-|---|---|---|
-| call into a never-PROT_EXEC page | SIGSEGV | returns 42 |
-| `mprotect(PROT_READ)` over a PROT_EXEC page, then call | SIGSEGV | returns 42 |
+**A `read(2)` that faults has already consumed its data.** AOK reads into a
+kernel buffer and then copies it out, so when the copy faults the bytes are
+already gone -- from a pipe, or past a file's offset. Linux copies first and
+consumes only what it copied: after `read(pipe, bad, 16)` fails EFAULT, the next
+read on Linux returns the 16 bytes, and on AOK it returns EAGAIN (measured on
+camd and alpine-arm64-test). Any bad buffer does it, not only a page past EOF.
 
-So every guest `.data`/`.bss` page is executable and any guest JIT's W^X
-discipline is decorative. Graded a mitigation gap rather than a hole: it takes
-a separate memory-corruption bug in guest software to matter.
+**On device, a store into the host page that holds EOF.** kernel/exec.c's
+split_tail comment records APFS failing the copy-on-write page-in of a host page
+that straddles EOF, on iOS. A syscall's copy into such a page is guarded like
+any other (EFAULT) and the guest's own store is a guest SIGBUS, where Linux lets
+a store into the guest page holding EOF succeed. Not reproduced on macOS 26,
+where that store succeeds (host probe, 2026-09-25); unmeasured on a device.
 
-**Why it is not fixed here, and what it would take.** The instruction-fetch
-path has no access type of its own -- `emu/tlb.h` fills the TLB for a fetch
-with `MEM_READ` -- so there is nothing for a check to hang off. Two designs
-were considered:
+**Debug-only readers are unguarded.** emu/amd64_interp.c's trace functions and
+kernel/user.c's htop trace `memcpy` from `mem_ptr` directly; each runs only
+behind its own `ISH_*` trace knob.
 
-- *A TLB bit.* `struct tlb_entry` is `page`, `page_if_writable`,
-  `data_minus_addr` -- 16 bytes, 1024 entries. Adding `page_if_executable`
-  pushes it to 24 and grows the emulator's hottest structure by half. Rejected
-  on cost.
+### FIXED 2026-10-01: `fcntl(F_GETFL)` on a pipe reported an O_NONBLOCK the guest never set
 
-- *Check once per compiled block, invalidate on revoke.* This is the right
-  shape and is nearly free: `jit_block_compile_common` runs once per block, so
-  the check lands exactly where Linux's fault-on-fetch would, and
-  `jit_invalidate_page` (already used for self-modifying code) handles the
-  revoke half when `pt_set_flags` clears P_EXEC.
-
-  The obstacle is fault delivery. `jit_block_compile*` returning NULL already
-  means OOM, and every dispatch loop responds by flushing the entire JIT,
-  retrying, and then killing the task with a "JIT OOM" printk. A non-executable
-  page needs a *distinct* signal threaded out to raise INT_PF with the faulting
-  address instead -- and there are four dispatch loops (i386, amd64, arm64,
-  riscv64), each with its own OOM and crash-unwind structure. The interpreter
-  build needs its own check as well.
-
-That is a contained project rather than a patch, and it touches the one path
-where a mistake stops every guest from running. Worth doing deliberately, with
-its own before/after benchmark run, rather than folded into a conformance
-sweep.
-
-### `fcntl(F_GETFL)` on a pipe reports an O_NONBLOCK the guest never set
+realfs_getflags now answers O_APPEND and O_NONBLOCK from fd->flags (see the F_GETFL entry above); tests/manual/fcntl_getfl_flags.c covers the get-set-restore idiom. The original diagnosis follows.
 
 Found 2026-08-23 while writing `native_ptrace_group_stop.c`, whose drain step
 did the textbook thing and got bitten:
@@ -420,1843 +1295,436 @@ the same neighbourhood as the poll/quiesce machinery. `curl` on its own shows
 the tail too, so it reproduces without Go, without yay and without the AUR:
 any repeated HTTPS handshake will do.
 
-### `pread_stack_thread_race` SIGSEGVs on i386 -- FIXED 2026-08-22
-
-**A dangling pointer to a dead stack frame, written one byte at a time by
-another thread.** `kernel/futex.c:412` publishes the address of one of its own
-STACK locals in `current->waiting_interrupt_flag` (`&wait.interrupted`) just
-before calling `wait_for`, and `wait_for_internal` (util/sync.c:180) is the only
-place that pointer is ever cleared. `wait_for`'s FIRST early return --
-`consume_wait_interrupted() || is_signal_pending(lock)` -- skips
-`wait_for_internal` entirely. So `futex_wait_masked` returns `_EINTR`, its frame
-dies, and `task->waiting_interrupt_flag` goes on pointing into it. From then on
-`wake_waiting_task` (kernel/signal.c:341) does
-
-    __atomic_store_n(waiting_interrupt_flag, true, __ATOMIC_RELEASE);
-
-from *another* thread, into dead stack, for the rest of that task's life.
-
-**Why the crash value was always identical.** `interrupted` sits at offset 4 of
-its eight-byte word, so the stale store always writes byte 4 of some aligned
-word -- every dangling address measured ends in 4 mod 8. When the dead frame has
-been reused by libpthread's `pthread_cond_wait` cleanup record, that word is the
-record's `__next`, and setting byte 4 of it makes exactly **0x100000000**. The
-thread dies later inside `pthread_exit` following it, on a frame with nothing of
-ours on it. Not a coincidence, not a stray value: one byte at a fixed
-sub-offset.
-
-Fixed by clearing the pointer on that early return. `ISH_WAITFLAG_LEAK=1`
-restores the old behaviour so the fix can be A/B'd on one binary, and
-`ISH_WAITFLAG_TRACE=1` proves the knob actually toggles it -- an A/B whose two
-arms behave identically looks exactly like an A/B whose subject does not matter.
-
-**Proven by counting the bug, not by waiting for it.** The SIGSEGV is the
-~1.3%-per-run tail of this: only a small fraction of stale stores happen to
-land on a live cleanup record, so proving a fix that way needs hundreds of runs
-per arm and a lot of patience with noise. `task->waiting_interrupt_flag` is only
-ever set to `&wait.interrupted`, so the containing `struct futex_wait` is
-recoverable and its magic says whether that object is still live --
-`futex_wait_flag_is_live()`, checked at the store site in `wake_waiting_task`,
-counts the defect directly:
-
-    ISH_WAITFLAG_LEAK=1 (bug restored)   12 runs, 17 stale stores
-    fix active                           12 runs,  0
-
-Twelve runs an arm, perfectly separated. tier0 is green on both arches with the
-fix in (113 passed, 0 failed, 4 environmental skips).
-
-**What had to be corrected on the way, because each one cost time:**
-
-- **"A nonzero `__cleanup_stack` is corruption by definition" is false.** Darwin's
-  `pthread_cond_wait` pushes a cleanup record itself, so every thread parked in
-  `wait_for`, `mem_quiesce_park` or `wrlock_acquire_locked` has one. A watcher
-  that reported any nonzero value fired on **12 runs out of 12**, every time on
-  a thread sitting innocently in `mem_quiesce_park`. The real invariant is NULL,
-  or a pointer into this thread's own 4 MB stack.
-- **`printk` goes to fd 555**, which an ordinary CLI run never opens -- and zsh
-  cannot even parse `555>file` to attach it. Two separate "nothing fired"
-  results in this hunt were a disconnected channel, not a zero, and one of them
-  would have closed the case an hour earlier. Diagnostics in a CLI debugging run
-  belong on stderr.
-- **Nine `sig`-changed reports** that looked like the corruption enriching on
-  exiting threads were the watcher racing a thread's own teardown. The tell was
-  in the report itself: the victim was missing from its own registered-threads
-  list, and the value differed every time, where all twelve genuine catches had
-  it present with exactly 0x100000000.
-- **Ten hardware-watchpoint traps** named `notify()` in the futex wake path. The
-  handler now re-reads the owner's `__cleanup_stack` at trap time and all ten
-  came back *record already popped* -- a stale watch address, legitimate stores.
-- **A census of cross-thread stack writes** initially listed three JIT gadgets,
-  which reads as a spectacular finding and was the masked watch window
-  overshooting above the struct into a guest page. Filter by address, not by
-  window geometry.
-- **The instrument itself shipped a crash.** The counter that killed the
-  leaked-record theory read a `__thread` variable from inside
-  `sigusr1_handler`, and the first read of an uninstantiated one goes through
-  dyld's `_tlv_get_addr`, which mallocs. A signal landing on a thread already
-  inside malloc -- `pthread_exit` freeing its TSD -- then re-enters the malloc
-  lock and aborts in `_os_unfair_lock_recursive_abort`. It looked safe because
-  the handler's `thread_locals_ready()` guard is right there, but that guard
-  only covers the variables `signal_thread_locals_init()` instantiates by hand.
-  Any NEW `__thread` variable in that handler is a fresh landmine. Found from a
-  stray `.ips` in the A/B lane, not from the test.
-- **The leaked-cleanup-record theory** (a `siglongjmp` abandoning a
-  `pthread_cond_wait` frame) is dead: a counter on `sigusr1_handler`'s
-  `siglongjmp` reads zero, because this test never reaches a
-  `sigunwind_start()` window at all.
-
-**Measurements worth keeping.** The corruption is transient -- it ping-pongs
-between the head and a record's `__next` as records are pushed and popped, and
-only kills the thread if it reaches `pthread_exit` while the value is in the
-head, which is why the crash is a flake rather than every run. Rate without
-instrumentation was **3 in 200** on this machine, not the 1-in-8 the original
-entry recorded. `ISH_MEM_QUARANTINE` is complete (emu/memory.c:823 is the only
-`munmap` of guest page data), so its earlier refutation stands -- though note it
-cannot see a kernel copyout, which returns EFAULT to a PROT_NONE page in
-silence. libpthread legitimately writes OTHER threads' `struct _pthread` at
-+16/+24 (the global thread list), measured at 200 runs out of 200; `+8` carries
-none of that traffic.
-
-**Two guards in kernel/futex.c that came out of this.** `futex_wait_is_live()`:
-`struct futex_wait` is a stack local published on a shared queue, so every wake
-path runs `pthread_cond_broadcast` over another task thread's stack -- a magic
-set when it is built and cleared when it leaves the queue means a stale entry is
-dequeued and reported rather than notified. It has never fired, which is the
-answer that theory deserved. `ISH_FUTEX_HEAP_WAIT=1|2` is the A/B harness built
-for it, with a decoy arm; the theory did not survive, but the harness is the
-shape to copy.
-
-**Knobs, all in kernel/task.c:**
-
-- `ISH_PTHREAD_CANARY=1` -- register every task thread's `self` and watch
-  `__cleanup_stack` and the cleanup chain's `__next` links, plus self-checks on
-  the owning thread. On a violation it suspends every other thread with the mach
-  APIs and dumps registers and a frame-pointer backtrace for each, then exits 66.
-  The report prints the image slide, so `atos -o build/ish -l <load address>`
-  symbolises it.
-- `ISH_PTHREAD_WATCH=1|record|stack|census` -- arm64 hardware watchpoints via
-  `thread_set_state(ARM_DEBUG_STATE64)`, which works in-process on this host.
-  `record` watches the live cleanup record, `census` lists every instruction that
-  stores into another task thread's stack.
-- `ISH_PTHREAD_WATCH_SELFTEST=1` -- positive control. A watchpoint that was never
-  applied looks exactly like one that was never hit. Run it before believing a
-  quiet watch run; the same discipline is what caught the fd-555 problem above.
-
-**Do not write a tier0 failure of this test off as "the known flake" any
-more.** That reflex is what kept this one invisible.
-
-<!-- superseded detail below retained deliberately -->
-### Original entry: `pread_stack_thread_race` SIGSEGVs on i386, about 1 run in 8
-
-Split out of the hang entry above once the hang was fixed and stopped hiding
-it. **Pre-existing, and NOT caused by the jetsam fix**: measured on a binary
-built before that change (1 in 8), and it survives the fix at about the same
-rate.
-
-The run dies with rc=139 and produces no output at all -- not even the test's
-first line -- so it is dying early, and the empty output is itself a clue worth
-starting from. amd64 has not shown it in 12 runs; only i386 so far.
-
-Next step is the same one that settled the hang: catch one and look, rather
-than reason from the symptom. `scratchpad/catch_hang.sh` in the working notes
-is the shape to copy -- run in a loop, and when the exit status is 139 rather
-than a timeout, get a core or attach before it goes.
-
-**Do not write a tier0 failure of this test off as "the known flake" any
-more.** That reflex is what kept this one invisible.
-
-## Closed during the 550 cycle
-
-### A traced NATIVE program never reported its group-stop -- FIXED 2026-08-23
-
-The other half of the entry below, found by reading it and confirmed by
-running it. `strace` (or any tracer) attached to a program iSH-AOK runs as
-HOST code hung the moment that program was ^Z'd: no stop report ever reached
-the tracer, so its `wait4` waited forever.
-
-**Why the native path has a second copy of anything.** A native program
-(`kernel/native.h`) is not translated -- it runs as host C on the guest task's
-own thread -- so nothing dispatches instructions for it and `handle_interrupt`
-never runs. It polls instead, at `native_checkpoint()` (`kernel/native.c`),
-which is called from every syscall the libc shim makes. That function carried
-its own group-stop wait, whose comment said it mirrored `handle_interrupt` and
-which did not:
-
-    struct tgroup *group = current->group;
-    if (group->stopped) {
-        lock(&group->lock, 0);
-        while (group->stopped)
-            wait_for_ignore_signals(&group->stopped_cond, &group->lock, NULL);
-        unlock(&group->lock);
-    }
-
-No `ptrace_group_stop()` on the way in, so the stop was invisible to the
-tracer, and no re-check of `ptrace.traced` while parked, so the
-attach-after-stop order below was unreachable too. Both attach orders hung.
-
-**Confirmed before fixing**, with `/AOK/native/smallclue` invoked as `yes` on
-an aarch64 guest: the child group-stops (the parent's `waitpid(WUNTRACED)`
-reports it), `PTRACE_SEIZE` succeeds, and the next `wait4` never returns.
-`lldb -p` on the hung run named the frame outright -- `native_checkpoint` at
-`native.c:627`, in `wait_for_ignore_signals`, under `nlibc_write` under
-smallclue's `yes` loop. Native programs are perfectly traceable otherwise:
-`receive_signals` already routes a traced task's signals through
-`signal_delivery_stop`, and `native_checkpoint` already calls it. It was only
-the group-stop that had no path to the tracer.
-
-**Fixed by deleting the second copy rather than repairing it.** The
-group-stop wait now lives once, as `group_stop_wait()` in `kernel/signal.c`,
-and both `handle_interrupt` and `native_checkpoint` call it. Copy-and-drift is
-what produced the bug -- the native copy was written from the translated one
-and then never tracked its ptrace fixes -- so one function is the fix for the
-class, not just for this instance. The native path also gains the
-`group->continued` notify it never had, which wakes a parent blocked in
-`wait4`/`waitid(WCONTINUED)` when a native program is SIGCONT'd.
-
-`tests/manual/native_ptrace_group_stop.c` is the guard. Four cases: both
-attach orders, against a native program AND against an ordinary guest ELF as a
-control (the control is the whole test on a Linux oracle, which has no native
-dispatch). Like `ptrace_group_stop.c` it FORCES the attach-after-stop order
-with `waitpid(WUNTRACED)` rather than racing for it. Two details worth
-keeping:
-
-* The victim writes into a pipe forever. The first read proves the program is
-  really running, so the stop lands inside it rather than somewhere in exec;
-  and draining that pipe *while the child is stopped* makes a later successful
-  read positive proof it was RESUMED. "It died when I killed it" proves
-  nothing -- SIGKILL reaps a stopped task too.
-* The watchdog names the case it timed out in. stdout is block-buffered when
-  the suite captures it and a signal handler cannot safely flush it, so
-  without that a hang reports only "timeout" and every `test_logf` line is
-  lost -- including the one saying whether it was the control or the subject
-  that hung. The first A/B run was misread for exactly that reason.
-
-A/B'd with the kernel change stashed: `FAIL timeout in case
-native_stop_after_attach` without it, PASS with it, and `ptrace_group_stop`
-passes either way (its half was already fixed).
-
-### #542: the JVM will not start on aarch64 -- FIXED 2026-08-23, and it was one bit
-
-`apk add openjdk21` then `java -version` on an aarch64 guest died before any
-Java code ran:
-
-    # Internal Error (assembler_aarch64.hpp:245), pid=947,
-    # guarantee(val < (1ULL << nbits)) failed: Field too big for insn
-
-The reporter had already ruled out the two usual suspects -- it failed
-identically under `-Xint` and `-Xshare:off`, so neither the JIT nor
-class-data-sharing. Reproduces exactly on the CLI build against
-`build/alpine-arm64-test`.
-
-**The value HotSpot could not encode was -1, and `hs_err` says so.** That file
-prints a register dump, and `R1=0x00000000ffffffff` is the `unsigned val`
-argument of `Instruction_aarch64::patch`. Alpine ships `libjvm.so` stripped, but
-the frame offsets in the report are enough: disassembling `libjvm.so+0x8af230`
-(the caller) shows `sub w1, w21, #1` / `bl <encode_logical_immediate>` /
-`patch(insn, val, 22, 10)` against an instruction word of `0x92000000`. Bits
-22:10 of an `AND (immediate)` are the N:immr:imms logical immediate, and
-`encode_logical_immediate` returns `0xffffffff` for an immediate that cannot be
-encoded. So: `and Xd, Xn, #(w21 - 1)` where `w21 - 1` came out unencodable. The
-same GOT slot is written in `VM_Version::get_os_cpu_info`, right after `mrs x3,
-DCZID_EL0` -- `w21` is `VM_Version::_zva_length`, and the caller is
-`MacroAssembler::zero_dcache_blocks`.
-
-**AOK reported DCZID_EL0 = 0x10 -- DZP=1, "DC ZVA prohibited at EL0".** That was
-a deliberate choice made to avoid implementing DC ZVA: `jit/gen.c` returned the
-constant, and the instruction itself fell through to SIGILL. HotSpot reads that
-bit, leaves `_zva_length` at its 0 initializer, and then goes on generating
-`zero_blocks` anyway, because `UseBlockZeroing` is a separate flag and defaults
-on. `andr(tmp, tmp, zva_length - 1)` is `and Xd, Xn, #0xffffffffffffffff`, and a
-mask of all ones is one of the two values the AArch64 logical-immediate encoding
-cannot represent. The JVM died in its own assembler.
-
-Confirmed before changing anything -- `java -XX:-UseBlockZeroing -version`
-starts cleanly on the unmodified build.
-
-**Linux enables DC ZVA for userspace** -- `SCTLR_EL1.DZE` is set in the kernel's
-SCTLR_EL1 init, so DZP reads 0 at EL0 on every aarch64 Linux box. DZP=1 was a
-state the JVM's target platform does not present, and HotSpot is not much at
-fault for never having been tested against it. That makes this ours rather than
-upstream's: AOK was describing a machine that does not exist. The fix is to
-stop:
-
-* `DCZID_EL0` now reads `0x4` -- DZP=0, BS=4, a 64-byte block, which is what
-  every real AArch64 core reports.
-* `DC ZVA` gets a real gadget (`gadget_arm64_dc_zva`, `jit/guest-arm64/
-  memory.S`): align the operand down, one `write_prep`, four `stp xzr, xzr`.
-
-Aligning down **before** `write_prep` is load-bearing rather than tidy. A
-64-byte-aligned address has a page offset of at most `0xfc0`, which is exactly
-`write_prep`'s `cmp x9, #(0x1000-64)` bound, so the crosspage branch is
-provably dead -- and it had to be, because the crosspage buffer (`LOCAL_value`,
-`jit/frame.h`) is 32 bytes and a 64-byte crosspage access would run off the end
-of it. The TLB *miss* path is very much live, so `write_bullshit` stays.
-
-**This also turns DC ZVA on for libc, which is a far bigger behaviour change
-than the JVM fix.** Both glibc's and musl's `memset` read DCZID_EL0 at runtime
-and skip their zeroing loops when DZP is set -- which is why no arm64 guest ever
-hit the old SIGILL. They will now, on every large `memset` in every aarch64
-guest. Verified two ways on `build/devuan-arm64-uv` (glibc 2.41): a
-`ctypes.memset` sweep over every offset/length combination that straddles a
-64-byte granule is byte-exact, and an lldb breakpoint on the gadget confirms
-libc genuinely reaches it rather than the test proving nothing. The same
-breakpoint fires in the Alpine (musl) root, so this is not a glibc-only change.
-
-That blast radius is the reason the regression suite mattered here, and it
-earned its keep: it turned up a **second, unrelated bug** that this change made
-reproducible -- see the next entry.
-
-`java -version`, `javac`, and a 4000-array allocation loop now run, and give
-identical results in mixed mode, `-Xint` and `-Xshare:off`.
-
-New test: `tests/manual/arm64/dc_zva.c`. It checks the two halves against each
-other -- DCZID_EL0.BS versus the granule DC ZVA *observes* zeroing -- because a
-block size that does not match what the instruction does is silent corruption,
-not a fault. Plus alignment-down, untouched neighbours, the last block of a
-page, a 24-page sweep for the TLB-miss path, a copy-on-write fault taken by the
-instruction itself, and SIGSEGV on a read-only page and on `dc zva, xzr`.
-Before the fix every one of those raises SIGILL.
-
-### PTRACE_SEIZE of an already-stopped tracee hung forever -- FIXED 2026-08-23, and DC ZVA is how it was found
-
-`ptrace_group_stop` started failing in the arm64 suite the moment the DC ZVA
-gadget above landed: `FAIL timeout (no group-stop report / never resumed)`. It
-passed standalone and failed in the suite, which reads exactly like the
-load-flake class -- and it is not one. Flipping DCZID_EL0 back to DZP=1 in the
-same binary made it pass; flipping it to DZP=0 made it fail. Causal, in one
-build, both directions.
-
-**What it actually was.** `lldb -p` on the hung process, `thread backtrace all`:
-
-* the tracer (pid 59) in `do_wait` -> `wait_for`, waiting for the tracee;
-* the tracee (pid 60) in `handle_interrupt` at `calls.c:6299` --
-  `wait_for_ignore_signals(&group->stopped_cond, ...)`, the **untraced**
-  job-control wait.
-
-That second frame is the whole answer. `handle_interrupt` tested
-`current->ptrace.traced` once, on entry, and only then fell into the plain
-job-control wait. `PTRACE_SEIZE` sets `traced` on the tracee from the tracer's
-thread and does not wake it. So a tracee that reached `raise(SIGSTOP)` before
-its tracer reached `ptrace()` parked in a wait that nothing would ever notify,
-never noticed it had become traced, and never reported the group-stop. The
-tracer's `wait4` then waited for a report that could not arrive.
-
-Nothing synchronises those two events in the test, so the losing order was
-always reachable -- the parent just always won. DC ZVA shifted musl's `memset`
-timing enough to flip that, every time. Linux handles the same race from the
-other side: `ptrace_attach()` explicitly wakes a `__TASK_STOPPED` tracee so it
-can re-enter the trap and report.
-
-Fixed on both sides, matching that:
-
-* `kernel/ptrace.c` -- `PTRACE_SEIZE` notifies `group->stopped_cond` when the
-  tracee it just seized is already group-stopped. Done with `pids_lock` still
-  held (it keeps the task alive and `pids_lock` -> `group->lock` is the
-  established order) and after dropping `ptrace.lock`.
-* `kernel/calls.c` -- the group-stop wait re-checks `ptrace.traced` on every
-  pass instead of once on entry, so the woken tracee goes to
-  `ptrace_group_stop()` and reports.
-
-`tests/manual/ptrace_group_stop.c` gained a second case for the attach-after-
-stop order, and it **forces** that order with `waitpid(WUNTRACED)` rather than
-racing for it: a test that only fails when the scheduler cooperates would have
-reported this fixed while it was still broken. A/B'd on its own with the kernel
-fix stashed -- hangs to the watchdog without it, passes with it.
-
-**Noticed while reading, and now fixed:** the native-program path had its own
-group-stop wait (`kernel/native.c`, the `^Z` block) with no ptrace handling at
-all. Confirmed real and fixed the same day -- see *A traced NATIVE program
-never reported its group-stop* above.
-
-**Worth remembering:** "passes alone, fails in the suite" is the signature of a
-load flake, and this project has a documented one (`time_conformance`). It is
-also the signature of a real bug that needs a warm machine to lose a race. The
-thing that separated them was not more re-runs -- it was one A/B on the
-suspected cause, and then a backtrace.
-
-### Typed characters arrived out of order -- FIXED 2026-08-23, and only h/j/k/l ever moved
-
-Typing quickly into the terminal delivered characters transposed, always with a
-later character jumping toward the front: `mkdir big` -> `kmdir big`,
-`cd /etc/apk` -> `cd k/etc/ap`, `clear; touch "my file;rm.txt"` ->
-`clear; htoucl "my fie;rm.txt"`. The shell genuinely received the wrong bytes,
-so it was neither a rendering artifact nor dropped input.
-
-**Every displaced character is in `hjkl`, and nothing else ever moves.** That is
-the whole diagnosis. `app/TerminalView.m` registered those four as bare
-`UIKeyCommand`s (added 2026-03-23 in `4c10b28af`) so that a held key would
-repeat -- UIKit only repeats keys a key command has claimed. But claiming a key
-also changes how it is delivered:
-
-* a key command is dispatched straight off the key event -- measured **0.3 ms**
-  after the press;
-* every other printable character reaches `-insertText:` through UIKit's
-  text-input pipeline -- measured **~5 ms** after the press, and further behind
-  once that pipeline has a backlog.
-
-Two delivery paths, nothing sequencing them. Each stream stayed internally
-ordered and they interleaved wrongly, which is exactly the observed shape:
-`abcdefghijklmnopqrst` reached the tty as `abcdhejkflgimnopqrst`, the sixteen
-other letters still in order.
-
-**Does it affect real users? Measured: no, not by typing.** Injecting a
-`ghghghghgh` alternation at controlled rates, order held at 11 ms between
-keystrokes and first broke at 5.6 ms -- about 90 keystrokes/second. It stayed
-correct at 40-100 ms with the terminal under heavy render load (a `yes` flood),
-because a busy main thread delays both paths together rather than spreading
-them. The software keyboard, paste and autocorrect never enter the key-command
-path at all, and key repeat is self-consistent. So the reordering needs a
-machine at the keyboard: synthetic injection, a macro key, a scanner, anything
-delivering faster than ~90 keys/s. It is still a defect -- the terminal has no
-business reordering what it is handed -- and it was worth fixing on those terms,
-not as a user-facing regression.
-
-**The fix** (`app/TerminalView.m`) drops the four bare key-command registrations
-so the letters travel the same in-order path as the rest of the alphabet, and
-synthesises the held-key repeat from `-pressesBegan:`/`-pressesEnded:` instead,
-at the delay and interval UIKit's own key-command repeat was measured using
-(0.4 s, then 0.1 s). The first character of a hold now comes from the ordinary
-text path, so only the repeats are synthetic.
-
-**Verified in the Xcode Simulator build**, same device and same harness for
-both sides, comparing the keys the app received against the bytes that reached
-the tty: baseline reordered 5 runs out of 5 at 2-3 ms per key, the fix preserved
-order 5 out of 5. End to end through the guest tty, all eight test lines --
-including every string from the original report and `hjkl hjkl hjkl kjhl lkjh`
--- came back byte-exact. Held h/j/k/l still deliver 7 characters over ~1.3 s,
-identical to the old behaviour, and an unregistered letter still delivers 1.
-
-Two things worth knowing about the harness, both of which cost time here:
-
-* `xcrun simctl`-style injection drops keys below about 3 ms spacing, and a
-  dropped key looks exactly like a reordering failure in a naive string compare.
-  Log what the app actually *received* alongside what it delivered; the diff
-  between those two is the only honest signal.
-* Another session on this machine was installing its own build onto the same
-  booted simulator, which silently replaced the binary under test and wiped the
-  guest root twice. Check the installed binary's hash before trusting a
-  measurement, or boot a private device.
-
-**The residual is fixed too, the same day.** Taking the vi keys off the
-key-command path cured the reported symptom but left the mechanism standing:
-arrows, Tab, Esc, the function keys and the Ctrl chords are still key commands
-and kept the same ~5 ms head start over typed text. Same defect, same window,
-just a rarer trigger -- it needs a special key inside those 5 ms rather than one
-of four very common letters. Reproduced by interleaving Left arrows with typed
-characters and capturing what the tty actually got: `a<Left>b<Left>...` arrived
-as `a<Left><Left>b<Left>c<Left>d<Left>e<Left>f<Left>gh<Left>`, 3 runs out of 3.
-Nothing was lost -- eight letters and eight arrows both times -- only reordered.
-
-`-pressesBegan:` turns out to see **every** hardware key, in true press order,
-before either route runs, including keys a UIKeyCommand goes on to claim. That
-makes it the one place that knows what order the user typed in, so it is where
-the ordering is now enforced (`app/TerminalView.m`): each press that can produce
-input reserves a slot, whichever route produces the bytes fills that press's
-slot, and slots are emitted strictly from the front.
-
-Three things keep it from being worse than the disease it cures:
-
-* **A lone keystroke costs nothing.** It fills the only slot and flushes in the
-  same call, so the common case adds no latency at all. Only overlapping presses
-  ever wait.
-* **Every uncertain case degrades to sending immediately**, which is exactly the
-  behaviour before any of this existed. A mis-identified slot can fail to
-  improve the ordering; it cannot lose or duplicate a keystroke.
-* **Nothing can hold the queue indefinitely.** A press that produces no input --
-  a chord belonging to another responder, a keystroke swallowed into an IME
-  composition -- is written off after 75 ms. That has to clear the worst
-  text-path latency (25 ms, cold) by a wide margin, because giving up early is
-  what reintroduces the reordering. Presses that cannot reach the tty at all
-  (a modifier on its own, any Command chord) never reserve a slot in the first
-  place.
-
-Key repeat needed care: UIKit repeats a held key by calling `-handleKeyCommand:`
-again with **no press in between**, so a repeat must not take a reservation
-belonging to a key typed a millisecond earlier. The claim is checked against the
-press's own characters, and an unmatched claim is dropped.
-
-Verified on a private simulator, same device and harness for baseline and fix:
-arrows interleaved with text went from 3/3 reordered to 4/4 byte-exact; a
-ten-line regression capture came back byte-exact with no loss or duplication,
-including Tab and Esc landing in place and a hardware Ctrl-A arriving exactly
-between the `x` and `y` it was typed between; held Left arrow still repeats 7
-times over ~1.3 s, as do h/j/k/l, while an unregistered letter still yields 1;
-and the on-screen keyboard and the Ctrl accessory key both still work. Command
-chords and Cmd+V paste could not be driven from this harness -- the Simulator
-eats Cmd for its own shortcuts -- but Command presses never enter the queue by
-construction, and paste reaches the empty-queue immediate path.
-
-### The file browsers froze behind bulk transfers -- FIXED 2026-08-23
-
-`GuestFileBridge` ran everything on one serial queue -- directory listings,
-stat, statfs, mkdir, rename, delete, whole-file reads and writes, chunked
-extraction, cross-backend copies -- so a large copy or extraction sat in front
-of every short operation behind it. The file manager made that maximally
-visible: `-setLoading:` (app/WorkspaceFileManager.m) holds
-`userInteractionEnabled = NO` for the whole load, so the folder was not merely
-stale, it was untappable. That is the mechanism behind the reports of the file
-manager going "completely unresponsive trying to do anything with the folder,
-including just viewing it".
-
-**Fixed by separating latency classes, not by adding parallelism.** Two SERIAL
-lanes, interactive and bulk. Concurrency was never the answer here: AOK's fakefs
-metadata mutex already saturates under a single thread (78% duty under
-`ISH_FAKEFS_LOCKSTATS`) and parallel metadata work measures slower. What was
-wrong was that a `readdir` of twelve entries queued behind a 300 MB transfer.
-
-Design and the full reasoning: [guest_file_bridge_lanes.md](guest_file_bridge_lanes.md).
-
-**The ordering question, which is where a naive split goes wrong.** Callers do
-write-then-reload (new folder, rename, duplicate, delete, then `-reload`) and
-expect the listing to show the result. Reading every call site settled it: they
-all issue the reload *from inside the mutation's completion block*, so the
-happens-before is the completion's, not the queue's, and splitting cannot break
-it. The `ioQueue` property that existed so callers could order their own work
-behind pending operations had **no users**; it is gone from the header so nobody
-can rebuild a dependency on a total order that no longer exists.
-
-That was not left to caller discipline. The bridge keeps a table of the claims
-held on each lane and enforces per-path ordering itself, under one invariant:
-**the interactive lane never waits** -- an interactive operation that would have
-to wait is re-routed onto the bulk lane behind the work it must follow, while
-the bulk lane may block, because it is already slow. No cycle, so no deadlock.
-
-**Three bugs found by testing it, all in the first draft of my own work:**
-
-- The claim-conflict rule started as "equal, or one is an ancestor of the
-  other". `/` is an ancestor of everything, so a copy into `/tmp/foo` conflicted
-  with a listing of `/` -- any transfer anywhere would have pushed every listing
-  of `/` onto the bulk lane, which is the exact blocking being removed. The rule
-  is now: same path, a path and its parent directory, and (for a recursive
-  delete alone) a subtree and anything inside it.
-- `WorkspaceImageViewer`'s sibling scan had no generation guard, so once
-  cancellation existed, a scan cancelled by the next `loadPath:` landed
-  afterward and cleared the token that load had just stored.
-- The cross-lane barrier is a `dispatch_sync` onto the interactive lane, which
-  self-deadlocks when `ISH_BRIDGE_SINGLE_LANE` makes the two lanes the same
-  queue -- and it duly did, the first time the control run reached section 4.
-  The shipping path was never exposed to it (the barrier is only ever set for
-  work heading to the bulk lane), but the knob is only useful if it runs, so the
-  barrier is now skipped when the queues are identical, where the ordering it
-  restores is already the queue's own.
-
-**Also folded in: listings are cancellable.** They had no token at all, and
-`ShellFileBrowser`'s `_loadGeneration` guard discarded the *answer*, not the
-*work* -- dismissing a sheet over a big directory left the whole enumeration
-running. `ISHGuestFileOperationToken` now covers listings, whole-file reads,
-extraction, and the cross-store copy (which previously ran to completion even
-when cancelled). Recursive delete is deliberately NOT cancellable: stopping a
-tree walk halfway leaves a half-deleted tree and no way to say what survived.
-
-**Measured, not asserted.** `ISH_BRIDGE_LANE_SELFTEST=<MiB>` runs a harness
-against the live guest fs at launch, and `ISH_BRIDGE_SINGLE_LANE=1` collapses
-the lanes back into one so the control is taken on the same hardware in the same
-binary. iPhone 17 Pro simulator, 64 MiB payload, listing `/etc` with the bulk
-lane saturated by continuous copies (mean 19-20ms each):
-
-                                    under load            idle baseline
-    one lane (the old behaviour)    mean 19.8ms worst 77.3ms    1.3 / 7.6ms
-    two lanes                       mean  1.6ms worst  7.7ms    0.8 / 5.7ms
-
-so listing latency under load drops about 12x on the mean and 10x on the worst
-case, and lands within noise of the idle baseline. Under one lane the mean
-listing costs almost exactly one copy, which is the head-of-line blocking stated
-as a number; the worst is four copies, because a listing there queues behind
-several. Section 1 correctly FAILS its own bar in the control run.
-
-Ordering held in both configurations: 40 iterations of write-then-reload under
-bulk load, 0 mismatches; 40 iterations of mutation-then-listing enqueued back to
-back *without* chaining through the completion, 0 same-lane and 0 cross-lane
-misses; 30 iterations of unchained write-then-copy, 0 stale reads. Cancelling a
-900-entry listing mid-walk cut it from 9.5ms to 2.8ms, so the work stops rather
-than the answer being thrown away.
-
-The claim-conflict truth table is also checked directly, including the `/` case
-above and the `/ab` vs `/abc` component-boundary trap.
-
-And by hand in `ShellFileBrowser` on the simulator, against a 400 MB file, since
-the harness drives the bridge and not the widget: Duplicate (a 400 MB bulk copy),
-New Folder, Rename and Delete each showed their result in the reload that
-followed. Note the simulator is far too fast for a wall-clock freeze demo -- it
-writes 400 MB through fakefs at 2.6 GB/s -- which is why the numbers above come
-from saturating the lane rather than from timing one copy.
-
-**The extraction leak is closed -- FIXED 2026-08-23.** `-clearExtractionCache`
-had no caller despite its own documentation saying it should run at app launch,
-so every video played and every image shared out of a fakefs root left a
-full-size copy in `NSTemporaryDirectory()/GuestFileBridgeExtractions` that no
-later run could even find to reuse -- the cache keyed to those files is
-in-memory, so it dies with the process while the files do not.
-`-application:didFinishLaunchingWithOptions:` now calls it. Nothing can be
-holding a URL from a previous run for the same reason the files were
-unreachable, and the call is a `dispatch_async` onto the bulk lane with no path
-claims, so it does not hold launch.
-
-**Still open in this area.** Copy and move return cancellation tokens that no UI
-drives yet.
-
-
-### SmallCLUE's pager wedged apt -- FIXED 2026-08-22, and it was not the pager
-
-`apt search maria` hung the whole app, every time, and removing
-/usr/local/native-bin/less cured it. This entry used to say the trigger was
-uncharacterised and name the pager's read-it-all spooling as the likely shape.
-The spooling was real and is gone now, but it was not the trigger.
-
-**The trigger was close-on-exec, and it was ours.** APT learns whether its pager
-exec'd by handing the child a close-on-exec pipe and reading four bytes from it:
-EOF means the exec happened and closed the write end; four bytes of errno mean
-it did not. `kernel/exec.c`'s native dispatch (`/AOK/native/*`) returned from
-`__do_execve` the moment it had recorded the program to run -- before
-`fdtable_do_cloexec`, before the signal-handler reset, before `vfork_notify`.
-The write end therefore survived into the pager, apt's read never saw EOF, and
-apt sat on four bytes while the pager sat on the stdin apt had not begun
-writing. That is both backtraces, exactly.
-
-It also explains the observation that stopped the last attempt: `PAGER=<path>
-apt search maria` COMPLETED. Anything that puts a real exec between apt and the
-native pager -- a shell script, an interpreter -- closes the pipe on apt's
-behalf, and the pager that runs after it is not the exec apt was watching.
-
-**And how apt found the pager at all**, which the old entry called a clue and
-could not resolve: `opt/AOK/tools/provision-ultimate-devuan.sh` exports
-`PAGER=less`, a BARE name. apt resolves that on PATH, and native-links.sh puts
-/usr/local/native-bin first on PATH through /etc/profile.d. A non-login ssh
-session never sources /etc/profile.d -- which is why seven attempts there kept
-getting /usr/bin/less and never reproduced it.
-
-**Fixed in three places:**
-
-1. `kernel/exec.c` -- `exec_apply_native_process_state()` applies the
-   process-state half of an exec to a native program: close-on-exec, the
-   signal-handler reset and altstack, did_exec/keepcaps, and `vfork_notify`.
-   That last one is its own latent hang: a vfork parent was being released by
-   the native program's EXIT rather than its exec, so it stayed blocked for the
-   whole run -- and glibc's `posix_spawn` waits exactly that way.
-2. `deps/smallclue` -- the pager streams. `pagerCollectLines` read the entire
-   input before drawing a line; `pagerBufferFill` now reads only as far as the
-   reader has scrolled, so the first screen appears at once and a stream that
-   never ends is paged rather than waited on. Pipes are read a byte at a time
-   for that reason, regular files in blocks. It also took real less's other
-   rule with it -- "if the output is not a tty, less acts like cat" -- which
-   this pager applied only when it had no controlling terminal at all, so
-   `less file | head` inside a session used to draw a page down a pipe nobody
-   was watching and then wait for a keystroke nobody would type.
-3. `opt/AOK/tools/native-links.sh` -- `less` and `more` are linked again.
-
-**Verified with the actual failing case rather than a model of it:** Devuan 6
-amd64, `native-links.sh` run for real, /usr/local/native-bin first on PATH via
-the snippet the script installs, `PAGER=less`, stdout a tty, `apt search maria`.
-Before: no pager output at all, four keypresses ignored, killed at 140s. After:
-the pager draws its first screen, Q exits it, `APT RC=0`, 83s.
-`tests/manual/native_exec_cloexec.c` is the guard -- it runs apt's handshake
-against a native exec, with an ordinary exec as a control so it still means
-something on a Linux oracle, which has no native dispatch.
-
-**Two things worth keeping.** Streaming alone would NOT have fixed this: apt
-writes nothing until its read returns, so a streaming pager would still have had
-an empty pipe to wait on. And the class is wider than the pager -- EVERY native
-program was exec'ing without close-on-exec, so any parent using that handshake
-would have hung on any of them.
-
-### ptraceomatic's divergence at 4175 -- NOT AN EMULATOR BUG, FIXED 2026-08-22
-
-The emulator was right and the tool was wrong, for the third time in this
-tool's short working life. `edx: real 0x1, fake 0x800000` -- and 0x800000 is
-8388608, which is exactly camd's `ulimit -s`. The correct answer was the one
-the emulator had.
-
-**What it actually was.** ptraceomatic does not let the real process execute
-`int $0x80` at all. It intercepts the instruction, `pt_copy`s the emulated
-process's output buffer into the tracee, injects the emulated return value into
-eax, and steps the eip past it. That is what the big switch in `step_tracing`
-is for. A syscall with no case in that switch still gets its **return value**
-synced -- the code falls out of the switch into `regs.rax = cpu->eax` -- but
-nothing writes the **memory** the syscall was supposed to fill. The real
-process keeps whatever was already there.
-
-Syscall 191, `ugetrlimit`, had no case. glibc's `__libc_early_init` calls
-`getrlimit(RLIMIT_STACK, &rlim)` and then reads `rlim.rlim_cur` off the stack
-four instructions later; the emulated process had 0x800000 written into it and
-the real one still had uninitialised stack, which happened to be 1. `8b 54 24
-14` was innocent, as the entry suspected -- but the write it was missing had
-never been performed in the first place, rather than performed differently.
-
-Both variants were missing, 191 and 76 (`old_getrlimit`), and both write a
-`struct rlimit32_` through the address in ECX. Two lines fix it.
-
-**The honest alternatives, ruled out rather than assumed away:**
-
-- *auxv, initial stack, environment.* Ruled out by construction, not by
-  argument: `prepare_tracee` calls `transplant_vdso` and then `pt_copy`s the
-  emulator's entire initial stack page range into the tracee, and sets the
-  tracee's esp to the emulator's. argv, envp and auxv in the real process are
-  the emulator's own bytes. This was the entry's first suspect and it was the
-  wrong one.
-- *ASLR.* `start_tracee` sets ADDR_NO_RANDOMIZE, and the divergence reproduces
-  at exactly instruction 4175 across two different binaries built minutes
-  apart -- 0x8058b8b in one, 0x805f2cb in the other, same four bytes, same
-  values. Nothing random survives that.
-- *A syscall returning host-specific data the tool does not synchronise.* This
-  is the right family, but the direction is the reverse of the guess. The
-  problem was never that the real process saw a host value the emulator could
-  not know. It was that the emulator's answer never reached the real process.
-  The tool's design means host-specific results are *already* handled: watch
-  `readlinkat` on /proc/self/exe, where both CPUs agree on the emulated answer
-  because case 305 copies it across.
-
-**Evidence, five independent lines.** The reading instruction is four
-instructions after the `call __new_getrlimit` that fills the slot;
-`__new_getrlimit` issues `mov $0xbf,%eax` = 191; 191 is absent from the switch;
-the fake value equals the host's real RLIMIT_STACK and the real value does not;
-and removing the case reproduces the divergence exactly while adding it back
-removes it. A new `PTRACEOMATIC_TRACE_SYSCALLS=1` prints the same conclusion
-directly -- `syscall 191 -> 0   [no memory sync]` -- which is the diagnostic
-that would have found this in minutes, so it is now part of the tool.
-
-**The second bug it was hiding.** With 4175 fixed the run got 416 instructions
-further and stopped again, at `call *%gs:0x10` in `_dl_get_origin`, with esp
-off by exactly 4. `step_tracing` runs the fake CPU, and on any interrupt other
-than INT_DEBUG hands it to `handle_interrupt` -- then steps the real CPU
-regardless. But a fault the emulator resolves itself, here an INT_GPF growing
-the stack after `sub $0x101c,%esp`, leaves the faulting instruction
-**un-retired**, to be retried on the next run. The real CPU had executed the
-`call` and pushed a return address; the fake one had not moved. One instruction
-out of phase, and the next compare blames whichever instruction is next. The
-fix holds the real CPU back whenever the fake CPU takes a non-syscall interrupt
-without advancing eip, bounded at 16 consecutive holds so a genuinely stuck
-emulator reports instead of hanging.
-
-**Where it leaves the tool.** A static i386 glibc binary now runs start to
-finish with no divergence at all. Verified on four binaries, twice each, exit
-codes matching a native run: an empty `main`, /tmp/hi, a witness printing
-getrlimit's result, and a syscall-heavy one doing uname, readlink, a 1MB
-malloc-and-touch, and file I/O. An edge-case binary calling 191 and 76 directly
-matches native on all four paths including the NULL-buffer EFAULT and the
-EINVAL that must leave the buffer untouched. Both compilers build it clean.
-
-amd64 guests still die in setup with SIGSEGV -- unchanged by any of this, and
-consistent with the comment in `prepare_tracee` saying vdso and stack sync for
-amd64 is phase-2 work.
-
-**The general lesson for this tool.** Only four syscalls in a whole start-up
-were intercepted rather than executed: 258 `set_tid_address`, 311
-`set_robust_list`, 386 `rseq`, and 191. The first three write no guest memory,
-so exactly one of the four needed a case and exactly that one was missing. When
-ptraceomatic next reports a memory divergence, run it with
-PTRACEOMATIC_TRACE_SYSCALLS=1 and read the `[no memory sync]` lines before
-reading the emulator.
-
-### CI was red for the whole 550 cycle -- FIXED 2026-08-22
-
-Found by release verification, not by anything failing locally. Every commit
-since 549 had failed CI, on three jobs, for two unrelated reasons. Neither
-shows up in an Xcode build, which is why neither was noticed.
-
-**Linux (clang and gcc).** `kernel/native_libc.c` included `<sys/sysctl.h>`
-unconditionally; glibc dropped it and musl never had it. A second one behind
-it: `kernel/native_kqueue.c` included `<sys/event.h>`, kqueue being BSD-only.
-Every other Darwin-only include in the non-app sources was already guarded, so
-these were the only two gaps -- which is why the build stopped at exactly them.
-Both are Darwin-only in substance: sysctl passthrough answers about the host,
-and the kqueue front end exists only because a runtime built for Apple reaches
-for kqueue. Linux gets ENOTSUP and four linkable stubs, not a second
-implementation.
-
-Consequence worth stating plainly: Linux CI is a second compiler, and GCC has
-caught shipping bugs here that clang's `-w` hides. Nothing in this cycle went
-through it until now.
-
-**mac, and the release tag.** `the aarch64-apple-ios target may not be
-installed`. None of the three workflows installed it. 549 shipped before Rust
-was in the build; 550 is the first release that needs it, helix being Rust and
-compiled in unconditionally. The release IPA workflow is not exercised until a
-tag is pushed, so **pushing builds/iSH-AOK_550 would have failed to produce an
-IPA** with nothing before it to warn us.
-
-The trap is `native_rust = auto`. The runners ship cargo, so auto enables the
-Rust program and the build only then discovers the target is missing. Detecting
-a toolchain is not the same as being able to build for the platform.
-
-Verified: CI green on 9fdeb44ca -- build-linux (clang), build-linux (gcc) with
-its Unit tests and e2e steps, and build-mac -- plus Build Dev IPA, which is the
-same shape as the release IPA job. The Linux fixes were iterated in an
-ubuntu:24.04 container with `ninja -k 0`, which reports every portability error
-in one pass instead of one per CI round trip.
-
-### System Console gave no prompt -- FIXED 2026-08-21 (tty hangup recovery)
-
-Reported as "the System Console fails to give the prompt". Reproduced in the
-CLI by booting the guest's own init (`./build/ish -f ROOT /sbin/init 2` under a
-pty): the pre-fix build never reaches a login prompt, the fixed one shows
-`login:` on tty1 within a minute, from the same root state.
-
-The full chain, all four steps confirmed:
-
-1. bootlogd holds /dev/tty1 through boot and is stopped at the end of it. A
-   session leader exiting hangs up its controlling terminal -- correct, and
-   kernel/exit.c does it deliberately.
-2. getty's EXISTING descriptors correctly go EIO, and it exits. Also correct.
-3. init respawns getty -- and its FRESH open was still EIO. **This was the
-   bug.** AOK modelled a hangup as one sticky bool on the tty, where Linux
-   scopes it to the descriptors open at the time.
-4. So getty died repeatedly until `init: Id "1" respawning too fast: disabled
-   for 5 minutes`, and the console stayed dead. Restarting the app did not
-   help, because bootlogd does the same thing every boot.
-
-Fixed by per-descriptor hangup generations (fs/tty.c, tests/manual/
-tty_hangup_reopen.c). Note bootlogd's TIOCCONS is already a deliberate no-op
-here and is NOT involved -- worth saying, because it looks like the culprit in
-a trace.
-
-Two wrong turns, both plausible: "udev rewrote the tty nodes" (it had, to
-root:tty 0620 -- but udev never ran on the boot that was broken), and "clear
-the flag when no descriptors remain" (the app holds the console open, so the
-list is never empty; that version passed a pty-based test and fixed nothing).
-
-### System Console never gets a shell on Devuan 6 -- ROOT CAUSED AND FIXED 2026-08-21
-
-Reported with a thread backtrace, then established by logging into the device
-itself, which turned a plausible story into a measured one and found a kernel
-bug underneath it.
-
-**The console was never the broken part.** sysvinit runs the runlevel as
-`l2:2:wait:/etc/init.d/rc 2`, and `wait` means init processes no later entry
-until rc exits -- the `getty` lines are `respawn` entries after it. rc was
-parked in `/etc/init.d/mariadb start`, which polls `mariadb-admin ping`
-forever against a mariadbd that had already decided to abort but could not
-exit. Killing that chain by hand made rc exit and six gettys appear within
-seconds, which is the whole chain confirmed end to end.
-
-**Why mariadbd could not exit -- the actual kernel bug.** Its `/proc` state
-named it exactly:
-
-    tid 990 (signal_handler, parked in sigwait)  SigPnd: 0
-    tid 857 (main thread)                        SigPnd: 0x4000  (SIGTERM)
-    both                                         SigBlk: 0x85007 (HUP INT QUIT PIPE TERM TSTP)
-    neither                                      ShdPnd: 0
-
-MariaDB signalled its own signal thread to make it exit. `kill(2)` is
-PROCESS-directed on Linux: it goes to the thread group's shared queue, where
-any thread not blocking it -- including one in `sigwait()` for exactly that
-signal -- dequeues it. AOK's `do_kill` delivered it to the addressed task's
-PRIVATE queue instead, so it landed on a thread that blocks it and that nobody
-will ever dequeue from, while the sigwait-ing thread saw nothing.
-
-That breaks the standard daemon shape -- block the signals in every thread,
-one dedicated thread sigwaits them -- which MariaDB, PostgreSQL and most sysv
-daemons use. `kill <pid>` against any of them was a no-op.
-
-Fixed by `pick_process_directed_target()` in kernel/signal.c: `kill` now hands
-the signal to a thread that can actually take it -- preferring one parked in
-`sigwait()` for exactly that signal -- while `tkill`/`tgkill` still deliver to
-the addressed thread's private queue, which is their purpose.
-tests/manual/sigwait_kill.c reproduces it -- watchdog before, PASS after, on
-all four ABIs.
-
-**The first fix was wrong and tier0 caught it.** Routing all of `kill` through
-`send_signal_to_group` looked like the obvious answer and hung
-`signal_restart`, `signal_stop_cont` and `process_conformance`: that path does
-not carry the stop/cont and default-ignore handling `send_signal()` has. The
-lesson generalises -- the group path is for signals that are genuinely
-group-wide (SIGCHLD from exit.c), not a drop-in for per-task delivery. Choosing
-the target thread instead leaves every case that already worked on exactly the
-task it used before, so the blast radius is only the case that was broken.
-
-**Still open, and the reason mariadb is disabled on that device:** the crash
-that started all of it, in the entry below.
-
-### mariadbd SIGSEGV in ha_maria::drop_table -- FIXED 2026-08-21, and it was ours
-
-Established on the M4 iPad, then reproduced locally and fixed. Not an Aria bug,
-and not an AIO one either: **AOK returned EBADF for a legal openat.**
-
-`openat(2)`, and POSIX for the whole *at() family: "If the pathname given in
-pathname is absolute, then dirfd is ignored." Ignored, not merely unused -- it
-is never looked at, so it may be -1, or closed. AOK validated it anyway. glibc,
-canonicalising an Aria temp table, calls
-
-    openat(-1, "/tmp", O_PATH|O_CLOEXEC|O_NOFOLLOW)
-
-got EBADF where Linux hands back a descriptor, and Aria carried the failure
-three frames -- surfacing first as `Got error 9 "Bad file descriptor" from
-storage engine Aria` -- before dereferencing the NULL it had left behind. The
-SIGSEGV therefore landed in ha_maria::drop_table, nowhere near the mistake,
-which is why it read as a MariaDB bug for weeks and why its fault address is
-recorded elsewhere in this file as an AIO nullptr.
-
-**No MariaDB install on iSH-AOK had ever completed**: mysql_install_db died
-leaving 3 of ~30 system tables. It now installs 88 and serves queries, verified
-on the device.
-
-Fixed by at_fd_for_path() in kernel/fs.c **and fs/stat.c** -- that file keeps
-its own copy of at_fd, so the first fix passed everything except fstatat, and
-only tests/manual/at_absolute_path.c noticed. statx lives in that same file,
-which is the call modern glibc actually makes. The two helpers are still
-duplicated; unifying them is worth doing.
-
-Found with the fd-555 syscall log against a local Devuan root. strace ON THE
-DEVICE would not follow the exec into the crashing binary and named nothing --
-build the local repro instead of fighting it.
-
-### AOK lost a connected UDP socket's error -- NO LONGER REPRODUCES 2026-08-20
-
-Measured again on the same harness the entry was written against: **10 of 10,
-five runs**, against the 14-of-20 recorded here. It does not reproduce with or
-without any change of mine, so it is fixed and I cannot claim it.
-
-**What fixed it.** `31261988b` ("a dead connection reports itself once, and AOK
-stops eating the report") landed 2026-08-19 at 18:28, hours after this entry
-was written, and introduced `sock_take_pending_error()` -- which the recv path
-calls when a read returns nothing, precisely to recover an error AOK's own poll
-probe consumed off the host first. That is this bug's mechanism, answered.
-
-**One genuine gap remains from the same family, and is fixed here.** The
-EVFILT_EXCEPT branch of fs/poll.c's `rpe_events` calls getsockopt(SO_ERROR) --
-which read-and-CLEARS on the host -- and threw the value away, returning only
-POLL_ERR. fd.h's contract for `host_connect_error` is that AOK's internal
-probes stash what they consume so the guest-facing call still sees it, and the
-two other probe sites do; this one did not.
-
-It is not what the UDP test measures, and the entry should not pretend
-otherwise: that test polls POLLIN only, so EVFILT_EXCEPT is never armed and the
-change is inert for it. It bites a guest that asks for POLLERR/EPOLLERR --
-which epoll consumers do, rtorrent and libtorrent among them, per the comment
-at that very site -- and then finds its error gone.
-
-### `pread_stack_thread_race` hangs -- FIXED 2026-08-21, and it was not a lock cycle
-
-**The recorded diagnosis was wrong, and confidently so.** This entry said the
-hang was an ordering cycle -- the mem read lock held across the jetsam lock --
-and proposed two fixes costed against that. Neither would have worked. Sampling
-a freshly wedged run showed:
-
-- one thread in `mem_write_lock_with_pokes`, waiting for readers to drain;
-- one frontend thread asleep in `_pthread_rwlock_lock_slow` on the jetsam lock,
-  holding the mem read lock;
-- every other thread parked in `mem_quiesce_park`, a futex, or nanosleep;
-- **and no thread holding the jetsam write lock at all.**
-
-There is no cycle. That reader is asleep on a lock NOBODY HOLDS -- the Darwin
-psynch lost-wakeup pathology kernel/task.c already documents ("writers asleep
-forever on a FREE lock"). `mem_write_lock_with_pokes` exists to fire SIGUSR1 at
-exactly these threads to evict them, and a signal landing on a thread parked in
-`_pthread_rwlock_lock_wait` is what loses the wakeup. The reader then never
-returns, never drops the mem read lock, and everything parks behind the writer.
-
-The earlier stack trace was real; the conclusion drawn from it was not. Two
-threads blocked on a lock looks like contention until you check whether anyone
-holds it.
-
-**Fixed** by `jetsam_read_lock_polled` (jit/jit.c): the nine blocking
-`pthread_rwlock_rdlock` sites poll with `tryrdlock` instead, so a lost wakeup
-self-heals on the next attempt. This is the treatment the WRITE path already
-had -- `jetsam_write_lock_timed` polls for the same reason, so a stuck reader
-cannot wedge writers -- applied to the side that was still blocking.
-
-Measured, same harness both sides:
-
-    pre-fix   amd64  hung on run 1;  i386  2 hangs in 8
-    post-fix  amd64  0 hangs in 12;  i386  0 hangs in 10
-
-**It was masking a second, unrelated bug** -- see the entry below. Every tier0
-failure of this test has been written off as "the known hang"; roughly one in
-eight on i386 was not.
-
-### Rust runs natively, async Rust included -- WORKING 2026-08-20
-
-The question blocking python, node, ripgrep and helix -- can another
-toolchain's objects be made to call `nlibc_open`? -- is answered, and no longer
-with a C stand-in: real Rust, `rustc 1.98`, built as a staticlib, its libc
-imports rewritten onto the shim by `tools/build-rust-native.sh`, running as
-`/AOK/native/rust-probe`. Every question the prototype left open is settled
-except one, and that one is now the whole remaining piece of work.
-
-**What works, measured rather than reasoned about.** `std::fs` reads and
-writes the guest. `env::args`/`env::vars` see the guest's. Threads work, and a
-spawned worker can read guest files -- it is not a main-thread-only trick.
-`std::process::Command` works with inherited, null and piped stdio, running
-guest binaries. `isatty` and `TIOCGWINSZ` answer about the guest's tty (43x132
-under a pty). `available_parallelism` reports AOK's core count, not the Mac's.
-
-**tokio works too, as of the same day.** kernel/native_kqueue.c is a kqueue
-front end over the guest's `ppoll`; the runtime builds, timers fire, an async
-TCP round trip completes, and `tokio::process` spawns a child, reads its
-output through the reactor and reaps it. Reproduce with
-
-    AOK_RUST_FEATURES=tokio-probe ninja -C build ish
-
-Four things had to be true, and three of them were bugs elsewhere:
-
-- **EV_CLEAR is edge, ppoll is level.** A descriptor that has been reported
-  ready is held back until it is next seen NOT ready, and is excluded from the
-  blocking set meanwhile. Without that, tokio's driver marks readiness, loops
-  straight back into kevent, and ppoll returns the same descriptor at once,
-  forever.
-- **A dup of a kqueue names the same queue.** mio's `Waker::new` calls
-  `try_clone()`, so the waker fires EVFILT_USER through a different descriptor
-  number than the poller waits on. Without the alias it got EBADF, which is
-  what tokio reported as "Runtime::build failed".
-- **SA_SIGINFO was refused**, on the grounds that there was no siginfo to hand
-  host code. There was: `rt_sigtimedwait` writes one and the shim was passing
-  NULL for it. signal_hook, and so tokio's process and signal drivers, needs
-  the three-argument form.
-- **The shim's handler table was per THREAD.** A native program's threads share
-  one task, so the thread that installs a handler is not the one that reaches
-  a checkpoint and delivers it; the deliverer saw an empty table and took
-  nothing. Now per task.
-- **The held set was one registration behind.** `nlibc_set_disposition`
-  computed it from the handler table before the table was written. A shell
-  installs several handlers and the next one papers over the last, so this
-  never showed; tokio installs exactly one, the held set stayed empty, and a
-  blocking poll in the guest was never interrupted for SIGCHLD.
-
-**Two gaps named rather than closed.** `SO_NOSIGPIPE` is accepted and does
-nothing -- Darwin's per-socket SIGPIPE suppression has no Linux counterpart,
-and a write to a departed peer still raises SIGPIPE. And a SA_SIGINFO handler
-is given a NULL `ucontext_t`: it describes interrupted machine state, and a
-native program's handler is a plain call at a checkpoint rather than a frame
-the kernel built.
-
-**What the front end covers**, which is mio's use of kqueue rather than all of
-it. Counted from mio 1.2.2's `sys/unix/selector/kqueue.rs` -- the rest of the
-EVFILT_/NOTE_ names in that file are a Debug formatting table, not calls:
-
-  filters   EVFILT_READ, EVFILT_WRITE, EVFILT_USER
-  flags in  EV_ADD, EV_DELETE, EV_CLEAR, EV_RECEIPT, EV_ONESHOT, EV_DISPATCH
-  flags out EV_ERROR, EV_EOF
-  fflags    NOTE_TRIGGER, for the waker
-
-Any other filter is refused with ENOTSUP rather than ignored, so a program
-that wants EVFILT_VNODE or EVFILT_PROC finds out.
-
-**Four silent host escapes were found on the way and closed**, all of the same
-family -- a Darwin entry point the rename list did not name:
-
-- `realpath$DARWIN_EXTSN`. `<stdlib.h>` makes `realpath()` emit the suffixed
-  symbol, the list was keyed on the bare name, and `fs::canonicalize` resolved
-  against the Mac's filesystem with every visible check passing. The generator
-  now emits `$DARWIN_EXTSN`, `$INODE64`, `$UNIX2003` and `$NOCANCEL` variants.
-- `getpwuid_r`. `getpwuid` was routed and the `_r` form was not, so Rust's
-  `home_dir()` read the Mac's `/etc/passwd`.
-- `_NSGetArgv`/`_NSGetEnviron`. Darwin has no linkable `environ`, so a runtime
-  built for Apple reads its arguments and environment through these -- and got
-  the iSH app's.
-- `std::fs::copy`'s fast path: `fclonefileat`, `fcopyfile`, `copyfile_state_*`.
-  Not read/write at all on Apple; it copied one host file to another.
-
-`ioctl(fd, FIOCLEX)` was a fifth of a different kind -- it hit the `default:
-ENOSYS`, and since Rust sets close-on-exec that way on every pipe it opens,
-`Command::output()` failed before the spawn was reached. It looked exactly like
-a broken spawn path, and the spawn path was fine.
-
-**Still open, and unchanged by any of this.** The rewrite does not reach inside
-a prebuilt dylib, and it does not catch a call made through `dlsym` -- Rust
-imports no `dlsym`, so nothing escaped that way here, but a runtime that does
-would need a different answer.
-
-**Turning the tokio test on from Xcode.** `AOK_RUST_FEATURES` in
-app/iSH.xcconfig, next to `ISH_LOG` and `ISH_GUEST_ARCHS`; set it to
-`tokio-probe`. It reaches cargo through a meson option rather than only the
-environment, so changing it reconfigures and rebuilds the crate on its own --
-through the environment alone the flag could be flipped and yesterday's crate
-would ship. Empty is the default, and has to stay that way: the tokio test
-pulls in a dependency tree with no business in a shipping app.
-
-**One loose end before release.** `rust-probe` is a diagnostic and it is in the
-app whenever cargo is on the build machine (`native_rust` defaults to `auto`).
-Either flip that default to `disabled` or drop the registry entry before the
-550 tag.
-
-**And the test that guards this.** tests/remote/native_job_control.py drives a
-native shell through a real pty -- ^C, ^Z, fg, the job table, a trap firing
-while the shell waits. tests/manual's two native-shell suites run a shell with
-`-c` and read what it prints, which covers everything except the part that
-needs a terminal, and that is exactly where the signal work above could have
-broken something.
-
-### A terminal MotePad, and a guest-to-app channel -- BOTH DONE 2026-08-21
-
-Requested 2026-08-20 as two halves, "and only the first is small". Both landed.
-
-**The channel** is `/proc/ish/workspace` (fs/proc/ish.c, app side in
-WorkspaceViewController.m), which answers the question the guest could not ask
--- am I under Workspace, and what can you open? -- and takes `open <tool>
-[path]` requests. Deliberately narrow: one verb, a tool allowlist decided in
-the app, unknown tool or relative path refused synchronously so the caller gets
-an errno rather than silence from a queue it cannot observe. It reports
-"accepted", not "on screen": UIKit cannot be touched from a task thread, and
-blocking a guest write on the UI queue would deadlock a terminal hosted BY that
-UI.
-
-**The launchers** are twenty `ws-*` scripts generated into /AOK/persist/bin at
-launch (AppDelegate.m). Prefixed because that directory is first on PATH and
-several tool identifiers collide with real commands -- `info` is GNU info.
-
-**The editor** is kernel/native_motepad.c, a native program: modeless, gutter,
-Ctrl-S/Q/F/G/K, UTF-8-aware motion, atomic save. Under Workspace it hands the
-file to the applet; -t forces the terminal.
-
-**The trap worth remembering, because it cost hours.** A native program built
-as an ordinary libish source gets the HOST libc, not the shim: it compiles,
-links and runs while writing files to the Mac and reading the Mac's stdin,
-where it races the emulator's own reader on the same descriptor and loses every
-other keystroke. It needs its own archive compiled with the native_libc.h
-force-include, folded in with link_whole (meson.build). Nothing about the
-failure points at the cause -- the visible symptom was dropped keys, which
-looks exactly like a tty bug in AOK. What ruled that out was running native
-bash through the same harness and watching it behave perfectly.
-
-Still open, and small: no wcwidth, so a double-width glyph counts as one column
-and can leave the cursor a cell off on such a line.
-
-### eudev refuses to start -- FIXED 2026-08-21, and it was never about containers
-
-The entry this replaces had two things wrong, both worth naming because both
-would have sent the work in the wrong direction.
-
-**It is not a container check.** eudev's init script line 126:
-
-    # System processes and/or kernel threads are surrounded by brackets: [...]
-    if ! ps --no-headers --format args ax | egrep -q '^\['; then
-      log_warning_msg "eudev does not support containers, $NAME not started"
-
-The test is "are any KERNEL THREADS visible". The word container appears only
-in the message. AOK showed none, so the check fired.
-
-**And udevd works.** The old entry hedged that starting it might be worse than
-the warning, since udevd wants netlink uevents AOK does not generate. Started
-by hand on the device it enumerated **30 devices**, and udevadm trigger and
-settle both returned 0. There was nothing to protect anyone from.
-
-Two things only a look at the device showed:
-
-  - Started by hand it passed **by accident**: `[elogind-daemon]` has an empty
-    cmdline, so ps brackets it and the egrep matches something that is not a
-    kernel thread at all.
-  - At boot it cannot. eudev is `Default-Start: S`; elogind is
-    `Default-Start: 2 3 4 5`. Nothing that early has an empty cmdline, so the
-    check fires -- which is exactly the reported symptom.
-
-**Fixed** with a synthetic kernel thread: /proc/2 is `kthreadd`, with an empty
-cmdline so ps renders it `[kthreadd]`, and pid 2 reserved in the allocator so
-no real task can collide (40 spawned tasks got 85+, never 2). Only the files a
-process listing reads are answered -- stat, cmdline, comm, status; everything
-else still reports ESRCH, because there is no process there.
-
-Deliberately ONE thread. AOK genuinely runs kernel-side threads (timer,
-netlink watcher, JIT) doing kernel work for the guest, so showing one is not a
-fiction -- but inventing a plausible crowd of `[ksoftirqd/0]` and friends would
-claim more than is true. kthreadd is the honest minimum: on Linux it is the one
-kernel thread that always exists.
-
-**Still to do on the device**: eudev is not enabled at boot there
-(`/etc/rc2.d` has no entry), so enabling it is a separate step from this fix.
-
-### Linux native AIO -- IMPLEMENTED 2026-08-21
-
-`apt install mariadb-server` used to leave the server crash-looping, because
-the whole io_* family was `syscall_stub` and MariaDB 11.8's thread pool does
-not fall back: `create_linux_aio()` returned nullptr. Now implemented in
-kernel/aio.c for all four guest ABIs, with
-tests/manual/aio_basic.c and aio_threads.c; see docs/aio_plan.md for the design
-and, more usefully, for the three things implementation contradicted.
-
-The drop-in workaround (`innodb_use_native_aio=0` under
-/etc/mysql/mariadb.conf.d/) is no longer needed and was never shipped.
-
-**Correction, 2026-08-21.** This entry used to claim the SIGSEGV in the
-original report was that nullptr being dereferenced, and named the faulting
-opcodes as "load the aio member". That was wrong. Resolving the same fault
-address against the binary on the device gives
-`_ZN8ha_maria10drop_tableEPKc+0x18` -- Aria's drop_table on a temp table, a
-different bug that is still open (see the entry below). The io_* stub was real
-and is fixed; it was simply not the thing that was crashing.
-
-Two things deliberately NOT done, both cheap to add if something wants them:
-
-  - **Asynchrony.** `io_submit` runs each iocb to completion before it returns.
-    Every caller is correct with this -- the completion is simply already on
-    the ring -- but a caller that submits a large read expecting to overlap it
-    with other work does not get the overlap. Phase 2 in the plan is a worker
-    per context; the structures do not change.
-  - **IOCB_CMD_POLL**, which needs that asynchrony to mean anything. It is
-    refused at submit with EINVAL, which is how a caller discovers it.
-
-Still worth revisiting: nginx's `aio`, PostgreSQL's `io_method=aio` and RocksDB
-all assume native AIO exists on Linux, and none has been tried yet.
-
-
-### #558 npm segfault installing OpenClaw -- CLOSED BY THE REPORTER 2026-08-20
-
-Reproduced the reporter's environment exactly rather than approximately, on the
-M4 iPad: **Devuan GNU/Linux 6 (excalibur), aarch64, glibc 2.41, node v24.18.0,
-npm v11.16.0** -- their distro, arch, libc and both version numbers. Devuan
-packages only node 20, so they must have installed 24 themselves; matched with
-the official arm64 build from nodejs.org.
-
-On current code, `npm install -g openclaw` **added 309 packages in 5m, exit 0**,
-and the result runs: `openclaw --version` reports 2026.7.1-2 (0790d9f) and
-`--help` loads. The ladder they never answered passes too -- `node -e`, bare
-`npm`, `npm --version`, `npm ping`, and a small install.
-
-Also reproduced on an Alpine arm64 guest (musl, node 24.18.0, npm 11.17.0) for
-a second data point: 309 packages in 14m, exit 0.
-
-**What changed is not established, and one attractive answer was tested and
-rejected.** They are on build 548, cut 2026-08-13, and reported on 2026-08-18;
-ninety-six emulator commits have landed since. `49de7e671` (2026-08-19, the day
-after the report) looked like the one -- a JIT use-after-free on a freed block's
-ret_cache, fixed in all four frontends, and exactly the shape that would hit a
-guest whose own JIT churns translated blocks the way V8 does. The dates were
-suggestive enough to be worth testing rather than asserting.
-
-It does not hold up. Built with that single commit reverted and ran the
-identical install: **309 packages, exit 0** (20m rather than 14m). So the crash
-does not come back when the fix is removed, and that commit cannot be credited.
-
-What survives is the observation and not a cause: the failure does not
-reproduce on current code in the reporter's exact environment, on Alpine arm64,
-or with the suspect commit removed. Either something else among the 96 commits
-fixed it, or it depends on a condition not matched here -- device memory
-pressure, a different node install method, or their particular root.
-
-Reported back on the issue with that evidence and asked them to retest on 549
-or later. They replied "This Problem is Resolved thx" and closed it the same
-day, so it was fixed somewhere in the 96 commits between 548 and now -- by
-which one is still not established, and the one candidate worth suspecting was
-tested and cleared.
-
-### pidfd_epoll_deadlock was two bugs, not a flake -- FIXED 2026-08-21
-
-Reported as "intermittently hangs and exits 137". It was both, and they are
-unrelated: on `18df370e5`, 40 runs of the test gave **8 exits with 137 and no
-hang**, and a later 24-run batch with only the first fix in gave **6 SIGKILLs
-and 1 hang**. Neither is the fakefs connection-pool work -- both predate that
-branch.
-
-**137 was not a guest status.** cli_halt maps a signalled init to 128+signo, so
-137 reads like the guest was SIGKILLed; the host `ish` process was. Every run
-left a crash report in `~/Library/Logs/DiagnosticReports`, and all fourteen of
-them were byte-for-byte the same stack:
-
-    _os_unfair_lock_recursive_abort <- malloc <- _tlv_get_addr
-      <- sigusr2_handler <- _sigtramp <- malloc <- _tlv_get_addr <- task_thread
-
-A wake poke landed on a brand-new task thread while it was inside
-`_tlv_get_addr` instantiating `current` -- the first `__thread` access on that
-thread, which on Darwin malloc()s -- and the handler's own `__thread` read
-re-entered malloc holding its lock. libplatform kills the process for that, and
-because stdout to a pipe is block-buffered, the test's already-completed "PASS"
-died in the buffer with it.
-
-`task_start` blocks both wake signals across `pthread_create` precisely to
-prevent this, and the mask really is inherited: instrumented, the creating
-thread read 0x60000000 in 1000 of 1000 creations. The child did not. **18 of
-1000 task threads entered `task_thread` with SIGUSR2 already missing from the
-mask**, and others lost it later with none of our handlers having run on them
-(verified with a per-thread ring buffer of handler entries). The same anomaly a
-standalone 1600-thread reproduction of the identical pattern -- same attrs,
-same pokes -- could not produce in three runs, and the same family as the
-"Darwin swallowed the poke and left it blocked and pending" behaviour that
-`signal_thread_unwedge_wake_sigs()` already exists to repair. **Not explained.**
-
-So the fix does not rely on the mask. `signal_thread_locals_init()` now sets a
-pthread TSD flag once the storage exists, and both handlers return immediately
-unless it is set -- reading a TSD slot cannot allocate, and a thread that has
-not run the init has no task and nothing to interrupt anyway. Every thread that
-runs guest work now calls it: `task_run_current()` covers whichever thread runs
-init, and `nlibc_thread_trampoline` covers native-program threads, which had
-the same latent hole.
-
-**The hang is an AB-BA cycle over three locks, and the pidfd path is innocent.**
-`pidfd_notify_exit`'s half was already fixed with the trylock form; this comes
-in through the SIGCHLD the same `do_exit` raises. Sampled live, with source
-lines:
-
-    A  do_exit          holds pids_lock   -> signalfd_wakeup_task -> fdtable_release -> files->lock
-    B  close(2)         holds files->lock -> epoll_close -> poll_destroy -> poll->lock
-    C  epoll_wait/ctl   holds poll->lock  -> pidfd_poll -> pids_lock
-
-`signalfd_wakeup_task` is written not to block -- it trylocks the fd table and
-gives up when busy -- but its give-up path called `fdtable_release()`, and that
-took `table->lock` unconditionally, so it waited for the lock whose trylock had
-just failed, with pids_lock still in hand. `refcount` is already atomic, so the
-lock was never what made the decrement safe; it now guards only the final
-teardown, which by definition runs with no other reference left.
-
-Verified by A/B against a build with a 1.5 ms delay in `poll_destroy` to widen
-the window: **2 hangs in 60 runs without the fix, 0 in 100 with it**. Unwidened,
-252 runs of the real binary passed with no SIGKILL and no hang.
-
-### `pidfd_open` refused a zombie -- FIXED 2026-08-20
-
-sys_pidfd_open went through pid_get_task_ref, and pid_get_task filters zombies
-out by design, so the call failed for a task that had exited and not been
-reaped. Linux succeeds there -- an immediately-readable pidfd is how a pidfd
-reports an exit at all -- and answers ESRCH only once the pid is gone.
-
-It showed up as a flaky suite rather than a bug report: pidfd_epoll_deadlock
-opens a pidfd on children that _exit at once, deliberately, so whenever a child
-won that race the open returned ESRCH. About one run in three on x86_64.
-
-pid_get_task_zombie_ref is the accessor it wanted, and it is safe against the
-exit path for reasons already in pidfd.c -- pidfd_create flags its reference so
-do_exit's exit_wait_needed() ignores it, and pidfd_poll already reported
-POLL_READ for a zombie. tests/manual/pidfd_zombie.c pins it down with no race
-in it (waitid(WNOWAIT) guarantees the zombie), and was verified to fail on both
-arches with the fix reverted. `52f55c10d`.
-
-### ptraceomatic did not run -- FIXED 2026-08-20 (GH #541)
-
-Its divergence reports went to printk, which writes to fd 555 -- the emulator's
-own log convention, which nobody redirects when running the tool by hand. The
-write failed with EBADF, the report vanished, and `debugger` fired an int3, so
-the tool that exists to say what differed died with "Trace/breakpoint trap" and
-no output at all. Reports go to stderr now, the trap is opt-in via
-PTRACEOMATIC_TRAP=1, and the report names the faulting instruction.
-
-The issue's "tracee reaped during setup" was real too: start_tracee waited with
-bare wait(), which reaps any child, so another child exiting at the wrong
-moment was consumed instead and the WIFSTOPPED check read a status belonging to
-something else.
-
-Then it ran, and immediately reported two flags the architecture does not
-define -- AF after a shift, and everything after DIV/IDIV. Both were gaps in
-undefined_flags_mask rather than emulator bugs, which is exactly the kind of
-false positive that would have made the restored tool useless. With them fixed
-it reaches instruction 4175 before reporting something real. `796a9c179`.
-That one turned out to be a third false positive of the same kind -- see
-"ptraceomatic's divergence at 4175" above.
-
-### `md`'s word boundaries come from the HTML, not from letter case -- FIXED 2026-08-20
-
-The camelCase splitter behind the original "i SH-AOK" report was a guess
-standing in for information the HTML converter had thrown away: dropping a tag
-without putting anything in its place runs words together, so
-"<td>Some</td><td>Text</td>" became "SomeText", and the answer had been to
-insert a space wherever a lowercase letter met an uppercase one. Gating it to
-fetched pages stopped it damaging local documents; it still damaged the fetched
-ones, where macOS read as "mac OS" and GitHub as "Git Hub".
-
-markdownHtmlTagKind classifies every tag reaching the converter's default case
--- inline, side by side, own line, own paragraph -- so the boundary comes from
-the element, which is the only place it exists. <td>, <button>, <dt>/<dd>,
-<nav> and the rest separate; <b>mac</b>OS stays "macOS".
-
-That left the guessing with nothing to do, so it is gone along with its three
-helpers, an 8 KB stack buffer and a copy of every line. It had been doing more
-than letter case: splitting a digit from a letter ("utf8mb4"), splitting
-"array[0]", and carrying hardcoded fixups for particular scraped sites.
-
-**The limit, recorded so it is not filed again as a bug.** CSS can make an
-inline element a block one and this does not read CSS, so GitHub's navigation
--- two <span>s inside one <a> -- still runs together as "GitHub CopilotWrite
-better code with AI". Unfixable from the element name, and the better failure:
-wrong about navigation furniture on some pages rather than wrong about macOS in
-every document. Article text on the same page reads correctly throughout.
-`6834e9e` in the fork.
-
-### `md`: indented code blocks, and the syntax that showed through -- FIXED 2026-08-20
-
-The indented-code-block gap filed earlier is closed, and the trap it was filed
-over turned out to be real: four spaces under a bullet is that item's
-continuation paragraph, not code. Detection is guarded on not being in a list
-and on no paragraph being open, since an indented chunk cannot interrupt one.
-
-Fixing it surfaced more of the same kind:
-
-- **A list item's own wrapped lines were rendered as a separate block**, so the
-  first line wrapped to the margin and the rest started again underneath --
-  stray one-word lines like "    but". Items go through the paragraph buffer
-  now and wrap once.
-- **Width was measured in bytes.** "• " is three bytes and one column, and the
-  list prefixes compensated by indenting continuations two spaces too far.
-- **Every list rendered loose**, once items went through the paragraph buffer,
-  until the trailing blank was made to come from a blank line in the source.
-- **`has_blank_separator` was lying after a heading** -- it claims the output
-  ends with a blank line and none was emitted, so two headings ran together.
-
-And five inline constructs were printing their own markup: `\*` kept the
-backslash and lost the asterisk; `&amp;` and numeric references rendered
-literally; `![alt](url)` came out as "!alt [3]"; `<https://example.com>` kept
-its brackets; and `[text][ref]` showed its brackets while every "[ref]: url"
-definition was rendered as a paragraph, so a README keeping its links at the
-bottom ended with a block of bare URLs. Hard breaks (two trailing spaces) are
-honoured rather than reflowed away.
-
-Checked against all 14 documents: every word of every source still present, no
-colour-marker leaks in piped output, and the only over-wide lines are inside
-code blocks. `11f07b4` in the fork.
-
-### `md` rewrote the documents it rendered -- FIXED 2026-08-20
-
-Reported against /AOK/docs, where "iSH-AOK" rendered as "i SH-AOK". Three bugs,
-all of them the renderer editing text it should have been showing, and the
-reported one was the least damaging of them.
-
-- **Web-scrape heuristics ran on local files.** md cleans up pages fetched as
-  HTML, and every one of those passes also ran on real .md files. camelCase
-  splitting rewrote the whole vocabulary -- macOS to "mac OS", GitHub to "Git
-  Hub", NSURLSession to "NSURL Session" -- and the CSS-selector detector
-  DELETED whole sentences: two commas and a '.' not followed by a space was
-  enough, so "small, synthetic, read-only filesystem (`aokfs`, see `fs/aok.c`)
-  that" vanished from the overview with no marker where it had been. They are
-  gated on the input having come out of the HTML converter now.
-- **Code spans were not verbatim.** A backtick was skipped rather than opening
-  a span, so `a*b*c` rendered as "abc".
-- **Every '*' and '_' was deleted on sight**, matched or not: TZ_NAME to
-  TZNAME, kernel/native_libc.c to kernel/nativelibc.c, "5 * 3" to "5  3".
-
-Checked by rendering all 14 documents and diffing every word against the
-sources: 66 words were missing before, and the remainder are table-cell
-wrapping and '/'-joined tokens, verified present by hand. `787236a` in the
-fork, `bdbd617e0` here.
-
-### `md` has colour -- ADDED 2026-08-20
-
-The reason it had none was a good one: the pager sanitises every line so a
-fetched page cannot emit escape sequences. So the renderer emits a two-byte
-private marker instead, and the pager expands markers into SGR only for buffers
-it was told are markdown renders. A document carrying a stray marker can change
-a colour and nothing else -- no cursor movement, no screen clear, no mode
-switch. Markers are only emitted when something will expand them, so a
-redirected run is plain text; NO_COLOR and a dumb TERM are honoured.
-
-Two fixes fell out of it. **The pager's `raw_mode` had never worked**: it was
-assigned before pagerCollectLines, which memsets the struct, so `less -r` has
-been sanitising its output for as long as the option has existed. And **table
-cells printed their backticks** while the same code span in a paragraph did
-not, because cells never went through the inline pass. `87e628c` in the fork.
-
-### The applets stubbed over a missing library -- FIXED 2026-08-20
-
-tar, gzip, gunzip, zcat, curl, wget and `md <url>` all refused with "not built
-into this iSH-AOK" or "networking support is unavailable in this build". Both
-groups are real now, and neither was the build-system problem it looked like.
-
-- **zlib was never missing.** It is public on iOS as well as macOS. The actual
-  obstacle was that a system dylib compiled against the HOST libc does host
-  I/O: `gzopen` on a guest path opened iOS's copy, invisibly correct wherever a
-  path existed on both sides. deps/smallclue-shim/zlib.h reimplements the six
-  gz* calls over the redirected open/read/write and leaves deflate/inflate --
-  which touch nothing but the caller's buffers -- to zlib. `550bc653c`.
-- **libcurl really is absent from the iOS SDK**, header and tbd alike.
-  deps/smallclue-shim/curl/curl.h implements the seven functions core.c uses on
-  NSURLSession. That is host networking, deliberately and with the cost written
-  down: guest /etc/hosts and /etc/resolv.conf do not apply. `643c8ef7d`.
-- **Enabling tar exposed a corruption in it.** SmallCLUE's tar treated GNU
-  @LongLink and PAX headers as files, then read their data as the next header
-  and abandoned the archive -- and those are what busybox tar writes for any
-  path over 100 bytes. Fixed in the fork before tar could reach anyone's PATH.
-  `07ed79c6e`.
-
-native-links.sh needed no edit: its PROBED list already anticipated "tar and
-gzip need zlib, curl and wget need libcurl" and runs each applet once to ask.
-The link count went from 106 to 112 on its own.
-
-**Verified on device** (ipp4-dev-arm64, an M4 iPad, 2026-08-20): tar, gzip,
-gunzip, zcat, curl, wget and `md <url>` all work in the app, which settles the
-`libz.tbd` link -- a build that had missed it could not have launched.
-
-**Also confirmed by a headless build, 2026-08-20**, and the earlier claim here
-that one was impossible was wrong. The project builds fine from the command
-line; it has to be driven by SCHEME, not by target:
-
-    xcodebuild -project iSH-AOK.xcodeproj -scheme iSH-AOK -configuration Release \
-        -sdk iphonesimulator ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
-
-`-target` disables the implicit dependency resolution that makes the Meson and
-Ninja targets run before anything links against their archives, which is why
-`libiSH-AOKApp` appeared to resolve SDKROOT to macOS and `iSH-AOK.FileProvider`
-appeared to link `-lish_emu` too early. Both were artefacts of the wrong flag,
-not project defects: iSH, ish-cli, iSH+Linux and Screenshots are all shared
-schemes and 16 target dependencies are declared. The resulting app binary links
-/usr/lib/libz.1.dylib with `_deflate`/`_inflate` bound to it.
-
-**The device found one thing the CLI could not**: plain HTTP to a public host
-failed in the app while HTTPS and localhost worked -- App Transport Security's
-exact signature, confirmed by serving plain HTTP from the guest itself and
-watching that succeed while `http://example.com` failed and the emulated curl
-got 200 from the same device. app/Info.plist declared NSAllowsArbitraryLoads
-AND NSAllowsLocalNetworking, and the presence of the latter makes the former be
-ignored on iOS 10 and later. Removing it is what makes the declaration apply:
-confirmed on the rebuilt device, where three plain-HTTP hosts now fetch, HTTPS
-is unaffected, and localhost still works -- so nothing was lost with the key.
-The shim also now reports the framework's own wording instead of mapping every
-unrecognised NSError to "Failure when receiving data from the peer", which is
-what made this look like a network fault for as long as it did.
-
-### Terminal cell height -- FIXED and SEEN 2026-08-19
-
-At font sizes under 16 a background highlight sat 1-2px proud of the Powerline
-separator beside it. hterm sizes a cell as
-`fontBoundingBoxAscent + fontBoundingBoxDescent` -- the font's MAXIMUM extent,
-with room for accents and deep descenders a block glyph never uses. The
-background fills that cell; `U+2588` only rises to about the em height, and the
-leftover is the band.
-
-Fixed with a `line-height` MULTIPLIER (not the reporter's second suggestion, a
-baseline offset, which cannot fix a glyph shorter than its cell -- it only moves
-the band from the top to the bottom). A multiplier rather than a formula because
-how much of the em a patched font's blocks cover varies between Nerd Font
-patches. Default 1 is the measured height, so nothing moves until someone asks.
-Settable at `/proc/ish/defaults/line_height` and from a Line Height row under
-Font Size in Appearance.
-
-**Seen, on an iPhone 17 Pro simulator, at font size 12** -- five rows of `U+2588`
-on a red background, three rows of blue background-only, and a line each of
-descenders/accents and CJK:
-
-| line-height | block-glyph band | `Agjpqy ÀÉÎÕÜ` and CJK |
-|---|---|---|
-| 1.00 (default) | thick red band between every row | intact |
-| 0.85 | much thinner | intact |
-| 0.75 | thinner still | **descenders clipping** |
-
-So the useful range for that font is about 0.85-0.95, the band narrows rather
-than vanishing, and clipping starts below ~0.8 -- which is exactly why this is a
-knob with bounds and not a computed value. Background-only rows tiled solid at
-every setting, confirming the diagnosis that it is the glyph and not the cell.
-
-**What actually took the time, and the real bug behind it.** The JS was correct
-from the start and had no effect for three builds, because
-`app/terminal/term.html` loads `hterm/dist/js/hterm_all.js` -- a bundle that is
-gitignored and that NOTHING in the build produced. The phase named "Compile
-JavaScript" only asserted the file existed. Fixed in `61fc0f59a`; see that
-commit for why the regeneration lives in `xcode-meson.sh` and not in the phase.
-
-### SmallCLUE `dmesg` said it was unsupported -- FIXED 2026-08-19
-
-The implementation was there all along, behind `#if defined(__linux__)`, and a
-native program is compiled for the HOST -- so the test was false even though the
-kernel the call would reach is Linux, and AOK's own. The same guest's
-`/usr/bin/dmesg` printed the boot line perfectly while this said it could not.
-The platform test was asking about the compiler's target when what matters is
-which kernel answers.
-
-`nlibc_klogctl` issues the guest's `syslog(2)`; `deps/smallclue` gained
-`SMALLCLUE_HAVE_KLOGCTL` so the existing branch compiles; and dmesg left
-`native-links.sh`'s EXCLUDED list, which now skips 27 applets rather than 28.
-Output verified byte-identical to the oracle -- the same guest's `/bin/dmesg` --
-for both `dmesg` and `dmesg -T`. `42c1536da`.
-
-### eudev's "sysfs not mounted", and the 30-second sleep behind it -- FIXED 2026-08-19
-
-`/sys/class` did not exist at all. Fixed together with the block-device naming
-below, because they need the same thing: `/sys/class/block/sda`.
-
-Supplying `/sys/class` alone would have made boot **worse**. `log_end_msg 1`
-does not exit, so the script runs on to a guard that checks
-`[ -e /sys/block -a ! -e /sys/class/block ]` and sleeps 30 seconds; an empty
-`/sys/class` turns a cosmetic warning into half a minute on every boot. Both
-arrive together and both guards now pass.
-
-**The open question answered itself.** Run against a real Devuan root with eudev
-actually installed, the init script no longer complains about sysfs, does not
-sleep, and stops at its NEXT guard with "eudev does not support containers,
-udevd not started ... (warning)", exit 0, in under a second. eudev decides
-correctly on its own. On a root where that container check passes by accident
-(the TODO's note about `[elogind-daemon]` being the one bracketed process), the
-30-second guard is now passed too, so both paths are covered. `4fb8c0768`.
-
-### btop's empty disk, net and io panels -- FIXED 2026-08-19 (in two goes)
-
-**The first attempt fixed the wrong thing, and this is why.** The entry said
-btop matches mounts to diskstats entries by device name, so the two files were
-made to agree on `sda`. Verified: the invariant held, in every file, on all four
-guest arches. Then it was installed on an iPad and both panels were still empty
--- because that invariant was never what btop reads.
-
-Reading btop's own binary settles it in one command:
-
-    strings /usr/bin/btop | grep -E "^/(proc|sys|etc)/"
-    /etc/fstab          /etc/mtab          /sys/block/{}/stat
-    /sys/class/net/     /statistics/       ...
-
-`/proc/net/dev` does not appear ANYWHERE in it, and `/proc/diskstats` does not
-either. Two separate causes, neither of them column alignment:
-
-- **Disks come from `/etc/fstab`.** btop's `use_fstab` defaults to true, so its
-  whole disk list is whatever fstab declares -- and a rootfs tarball has never
-  heard of AOK's root. Alpine's ships `noauto` lines for a CD-ROM and a USB
-  stick and nothing else. Measured both ways: with `use_fstab = false` the panel
-  fills in; with the default, blank. `ensure_root_fstab_entry()` (kernel/init.c,
-  called from both the CLI and the app at boot, like the /dev repair beside it)
-  adds a root line when nothing declares "/", and only then.
-- **Counters come from `/sys/class/net/<iface>/statistics/`.** AOK had no
-  `/sys/class/net` at all, so every interface read zero -- which is exactly the
-  "shows no traffic" seen on the iPad's tailscale interface. Now present, with
-  statistics plus address/mtu/flags/operstate/carrier/type, built from the same
-  snapshot `/proc/net/dev` uses so the two cannot disagree.
-
-With btop's stock config, unmodified: disks show 926 GiB at 32% used, and the
-net panel reads 2.88 MiB/s down / 124 KiB/s up against real traffic.
-
-**The lesson, since it cost a round trip:** the invariant was verified and the
-outcome was not. Running btop once would have caught it in a minute, and reading
-its binary for the paths it opens would have caught it before any code changed.
-
-**The name fix was still worth doing**, for everything that DOES read those
-files. `/proc/diskstats` named "disk1" and `/proc/mounts` named the root
-"alpine-arm64-test", so nothing tied a mount to a device. "disk1" was the host's name for a Mac
-disk -- a host detail leaking into a guest -- and it contradicted the major 8,
-minor 0 printed beside it, which IS sda in Linux's numbering.
-
-The device is `sda` now, defined once in `fs/real.h` and used by
-`/proc/diskstats`, `/sys/block` and `/sys/class/block`, and `/` reports
-`/dev/sda`. That replaces a deliberate choice worth naming: `mount_root` used to
-report the root's directory name there so df would not print the host path.
-`/dev/sda` is the Linux answer and the one that makes tools work; busybox df
-prints it correctly. `4fb8c0768`.
-
-### Uptime and btime described the app process -- FIXED 2026-08-19
-
-The decision the entry asked for: **the machine is the guest**. `boot_time` is
-now set where pid 1 is created, the only event in AOK that means what a boot
-means, instead of once per app process. `run_at_boot` still seeds it so nothing
-reading the clock before init exists sees zero.
-
-Two more found there. `sysinfo(2)` reported uptime in the wrong unit --
-`uptime_ticks` is 100 Hz and `kernel/uname.c` handed it to a field measured in
-SECONDS, so a 12-second-old guest read as "up 20 min" through busybox uptime and
-anything else on `sysinfo(2)`. And the two platforms disagreed about that unit,
-which is how it survived: darwin produced ticks, linux produced seconds taken
-straight from the HOST's `sysinfo()`, a different and much older machine. Both
-produce ticks from the guest's boot now. Measured after a `sleep(15)`: sysinfo
-16 s, `/proc/uptime` 16.0 s.
-
-Also gone: darwin's `get_uptime()` read `kern.boottime` into a local and never
-used it -- and had it been used it would have reported when the DEVICE last
-booted. `f23d92bdc`.
-
-Confirmed end to end on the Linux build, where the old behaviour was worst: on a
-host 685417 seconds into its uptime, a guest that had slept 6 seconds reports
-`/proc/uptime` 7.0 and a btime 7 seconds back. GCC and clang both build it
-clean; `platform/linux.c` needed a `<time.h>` it had been getting from nobody
-(`d672344af`).
-
-### The `fflush(NULL)`-adjacent socket bugs -- chronyd's spin -- FIXED 2026-08-19
-
-Two bugs, one recorded and one not.
-
-**The recorded one.** iOS kills connected sockets when the device sleeps, reads
-return ENOTCONN, and `sock_translate_err` maps that to ECONNRESET -- on every
-call, for ever, because the host keeps answering ENOTCONN while `sock_poll` went
-on reporting the fd readable. The translation now records that the connection is
-finished; after that, reads report end-of-file and poll reports
-`POLL_ERR|POLL_HUP`.
-
-**Correction to the plan that was written here.** `POLL_ERR|POLL_HUP` alone
-would NOT have stopped it. `kernel/poll.c`'s `SELECT_READ` counts both as
-readable, matching Linux, so a select-based loop like chronyd's still wakes. It
-is the read returning EOF that ends the loop; both halves are needed.
-
-**The unrecorded one, and the one that could be measured.** A TCP peer resetting
-with SO_LINGER 0 makes `recv()` report ECONNRESET on the macOS host and on Linux
-6.12 alike. An AOK guest agreed -- until it called `poll()` first, after which
-the same `recv()` returned 0 bytes. AOK reads the host's SO_ERROR itself
-(`socket_tcp_connect_write_ready`, on every `sock_poll` of a stream socket) and
-SO_ERROR is read-and-clear, so AOK's own poll consumed the pending error and the
-guest's read saw a clean end-of-file. The stash that already existed for this
-was consulted only by `getsockopt(SO_ERROR)`; `read`, `recvfrom` and `recvmsg`
-consult it now too.
-
-**The secondary item in the old entry did not reproduce.** It said a connected
-UDP socket on ICMP port-unreachable showed ECONNRESET where the host and Linux
-show ECONNREFUSED. AOK reports ECONNREFUSED correctly. What it does do is lose
-the error entirely about a third of the time -- filed above, on its own.
-
-Guarded by `tests/manual/sock_conn_error.c`, which passes on real Linux 6.12 as
-well as on AOK -- re-run against the oracle after it came back online, together
-with `proc_field_layout`. `31261988b`.
-
-### i386 `fakefs_type_race` killed the CLI build -- FIXED 2026-08-19
-
-**The recorded bisect was measuring the wrong thing.** The entry said
-`ISH_I386_NOCHAIN=1` made it pass and `ISH_I386_NOBACKCHAIN=1` did not, and
-concluded "forward-edge block chaining". But `i386_jit_chaining_enabled()` is a
-C-side gate on the *linking loop* only -- it does not touch a single line of the
-assembly that writes `frame->last_block` -- and it appears in the crashing
-expression itself:
-
-```c
-if (last_block != NULL && i386_jit_chaining_enabled() &&
-        (last_block->jump_ip[0] != NULL || ...     // <- jit.c, the faulting line
-```
-
-`&&` short-circuits, so `NOCHAIN=1` was not preventing the corruption, it was
-skipping the DEREFERENCE. Instrumenting `last_block` proved it: with
-`NOCHAIN=1`, and the test "passing", the pointer was still being corrupted
-1-3 times per run. Chaining was never involved.
-
-**What it actually was.** `frame->last_block` was `0x4`, and `jump_ip` is at
-offset `0x18`, giving the reported fault address `0x1c`. 4 and 8 are `4 + imm`
-from `RET_NEAR(imm)` -- a **ret** gadget's pop count. The `ret` gadget's
-return-cache path reads its candidate block pointer from the offset where a
-**call** gadget keeps one, so the cache entry was pointing into a block that had
-been freed and whose memory had been reused by a block with a ret gadget there.
-
-The dangling entry survives because of a hole between the two staleness guards:
-
-- `jit_entry_scratch_get()` purges `cache` and `ret_cache` when
-  `jit_block_free_generation` has moved -- but it is called **before** the
-  caller takes `jetsam_lock`, so it samples the counter too early;
-- the frontend loop purges when `cleanup_seq` has moved -- but it seeds
-  `last_block_cleanup_seq` **after** the lock, so a bump inside the window is
-  already included and never seen.
-
-A `jit_free_jetsam()` pass landing between the two reads is therefore invisible
-to both, and the thread runs the whole entry with a `ret_cache` full of pointers
-into freed blocks. Fixed by `jit_entry_scratch_refresh()`, called with the read
-lock held -- at which point no free can be in flight, so the generation it reads
-holds for the entry. One relaxed load when nothing was freed; no measurable
-cost on a syscall-heavy or a find-heavy guest benchmark.
-
-**All four frontends had it**, not just i386 -- the same three lines appear in
-the arm64, riscv64 and amd64 entry paths, and all four are fixed. i386 is
-simply where a test hit it: 3/3 crashes before, 6/6 clean after, and 9/9 across
-`default` / `NOCHAIN` / `NOBACKCHAIN` with the instrumentation still in and
-reporting zero corruption events.
-
-`ISH_I386_NOCHAIN=1` is no longer needed as a workaround, and would not have
-been a real one -- it left the corrupt pointer in place.
-
-**Regression gate:** `python3 tests/remote/conductor.py tier0`, then
-`./build/ish -f tests/remote/.work/tier0fs-i386 /bin/fakefs_type_race`. Capture
-the status directly; piping to `tail` reports tail's status and hides a crash.
-
-### `/proc/net/dev` printed nine columns a side -- FIXED 2026-08-19
-
-`proc_show_dev()` passed eighteen arguments to a format string with sixteen
-conversions: Linux folds four counters into its single `frame` column and four
-more into `carrier`, and the port had given each half of those sums an argument
-of its own. printf dropped the last two and every transmit column sat one place
-left of its header -- multicast printed as tx_bytes, rx_bytes as tx_packets.
-btop's network panel was empty and ifconfig showed a loopback that had received
-259 MiB and sent 33 kB. Fixed in `104e5ff4d`.
-
-**Why it shipped, and what else it was hiding.** `proc_printf()` carried no
-`format` attribute, so no compiler ever checked a single procfs format string.
-It has one now, and it immediately found three more:
-
-- `/proc/<pid>/stat` printed six `addr_t` values through `%lu`. `addr_t` is 32
-  bits, so the conversion read eight bytes where four were passed -- correct
-  today on Darwin arm64 only because the adjacent stack happens to be zero.
-- `/proc/<pid>/status` rendered the signal masks as `%08x` from a 64-bit
-  `sigset_t_`; Linux's `render_sigset_t()` always emits all sixteen hex digits.
-- `/proc/consoles` passed `console_major` twice and dropped `console_minor`.
-
-**Guarded by `tests/manual/proc_field_layout.c`.** Counting fields does NOT
-catch the `/proc/net/dev` bug -- the line still had sixteen of them -- so the
-test pushes a megabyte through loopback and requires the column the header
-calls tx_bytes to move by at least that much. Against the pre-fix kernel it
-reports tx_bytes moving by 0 and tx_packets by 1054720, which is rx_bytes,
-exactly one place over. Passes on real Linux (Debian 13, 6.12) too.
-
-Not simplified, deliberately: the literal space after the name colon. It is
-what Linux itself writes, not a workaround, and without it an 8-digit rx_bytes
-glues onto the interface name and busybox ifconfig loses the device. The test
-asserts it so nobody "tidies" it away.
-
-### Lingering `ish` processes: the `fflush(NULL)` deadlock -- FIXED 2026-08-19
-
-The entry that used to sit under *Diagnosed, not fixed* had the stack right and
-the mechanism half right, and the fix it proposed would have traded the hang for
-silent data loss. Recorded here because of that.
-
-**What was actually observed**, with `lldb` on two live wedged processes rather
-than inferred:
-
-- The blocked frame is `cli_halt -> _fwalk -> sflush_locked -> flockfile ->
-  __psynch_mutexwait`. `_fwalk` is `fflush(NULL)` walking every host stream.
-- The stream it blocks on is **one of ours**: `_file = -1`, `_write =
-  nlibc_file_write`, cookie = guest fd 1. That is the native-libc shim's
-  `funopen()` wrapper for a native program's stdout (`nlibc_file_wrap`), living
-  in libc's `usual[]` pool -- NOT `stdout`, and not some stream a native program
-  opened for itself.
-- The mutex's recorded owner tid was absent from the process's own live thread
-  list, in both processes. Both had exactly two threads left, neither of them
-  the owner.
-
-So: a native program is host code on a guest task's thread. A task killed before
-`nlibc_flush_std()` runs leaves its wrapped stdout live in libc's pool, and a
-task killed INSIDE stdio leaves that stream's lock held. Darwin does not release
-a mutex when its owner thread dies, so `fflush(NULL)` waits for a thread that no
-longer exists. Confirmed independently by a 30-line host probe with no AOK in
-it: a thread that exits holding a `flockfile` makes a later `fflush(NULL)` hang
-for ever, and `ftrylockfile` refuses that lock rather than blocking on it.
-
-**Why the proposed fix was wrong.** "Flush `stdout` and `stderr` by name" would
-have stopped the hang, but `stdout` is `__sF[1]` -- not where a native program's
-pending output is. The shim's wrappers are, and skipping them loses the tail of
-every native program's output. What landed instead: flush the same set of
-streams, each guarded by `ftrylockfile()`, and skip any whose lock cannot be
-taken. A stream nobody can lock has nothing recoverable in it anyway. Verified
-A/B on the real algorithm -- old hangs, new returns and still writes the owned
-stream's bytes -- and by 360 runs of the reproducer under self-contention with
-zero survivors.
-
-**The same landmine was inside native programs, and that one reached users.**
-`fflush` was on `check-native-libc.py`'s PURE list, justified as "every stream a
-native program holds is one the shim made". True of `fflush(f)`, and not an
-argument about `fflush(NULL)` at all -- that one flushes EVERY stream in the
-process, meaning every other concurrently-running native program's stdout and
-stderr as well, and it blocks on any lock a departed task's thread still holds.
-smallclue's shell alone calls it 20 times, several around fork and pipeline
-teardown. This is the third instance of that exact error shape, after `fileno`
-and `getopt`: premise right, conclusion backwards. `fflush` is now routed to
-`nlibc_fflush`, which reads NULL as "the streams this program owns" -- the
-registry gained a per-thread owner tag to answer that -- and flushes them
-without waiting. Unlike the `cli_halt` half, this one was reachable in the iOS
-app, where it would have hung a user's shell rather than a test process.
-
-`fclose` came with it, for a different reason. It was on PURE too, and closing a
-stream really does reach nothing on the host -- but it has to drop the stream
-from the shim's own registry, and leaving it to the host left a stale entry
-behind for every `fopen`/`fclose` pair a native program ever made. Only
-`nlibc_flush_std`'s teardown forgot one. The registry is keyed by `FILE*` and
-libc reissues the same slot, so a later stream inherited the dead entry's answer
-to `fileno()` -- the hazard `nlibc_stream_forget`'s own comment describes, with
-nothing closing the loop. Now routed to `nlibc_fclose`, and `nlibc_freopen` and
-`nlibc_pclose` go through it too.
-
-Also fixed in passing: refreshing the archives the gate reads (`ninja ish` does
-not, which is its own trap) exposed a real pre-existing failure --
-`deps/zsh/Src/aok_fork.c` calls `pthread_get_stackaddr_np` and
-`pthread_get_stacksize_np`. Those ask about the calling HOST thread's own stack,
-which is the only correct answer for a stack-overflow guard, and the shim's own
-`nlibc_stack_exhausted()` asks the same two questions. Added to PURE with that
-reason; the gate is clean again, at 236 host symbols.
-
 ---
 
-## Closed during the 549 cycle
+### FIXED: a checkpoint save before the guest booted crashed on a NULL list head
 
-Kept only because the entry was wrong in a way worth remembering.
+**Root-caused and fixed 2026-09-12.** Four device crashes, all
+`task_snapshot_collect+172`, `ldur x28, [x24, #-0x8]`,
+`KERN_INVALID_ADDRESS at 0xfffffffffffffff8`, always from the app's background
+save.
 
-### tmpfs asserts that can abort the whole app -- FIXED 2026-08-19
+**The cause.** `alive_pids_list` was a bare global (`kernel/task.c`), so it
+started **NULL/NULL** and only became a valid empty list when
+`become_first_process` called `list_init` (`kernel/init.c:304`). But
+`list_for_each_entry` has no NULL check, so any walk before boot followed
+`next` into 0 and faulted on the FIRST iteration. `ckpt_check_scope` does have
+the right guard -- it refuses with "there is no guest running" when the
+snapshot is empty -- but it has to call `task_snapshot_collect` to learn that,
+and that call was the crash. The guard sat downstream of the fault.
 
-This entry said the remaining sites were "now unreachable via mknod". That was
-wrong, and the cost of being wrong was high: `11edc1843` mapped only the type-0
-case, so any OTHER invalid `S_IFMT` -- `0x3000`, say -- walked through
-`generic_mknodat`, which rejects only DIR and LNK and gates only BLK and CHR on
-superuser. The result was a tmpfs inode of no type at all, and `read`, `pread`,
-`pwrite` and `ftruncate` each hit an assert and aborted the WHOLE app. Three
-lines of C, no privilege required, on any mounted tmpfs. Reproduced, then fixed:
+**What made it reachable, and it was a regression of mine.** The app's
+background save (`AppDelegate.m`, `ISHSuspendGuardEnterBackground`) is gated on
+`shouldSuspendToDisk`, **not** on the guest being booted. The session-resume
+picker added earlier the same day defers `ensureBooted` while it waits for an
+answer (`TerminalViewController.m:464-467`). So once any session slot existed,
+every launch deferred the boot, and backgrounding fired a save against a kernel
+that had never come up. The first device run had no slot, booted normally, and
+saved 20 tasks and 24 sockets without incident -- which is why it looked
+intermittent.
 
-- `kernel/fs.c` now whitelists the five types Linux's `may_mknod` accepts and
-  returns EINVAL otherwise, so such an inode cannot be created in the first
-  place;
-- the five reachable asserts in `fs/tmp.c` became errno returns anyway, because
-  an assert reachable from a syscall argument is the wrong tool.
+**The fix** is one line: `alive_pids_list` (and
+`tasks_pending_deletion_queue`, the only other bare global head) are now
+`LIST_INITIALIZER`-initialised, so an empty list READS as empty from load.
+`init.c`'s `list_init` stays -- re-initialising an empty list is a no-op.
 
-The one assert left (`tmpfs_init_regular_file`) is a creation-time invariant its
-only caller satisfies by construction.
+**Measured, same tree and build dir, only the declaration differing:**
 
----
+| binary | `ISH_CHECKPOINT_AFTER=0.001` x8 | result |
+|--------|--------------------------------|--------|
+| before | 8/8 **SIGSEGV** (rc 139)       | crash in the walk |
+| after  | 0/8                            | `refused (-3) there is no guest running` |
+
+The reproducer to keep: `ISH_CHECKPOINT_AFTER=<delay>:<path>` with a delay
+short enough to beat the boot. Driving `/proc/ish/checkpoint` instead exercises
+`checkpoint_save` from a guest task and cannot reach this at all -- which is
+why ~20 earlier attempts found nothing.
+
+**Still worth doing:** gate the background save on the guest actually being
+booted, so it refuses cleanly rather than relying on the scope check; and the
+`list_remove`/`list_for_each_entry` NULL class below.
+
+### list_remove leaves a NULL node and the walk macro has no NULL check
+
+**The class behind the alive_pids_list crash above, and it is wider than that
+one list.** `list_remove` (util/list.h:69) sets a node's `next` and `prev` to
+**NULL**; `list_init` leaves a node pointing at **itself**; and
+`list_for_each_entry` terminates only on `&item->member != (list)`, with no
+NULL check. So any node that is reachable from a list while holding a NULL
+`next` faults the walk at the `container_of` subtraction --
+`ldur x28, [x24, #-0x8]`, address `0xfffffffffffffff8`.
+
+Measured spread in kernel/ and fs/:
+
+- **94** bare `list_remove(` calls vs **14** `list_remove_safe(`.
+- Unguarded `list_for_each_entry` walks per list head: `mounts` 19,
+  `group->threads` 9, `pid->pgroup` 7, `alive_pids_list` 6, `sighand->queue` 4,
+  `poll->poll_fds` 4, and a long tail.
+- `list_for_each_entry_safe` caches `next` one step ahead but has the same
+  termination test, so it is not immune either.
+
+**Fixed so far: only the two `alive_pids_list` sites** (`task_unlink_locked`,
+`kernel/exec.c`'s exec unlink), which now `list_init` after removing. That is
+the list with an actual device crash report behind it.
+
+**The class fix would be one line** -- have `list_remove` re-init instead of
+NULLing -- but it changes the meaning of `list_null()` for 94 call sites, and
+`list_empty()` treats NULL and self-pointing as the same thing while
+`list_null()` does not. That needs its own audit of every `list_null` reader
+before it is safe, which is why it was not bundled into a checkpoint fix.
+
+**Next step.** Audit `list_null()` callers, then decide between the one-line
+`list_remove` change and converting the remaining bare removes to a re-initing
+form.
+
+### The Desktops applet's default height under-counts its action buttons
+
+Noticed 2026-09-12 while adding the Session button, and **pre-existing** -- left
+alone rather than changed under an unrelated commit.
+
+`ISHWorkspaceWorkspacesContentSize` (app/WorkspaceViewController.m) derives the
+applet's preferred size from its contents, but carries a single
+`actionsHeight` term (36pt phone / 44pt otherwise) while `_contentStack`
+receives more than one action row in the classic style:
+
+- **classic**: `_newWorkspaceButton`, `_closeHiddenButton`, `_sessionButton`,
+  `listCard` -- three buttons, one term (plus the `sessionHeight` term added
+  with the Session button, so the shortfall is the *second* of the two older
+  buttons).
+- **modern**: `layoutRow`, `_sessionButton`, `listCard` -- covered correctly by
+  `actionsHeight` + `sessionHeight`.
+
+The consequence is cosmetic: this is the preferred/fallback size for a window
+the user can resize, so the applet opens a little shorter than its contents in
+the classic style and the bottom button sits tight against the edge.
+
+**Next step.** Replace the fixed `actionsHeight` with a count of the action
+rows actually added, so the two styles cannot drift apart again -- the same
+bug will recur the next time a button is added to one branch and not the
+other.
+
+### An effective uid of 0 counts as every capability, whatever the effective set says
+
+`current_capable()` (kernel/getset.c) is `superuser() || <the bit in
+cap_effective>`, and `superuser()` is an effective uid of 0. Linux asks the
+effective set alone. The one place a test shows it is
+`tests/manual/exec_setid_unsafe.sh`, row R7. Root drops `CAP_SYS_PTRACE` and
+`CAP_SETUID` from its effective set, calls `PTRACE_TRACEME`, and execs a
+binary that is set-user-ID to uid 1000:
+
+- **Linux** refuses the new uid, since the tracer could not have attached and
+  the caller cannot set ids itself. The image runs as 0/0/0/0.
+- **AOK** runs it as 0/1000/1000/1000.
+
+That is the only one of the test's 51 rows that differs.
+
+Every privileged syscall asks the same function, so the fix is tree-wide. Each
+`current_capable()` and `superuser()` caller needs checking against what Linux
+asks there, and the capability tests need re-running as root with a reduced
+effective set, which none of them do today.
+
+Two more gaps in the same exec rules, neither with a test:
+- **Shared filesystem context:** Linux's third unsafe-exec condition, a
+  `CLONE_FS` shared with a process outside this one, is not modelled.
+- **`#!` interpreters:** Linux honours an interpreter's own set-id bits, and
+  AOK does not.
+
+### Tracing a native program: what a tracer still cannot see
+
+Found 2026-09-25 while fixing gdb's `startup-with-shell` under
+`SHELL=/AOK/native/zsh` (tests/manual/ptrace_startup_with_shell.c). A traced
+native program now reports its exec, and its own exec replaces it in place,
+keeping its pid (native_exec_in_place_wanted, kernel/native.h) -- which is all
+gdb's start-up needs. Three things a tracer sees on Linux it still does not:
+
+- **No syscall stops.** A native program's calls go through
+  syscall_dispatch_native, which has no ptrace hooks, and there is no guest
+  register file to report them from. `strace` shows the exec and the exit and
+  nothing between; a PTRACE_SYSCALL tracer sees one execve entry, the native
+  program's exec events, and one exit.
+- **Children are not followed.** A native shell starts a command with
+  native_spawn, not clone, so `strace -f` and gdb's `follow-fork-mode` never
+  attach to it.
+- **An untraced exec still stands in.** Only a traced program's exec goes in
+  place, since abandoning the program leaks its heap. Anything that attaches
+  AFTER a native program has exec'd finds the stand-in's wait, not the program
+  (its pid is the child's).
+
+## Timers across a checkpoint
+
+### FIXED: timers, and the signals they queue, were not in the image
+
+**Fixed 2026-09-22.** POSIX timers (`timer_create`), the interval timers
+(`setitimer`) and `alarm()` were not in a checkpoint image at all, so a
+restored process that had armed one never got its signal: a program using
+SIGALRM as a timeout waited for ever. Now each process's timers travel with its
+first running task (struct group_timers_ckpt, kernel/timer_ckpt.h), are
+rebuilt in their own slots, and are armed only once every restored task has
+started -- `task_never_ran_destroy` does not free a group's timers, so arming
+them any earlier would leave them firing into a failed restore.
+
+- **Each deadline travels on the clock Linux counts it on**, not as "time
+  left". MONOTONIC does not count the stop, and a relative arming on
+  CLOCK_REALTIME and ITIMER_REAL live there (hrtimer_init moves them).
+  BOOTTIME, the alarm clocks and a TIMER_ABSTIME arming on the wall clock do
+  count it, and come due that much sooner. A CPU-time timer keeps the CPU time
+  it had left. `posix_timer.abstime` and `fd->timerfd.abstime` remember the
+  arming, and a timerfd now uses the same rule, where it was time left.
+- **The signal queues travel too.** Only the task's `pending` bitmask was
+  carried, and delivery takes from the queue lists while the waits ask the
+  bitmask, so a signal pending at the save came back as a bit with no signal
+  behind it: never delivered, and once unblocked, every wait returned EINTR at
+  once (measured: a 0.2 s select took 0.000 s). Both queues now come back with
+  their siginfo, overrun counts included, and the pending sets are rebuilt from
+  them. Timers are read before the queues, so a timer firing mid-save costs at
+  most an overrun, never an expiry.
+- `signal_wake_task` no longer pokes a task whose host thread has not started
+  (its `thread` is the parent's, or nothing, for the app's pid 1 before
+  `task_start`), which a due timer made ordinary on the resume path.
+
+**Three defects in the first version, found by an adversarial review and each
+proved on the committed binary (e28c9476) before its fix:**
+- *ITIMER_VIRTUAL/PROF were measured on the wrong thread.* `cpu_time_now_of`
+  asks the CALLING thread for whichever member is `current`, and the writer
+  sets `current` to the task it describes. With 2.5 s of CPU on the carrying
+  thread, ITIMER_PROF came back 2.6 s of CPU late. The group's CPU is now read
+  with `current` cleared (`group_cpu_now`), on both sides.
+- *An expiry being delivered during the save was lost.* The timer thread
+  decides to fire, drops its lock and only then queues the signal; a timer read
+  in that gap was a fired one-shot, and its signal was not in the queue yet.
+  `timer_read` now waits the delivery out, and ITIMER_VIRTUAL/PROF are re-read
+  if the sampler ticked meanwhile (`timer_settle`). The window is microseconds,
+  so `ISH_TEST_TIMER_FIRE_DELAY_MS` holds every delivery open: with it, the
+  committed code lost both a POSIX timer's and ITIMER_REAL's signal 3/3, and
+  the fix delivered both 3/3 (checkpoint_timers.sh's race leg).
+- *"Never" overflowed.* A timer or timerfd armed at TIME_T_MAX -- systemd's
+  clock-change watch -- and a nanosleep of TIME_T_MAX, which is what
+  `sleep infinity` asks for, came back due at once: the nanosecond arithmetic
+  wrapped. Saturated now (TIMER_CKPT_NEVER), and "never" comes back never.
+
+**Test:** `tests/manual/checkpoint_timers.sh [root]` (+ .c), both save paths, a
+3 s stop: alarm() in a child, POSIX timers on MONOTONIC, REALTIME relative
+and absolute, BOOTTIME, periodic, SIGEV_NONE, process and thread CPU clocks,
+ITIMER_REAL and ITIMER_PROF, queued signals with their siginfo, and the sleeps
+below. Before the fix every check failed on both legs (24 on x86_64); after, each meets its
+deadline within ~10 ms, on devuan amd64 and arm64 (glibc) and alpine amd64
+(musl).
+
+### FIXED: a sleep the freeze interrupted started over -- even with no restore
+
+**Fixed 2026-09-22.** The earlier entry here said that within one process the
+freeze's restart carried the deadline. It did not: a freeze reached a sleep, poll or
+select as a bare EINTR, which `syscall_result_should_restart` restarted, but
+nothing had recorded the deadline, so the re-executed call waited its whole
+timeout again. Measured on the old binary with a plain save, no restore:
+nanosleep, clock_nanosleep, select, pselect6, poll, ppoll, epoll_wait and
+epoll_pwait all took 8.07 s for a 6 s timeout. Across a restore `sleep 5`,
+frozen 3 s in, slept 5 s more.
+
+Now the sleeps (`sleep_restart_or_eintr`) and `poll_wait` report a freeze as
+the `_ERESTART_NOHAND` it is and keep their deadline, as a job-control stop
+already did. The image carries it on the guest clock (MONOTONIC; BOOTTIME for a
+relative BOOTTIME sleep, which counts the stop), with the pending-rewind flags,
+so a handler that runs before the call re-executes still cancels it. epoll
+keeps a freeze's restart and drops the deadline with every other one: nothing
+consumed it, so after a SIGSTOP the NEXT poll or select to run waited out the
+stale deadline, or epoll's own 2 s cap. `tests/manual/checkpoint_freeze_restart.c`
+now also fails a sleep or poll-family case that returns late.
+
+### Timers and timed waits: what is still open
+
+- **Every other timed wait still starts its timeout over after a freeze:** a
+  relative futex FUTEX_WAIT (and so every glibc timed lock and condvar wait
+  that is relative), `rt_sigtimedwait`, `semtimedop`, a socket's
+  SO_RCVTIMEO/SO_SNDTIMEO wait, and clock_nanosleep on a CPU clock. Each needs
+  a deadline carried the way `sleep_restart_deadline` carries one (Linux's
+  restart_block). kernel/calls.c's `syscall_result_should_restart` names them.
+  A relative FUTEX_WAIT does now keep its deadline across a restart nothing
+  ran in front of -- a stop, an ignored signal (`futex_restart_deadline`,
+  parked with the wait) -- but a freeze answers "no restart" from the signal
+  side, which drops the park, so it still starts over there.
+- **The CPU-time clocks start again from zero after a restore.** A restored
+  thread is a new host thread, so CLOCK_PROCESS_CPUTIME_ID,
+  CLOCK_THREAD_CPUTIME_ID, getrusage, times() and /proc/<pid>/stat's
+  utime/stime all go backward across one. A CPU-time timer is right -- it
+  carries the CPU time it had left -- but a reading taken before the save, or
+  an absolute CPU-clock arming made from one, is not.
+- **The clocks resume when the restore STARTS** (`guest_clock_resume`), so
+  MONOTONIC counts the restore's own duration, which Linux's does not -- it
+  continues from the thaw. Every carried deadline agrees with it, so a relative
+  and an absolute wait still agree; moving the resume to just before the thaw
+  would fix all of them at once.
+- **A native program's pending signals come back as bits with no queue entry**,
+  as before. It is re-launched, and nothing it had pending is delivered.
+- **Found alongside, not a checkpoint bug:** `ppoll` with an INT64_MAX
+  timeout returns 0 at once (measured on the pre-change binary, no checkpoint
+  involved), where nanosleep and clock_nanosleep with the same value sleep --
+  poll_wait's deadline arithmetic overflows. A NULL timeout is the usual way to
+  say "for ever", so nothing common hits it.
+- **Found alongside, not a checkpoint bug -- FIXED 2026-09-23:** a signal
+  whose delivery runs no handler (SIGCHLD with SIG_DFL) ended a restartable
+  wait with EINTR, where Linux restarts the call; and
+  `deliver_signal_to_group_locked` queued such a signal whenever ANY member
+  blocked it, where Linux asks only the target. musl's fork() and pthread_exit
+  block every signal, so a child dying while a sibling thread exited EINTR'd
+  the other threads' sleeps. Now only the target's mask decides, and an ignored
+  signal restarts what it interrupts, even when a sibling took it first
+  (kernel/signal.c; `tests/manual/signal_ignored_restart.c`). A HANDLED
+  process signal woke every thread too, so its handler ran in a sibling and
+  other siblings' calls failed with EINTR; since the same day ONE thread is
+  told, as Linux's complete_signal does
+  (`tests/manual/signal_process_wake_one.c`).
+  `checkpoint_timers.c` still parks its threads and its asker, so it depends
+  on neither.
+
+## Suspend and resume across the three modes
+
+The goal: a suspend or checkpoint comes back exactly as it was, whether it was
+taken in shell, Workspace or Wayland mode, with every applet in it (the Wayland
+display included). Terminal and applet restoration are done. These three are
+open. All were reported 2026-09-15.
+
+### Saving takes a long time when a Wayland applet is open
+
+**Established.** Nothing yet. The user reported that a suspend with a Wayland
+applet open is slow on the SAVE side. It has not been measured and the cause is
+not known. Candidates, none checked:
+- the freezer waiting for the compositor's or RFB client's tasks to park, up to
+  the freeze timeout in kernel/checkpoint.c;
+- a much larger image, because a Wayland session keeps framebuffers in guest
+  memory;
+- the app side of the save (ISHWorkspaceCaptureLayoutForSuspend, and
+  DisplayViewController tearing down its RFB connection).
+
+**Next step.** Time the phases. Save the same session with and without the
+Wayland applet open, and compare the image size, the `session.*` breadcrumb
+timestamps in Diagnostics, and an `ISH_CHECKPOINT_DEBUG` trace of which task
+the freezer waits on.
+
+### Restore should come back in the mode it was saved in
+
+**Established.**
+- The launch mode comes only from the Settings "Initial Window" preference.
+  SceneDelegate.m reads it through `ISHShouldLaunchWaylandDisplayAtStartup()`
+  and `ISHShouldLaunchWorkspaceAtStartup()`.
+- A suspend records the Workspace arrangement next to its image
+  (`ISHWorkspaceCaptureLayoutForSuspend`). It does not record which mode was on
+  screen.
+- So a session saved in Wayland mode and resumed with the preference set to
+  Workspace comes back in Workspace, and the reverse.
+
+**Next step.** Record the on-screen mode (shell, Workspace, or standalone
+Wayland) beside the image, the same way the layout is filed. On a resume,
+choose the window from that record instead of the preference, and use the
+preference only for a fresh boot.
+
+### Wayland mode has no quick way to suspend or checkpoint
+
+**Established.** Shell mode has a Save Session button and a Cmd+S key command
+(TerminalViewController.m, TerminalView.m). Workspace has "Save Session" in its
+root menu (WorkspaceViewController.m). The standalone Wayland display
+(DisplayViewController) has neither. Its only suspend path is backgrounding the
+app with Suspend to Disk on.
+
+**Next step.** Give the standalone display the same two actions the others
+have, "Save Session Now" and "Suspend and Exit" (`ISHSuspendSessionSaveNow`,
+`ISHSuspendSessionSuspendAndExit`). Offer them as an on-screen control that
+does not cover the desktop, plus a key command. Cmd+S matches shell mode and
+looks free there: DisplayRFBView forwards only Cmd+= + - 0 to the guest, and
+deliberately not Cmd+letter. Confirm it does not also reach the Wayland
+session before claiming it.
+
+### The signal waits can still be poked into EINTR
+
+**Established (2026-09-17).** The address-space barrier
+(`task_poke_shared_mem`) skips a task that is `io_block`, but it can read the
+flag a moment before a task entering a blocking call sets it. The poke then
+lands inside the wait, and `wait_for` reports it as `_EINTR` with no signal
+pending. Seen unforced once in several hundred tries: an `inotify` read on the
+Devuan arm64 root came back EINTR at 0ms with no handler run, while a sibling
+thread mapped memory. `ISH_TEST_POKE_BLOCKED_TASKS=<comm prefix>` forces the
+race (kernel/task.c).
+
+Forced, it failed every wait that trusted `io_block` alone, and all of those
+outside kernel/signal.c are now on `wait_for_blocked` (util/sync.c), which
+treats a bare poke as a spurious wakeup: `eventfd`, `inotify` and `timerfd`
+reads, pty reads and writes, FIFO opens, reads and writes (tmpfs FIFOs in
+fs/fifo.c; a host FIFO's open retries in fs/real.c), `F_SETLKW`, `flock`, the
+kmsg wait and the `/dev/fuse` read. `tests/manual/blocked_wait_state.c` checks
+thirteen of them, and run with the knob it failed all thirteen before the
+change and passes after.
+
+**Still open: pause, rt_sigsuspend, rt_sigtimedwait and the signalfd read**, all
+in kernel/signal.c, which was being rewritten for the restart record when the
+rest landed. Forced, `rt_sigtimedwait` returned EINTR within milliseconds.
+Only signalfd can take `wait_for_blocked` as it is, because its loop re-reads
+the signals first. The other three cannot:
+- `rt_sigtimedwait` waits for signals it has BLOCKED. Their arrival shows up
+  only as the interruption mark a poke also leaves, which
+  `task_wake_signal_pending` does not count. Its loop is
+  `do wait_for(...) while (err == 0)`, with no look at the set, so a spurious
+  wakeup would wait on past the signal. It needs to check the set on every
+  pass first.
+- pause and rt_sigsuspend loop until `wait_for` says `_EINTR`, so they need the
+  same predicate inside the loop rather than a different wait.
+
+**Next step.** Once the restart-record work in kernel/signal.c has landed,
+restructure those loops as above. Then add the four calls to
+`blocked_wait_state`'s knob-driven checks.
+
+### A task blocked OPENING a FIFO still cannot be frozen if its wake is lost
+
+**Established (2026-09-15).** The freezer's wakes (a `pthread_kill` and a
+cond notify) can be lost on a device. `ISH_CHECKPOINT_LOSE_WAKES=1` drops them
+on the CLI, so that failure can be reproduced on a Mac. Every cond-based wait
+in the kernel now checks for a freeze once a second (`wait_for` in
+util/sync.c). With the wakes dropped, a sweep of blocking shapes shows:
+- **Now freeze:** dash/busybox `wait` (rt_sigsuspend), bash `wait` and
+  `waitpid` (wait4), `flock`, a pipe read, and perl `pause`/`sigsuspend`.
+- **Still refuses:** `cat` opening a FIFO nobody has opened for writing:
+  "did not reach a syscall boundary (blocked in arm64 syscall 56)".
+
+A fakefs FIFO is a real host FIFO, and `realfs_open` calls the host `openat`
+without O_NONBLOCK. The task therefore sits in a HOST syscall that only the
+`pthread_kill` can interrupt. No wait slice helps, because the task is not in a
+cond wait.
+
+**Why it was not fixed with the rest.**
+- The writer half is simple: open O_WRONLY|O_NONBLOCK, and retry on ENXIO in
+  short slices that ask about signals and the freeze.
+- The reader half has no faithful emulation. A non-blocking O_RDONLY open
+  succeeds at once, and Darwin offers no way to ask whether a writer exists.
+  Inferring it from Darwin's spurious POLLHUP misses a writer that opens and
+  closes without writing. Linux wakes the blocked reader for that writer, so
+  the inference would change guest-visible behaviour.
+- Cancelling a blocked reader by briefly opening the write end is visible to
+  any other reader of the same FIFO, which would see a writer come and go.
+
+**Next step.** Do the writer half as above. For the reader, look for a Darwin
+query that reports the writer count, or accept the POLLHUP inference only
+where a lost write-and-close cannot happen. Until then this is a
+rarely-hit shape: a checkpoint has to land while a process sits in an unpaired
+FIFO open.
 
 ## Deferred on purpose
+
+### Suspend and Exit terminates the app, which the HIG discourages
+
+`ISHSuspendSessionSuspendAndExit` ends in `exit(0)`, because iOS has no public
+"quit my app" API and the feature is, precisely, to put the machine down and
+leave. It is behind an explicit, confirmed, user-initiated action in the Session
+menu -- never automatic -- and the image is fsynced and renamed into place
+before the process goes, so the session is durable rather than merely written.
+
+**The decision to make before an App Store build**: keep it, or replace the exit
+with a "session suspended" screen that leaves closing the app to the person.
+Reviewers object to apps that appear to crash; an app that quits on a button the
+user just confirmed is a weaker case against, but it is not no case. Recorded
+here so the choice is made deliberately at submission rather than discovered.
+`/AOK/tools/suspend.sh` has always ended the same way and is unaffected either
+way, since a guest-initiated halt is not the app terminating itself.
+
+
 
 ### External display / AirPlay -- GH #540
 
@@ -2267,6 +1735,204 @@ Work exists on the branch `worktree-external-display-540`:
 **Deferred to a future release by the maintainer (2026-08-18): "the external
 display work is flawed".** The commit is NOT merged and must not be swept into a
 release by accident. Left on its branch deliberately.
+
+---
+
+## Host capabilities worth exposing
+
+What the iPhone and iPad hardware actually lets an app reach, and which parts
+are worth surfacing to the guest. Surveyed 2026-09-07.
+
+### Bluetooth LE -- the one radio that is genuinely open
+
+**Established.** CoreBluetooth's central role is available to every app with no
+MFi programme, no Apple-granted entitlement and no vendor agreement: scan,
+connect, discover services and characteristics, read/write/notify against any
+BLE peripheral. The peripheral role is open too, and `CBL2CAPChannel` (iOS 11+)
+gives a real bidirectional stream over LE credit-based flow control rather than
+characteristic ping-pong. Entry cost is one Info.plist key
+(`NSBluetoothAlwaysUsageDescription`) and a user prompt.
+
+Classic BR/EDR is closed in the other direction -- no RFCOMM, no SPP, no SDP,
+no HCI, no programmatic pairing. Bluetooth serial needs MFi through
+ExternalAccessory, the same gate as the port. Keyboards (HID) and audio (A2DP)
+are handled by the system and already work in AOK for free. Multipeer
+Connectivity and `Network.framework` peer-to-peer do use Bluetooth, but only
+between Apple devices. AccessorySetupKit (iOS 18+) narrows the permission
+prompt; it does not add capability.
+
+One hard limit: there are no Bluetooth addresses. CoreBluetooth hands out an
+opaque per-app UUID that differs between apps and rotates, so anything
+`hcitool`-shaped is impossible by construction. Throughput is kilobytes per
+second -- fine for sensors and control, useless for bulk transfer.
+
+**Next step** is a `/dev/bluetooth` character device on the `/dev/url` recipe
+([[dev-url-scheme-device]]), central role only to start: a line protocol for
+scan / connect / read / write / subscribe, plus a guest-side helper tool.
+app/LocationDevice.m is 190 lines for a read-only device; this one is read/write
+and stateful, so budget several hundred, plus the same five registration points.
+
+Two things to get right:
+
+- **Do not fake BlueZ.** `AF_BLUETOOTH`, HCI sockets and `bluetoothctl` would
+  mean synthesising controller-level events out of a GATT-level API, and the
+  result reports states no real controller produces -- exactly the failure in
+  [[capability-lies-are-load-bearing]]. Ship an AOK-native interface and
+  document it as one. A `bleak` backend on top is a reasonable follow-on.
+- **App Review will ask why a terminal wants Bluetooth.** The precedent is
+  already in the tree: AOK ships `/dev/location` and asks for location
+  permission on the same argument -- an opt-in device capability surfaced to a
+  scripting environment.
+
+### The Lightning / USB-C port -- mostly nothing to do
+
+**Established.** There is no raw USB access at any tier: no enumeration, no bulk
+transfers, no device nodes. What exists, in order of reachability:
+
+- **Free, no code.** USB Ethernet adapters (just a network interface -- the
+  wired device-testing link already rides this), USB and Bluetooth keyboards,
+  USB audio, external displays.
+- **Files plus security-scoped bookmarks.** iOS 13+ mounts USB storage into
+  Files, and a document picker can select a folder on it. **AOK already has
+  this** -- `iosfs` in app/iOSFS.m is exactly that mechanism. Limits: no block
+  device, no `mount(2)`, FAT/exFAT/APFS/HFS+ only, and bookmarks go stale on
+  unplug.
+- **ExternalAccessory (MFi).** Per-accessory protocol strings declared in
+  Info.plist, and the accessory needs Apple's auth chip. Not generic USB.
+- **DriverKit (iPadOS 16+, M-series only).** The
+  `com.apple.developer.driverkit.*` entitlements are granted by Apple per app
+  against a specific hardware justification, and they vanish in unsigned builds
+  ([[unsigned-ipa-drops-entitlements]]).
+
+Thunderbolt is not a separate thing to expose: the M-series iPad port is USB4,
+but there is no PCIe API on iPadOS. The device side is fully closed -- AOK
+cannot present itself to a connected Mac as USB serial or mass storage.
+
+**Verdict: no DriverKit work.** M-series iPad only, an entitlement Apple is
+unlikely to grant for this use case, and dead in sideloaded builds -- it would
+split the user base for a feature most users cannot run.
+
+**Next step**, if anything: polish `iosfs` for external volumes -- a sane story
+when the drive is unplugged mid-session and the bookmark goes stale, and a line
+in the docs saying a USB-C SSD can be mounted. Users do not know AOK already
+does this. A Redpark-backed `/dev/ttyUSB0` over ExternalAccessory would slot
+into the same dyndev recipe and is the one genuinely differentiating port
+feature -- iPad plus console cable -- but it needs specific hardware, Redpark's
+licensing terms, and it is dead code for everyone without the cable. Only worth
+it if the maintainer wants it personally.
+
+### YubiKey for ssh -- possible add, tested by the requester
+
+Asked for on Discord (2026-09-21) by a user who authenticates ssh with a
+YubiKey over NFC or USB. They had tried to build it themselves and stopped at
+the NFC entitlement, which a free Apple account cannot hold. That wall is ours,
+not theirs: the TestFlight build is signed on a paid team, so an entitlement we
+add reaches TestFlight users. It does not reach free-account sideloaders of the
+GitHub IPA, whose re-signer drops what their team cannot hold
+([[unsigned-ipa-drops-entitlements]]).
+
+**Established.**
+
+- **Shape: an ssh-agent in the app, not key passthrough.** The guest has no
+  USB, HID or PC/SC, and building any of them is far more work than the agent
+  protocol, which is small (list identities, sign) and stable. The app talks to
+  the key; the guest gets a unix socket and `SSH_AUTH_SOCK`; guest `ssh`, `git`,
+  `scp` and `rsync` work unchanged on every arch, musl and glibc.
+- **Transports.** NFC is iPhone only -- iPads and Macs have no reader CoreNFC
+  can use. USB-C (iPad, iPhone 15+, iOS 16+) goes through CryptoTokenKit and
+  reaches only the key's smart-card applets: PIV, not FIDO2, because apps get no
+  HID. Lightning (5Ci) is MFi ExternalAccessory, and App Store use needs Yubico
+  to register the app -- skip it.
+- **Key types.** PIV (slot 9a) works over NFC and USB-C. FIDO2 `ed25519-sk` /
+  `ecdsa-sk` works over NFC only, and only by speaking CTAP2 to the key
+  directly with its `ssh:` application id. Apple's AuthenticationServices
+  security-key API cannot do it: it signs only for an associated web domain, so
+  it never matches a key `ssh-keygen -t ed25519-sk` made. Existing `id_*_sk`
+  files would load through `ssh-add`; creating sk keys on the device is out of
+  scope.
+- **Socket plumbing is small.** `unix_socket_get` (fs/sock.c) already maps a
+  guest socket node to a host socket by `socket_id`, so the kernel makes the
+  node and the app owns the host listener behind it. The listener must strip
+  the 8-byte peer cookie AOK's connect sends first (the unix peer-token
+  registry, same file). AF_UNIX listeners survive suspend
+  ([[listening-sockets-die-on-suspend]]), so no resume hook should be needed --
+  confirm it on the device rather than assume.
+- **UX limits.** Signing needs AOK in the foreground (NFC sheets and PIN
+  prompts both do). Over NFC it is one tap per ssh connection, so `git` work
+  that opens many wants `ControlMaster`; USB-C has no such cost. Listing
+  identities would cost a tap of its own unless the public keys are cached by a
+  one-time "enroll key" step in Settings.
+
+**Sizing** (estimated 2026-09-22, nothing built): about 2,500 lines. Agent
+protocol and signature encoding ~700 lines of C; PIV and both transports ~600,
+or far fewer on YubiKit (ObjC, Apache-2 -- compatible with GPLv3 -- vendored
+as an emkey1 fork per [[vendor-as-fork-submodule]]), which also covers FIDO2;
+app UI ~500 (enroll, key list, PIN prompt with an optional per-session cache).
+FIDO2 sk keys over NFC are a second phase of ~500 more. Entitlements:
+`com.apple.developer.nfc.readersession.formats` (TAG), the PIV and FIDO AIDs in
+`com.apple.developer.nfc.readersession.iso7816.select-identifiers`,
+`NFCReaderUsageDescription`, and `com.apple.security.smartcard` for USB-C.
+NFC Tag Reading must be enabled on the App ID in the developer portal and the
+profiles regenerated; whether the smart-card entitlement needs the same is not
+known.
+
+**Testing without hardware.** The maintainer has no YubiKey and does not plan
+to buy one, and the simulator has neither NFC nor smart cards, so the
+transports can only be proven by the requester on TestFlight. What can be
+proven here first: the agent core and socket on the CLI build, behind a
+software key backend, with guest `ssh-add -L` and `ssh` against a guest sshd.
+Ship the hardware path behind a Settings toggle marked experimental, and log
+each APDU exchange's status word with `ish_printk` so the tester can paste
+`dmesg` back -- ssh itself only ever sees `SSH_AGENT_FAILURE`.
+
+**Next step** is a question to the requester, not code: PIV or FIDO2? Yubico's
+own guide calls FIDO2 the simplest ssh setup, and if that is what they use, a
+PIV-first phase does nothing for them and the order flips.
+
+### x86 guests have no crypto acceleration, and it costs 18-46x
+
+**Established, measured 2026-09-18** ([docs/guest_pc_sampling_2026_09.md](guest_pc_sampling_2026_09.md)).
+`jit/guest-arm64/crypto.S` maps the arm64 guest's AESE/AESMC/PMULL/SHA256H onto
+the host's own crypto instructions and `kernel/exec.c` advertises them in
+`AT_HWCAP`. The x86 guests get none of it, and `openssl speed` at 16 KB blocks
+shows what that is worth:
+
+| | arm64 guest | amd64 guest | ratio |
+|---|---:|---:|---:|
+| AES-128-GCM | 97,352 kB/s | 5,308 kB/s | **18.3x** |
+| SHA256 | 109,685 kB/s | 2,383 kB/s | **46.0x** |
+
+Not a benchmark artefact: on `apt install` this is 20.6% of on-CPU time on the
+amd64 guest (`libmd` 10.6% + `libcrypto` 10.0%, hashing and verifying packages;
+24.6% of wall) against ~1% on arm64, and 35.8% of on-CPU on amd64 `apk add` against 6.9%.
+
+(Superseded 2026-10-08: the vector switch is on, and AES-NI and PCLMULQDQ are advertised with it, legacy SSE encodings included.)
+
+**The scoping point that makes this tractable.** In `emu/cpuid.h` the AES-NI and
+PCLMULQDQ bits sit inside `#if CPUID_ADVERTISE_VECTOR_STATE`, next to
+XSAVE/OSXSAVE/AVX. That switch is 0 for a real reason -- the signal frame cannot
+carry `ymm_hi`, so advertising AVX would corrupt registers across a signal.
+**AES-NI does not share that debt**: its legacy SSE encodings use `xmm0-15`,
+which the existing 512-byte FXSAVE signal frame already saves in full. The bits
+are bundled there because making OpenSSL emit those encodings is, in that
+comment's words, a separate claim needing its own evidence -- not because XSAVE
+is required.
+
+**Next step**: implement the legacy SSE `AESENC`/`AESENCLAST`/`AESDEC`/
+`AESDECLAST`/`AESIMC`/`AESKEYGENASSIST` and `PCLMULQDQ` in the i386 and amd64
+engines, mapped onto host AESE/AESMC/PMULL as `jit/guest-arm64/crypto.S`
+already does, then advertise **only** bits 1 and 25 and leave
+`CPUID_ADVERTISE_VECTOR_STATE` at 0. Do SHA256 in the same pass -- it is the
+larger half of the loss, and the host instructions for it are already in use by
+the arm64 guest. Note `emu/avx.c`'s `avx_aes_round` is a software S-box today,
+so the VEX forms need the same treatment or they become a trap for anything
+that probes AES-NI and then uses the VEX encoding.
+
+Related and already shipped: `ISH_SYS_AEAD` (`kernel/ish_accel_aes.c` plus the
+OpenSSL provider in `opt/AOK/tools/crypto`) is ABI-neutral, so it already works
+for x86 guests -- but it is off by default, needs a provider installed in the
+root, and covers AEAD ciphers only, not the bare SHA256 that `libmd` and `apt`
+spend their time in.
 
 ---
 
@@ -2327,34 +1993,142 @@ rather than a gap. **Next step** is the interposition prototype, not helix
 itself -- pick the smallest Rust program that does one `open` and see whether
 its objects can be made to call `nlibc_open`.
 
+### gzip is already native, and nothing routes to it
+
+**Established, measured 2026-09-18** ([docs/guest_pc_sampling_2026_09.md](guest_pc_sampling_2026_09.md)).
+`tar xzf` spends 50-83% of its on-CPU time in a decompressor **binary**, never
+in libz: `/usr/bin/gzip` on the Devuan roots, `/bin/busybox` on Alpine. Read off
+the ELF, `DT_NEEDED` for `/usr/bin/gzip` is `libc.so.6` alone -- GNU gzip and
+busybox each carry their own inflate, so no libz accelerator of any kind can
+touch this workload.
+
+smallclue already has `gzip`/`gunzip`/`zcat` applets. Shadowing the guest's
+gzip with the native one on PATH, interleaved A/B, median of 4, same 14 MB
+tarball:
+
+| guest | distro gzip | native gzip | speedup |
+|---|---:|---:|---:|
+| amd64 / glibc | 13.130 s | 4.759 s | **2.76x** |
+| arm64 / glibc | 5.583 s | 4.797 s | **1.16x** |
+
+So the capability exists and is unreached, because `/AOK/tools/native-links.sh`
+is not applied by default. **Next step** is a decision, not code: whether
+shadowing a distro binary by default is acceptable (it changes what `tar -z`
+runs, and the applets' flag coverage would need to be checked against GNU
+gzip's first). The arm64 win is smaller because what is left there is tar's own
+file creation through fakefs, not the codec.
+
+### smallclue's `git`, `rsync` and `dvtm` are compiled as stubs
+
+**Wanted, and deferred on 2026-09-25: not before 556.** smallclue carries all
+three, and the applets are in AOK's binary, but each one only refuses:
+
+| applet | what it says today | why |
+|---|---|---|
+| `git` | "libgit2 support is not enabled in this build" | built without `PSCAL_HAS_LIBGIT2` |
+| `dvtm` | "applet is disabled in this build" | built without `SMALLCLUE_WITH_DVTM` |
+| `rsync` | "openrsync: not built into this iSH-AOK" | AOK's own stub, `kernel/smallclue_glue.c` |
+
+meson.build takes only openssh and nextvi from deps/smallclue/third-party. So
+AOK has never checked out the dvtm, libgit2 and openrsync submodules, not even
+in the main checkout. Each one is a port, not a flag:
+
+- **libgit2** (`git`). It has to be built for iOS inside meson, with every
+  source file going through kernel/native_libc.h like the rest of smallclue.
+  - It needs a TLS and HTTPS transport, and AOK links no OpenSSL. The
+    NSURLSession-backed curl shim in deps/smallclue-shim is the likely route,
+    through a custom smart-HTTP transport.
+  - ssh remotes need an ssh transport; running the native `ssh` is one option.
+  - Licence: GPLv2 with the linking exception. Check it against the
+    Licensing summary in meson.build before shipping. Nothing else in the
+    binary is GPL unless `-Dnative_bash` is on.
+- **dvtm**. It starts a shell on each pty, and a native program cannot
+  `fork()`. That needs AOK's native spawn with a pty.
+  deps/smallclue/src/dvtm_runtime_hooks.h is smallclue's iOS hook point.
+- **openrsync** (`rsync`). Its remote side runs over an ssh child. That needs
+  native spawn plus pipes, and deps/smallclue/src/openrsync_ios_shim.h and
+  openrsync_hooks.h are the starting points.
+- **Submodules.** Initialise them in the main checkout only, never from a
+  worktree, because worktrees share the submodule git dir. A worktree made
+  now gets only the two submodules the build uses, and git then marks
+  deps/smallclue as modified for the three missing folders. Creating the
+  folders silences it.
+
+Until then, the guest's packages do the job: `apk add git rsync dvtm`, or
+`apt install` on Devuan. They are slower, being translated rather than native.
+
+### Library-level native interposition: measured, and the answer is no
+
+**Established 2026-09-18.** The idea of running a host libz/libcrypto/libc in
+place of the guest's was measured with a sampling profiler
+(`kernel/guestprof.c`, `ISH_GUEST_PROFILE`) across four workloads and four
+guests. It does not pay:
+
+- `tar xzf` reaches no shared library at all (above).
+- In `git clone`, libz is 8-11% of on-CPU against `[kernel]` at 22-38%.
+- The only library clearing a high bar is `liblzma` (27-40% of on-CPU in
+  `apt install`, because `.deb` data is xz) -- and on musl that slot is libz
+  instead, because `.apk` is gzip. Even "accelerate the package manager's
+  codec" is a different library per distro, for a win confined to one of them.
+
+No further work is planned on it. The instrument stays; the full argument,
+including what would have had to be true for a go, is in the doc.
+
+---
+
+## Large work in flight, tracked in its own document
+
+Recorded here because this file was silent about the biggest thing in the tree
+for a whole cycle. These are not TODO entries -- each has a plan document that
+is the live record -- but a reader who does not know they exist will misread
+everything above.
+
+**Simulated swap.** [docs/simulated_swap_plan.md](simulated_swap_plan.md).
+Phases 0, 1 and 2 built and on `working`; phase 3 device validation under way
+and already the most productive part of the project -- a 3 GB iPhone SE reached
+states the 16 GB iPad never does, and found that AOK's growth guard did not
+cover the page-fault path at all, so a guest could commit 704 MiB past the point
+where the same total in separate `mmap`s was refused. Fixed by sensing in
+`tlb_handle_miss` and acting in `handle_timer_interrupt`. Ships **off by
+default**, enabled in Settings with a user-specified size. The plan's own
+"still open" lists are themselves stale: `/proc/swaps`, `swapon`/`swapoff` and
+`mincore` have all landed since they were written.
+
+**Memory truth.** Landed with the above and worth naming separately, because
+the swap plan's section 11 deferred it and that deferral is what the plan is
+still written around. `mem_resident_page_count` (emu/memory.c:879) is real, and
+`/proc/meminfo` now describes the guest rather than the phone
+(fs/proc/root.c:479). Before that a guest on a 3 GB phone read `MemTotal` 2957
+MB against a real ceiling of 2098 MB, so `free`, `top` and ktop all showed the
+machine as ~100% full at idle and no guest allocator could act on any of it.
+
+**The amd64 JIT.** A full amd64 regression suite now runs with **zero**
+interpreter fallbacks, closed opcode group by opcode group with
+`/proc/ish/amd64_jit` reporting what could not be compiled. The interpreter
+entry points the JIT stopped using are deleted. What remains is the dispatch
+loop itself, which is a separate question from the fallbacks.
+
 ---
 
 ## Reported issues
 
-### Bugs
+Checked against GitHub on 2026-10-12: **8 open** (#540, #577, #616, #620, #625,
+#628, #631, #639), after a pass that closed #521 (fixed in 552 and never told)
+and #604 (answered; its one open ask is #639). **Closing the issue is part of
+fixing the bug** -- a fix recorded here and not there is a fix the reporter
+never learns about.
 
-| # | Title | Notes |
+| # | Title | State |
 |---|---|---|
-| [#482](https://github.com/emkey1/ish-AOK/issues/482) | Wayland applet does not resize properly | |
-| [#485](https://github.com/emkey1/ish-AOK/issues/485) | Qt apps (Falkon) cannot connect to session bus | 6 comments |
-| [#503](https://github.com/emkey1/ish-AOK/issues/503) | amd64: gdb next/step after a breakpoint crashes with SIGILL | ours |
-| [#521](https://github.com/emkey1/ish-AOK/issues/521) | Buildroot `make` crashes on "checking for working sigaltstack" | body is a screenshot only |
-| [#523](https://github.com/emkey1/ish-AOK/issues/523) | yay (AUR helper) fails on Arch ARM64 | **reported symptom does not reproduce** -- see *Diagnosed* above. Previously: **half fixed.** The crash was a poll.c fd use-after-free, fixed in `717e6d3d`. The *reported* symptom -- `yay -S pandoc-bin` dying with `context: signal: terminated` -- still reproduces and is not a crash: yay's Go runtime sends itself SIGTERM when its context is cancelled, most likely its own timeout firing because emulated syscalls are slower than its budget assumes. Not a re-test; a timeout question |
-| [#527](https://github.com/emkey1/ish-AOK/issues/527) | pikaur fails on Arch ARM64 | blocked on `systemd-run` |
-| [#541](https://github.com/emkey1/ish-AOK/issues/541) | ptraceomatic does not run: tracee reaped during setup | **fixed 2026-08-20** -- see *Closed during the 550 cycle* |
-| [#542](https://github.com/emkey1/ish-AOK/issues/542) | JVM/HotSpot crashes on aarch64, "Field too big for insn" | **fixed 2026-08-23** -- ours, not upstream: AOK reported DCZID_EL0 DZP=1. See *Closed during the 550 cycle* |
-| -- | btop shows nothing in its disk, net and io sections | reported 2026-08-19; **fixed** -- see *Closed during the 550 cycle* |
-
-### Feature requests
-
-| # | Title |
-|---|---|
-| [#483](https://github.com/emkey1/ish-AOK/issues/483) | Fullscreen mode for the Wayland applet, dynamic resolution |
-| [#484](https://github.com/emkey1/ish-AOK/issues/484) | 3D acceleration via virglrenderer |
-| [#540](https://github.com/emkey1/ish-AOK/issues/540) | External display support (AirPlay) -- see *Deferred* above |
-| [#556](https://github.com/emkey1/ish-AOK/issues/556) | Updated preset appearances |
-| [#559](https://github.com/emkey1/ish-AOK/issues/559) | Feedback: own icons rather than iSH's, more OS images, QEMU |
-| -- | Terminal cell height / line-height control -- see *Diagnosed* above |
+| [#540](https://github.com/emkey1/ish-AOK/issues/540) | External display support (AirPlay) | built, reverted for 546, parked -- see *Deferred on purpose* above |
+| [#577](https://github.com/emkey1/ish-AOK/issues/577) | Home Screen start-up options | **done for 559** (quick actions), and said so 2026-10-12. Close when 559 is out |
+| [#616](https://github.com/emkey1/ish-AOK/issues/616) | Customizable bottom padding | **done for 559** (Settings > Appearance > Bottom Padding), and said so 2026-10-12. Close when 559 is out. The reporter's extras (status text in the margin, a pre-typing queue) were not done |
+| [#620](https://github.com/emkey1/ish-AOK/issues/620) | Some apps don't work in the Wayland display | the two games fixed for 559, VLC and Pi-Apps refuse root, and said so 2026-10-12; the Synaptic freeze is unverified and the reporter was asked again (queue above) |
+| [#625](https://github.com/emkey1/ish-AOK/issues/625) | Browsing filesystem crashes app | **fixed for 559** (queue above), said so 2026-10-12 and asked whether the copy was sideloaded. Close when 559 is out, or sooner on the answer |
+| [#628](https://github.com/emkey1/ish-AOK/issues/628) | Wayland display: touchpad | **Built 2026-10-13 for 559:** Touchpad Mode in the display's menu (UserPreferences displayTouchpadMode, DisplayRFBView): one finger moves the pointer from where it is, with acceleration; tap, double tap, tap-and-drag; two fingers scroll or right-click; three middle-click. Checked in the simulator against a real labwc desktop, reading `wev`'s log in the guest for each gesture, and with the mode off for the old behaviour. Not checked: three fingers (the simulator tool has two), and feel on a real phone. The reporter never answered the question; comment and close when 559 ships. |
+| [#631](https://github.com/emkey1/ish-AOK/issues/631) | SSH client disconnects after a short time idle | answered 2026-10-12: iOS behaviour, the /dev/location keep-alive, and the errno fixed for 559. Close when 559 is out unless the reporter says the keep-alive does not hold |
+| [#639](https://github.com/emkey1/ish-AOK/issues/639) | Install a desktop from Settings | **Built 2026-10-13 for 559.** Settings → Wayland Desktop → Install a Desktop…, and the same page from the display's ··· menu: the four desktops with their state (asked of select-desktop.sh), install by tapping (the setup script runs as root with its output shown live and a Stop button), select by tapping, and Games / Tools / X11 / GPU drivers under More Programs. Done end to end in the simulator on an Alpine filesystem with no desktop: the display's "labwc not found", the page, a seven-minute install to "Finished.", sway then labwc selected (/etc/aok-desktop.conf followed), and the display connected. Not tried: Xfce, Wayfire, Devuan, a device, Stop. Found on the way: a headless guest command has no exit status when the guest's own init reaps it first (run_guest_command_capture says so), so the page reads the status from a line the command prints. Comment and close when 559 ships. |
+| [#640](https://github.com/emkey1/ish-AOK/issues/640) | Storage: where the space has gone | Opened 2026-10-12, after this pass. A Storage tool already existed (Utilities → Storage) but printed one total per filesystem and stopped. **Rebuilt 2026-10-13 for 559** as a browsable list: every place the app keeps data, largest first, and inside each its directories and files by size (one background scan per place with fts, hard links counted once, allocated blocks). In the simulator its figures equal `du`'s to the kilobyte (a root 855.9 MB, its /usr 830.8 MB). Comment and close when 559 ships; mention where the tool is, since the reporter had not found the old one. |
 
 ---
 

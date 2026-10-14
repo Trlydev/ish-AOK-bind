@@ -4,6 +4,8 @@
 #include "jit/jit.h"
 #include "emu/tlb.h"
 #include "kernel/calls.h"
+#include "jit/arm64_mops.h"
+#include "kernel/foreign_exec.h"
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/binder.h"
@@ -14,6 +16,12 @@
 #include "kernel/calls.h"
 #include "emu/memory.h"
 #include "kernel/swap.h"
+#include "fs/fake-snapshot.h"
+#include "kernel/checkpoint.h"
+#include "kernel/memcomp.h"
+#include "kernel/zswap.h"
+#include "fs/poll.h"
+#include "util/sync.h"
 #include "platform/platform.h"
 #include <stdatomic.h>
 #include <stdbool.h>
@@ -45,8 +53,10 @@ char *(*ish_roots_status)(void);
 int (*ish_roots_command)(const char *command);
 char *(*ish_workspace_status)(void);
 int (*ish_workspace_open)(const char *request);
+char *(*ish_applets_status)(void);
 
 #include "kernel/hostinfo.h"
+#include "kernel/BatteryStatus.h"
 
 static int proc_ish_show_colors(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf,
@@ -221,6 +231,698 @@ static int proc_ish_update_swap(struct proc_entry *UNUSED(entry), struct proc_da
     }
     int err = swap_enable((uint64_t) mb * 1024 * 1024);
     return err < 0 ? err : 0;
+}
+
+// ---------------------------------------------------------------------------
+// /proc/ish/snapshot -- a copy-on-write point-in-time copy of the booted root
+// ---------------------------------------------------------------------------
+
+// Gated on a launch-time environment variable, the same shape swap's guest
+// control uses and for the same reason: this writes a whole second root into
+// the container, so on an installed app it would let any guest root process
+// spend the user's storage. The shipping trigger for a snapshot is meant to be
+// the Machines screen, not a guest write -- this is the development control
+// that makes the mechanism reachable from the CLI while it is being built.
+//
+// getenv rather than a cached flag set at startup: this path runs once per
+// snapshot, the environment does not change under a running process, and a
+// startup hook would be a second place to keep in sync for no benefit.
+static bool snapshot_guest_control_allowed(void) {
+    const char *env = getenv("ISH_GUEST_SNAPSHOT");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
+static lock_t snapshot_last_lock = LOCK_INITIALIZER;
+static struct fakefs_snapshot_stats snapshot_last;
+static char snapshot_last_name[64];
+static int snapshot_last_err;
+static bool snapshot_last_valid;
+
+// The booted root's data directory, as the root mount records it. Returns false
+// when / is not a fakefs mount -- which is a real configuration (a realfs root
+// under the CLI), not an error worth asserting on.
+static bool snapshot_root_data_path(char *out, size_t size) {
+    char root_path[] = "/";
+    struct mount *root = mount_find(root_path);
+    if (root == NULL)
+        return false;
+    bool ok = false;
+    if (root->source != NULL) {
+        size_t n = strlen(root->source);
+        // Only a fakefs root has the "<root>/data" shape fakefs_snapshot needs.
+        if (n > 5 && strcmp(root->source + n - 5, "/data") == 0 && n < size) {
+            memcpy(out, root->source, n + 1);
+            ok = true;
+        }
+    }
+    mount_release(root);
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// /proc/ish/mem_compress -- phase 0 for guest-memory compression
+// ---------------------------------------------------------------------------
+//
+// A measurement, not a feature. See kernel/memcomp.c for what it is answering
+// and why the obvious answer ("the OS already compresses, so don't bother") is
+// wrong: the host's compression does not move phys_footprint, which is the
+// ledger jetsam kills on, so it buys AOK no headroom at all.
+
+static lock_t memcomp_last_lock = LOCK_INITIALIZER;
+static struct memcomp_result memcomp_last;
+static bool memcomp_last_valid;
+static dword_t memcomp_last_pid;
+
+static void proc_ish_show_memcomp_algo(struct proc_data *buf, const char *name,
+                                       const struct memcomp_algo *a,
+                                       uint64_t bytes_in, uint64_t pages) {
+    if (pages == 0)
+        return;
+    double ratio = a->bytes_out > 0 ? (double) bytes_in / (double) a->bytes_out : 0;
+    proc_printf(buf, "  %-6s ratio %5.2fx   saved %6llu MB of %llu MB\n",
+                name, ratio,
+                (unsigned long long) ((bytes_in - a->bytes_out) / 1048576),
+                (unsigned long long) (bytes_in / 1048576));
+    proc_printf(buf, "         compress %6.2f us/page   decompress %6.2f us/page\n",
+                (double) a->ns_compress / (double) pages / 1000.0,
+                (double) a->ns_decompress / (double) pages / 1000.0);
+    proc_printf(buf, "         >=8x %llu  >=4x %llu  >=2x %llu  >=1.33x %llu  worse %llu\n",
+                (unsigned long long) a->buckets[0], (unsigned long long) a->buckets[1],
+                (unsigned long long) a->buckets[2], (unsigned long long) a->buckets[3],
+                (unsigned long long) a->buckets[4]);
+    proc_printf(buf, "         incompressible %llu   verify_failures %llu%s\n",
+                (unsigned long long) a->incompressible,
+                (unsigned long long) a->verify_failures,
+                a->verify_failures != 0 ? "   <-- BROKEN, ratio above means nothing" : "");
+}
+
+// /proc/ish/zswap -- the compressed tier in front of the swap area.
+//
+// Read-only. There is no write control because the tier has no development
+// knob worth exposing: it is sized at launch (ISH_GUEST_ZSWAP_MB) and will be
+// sized from Settings, the way swap is. What this exists for is proving it
+// actually did something -- a swap test that passes with the tier enabled
+// proves nothing unless the counters moved.
+// ---- checkpoint inventory ---------------------------------------------------
+//
+// Phase 0 of suspend-to-disk (docs/roadmap.md) is a GATE, not a feature, and
+// this is the measurement it gates on. The question that decides whether a
+// checkpoint is worth building is not "is a pty hard" -- it is how many of the
+// descriptors in a NORMAL session are the easy kind. That is an empirical
+// question about a running guest, so it is answered by reading a running guest
+// rather than by reasoning about fd_ops.
+//
+// Nothing here checkpoints anything. It reports what a checkpoint would have to
+// carry and what it would have to refuse, so the plan can be judged against a
+// real session -- including a real session on a device, which is the only place
+// the interesting fd mix exists.
+enum ckpt_verdict {
+    CKPT_REOPEN,    // a path and an offset are enough
+    CKPT_MEMORY,    // contents live in guest memory; serialised with it
+    CKPT_RESTATE,   // rebuildable from state this fd already holds
+    CKPT_REBUILD,   // cannot be restored, only rebuilt -- see sockrestart
+    CKPT_LOSSY,     // survivable, but something in flight is lost
+    CKPT_UNKNOWN,
+};
+
+static const char *ckpt_verdict_text(enum ckpt_verdict v) {
+    switch (v) {
+        case CKPT_REOPEN:  return "re-open the path, seek to the offset";
+        case CKPT_MEMORY:  return "contents are guest memory, saved with it";
+        case CKPT_RESTATE: return "rebuild from the state it already holds";
+        case CKPT_REBUILD: return "CANNOT be restored, only rebuilt";
+        case CKPT_LOSSY:   return "restorable, but data in flight is lost";
+        default:           return "not yet classified";
+    }
+}
+
+// One row per fd_ops family, plus the pseudo-families that share one.
+static enum ckpt_verdict ckpt_verdict_for(const char *family) {
+    if (family == NULL)
+        return CKPT_UNKNOWN;
+    // Paths are stable across a restart -- fakefs paths especially -- so the
+    // common case really is the easy one.
+    if (strcmp(family, "realfs") == 0 || strcmp(family, "aokfs") == 0 ||
+        strcmp(family, "procfs") == 0 || strcmp(family, "fscontext") == 0 ||
+        strcmp(family, "opath_link") == 0)
+        return CKPT_REOPEN;
+    if (strcmp(family, "tmpfs") == 0 || strcmp(family, "memfd") == 0)
+        return CKPT_MEMORY;
+    if (strcmp(family, "eventfd") == 0 || strcmp(family, "signalfd") == 0 ||
+        strcmp(family, "timerfd") == 0 || strcmp(family, "epoll") == 0 ||
+        strcmp(family, "inotify") == 0)
+        return CKPT_RESTATE;
+    // A pty and a socket are the same shape of problem, and sockrestart is
+    // already the answer for one of them: do not restore it, record enough to
+    // rebuild it, because iOS destroys the original either way.
+    if (strcmp(family, "devpts") == 0 || strcmp(family, "socket") == 0)
+        return CKPT_REBUILD;
+    // fuse's server is a guest process, so it comes back only if that process
+    // does -- which is a checkpoint ordering problem, not a serialisation one.
+    if (strcmp(family, "fuse") == 0)
+        return CKPT_REBUILD;
+    if (strcmp(family, "pidfd") == 0)
+        return CKPT_RESTATE;
+    return CKPT_UNKNOWN;
+}
+
+#define CKPT_MAX_FAMILIES 24
+struct ckpt_family {
+    const char *name;
+    unsigned count;
+};
+
+// The live half. Everything above this point is the INVENTORY -- what a
+// checkpoint would have to deal with. These two are the checkpoint itself
+// (kernel/checkpoint.c).
+//
+//     echo save /host/path > /proc/ish/checkpoint
+//
+// does not save anything by itself: it asks, and the save happens at the next
+// pass round task_run_current's loop, after this write's return value is in
+// the guest's register file and the program counter has moved past it. That is
+// what makes a restore CONTINUE rather than re-run the write.
+//
+// The restore side is not here. A guest cannot restore itself -- the thing
+// being replaced is the caller -- so it is the CLI's ISH_RESTORE, which stands
+// in for what the app will do when iOS has killed it and it comes back.
+// Its own switch rather than sharing the snapshot's. Both hand a guest process
+// a host path, so both are gated, but they are different capabilities: a
+// snapshot copies the root, a checkpoint writes the whole address space out.
+// Same shape as ISH_GUEST_SNAPSHOT, and the same reasoning about getenv.
+static bool checkpoint_guest_control_allowed(void) {
+    // The app's Settings switch, published at boot and whenever it becomes
+    // active (kernel/checkpoint.c's checkpoint_set_guest_control). Without
+    // this the only gate was the CLI environment variable below, which the app
+    // never sets -- so `echo suspend > /proc/ish/checkpoint` answered EPERM on
+    // a device, and the ONLY way to suspend was to background the app. The
+    // feature had no manual control at all where it matters most.
+    if (checkpoint_guest_control())
+        return true;
+    const char *env = getenv("ISH_GUEST_CHECKPOINT");
+    return env != NULL && env[0] != '\0' && env[0] != '0';
+}
+
+static int proc_ish_update_checkpoint(struct proc_entry *UNUSED(entry),
+        struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    if (data->size == 0 || data->size >= PATH_MAX)
+        return _EINVAL;
+    char line[PATH_MAX];
+    memcpy(line, data->data, data->size);
+    line[data->size] = '\0';
+    // Same embedded-NUL rule as proc_ish_update_roots: refuse rather than act
+    // on a prefix of what was meant.
+    if (strlen(line) != data->size)
+        return _EINVAL;
+    char *nl = strchr(line, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+
+    // Two verbs, and the difference is what happens afterwards. `save` is a
+    // copy and the guest carries on; `suspend` writes the image and stops the
+    // machine, so the next launch resumes rather than boots.
+    static const char save_verb[] = "save ";
+    static const char suspend_verb[] = "suspend ";
+    const char *path;
+    bool and_halt;
+    if (strncmp(line, save_verb, sizeof(save_verb) - 1) == 0) {
+        path = line + sizeof(save_verb) - 1;
+        and_halt = false;
+    } else if (strncmp(line, suspend_verb, sizeof(suspend_verb) - 1) == 0) {
+        path = line + sizeof(suspend_verb) - 1;
+        and_halt = true;
+    } else if (strcmp(line, "suspend") == 0) {
+        // With no path: the session file the entry point was given. This is
+        // the shape a user actually wants -- `echo suspend >
+        // /proc/ish/checkpoint` and the session comes back next launch --
+        // and the one an app-side button will call.
+        path = checkpoint_session();
+        if (path == NULL || path[0] == '\0')
+            return _EINVAL;
+        and_halt = true;
+        if (!checkpoint_guest_control_allowed())
+            return _EPERM;
+        return checkpoint_request(path, and_halt);
+    } else {
+        return _EINVAL;
+    }
+    while (*path == ' ')
+        path++;
+    // A host path, so it is the same capability as /proc/ish/snapshot's and
+    // gated the same way: root inside the guest, and only where guest control
+    // of this kind is allowed at all.
+    if (*path != '/')
+        return _EINVAL;
+    if (!checkpoint_guest_control_allowed())
+        return _EPERM;
+
+    // The error reaches the guest as the write's own return value, so a
+    // script sees `echo save ... > /proc/ish/checkpoint` fail rather than
+    // having to go and read the file back to find out.
+    return checkpoint_request(path, and_halt);
+}
+
+static int proc_ish_show_checkpoint(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct ckpt_family fams[CKPT_MAX_FAMILIES];
+    unsigned fam_count = 0;
+    unsigned tasks = 0, fds_total = 0, unnamed = 0;
+    unsigned native_on_stack = 0, native_can_dump = 0, native_cannot = 0;
+    // The names are worth more than the count: which native program is on a
+    // stack decides whether the checkpoint is deferred or refused outright.
+    char native_names[8][16];
+    unsigned native_named = 0;
+
+    struct task_snapshot snapshot = {0};
+    if (task_snapshot_collect(&snapshot, true) < 0) {
+        proc_printf(buf, "checkpoint: could not take a task snapshot\n");
+        return 0;
+    }
+
+    for (unsigned i = 0; i < snapshot.count; i++) {
+        struct task *task = snapshot.tasks[i];
+        // trylock and skip, for the reason collect_mem_page_stats documents at
+        // length: a task we cannot lock immediately is mid-exit, and blocking
+        // here against do_exit's backoff loop is a genuine deadlock.
+        if (trylock(&task->general_lock) != 0)
+            continue;
+        struct fdtable *files = task->files;
+        if (files != NULL)
+            fdtable_retain(files);
+        // A native program is on this task's stack for exactly the lifetime of
+        // its call, and native_argv is published for exactly that window
+        // (kernel/native.c). This is the checkpoint's stated capability
+        // boundary: there is no serialising a host C stack, so a checkpoint
+        // refuses while one is running.
+        if (task->native_argv != NULL) {
+            native_on_stack++;
+            // zsh already knows how to describe itself and re-launch
+            // (deps/zsh/Src/aok_fork.c), which is the same capability a
+            // checkpoint needs. bash does NOT and will not: it is GPLv3, so an
+            // App Store build cannot contain it, and it ships disabled by
+            // default (native_bash meson option;
+            // docs/historical/shell_transition_plan.md). Teaching it to dump state would
+            // be work thrown away, so a native bash is a hard refusal rather
+            // than a wait-for-a-quiet-point.
+            if (strcmp(task->comm, "zsh") == 0)
+                native_can_dump++;
+            else
+                native_cannot++;
+            if (native_named < 8) {
+                strncpy(native_names[native_named], task->comm,
+                        sizeof(native_names[0]) - 1);
+                native_names[native_named][sizeof(native_names[0]) - 1] = '\0';
+                native_named++;
+            }
+        }
+        unlock(&task->general_lock);
+        if (files == NULL)
+            continue;
+        tasks++;
+
+        lock(&files->lock, 0);
+        for (unsigned f = 0; f < files->size; f++) {
+            struct fd *fd = files->files[f];
+            if (fd == NULL)
+                continue;
+            fds_total++;
+            // MODE BEFORE FAMILY, and the order is the whole correctness of
+            // this. A pipe is created with adhoc_fd_create(&realfs_fdops)
+            // (fs/pipe.c) and so reports the realfs family -- classifying by
+            // family first counted every pipe as "re-open the path and seek",
+            // which is exactly wrong twice over: a pipe has no path, and the
+            // bytes sitting in it are lost. Measured before the fix: a probe
+            // holding one byte in a pipe reported 89% of descriptors easy, and
+            // the pipe was one of the ones counted easy.
+            const char *family;
+            if (S_ISFIFO(fd->type)) {
+                family = "pipe/fifo";
+            } else if (S_ISSOCK(fd->type)) {
+                family = "socket";
+            } else if (S_ISCHR(fd->type)) {
+                family = "chardev";
+            } else if (fd->ops != NULL && fd->ops->name != NULL) {
+                family = fd->ops->name;
+            } else {
+                unnamed++;
+                family = "(unnamed fd_ops)";
+            }
+            unsigned k = 0;
+            for (; k < fam_count; k++)
+                if (strcmp(fams[k].name, family) == 0)
+                    break;
+            if (k == fam_count) {
+                if (fam_count >= CKPT_MAX_FAMILIES)
+                    continue;
+                fams[fam_count].name = family;
+                fams[fam_count].count = 0;
+                fam_count++;
+            }
+            fams[k].count++;
+        }
+        unlock(&files->lock);
+        fdtable_release(files);
+    }
+    task_snapshot_release(&snapshot);
+
+    // ---- and the checkpoint itself --------------------------------------
+    struct checkpoint_status ck;
+    checkpoint_get_status(&ck);
+    proc_printf(buf, "\n");
+    proc_printf(buf, "restored        %s\n", ck.restored ? "yes" : "no");
+    proc_printf(buf, "generation      %lu\n", ck.generation);
+    proc_printf(buf, "saves           %lu\n", ck.saves);
+    if (ck.last_path[0] != '\0')
+        proc_printf(buf, "last_path       %s\n", ck.last_path);
+    if (ck.pages != 0)
+        proc_printf(buf, "last_pages      %lu (%llu bytes of guest memory)\n",
+                    ck.pages, ck.bytes);
+    if (ck.tasks != 0)
+        proc_printf(buf, "last_tasks      %lu\n", ck.tasks);
+    if (ck.last_err != 0)
+        proc_printf(buf, "last_err        %d\n", ck.last_err);
+    if (ck.last_refusal[0] != '\0')
+        proc_printf(buf, "last_refusal    %s\n", ck.last_refusal);
+    // Not an error, and deliberately not called one: these were saved, they
+    // just come back started again rather than where they were.
+    if (ck.natives_restarted != 0)
+        proc_printf(buf, "restarted       %lu native program(s) re-launched: %s\n",
+                    ck.natives_restarted, ck.natives_note);
+    // What the last restore brought back degraded -- a listener that could not
+    // be rebound, say. The session runs on without it, so this is where it shows.
+    char restore_note[256];
+    checkpoint_get_restore_note(restore_note, sizeof(restore_note));
+    if (restore_note[0] != '\0')
+        proc_printf(buf, "restore_note    %s\n", restore_note);
+    proc_printf(buf, "\n  echo save /host/path > /proc/ish/checkpoint\n");
+    proc_printf(buf, "  ISH_RESTORE=/host/path ish -f <root>   # brings it back\n");
+
+    proc_printf(buf, "what a checkpoint of this guest would have to carry\n");
+    proc_printf(buf, "(phase 0 of suspend-to-disk: a measurement, not a feature)\n\n");
+    proc_printf(buf, "processes with an fd table   %u\n", tasks);
+    proc_printf(buf, "open descriptors             %u\n\n", fds_total);
+
+    unsigned easy = 0;
+    proc_printf(buf, "by family:\n");
+    for (unsigned k = 0; k < fam_count; k++) {
+        enum ckpt_verdict v = ckpt_verdict_for(fams[k].name);
+        // pipe/fifo and chardev are named by mode, not by fd_ops.
+        if (strcmp(fams[k].name, "pipe/fifo") == 0)
+            v = CKPT_LOSSY;
+        else if (strcmp(fams[k].name, "chardev") == 0)
+            v = CKPT_REBUILD;
+        if (v == CKPT_REOPEN || v == CKPT_MEMORY || v == CKPT_RESTATE)
+            easy += fams[k].count;
+        proc_printf(buf, "  %-18s %5u   %s\n",
+                    fams[k].name, fams[k].count, ckpt_verdict_text(v));
+    }
+    if (unnamed > 0)
+        proc_printf(buf, "  (%u fd(s) whose fd_ops carries no name -- a family was "
+                    "added without one)\n", unnamed);
+
+    proc_printf(buf, "\nthe number phase 0 exists to produce:\n");
+    if (fds_total > 0) {
+        proc_printf(buf, "  %u of %u descriptors (%u%%) need only a path, their own "
+                    "state, or memory that is being saved anyway\n",
+                    easy, fds_total, easy * 100 / fds_total);
+        proc_printf(buf, "  Treat that as an UPPER BOUND: an unlinked file still counts\n"
+                    "  as re-openable here, and it is not -- there is no path left to\n"
+                    "  re-open. Distinguishing one needs an fstat per descriptor, which\n"
+                    "  this read does not do.\n");
+    } else {
+        proc_printf(buf, "  no descriptors open\n");
+    }
+
+    proc_printf(buf, "\nwhat a checkpoint would do with native programs:\n");
+    proc_printf(buf, "  native programs on a task stack   %u\n", native_on_stack);
+    if (native_on_stack == 0) {
+        proc_printf(buf, "  none -- every task is running guest code, whose whole\n"
+                    "  state is AOK's own and can simply be written out\n");
+        return 0;
+    }
+    for (unsigned k = 0; k < native_named; k++)
+        proc_printf(buf, "    %s\n", native_names[k]);
+    proc_printf(buf,
+        "\n  A native program is host code on a host C stack, so there is no\n"
+        "  guest PC to resume from -- stopping the scheduler does not reach it.\n"
+        "  It is saved either way: the image carries its name, its command line,\n"
+        "  its environment and its descriptors.\n");
+    if (native_can_dump > 0)
+        proc_printf(buf,
+            "\n  %u can describe itself (zsh: deps/zsh/Src/aok_fork.c) and comes\n"
+            "  back where it was. At a prompt that is a quiet point -- the C stack\n"
+            "  holds only \"waiting for input\" and everything else is already\n"
+            "  dumpable. Mid-command it is not.\n",
+            native_can_dump);
+    if (native_cannot > 0)
+        proc_printf(buf,
+            "\n  %u cannot, and are RE-LAUNCHED from their command line instead --\n"
+            "  which for a shell at a prompt is the same thing, and for one part\n"
+            "  way through a script means the script runs again from the top.\n"
+            "  This used to refuse the whole checkpoint. It no longer does: the\n"
+            "  alternative to a degraded restore is not a perfect one, it is no\n"
+            "  restore at all.\n",
+            native_cannot);
+    return 0;
+}
+
+static int proc_ish_show_zswap(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct zswap_stats z;
+    zswap_get_stats(&z);
+    if (!z.enabled) {
+        proc_printf(buf, "off\n\n");
+        proc_printf(buf, "A compressed cache in front of the swap area: a frame that compresses\n");
+        proc_printf(buf, "is kept in RAM instead of written to flash, which costs no write budget\n");
+        proc_printf(buf, "and comes back about two orders of magnitude faster than a disk read.\n");
+        proc_printf(buf, "Needs swap enabled -- it fronts the swap area rather than replacing it.\n");
+        return 0;
+    }
+    proc_printf(buf, "on               cap %llu MB\n",
+                (unsigned long long) (z.max_bytes / (1024 * 1024)));
+    proc_printf(buf, "objects          %llu\n", (unsigned long long) z.objects);
+    proc_printf(buf, "pool             %llu KB  (what it occupies)\n",
+                (unsigned long long) (z.pool_bytes / 1024));
+    proc_printf(buf, "stored           %llu KB  (compressed bytes live in it)\n",
+                (unsigned long long) (z.stored_bytes / 1024));
+    proc_printf(buf, "original         %llu KB  (what those frames occupied)\n",
+                (unsigned long long) (z.original_bytes / 1024));
+    // Only with live objects: with none, pool_bytes is retained empty slabs
+    // and the ratio would describe nothing.
+    if (z.objects > 0 && z.pool_bytes > 0 && z.original_bytes > 0)
+        proc_printf(buf, "effective ratio  %llu.%02llux  (original / pool, so fragmentation is counted)\n",
+                    (unsigned long long) (z.original_bytes / z.pool_bytes),
+                    (unsigned long long) ((z.original_bytes * 100 / z.pool_bytes) % 100));
+    proc_printf(buf, "\n");
+    proc_printf(buf, "stores           %llu  (frames kept in RAM)\n", (unsigned long long) z.stores);
+    proc_printf(buf, "declined         %llu  (incompressible or pool full -- went to flash)\n",
+                (unsigned long long) z.store_declined);
+    proc_printf(buf, "loads            %llu  (faults served from RAM)\n", (unsigned long long) z.loads);
+    proc_printf(buf, "frees            %llu\n", (unsigned long long) z.frees);
+    proc_printf(buf, "flash NOT written %llu KB  (the wear saving, off the 24h budget)\n",
+                (unsigned long long) (z.bytes_not_written / 1024));
+    return 0;
+}
+
+static int proc_ish_show_mem_compress(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    if (!memcomp_available()) {
+        proc_printf(buf, "no compressor on this host -- nothing to measure\n");
+        return 0;
+    }
+    lock(&memcomp_last_lock, 0);
+    if (!memcomp_last_valid) {
+        unlock(&memcomp_last_lock);
+        proc_printf(buf, "no measurement yet\n");
+        proc_printf(buf, "\n  echo <pid> > /proc/ish/mem_compress   # measure that process's resident pages\n\n");
+        proc_printf(buf, "Reports what AOK-level compression would buy. The HOST already compresses\n");
+        proc_printf(buf, "idle memory for free, but that does not move phys_footprint -- the ledger\n");
+        proc_printf(buf, "jetsam kills on -- so only compression AOK does itself can help.\n");
+        return 0;
+    }
+    struct memcomp_result r = memcomp_last;
+    dword_t pid = memcomp_last_pid;
+    unlock(&memcomp_last_lock);
+
+    proc_printf(buf, "last measurement pid %d\n", (int) pid);
+    proc_printf(buf, "  resident pages  %llu  (%llu MB at %zu-byte pages)\n",
+                (unsigned long long) r.pages,
+                (unsigned long long) (r.bytes_in / 1048576), r.page_size);
+    proc_printf(buf, "  walk took       %llu ms for all three algorithms\n\n",
+                (unsigned long long) (r.wall_ns / 1000000));
+    proc_ish_show_memcomp_algo(buf, "lz4", &r.lz4, r.bytes_in, r.pages);
+    proc_ish_show_memcomp_algo(buf, "lzfse", &r.lzfse, r.bytes_in, r.pages);
+    proc_ish_show_memcomp_algo(buf, "zlib", &r.zlib, r.bytes_in, r.pages);
+    return 0;
+}
+
+static int proc_ish_update_mem_compress(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!superuser())
+        return _EPERM;
+    if (!memcomp_available())
+        return _ENOSYS;
+    if (data->size == 0 || data->size > 32)
+        return _EINVAL;
+    char text[33];
+    memcpy(text, data->data, data->size);
+    text[data->size] = '\0';
+    if (strlen(text) != data->size)
+        return _EINVAL;
+    char *end = NULL;
+    long want = strtol(text, &end, 10);
+    while (end != NULL && (*end == '\n' || *end == ' '))
+        end++;
+    if (end == NULL || *end != '\0' || want <= 0)
+        return _EINVAL;
+
+    // Identical pinning to proc_ish_update_swap_evict, and for the identical
+    // reason: pids_lock does not protect task->mm, do_exit frees it with
+    // neither lock held, and walking a dying address space dereferences NULL
+    // (three crash reports, same stack). trylock rather than lock, because
+    // do_exit spins in exit_wait_backoff() holding general_lock and a task
+    // mid-exit has nothing worth measuring.
+    struct task *task = pid_get_task_ref((dword_t) want);
+    if (task == NULL)
+        return _ESRCH;
+    struct mm *mm = NULL;
+    if (trylock(&task->general_lock) == 0) {
+        if (task->mm != NULL) {
+            mm = task->mm;
+            mm_retain(mm);
+        }
+        unlock(&task->general_lock);
+    }
+    task_ref_cnt_mod(task, -1);
+    if (mm == NULL)
+        return _ESRCH;
+
+    struct memcomp_result result;
+    int err = memcomp_measure_mem(&mm->mem, &result);
+    mm_release(mm);
+    if (err != 0)
+        return err;
+
+    lock(&memcomp_last_lock, 0);
+    memcomp_last = result;
+    memcomp_last_pid = (dword_t) want;
+    memcomp_last_valid = true;
+    unlock(&memcomp_last_lock);
+    return 0;
+}
+
+static int proc_ish_show_snapshot(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char data_path[PATH_MAX];
+    if (snapshot_root_data_path(data_path, sizeof data_path))
+        proc_printf(buf, "source           %s\n", data_path);
+    else
+        proc_printf(buf, "source           (not a fakefs root -- nothing to snapshot)\n");
+    proc_printf(buf, "guest_control    %s\n",
+                snapshot_guest_control_allowed() ? "on" : "off (ISH_GUEST_SNAPSHOT unset)");
+
+    lock(&snapshot_last_lock, 0);
+    if (snapshot_last_valid) {
+        proc_printf(buf, "\nlast snapshot    %s\n", snapshot_last_name);
+        proc_printf(buf, "  result         %s\n",
+                    snapshot_last_err == 0 ? "ok" : "FAILED");
+        if (snapshot_last_err != 0 && snapshot_last.error[0] != '\0')
+            proc_printf(buf, "  error          %s\n", snapshot_last.error);
+        proc_printf(buf, "  quiesced       %s", snapshot_last.quiesced ? "yes" : "no");
+        if (!snapshot_last.quiesced)
+            proc_printf(buf, "  (%u transaction(s) still in flight)",
+                        snapshot_last.quiesce_stragglers);
+        proc_printf(buf, "\n");
+        proc_printf(buf, "  data           %lu ms", snapshot_last.clone_ms);
+        if (snapshot_last.entries > 0)
+            proc_printf(buf, "  (%lu entries copied -- no clone support on this host)",
+                        snapshot_last.entries);
+        proc_printf(buf, "\n");
+        proc_printf(buf, "  meta.db        %lu ms\n", snapshot_last.db_ms);
+        proc_printf(buf, "  total          %lu ms\n", snapshot_last.total_ms);
+    }
+    unlock(&snapshot_last_lock);
+
+    if (snapshot_guest_control_allowed())
+        proc_printf(buf, "\n  echo <name> > /proc/ish/snapshot   # clone the booted root to a sibling directory\n\n");
+    // Cost is per directory entry, not per byte -- say so here rather than let
+    // the first user discover it on a root full of node_modules.
+    //
+    // Platform-conditional, because the unconditional version was a capability
+    // lie: it promised copy-on-write sharing on a host that has no clone
+    // support and had just made a full byte-for-byte copy. Caught by running
+    // the fallback on Linux, where the same text printed beside "6982 entries
+    // copied -- no clone support on this host".
+#if defined(__APPLE__)
+    proc_printf(buf, "A snapshot costs roughly 25us per directory entry and almost nothing\n");
+    proc_printf(buf, "per byte: the file data is shared copy-on-write with the original,\n");
+    proc_printf(buf, "so it costs no space until the two copies diverge.\n");
+#else
+    proc_printf(buf, "This host has no copy-on-write clone support, so a snapshot is a full\n");
+    proc_printf(buf, "copy: it costs time proportional to the data and as much space as the\n");
+    proc_printf(buf, "original. (On iOS and macOS it is an APFS clone and costs neither.)\n");
+#endif
+    return 0;
+}
+
+static int proc_ish_update_snapshot(struct proc_entry *UNUSED(entry), struct proc_data *data) {
+    if (!snapshot_guest_control_allowed())
+        return _EPERM;
+    if (!superuser())
+        return _EPERM;
+    if (data->size == 0 || data->size > sizeof(snapshot_last_name) - 1)
+        return _EINVAL;
+    char name[sizeof(snapshot_last_name)];
+    memcpy(name, data->data, data->size);
+    name[data->size] = '\0';
+    // Same embedded-NUL rule as the other writable entries here.
+    if (strlen(name) != data->size)
+        return _EINVAL;
+    char *nl = strchr(name, '\n');
+    if (nl != NULL)
+        *nl = '\0';
+    if (name[0] == '\0')
+        return _EINVAL;
+
+    // The name becomes a host directory beside the booted root, so it must be
+    // one path component and nothing clever. Without this a guest root process
+    // could write a root anywhere on the host the app can reach, which is a
+    // container escape rather than a snapshot.
+    if (strchr(name, '/') != NULL || is_dot_or_dotdot(name))
+        return _EINVAL;
+    for (const char *p = name; *p != '\0'; p++) {
+        bool ok = (*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+                  (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.';
+        if (!ok)
+            return _EINVAL;
+    }
+
+    char data_path[PATH_MAX];
+    if (!snapshot_root_data_path(data_path, sizeof data_path))
+        return _EINVAL;
+
+    // <root>/data -> <roots dir>, then <roots dir>/<name>.
+    char dst[PATH_MAX];
+    size_t n = strlen(data_path);
+    char root_dir[PATH_MAX];
+    memcpy(root_dir, data_path, n - 5);     // drop "/data"
+    root_dir[n - 5] = '\0';
+    char *slash = strrchr(root_dir, '/');
+    if (slash == NULL)
+        return _EINVAL;
+    *slash = '\0';
+    if (snprintf(dst, sizeof dst, "%s/%s", root_dir, name) >= (int) sizeof dst)
+        return _ENAMETOOLONG;
+
+    struct fakefs_snapshot_stats stats;
+    int err = fakefs_snapshot(data_path, dst, &stats);
+
+    lock(&snapshot_last_lock, 0);
+    snapshot_last = stats;
+    strncpy(snapshot_last_name, name, sizeof(snapshot_last_name) - 1);
+    snapshot_last_name[sizeof(snapshot_last_name) - 1] = '\0';
+    snapshot_last_err = err;
+    snapshot_last_valid = true;
+    unlock(&snapshot_last_lock);
+
+    return err;   // already a guest _E* code, or 0
 }
 
 static int proc_ish_show_swap_evict(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
@@ -419,6 +1121,29 @@ static int proc_ish_show_workspace(struct proc_entry *UNUSED(entry), struct proc
     return 0;
 }
 
+// The Launcher applets -- File Manager, MotePad, LLM Chat, Music, Settings,
+// the Wayland display and the rest -- are iOS UI running inside the app. They
+// have no pid, no address space and nothing a signal could reach, so they are
+// not in /proc/<pid> and ps, top and ktop do not show them. Inventing
+// processes for them would be a lie every tool would repeat: a pid that
+// accepts kill(2) and does nothing is a state no real system produces. This
+// file lists them for what they are instead.
+//
+// A header, then one line per open applet with the title last, since a title
+// has spaces in it. Nothing below the header means none are open, which is
+// also the whole answer in the command-line build and outside Workspace.
+static int proc_ish_show_applets(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "ID TOOL DESKTOP STATE AGE TITLE\n");
+    if (ish_applets_status == NULL)
+        return 0;
+    char *body = ish_applets_status();
+    if (body == NULL)
+        return 0;
+    proc_printf(buf, "%s", body);
+    free(body);
+    return 0;
+}
+
 // One verb today: `open <tool> [path]`. A verb set rather than a bare path is
 // the point -- this is a guest asking the app to put something on screen, so
 // what it may ask for has to be enumerable, and the app validates both the
@@ -585,6 +1310,17 @@ static int proc_ish_update_mem_release_probe(struct proc_entry *UNUSED(entry), s
 
 static int proc_ish_show_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     proc_printf(buf, "%s\n", amd64_jit_preference_get() ? "on" : "off");
+    // Block-compile accounting, process-wide since boot. `fallbacks` is the
+    // number of blocks the JIT could not translate and handed to the
+    // interpreter, so it is the measure of how much of the amd64 interpreter
+    // is still load-bearing -- read it after a workload rather than inferring
+    // it from the absence of ISH_TRACE_AMD64_JIT_STATS output, which stays
+    // silent below eight fallbacks.
+    unsigned long attempts = 0, successes = 0, fallbacks = 0;
+    amd64_jit_compile_stats(&attempts, &successes, &fallbacks);
+    proc_printf(buf, "compile attempts   %lu\n", attempts);
+    proc_printf(buf, "compile successes  %lu\n", successes);
+    proc_printf(buf, "interp fallbacks   %lu\n", fallbacks);
     return 0;
 }
 
@@ -612,9 +1348,10 @@ static int proc_ish_show_i386_no_cache_comm(struct proc_entry *UNUSED(entry), st
 //   echo "addr=0 alu=1" > /proc/ish/i386_jit_fuse    (space or comma separated)
 //   echo all=1 > /proc/ish/riscv64_jit_fuse
 //
-// Families: i386 addr/movmr/lea/alu/pushpop; arm64 bcond/ldst/ldcmp;
-// riscv64 fold/jal; amd64 incdec_reg (native gadget vs. the C-helper bridge,
-// see jit/jit.h -- same A/B, different mechanism).
+// Families: i386 addr/movmr/lea/alu/pushpop/jcc8/alurr/shift/incdec/movimm/movx/imul/addrsi/cmprr; arm64 bcond/ldst/ldcmp/
+// retcache/vspec/ospec/lspec/btfn/pair/fwd; riscv64 fold/jal/retcache/pair/alu/br/btfn/rcache/fuse2/fwd;
+// amd64 incdec_reg (native gadget vs. the C-helper bridge, see jit/jit.h --
+// same A/B, different mechanism).
 //
 // Exists for measurement: it makes a fusion A/B a file write instead of an app
 // relaunch, so arms can be interleaved rep by rep (the only way to keep thermal
@@ -729,6 +1466,159 @@ static int proc_ish_show_amd64_jit_fuse(struct proc_entry *UNUSED(e), struct pro
 }
 static int proc_ish_update_amd64_jit_fuse(struct proc_entry *UNUSED(e), struct proc_data *d) {
     return proc_ish_update_jit_fuse(JIT_FUSE_ARCH_AMD64, d);
+}
+
+// /proc/ish/foreign_exec: what happens to a program from another installed
+// root (/AOK/roots/<name>/...) whose loader is not in this one
+// (kernel/foreign_exec.c). Reads "root", "libs" or "off" -- with the choices
+// on a second line -- and takes any of them written. The app's Settings write
+// it too. Takes effect at the next exec.
+static int proc_ish_show_foreign_exec(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    proc_printf(buf, "%s\n", foreign_exec_mode_name(foreign_exec_get_mode()));
+    proc_printf(buf, "# root: run it chrooted into its root; libs: run it here with its "
+                     "root's libraries; off: fail, as Linux does\n");
+    return 0;
+}
+static int proc_ish_update_foreign_exec(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    int mode = foreign_exec_parse_mode(d->data, d->size);
+    if (mode < 0)
+        return _EINVAL;
+    foreign_exec_set_mode((enum foreign_exec_mode) mode);
+    return 0;
+}
+
+// /proc/ish/arm64_mops: 1 when arm64 programs are told about FEAT_MOPS
+// (jit/arm64_mops.c), and so glibc's memcpy/memmove/memset use it; write 0
+// or 1. Takes effect at the next exec.
+static int proc_ish_show_arm64_mops(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    proc_printf(buf, "%d\n", arm64_mops_advertised() ? 1 : 0);
+    return 0;
+}
+static int proc_ish_update_arm64_mops(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    if (n != 1 || (d->data[0] != '0' && d->data[0] != '1'))
+        return _EINVAL;
+    arm64_mops_set_advertised(d->data[0] == '1');
+    return 0;
+}
+
+// /proc/ish/hle: 1 when high-level emulation of libc functions is on
+// (jit/hle.c; the app's HLE toggle and ISH_HLE set it too). Write 0 or 1;
+// blocks translated afterwards follow it.
+extern bool doEnableHLE;
+static int proc_ish_show_hle(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    proc_printf(buf, "%d\n", doEnableHLE ? 1 : 0);
+    return 0;
+}
+static int proc_ish_update_hle(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    if (n != 1 || (d->data[0] != '0' && d->data[0] != '1'))
+        return _EINVAL;
+    doEnableHLE = d->data[0] == '1';
+    return 0;
+}
+
+// /proc/ish/jit_cache: the cache of translated code that outlives the process
+// that made it (jit.c's exec cache; the app's "Cache Translated Code"
+// setting). Read: "1" or "0", then what it has done. Write 1 or 0 to turn it
+// on or off -- on also sets /proc/sys/kernel/randomize_va_space to 0 and
+// makes it refuse any other value, because a cached block is found by its
+// address; off puts that back and empties the cache. arm64 guests only.
+static int proc_ish_show_jit_cache(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    struct jit_xcache_stats xc;
+    jit_xcache_get(&xc);
+    proc_printf(buf, "%d\nhits %lu\nmisses %lu\nstored %lu\nrefused %lu\nbytes %llu\n", xc.enabled ? 1 : 0,
+            xc.hits, xc.misses, xc.stored, xc.refused, xc.bytes);
+    return 0;
+}
+static int proc_ish_update_jit_cache(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    if (n != 1 || (d->data[0] != '0' && d->data[0] != '1'))
+        return _EINVAL;
+    jit_xcache_set_enabled(d->data[0] == '1');
+    return 0;
+}
+
+// /proc/ish/fault_reports: which guest faults are written to the kernel log
+// (kernel/calls.c guest_fault_reported). Reads as the mode and the number of
+// reports the rate limit has dropped; write "unhandled" (the default: only a
+// fault that kills its program, ten in five seconds at most), "all" (every
+// fault, as it used to be -- for working on the emulator) or "none".
+static int proc_ish_show_fault_reports(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    unsigned long suppressed = 0;
+    int mode = guest_fault_reports_get(&suppressed);
+    proc_printf(buf, "%s\nsuppressed %lu\n", guest_fault_reports_name(mode), suppressed);
+    return 0;
+}
+static int proc_ish_update_fault_reports(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    int mode = guest_fault_reports_parse(d->data, n);
+    if (mode < 0)
+        return _EINVAL;
+    guest_fault_reports_set(mode);
+    return 0;
+}
+
+// /proc/ish/jit_timing: time spent translating guest code into gadget blocks.
+// Write 1 to zero the counters and start counting, 0 to stop; read for the
+// totals so far, across every process. Counting costs two clock reads per
+// block translated.
+static int proc_ish_show_jit_timing(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    struct jit_timing_stats st;
+    jit_timing_get(&st);
+    unsigned long long ns = 0;
+    unsigned long blocks = 0;
+    for (unsigned i = 0; i < 4; i++) {
+        ns += st.ns[i];
+        blocks += st.blocks[i];
+    }
+    proc_printf(buf, "enabled %d\nblocks %lu\nns %llu\nbytes %llu\n", st.enabled ? 1 : 0, blocks, ns, st.bytes);
+    unsigned long inherited = 0;
+    for (unsigned i = 0; i < 4; i++)
+        inherited += st.inherited[i];
+    proc_printf(buf, "inherited %lu\n", inherited);
+    for (unsigned i = 0; i < 4; i++)
+        if (st.blocks[i] != 0)
+            proc_printf(buf, "%s %lu blocks %llu ns %lu inherited\n", st.arch[i], st.blocks[i], st.ns[i],
+                        st.inherited[i]);
+    return 0;
+}
+
+// /proc/ish/jit_inherit: 1 (the default; ISH_JIT_INHERIT=0 starts it at 0)
+// when a forked child copies its parent's translated blocks instead of
+// translating them again (jit_fork in jit/jit.c). Write 0 or 1.
+static int proc_ish_show_jit_inherit(struct proc_entry *UNUSED(e), struct proc_data *buf) {
+    proc_printf(buf, "%d\n", jit_inherit_enabled() ? 1 : 0);
+    return 0;
+}
+
+static int proc_ish_update_jit_inherit(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    if (n != 1 || (d->data[0] != '0' && d->data[0] != '1'))
+        return _EINVAL;
+    (void) jit_inherit_enabled(); // read the environment first, so it cannot undo this
+    jit_inherit_set(d->data[0] == '1');
+    return 0;
+}
+
+static int proc_ish_update_jit_timing(struct proc_entry *UNUSED(e), struct proc_data *d) {
+    size_t n = d->size;
+    while (n > 0 && (d->data[n - 1] == '\n' || d->data[n - 1] == ' '))
+        n--;
+    if (n != 1 || (d->data[0] != '0' && d->data[0] != '1'))
+        return _EINVAL;
+    jit_timing_set(d->data[0] == '1');
+    return 0;
 }
 
 static int proc_ish_update_amd64_jit(struct proc_entry *UNUSED(entry), struct proc_data *data) {
@@ -960,7 +1850,17 @@ static void get_child_names(struct proc_entry *entry, unsigned long index) {
 
 static bool proc_ish_underlying_defaults_readdir(struct proc_entry *entry, unsigned long *index, struct proc_entry *next_entry) {
     get_child_names(entry, *index);
-    if (entry->child_names == NULL || entry->child_names[*index] == NULL)
+    if (entry->child_names == NULL)
+        return false;
+    // Every key in the defaults database is listed, not just AOK's own, and
+    // proc_ish_defaults_getname strcpy's the key into buffers of MAX_NAME
+    // bytes (proc_lookup's, proc_getpath's, proc_entry_inode's). A key longer
+    // than NAME_MAX would overrun them, so it is left out of the listing; it
+    // is not a file, and a lookup of it fails with ENAMETOOLONG anyway.
+    while (entry->child_names[*index] != NULL &&
+            strlen(entry->child_names[*index]) > NAME_MAX)
+        (*index)++;
+    if (entry->child_names[*index] == NULL)
         return false;
     next_entry->meta = &proc_ish_underlying_defaults_fd;
     next_entry->name = strdup(entry->child_names[*index]);
@@ -1113,20 +2013,93 @@ static int proc_ish_show_version(struct proc_entry *UNUSED(entry), struct proc_d
     return 0;
 }
 
-extern char* printBatteryStatus(int type);
+// /proc/ish/BAT0 and its two single-value siblings: AOK's own battery files,
+// which predate /sys/class/power_supply here. Their output is unchanged from
+// when the app formatted it, including the level's two decimals and the
+// -100.00 a host with no battery produces (UIDevice's -1, times 100); scripts
+// read these.
+static const char *proc_ish_battery_state_name(enum host_battery_state state) {
+    switch (state) {
+        case HOST_BATTERY_UNPLUGGED:
+            return "Discharging";
+        case HOST_BATTERY_CHARGING:
+            return "Charging";
+        case HOST_BATTERY_FULL:
+            return "Full";
+        default:
+            return "Unknown";
+    }
+}
 
 static int proc_ish_show_battery(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    proc_printf(buf, "%s", printBatteryStatus(3));
+    struct host_battery_status battery;
+    hostBatteryStatus(&battery);
+    proc_printf(buf, "battery_level: %.2f\n", battery.level * 100);
+    proc_printf(buf, "battery_state: %s\n", proc_ish_battery_state_name(battery.state));
+    proc_printf(buf, "low_power_mode: %s\n",
+                battery.low_power_mode > 0 ? "Enabled" :
+                battery.low_power_mode == 0 ? "Disabled" : "Unknown");
     return 0;
 }
 
 static int proc_ish_show_battery_capacity(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    proc_printf(buf, "%s", printBatteryStatus(2));
+    struct host_battery_status battery;
+    hostBatteryStatus(&battery);
+    proc_printf(buf, "%.2f\n", battery.level * 100);
     return 0;
 }
 
 static int proc_ish_show_battery_status(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
-    proc_printf(buf, "%s", printBatteryStatus(1));
+    struct host_battery_status battery;
+    hostBatteryStatus(&battery);
+    proc_printf(buf, "%s\n", proc_ish_battery_state_name(battery.state));
+    return 0;
+}
+
+// iOS's coarse thermal state -- nominal, fair, serious, critical -- which is all
+// it offers: there is no temperature to read. "unknown" is a host with no
+// source, which is every command-line build. It is not a fifth state, and it is
+// not dressed up as nominal.
+static int proc_ish_show_thermal_state(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    const char *name;
+    switch (hostThermalState()) {
+        case HOST_THERMAL_NOMINAL:
+            name = "nominal";
+            break;
+        case HOST_THERMAL_FAIR:
+            name = "fair";
+            break;
+        case HOST_THERMAL_SERIOUS:
+            name = "serious";
+            break;
+        case HOST_THERMAL_CRITICAL:
+            name = "critical";
+            break;
+        default:
+            name = "unknown";
+            break;
+    }
+    proc_printf(buf, "%s\n", name);
+    return 0;
+}
+
+// The host's IANA zone name, e.g. Europe/London: the name to find under
+// /usr/share/zoneinfo. An empty line when the host has none to give.
+static int proc_ish_show_timezone(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char name[128];
+    if (!hostTimeZoneName(name, sizeof(name)))
+        name[0] = '\0';
+    proc_printf(buf, "%s\n", name);
+    return 0;
+}
+
+// /proc/ish/languages -- the device's preferred languages, most preferred
+// first, one BCP 47 tag per line ("zh-Hans-CN"). What a guest needs to pick a
+// matching locale: /AOK/tools/setup-locale.sh reads it.
+static int proc_ish_show_languages(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    char languages[1024];
+    if (hostPreferredLanguages(languages, sizeof(languages)))
+        proc_printf(buf, "%s", languages);
     return 0;
 }
 
@@ -1146,6 +2119,50 @@ static int proc_ish_show_uidevice(struct proc_entry *UNUSED(entry), struct proc_
 // and not the one any of these guards read. There was no way to ask the guards
 // what they saw. Now there is: run the workload, read this file, and the answer
 // is arithmetic instead of argument.
+// What the wake-poke machinery has had to repair.
+//
+// A task is pulled out of a host blocking call by pthread_kill(SIGUSR1/SIGUSR2)
+// (kernel/signal.c signal_wake_task). A thread whose host mask has the signal
+// blocked stays deaf to every such poke until something unblocks it, and both
+// blocking sites that can meet that state repair themselves and count the
+// repair here. A thread never blocks its own wake signal across those waits, so
+// a repair means ANOTHER thread changed its mask -- on Darwin, sigprocmask sets
+// every thread's mask, and a mask-restoring siglongjmp calls it. That was every
+// interrupted wait's unwind until 2026-09-24 (util/sync.h sigunwind_start).
+//
+// This file exists because the counters had no reader. The first repair on each
+// path is printk'd and every one after it was only ever added to a static that
+// needed a debugger to see -- so on a device, where a debugger is exactly what
+// you do not have, "it happened once at boot" and "it has happened nine hundred
+// times since" looked identical.
+//
+// Nonzero is not by itself a fault to chase: a repair means the mechanism
+// worked. A number that CLIMBS while the guest misbehaves is the signal.
+static int proc_ish_show_wake_signals(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    long sleeps = atomic_load_explicit(&sleep_wedged_repairs, memory_order_relaxed);
+    long polls = atomic_load_explicit(&poll_wedged_repairs, memory_order_relaxed);
+    long capped = atomic_load_explicit(&poll_capped_waits, memory_order_relaxed);
+
+    proc_printf(buf, "sleep_repairs    %ld  (kernel/time.c, a task sleeping)\n", sleeps);
+    proc_printf(buf, "poll_repairs     %ld  (fs/poll.c, a task in poll/select/epoll)\n", polls);
+    proc_printf(buf, "capped_waits     %ld  (host waits bounded because the caller named no deadline)\n",
+                capped);
+    proc_printf(buf, "recheck_interval %ld ms  (the cap; a lost wake costs at most this)\n",
+                (long) (POLL_WAKE_RECHECK_NS / 1000000L));
+    proc_printf(buf, "\n");
+    if (sleeps == 0 && polls == 0) {
+        proc_printf(buf, "No wake signal has been lost. This is the expected state.\n");
+    } else {
+        proc_printf(buf, "A repaired thread had found its wake signal blocked by some other\n"
+                         "thread, and was deaf to its wake poke until it looked. On Darwin,\n"
+                         "sigprocmask -- and longjmp or siglongjmp restoring a saved mask --\n"
+                         "sets the mask of every thread in the app. A count that climbs means\n"
+                         "something in the process still does that: break on sigprocmask\n"
+                         "with a non-NULL set to find it.\n");
+    }
+    return 0;
+}
+
 static int proc_ish_show_mem_guard(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
     struct mem_usage machine = get_mem_usage();
     struct mem_budget budget = get_mem_budget();
@@ -1176,16 +2193,303 @@ static int proc_ish_show_mem_guard(struct proc_entry *UNUSED(entry), struct proc
             proc_printf(buf, "  headroom       unmeasured\n");
     }
     proc_printf(buf, "\nsystem memory pressure  %s\n",
-                pressure >= 2 ? "CRITICAL  (growth refused)" :
+                pressure >= 2 ? "CRITICAL  (a large growth is refused while the machine is short)" :
                 pressure >= 1 ? "WARN      (throttle engaged, growth still allowed)" :
                                 "normal");
-    proc_printf(buf, "\ngrowth refused now      %s\n",
+    proc_printf(buf, "\ngrowth refused now      %s  (a LARGE growth; small ones are always allowed,\n"
+                     "                             see mem_growth_refused in kernel/mmap.c)\n",
                 host_mem_headroom_low() ? "YES" : "no");
     proc_printf(buf, "throttle engaged now    %s\n",
                 host_mem_should_reclaim() ? "YES" : "no");
     proc_printf(buf, "\nA jetsam kill is predicted by the MACHINE's figures, not this\n"
                      "process's. On a small device the ceiling is close to the size of\n"
                      "RAM, so headroom can read healthy while the machine dies.\n");
+    return 0;
+}
+
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#endif
+// The Mach port names this process holds, and how many of them are dead names
+// -- a right to something that no longer exists, a thread that exited being the
+// usual one. iOS kills an app outright at a per-process limit (114,882 ports
+// on an M4 iPad, EXC_RESOURCE PORT_SPACE), and a leak of one right per guest
+// thread got there in about four roots of the regression suite. Read it
+// before and after a workload: a count that climbs with the number of threads
+// or processes the guest made is a leak (tests/manual/host_port_leak.c). A host
+// with no Mach ports says so, and the test skips.
+static int proc_ish_show_host_ports(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+#if defined(__APPLE__)
+    mach_port_name_array_t names = NULL;
+    mach_port_type_array_t types = NULL;
+    mach_msg_type_number_t nnames = 0, ntypes = 0;
+    if (mach_port_names(mach_task_self(), &names, &nnames, &types, &ntypes) != KERN_SUCCESS)
+        return _EIO;
+    unsigned dead = 0;
+    for (mach_msg_type_number_t i = 0; i < ntypes; i++)
+        if (types[i] & MACH_PORT_TYPE_DEAD_NAME)
+            dead++;
+    vm_deallocate(mach_task_self(), (vm_address_t) names, nnames * sizeof(*names));
+    vm_deallocate(mach_task_self(), (vm_address_t) types, ntypes * sizeof(*types));
+    proc_printf(buf, "names      %u\n", (unsigned) nnames);
+    proc_printf(buf, "dead_names %u\n", dead);
+#else
+    proc_printf(buf, "unsupported (no Mach ports on this host)\n");
+#endif
+    return 0;
+}
+
+// /proc/ish/host_fds -- the host descriptors this process has open, and the
+// host's limit on them. Every guest file, socket and pipe is one of these,
+// across every guest process, so "Too many open files" from the HOST arrives
+// at a count the guest's own ulimit knows nothing about. `started` is the
+// soft limit the process was launched with, before mount_root raised it.
+static void proc_ish_print_fd_limit(struct proc_data *buf, const char *name, long long value) {
+    if (value < 0)
+        proc_printf(buf, "%s unlimited\n", name);
+    else
+        proc_printf(buf, "%s %lld\n", name, value);
+}
+static int proc_ish_show_host_fds(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    struct host_fd_usage usage = host_fd_usage();
+    proc_printf(buf, "open       %ld\n", usage.open);
+    proc_printf(buf, "highest    %ld\n", usage.highest);
+    proc_printf(buf, "files      %ld\n", usage.files);
+    proc_printf(buf, "dirs       %ld\n", usage.dirs);
+    proc_printf(buf, "sockets    %ld\n", usage.sockets);
+    proc_printf(buf, "pipes      %ld\n", usage.pipes);
+    proc_printf(buf, "other      %ld\n", usage.other);
+    proc_ish_print_fd_limit(buf, "soft_limit", usage.soft);
+    proc_ish_print_fd_limit(buf, "hard_limit", usage.hard);
+    proc_ish_print_fd_limit(buf, "started   ", usage.started);
+    return 0;
+}
+
+// /proc/ish/host_vm -- where the app's own memory is, by the host's region
+// tags: the footprint jetsam kills on, then each tag's resident, dirty and
+// compressed megabytes, largest first. Guest memory is untagged (0); Metal's is
+// IOAccelerator; malloc has several. Written when Tux Racer's race took the
+// M4 app from 1 GB to 3.9 GB and past its 6 GB limit with the guest's Vulkan
+// device memory, MoltenVK's textures and descriptor pools all small: nothing
+// short of asking the host could say where the rest was.
+#if defined(__APPLE__)
+static const char *host_vm_tag_name(unsigned tag) {
+    switch (tag) {
+    case 0: return "untagged (guest memory, plain mmap)";
+#ifdef VM_MEMORY_MALLOC
+    case VM_MEMORY_MALLOC: return "malloc";
+    case VM_MEMORY_MALLOC_SMALL: return "malloc small";
+    case VM_MEMORY_MALLOC_LARGE: return "malloc large";
+    case VM_MEMORY_MALLOC_HUGE: return "malloc huge";
+    case VM_MEMORY_MALLOC_TINY: return "malloc tiny";
+    case VM_MEMORY_MALLOC_LARGE_REUSABLE: return "malloc large (reusable)";
+    case VM_MEMORY_MALLOC_LARGE_REUSED: return "malloc large (reused)";
+    case VM_MEMORY_MALLOC_NANO: return "malloc nano";
+#endif
+#ifdef VM_MEMORY_MALLOC_MEDIUM
+    case VM_MEMORY_MALLOC_MEDIUM: return "malloc medium";
+#endif
+#ifdef VM_MEMORY_IOKIT
+    case VM_MEMORY_IOKIT: return "IOKit";
+#endif
+#ifdef VM_MEMORY_STACK
+    case VM_MEMORY_STACK: return "stacks";
+#endif
+#ifdef VM_MEMORY_DYLIB
+    case VM_MEMORY_DYLIB: return "dylib";
+#endif
+#ifdef VM_MEMORY_DYLD
+    case VM_MEMORY_DYLD: return "dyld";
+#endif
+#ifdef VM_MEMORY_SQLITE
+    case VM_MEMORY_SQLITE: return "SQLite";
+#endif
+#ifdef VM_MEMORY_JAVASCRIPT_CORE
+    case VM_MEMORY_JAVASCRIPT_CORE: return "JavaScriptCore";
+#endif
+#ifdef VM_MEMORY_LAYERKIT
+    case VM_MEMORY_LAYERKIT: return "Core Animation";
+#endif
+#ifdef VM_MEMORY_LIBDISPATCH
+    case VM_MEMORY_LIBDISPATCH: return "libdispatch";
+#endif
+#ifdef VM_MEMORY_IOSURFACE
+    case VM_MEMORY_IOSURFACE: return "IOSurface";
+#endif
+#ifdef VM_MEMORY_IOACCELERATOR
+    case VM_MEMORY_IOACCELERATOR: return "IOAccelerator (Metal)";
+#endif
+#ifdef VM_MEMORY_OS_ALLOC_ONCE
+    case VM_MEMORY_OS_ALLOC_ONCE: return "os_alloc_once";
+#endif
+    default: return NULL;
+    }
+}
+#endif
+
+// The GPU stack's own totals, where a build has it. They are what the graphics
+// figure above has to be made of, so a gap between them says the memory is
+// somewhere none of the layers counts. Only an ISH_VIRTGPU build (renderer and
+// MoltenVK both in) refers to them: ld64 will not leave a weak reference
+// unresolved, so a Mac build without the GPU failed to link on them.
+#ifdef ISH_VIRTGPU
+void mvkAOKMemStats(unsigned long long out[12]) __attribute__((weak));
+void vkr_aok_mem_stats(uint64_t *bytes, uint32_t *count) __attribute__((weak));
+void virtgpu_blob_stats(uint64_t *bytes, uint64_t *mappable, uint32_t *count) __attribute__((weak));
+#endif
+
+static int proc_ish_show_host_vm(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+#if defined(__APPLE__)
+    struct { uint64_t resident, dirty, swapped, virt; } tags[256];
+    memset(tags, 0, sizeof(tags));
+    task_vm_info_data_t vmi;
+    mach_msg_type_number_t vmi_count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &vmi, &vmi_count) != KERN_SUCCESS)
+        return _EIO;
+    const uint64_t page = vm_page_size;
+    // vm_region_recurse_64, not mach_vm_region_recurse: the iOS SDK has no
+    // mach_vm.h. On a 64-bit host vm_address_t is 64 bits anyway.
+    vm_address_t addr = 0;
+    natural_t depth = 0;
+    for (;;) {
+        vm_size_t size = 0;
+        vm_region_submap_info_data_64_t info;
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &addr, &size, &depth,
+                (vm_region_recurse_info_64_t) &info, &count) != KERN_SUCCESS)
+            break;
+        if (info.is_submap) {
+            depth++;
+            continue;
+        }
+        unsigned tag = info.user_tag & 0xff;
+        tags[tag].resident += (uint64_t) info.pages_resident * page;
+        tags[tag].dirty += (uint64_t) info.pages_dirtied * page;
+        tags[tag].swapped += (uint64_t) info.pages_swapped_out * page;
+        tags[tag].virt += size;
+        addr += size;
+    }
+    proc_printf(buf, "footprint %llu MB  (peak %llu MB, the jetsam ledger)\n",
+                (unsigned long long) (vmi.phys_footprint >> 20),
+                (unsigned long long) (vmi.ledger_phys_footprint_peak >> 20));
+    // The host's own split of that footprint. Graphics is GPU memory charged
+    // to the app that no region of its address space shows (a private Metal
+    // allocation); the tag table below cannot see it at all.
+    proc_printf(buf, "  internal %llu MB, compressed %llu MB, purgeable %llu MB\n",
+                (unsigned long long) (vmi.internal >> 20),
+                (unsigned long long) (vmi.compressed >> 20),
+                (unsigned long long) ((uint64_t) vmi.ledger_purgeable_nonvolatile >> 20));
+    proc_printf(buf, "  graphics %llu MB (+%llu MB compressed), neural %llu MB\n",
+                (unsigned long long) ((uint64_t) vmi.ledger_tag_graphics_footprint >> 20),
+                (unsigned long long) ((uint64_t) vmi.ledger_tag_graphics_footprint_compressed >> 20),
+                (unsigned long long) ((uint64_t) vmi.ledger_tag_neural_footprint >> 20));
+#ifdef ISH_VIRTGPU
+    if (virtgpu_blob_stats != NULL) {
+        uint64_t bytes, mappable;
+        uint32_t count;
+        virtgpu_blob_stats(&bytes, &mappable, &count);
+        proc_printf(buf, "  guest blobs: %u, %llu MB (%llu MB mappable)\n", count,
+                    (unsigned long long) (bytes >> 20), (unsigned long long) (mappable >> 20));
+    }
+    if (vkr_aok_mem_stats != NULL) {
+        uint64_t bytes;
+        uint32_t count;
+        vkr_aok_mem_stats(&bytes, &count);
+        proc_printf(buf, "  Vulkan device memory: %u allocations, %llu MB\n", count,
+                    (unsigned long long) (bytes >> 20));
+    }
+    if (mvkAOKMemStats != NULL) {
+        unsigned long long m[12];
+        mvkAOKMemStats(m);
+        proc_printf(buf, "  MoltenVK: textures %llu, %llu MB; descriptor pools %llu, %llu MB\n",
+                    m[3], m[2] >> 20, m[1], m[0] >> 20);
+        proc_printf(buf, "  MoltenVK: pipelines %llu live (%llu made), shader libraries %llu live (%llu made)\n",
+                    m[4], m[5], m[6], m[7]);
+        proc_printf(buf, "  MoltenVK: temp buffers private %llu, %llu MB; shared %llu, %llu MB\n",
+                    m[9], m[8] >> 20, m[11], m[10] >> 20);
+    }
+#endif
+    proc_printf(buf, "%-38s %9s %9s %9s %9s\n", "tag", "dirty MB", "compr MB", "resid MB", "virt MB");
+    bool shown[256] = {false};
+    for (;;) {
+        int best = -1;
+        for (int t = 0; t < 256; t++)
+            if (!shown[t] && (tags[t].dirty + tags[t].swapped) >= (1u << 20) &&
+                    (best < 0 || tags[t].dirty + tags[t].swapped > tags[best].dirty + tags[best].swapped))
+                best = t;
+        if (best < 0)
+            break;
+        shown[best] = true;
+        const char *name = host_vm_tag_name(best);
+        char unnamed[24];
+        if (name == NULL) {
+            snprintf(unnamed, sizeof(unnamed), "tag %d", best);
+            name = unnamed;
+        }
+        proc_printf(buf, "%-38s %9llu %9llu %9llu %9llu\n", name,
+                    (unsigned long long) (tags[best].dirty >> 20),
+                    (unsigned long long) (tags[best].swapped >> 20),
+                    (unsigned long long) (tags[best].resident >> 20),
+                    (unsigned long long) (tags[best].virt >> 20));
+    }
+#else
+    proc_printf(buf, "unsupported (no Mach VM on this host)\n");
+#endif
+    return 0;
+}
+
+// /proc/ish/arch -- which architecture every process runs, readable by anyone.
+//
+// ktop's ARCH column read the ELF header behind /proc/<pid>/exe. Since 02c057cb
+// another user's exe is off limits, as on Linux (ptrace_may_access), so to a
+// normal user every root-owned process showed "?". Linux publishes nothing like
+// this because it runs one architecture; iSH-AOK runs four plus host code, and
+// which one a process runs is no secret -- its name in /proc/<pid>/stat, which
+// anyone may read, usually says as much. It lives here, in iSH-AOK's own
+// directory, rather than as a line added to a file Linux defines.
+//
+// One line per process (thread-group leader): the pid, then the machine name
+// uname(2) reports inside it (aarch64, x86_64, i686, riscv64); for a program
+// compiled into iSH-AOK and running as host code (/AOK/native), the HOST's
+// machine name marked "(n)" -- "aarch64(n)" on every Apple device -- because
+// that is what the code is, whichever root is booted; or "-" for a task caught
+// without an address space (task_arch_name). A zombie, or a leader that has
+// exited ahead of its threads, is listed with what it ran when it began to
+// exit: it has no address space left to ask, and leaving it out made ktop's
+// ARCH column read "?" for every zombie.
+static int proc_ish_show_arch(struct proc_entry *UNUSED(entry), struct proc_data *buf) {
+    proc_printf(buf, "PID ARCH\n");
+    struct task_snapshot snapshot = {0};
+    if (task_snapshot_collect_all(&snapshot) < 0)
+        return 0;
+    for (unsigned i = 0; i < snapshot.count; i++) {
+        struct task *task = snapshot.tasks[i];
+        // One line per process. A leader's pid is its tgid, which asks without
+        // following a group pointer (see task_free_final).
+        if (task->pid != task->tgid)
+            continue;
+        // A task that has begun to exit answers from exit_arch, whether or not
+        // its lock is free: a finished zombie's is, and by then it has no
+        // address space to ask (it read "-"). Otherwise task->mm is
+        // general_lock's, and a task caught inside do_exit is not waited for
+        // (see task_lock_unless_exiting).
+        const char *arch = __atomic_load_n(&task->exit_arch, __ATOMIC_ACQUIRE);
+        if (arch == NULL) {
+            if (task_lock_unless_exiting(task)) {
+                if (task->exiting)
+                    arch = __atomic_load_n(&task->exit_arch, __ATOMIC_ACQUIRE);
+                if (arch == NULL)
+                    arch = task_arch_name(task);
+                unlock(&task->general_lock);
+            } else {
+                arch = __atomic_load_n(&task->exit_arch, __ATOMIC_ACQUIRE);
+            }
+            if (arch == NULL)
+                continue;
+        }
+        proc_printf(buf, "%u %s\n", (unsigned) task->pid, arch);
+    }
+    task_snapshot_release(&snapshot);
     return 0;
 }
 
@@ -1242,6 +2546,13 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"arm64_watch", S_IFREG | 0644, .show = proc_ish_show_arm64_watch, .update = proc_ish_update_arm64_watch},
     {"arm64_faultdump", S_IFREG | 0644, .show = proc_ish_show_arm64_faultdump, .update = proc_ish_update_arm64_faultdump},
     {"arm64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_arm64_jit_fuse, .update = proc_ish_update_arm64_jit_fuse},
+    {"arm64_mops", S_IFREG | 0644, .show = proc_ish_show_arm64_mops, .update = proc_ish_update_arm64_mops},
+    {"foreign_exec", S_IFREG | 0644, .show = proc_ish_show_foreign_exec, .update = proc_ish_update_foreign_exec},
+    {"hle", S_IFREG | 0644, .show = proc_ish_show_hle, .update = proc_ish_update_hle},
+    {"jit_inherit", S_IFREG | 0644, .show = proc_ish_show_jit_inherit, .update = proc_ish_update_jit_inherit},
+    {"fault_reports", S_IFREG | 0644, .show = proc_ish_show_fault_reports, .update = proc_ish_update_fault_reports},
+    {"jit_cache", S_IFREG | 0644, .show = proc_ish_show_jit_cache, .update = proc_ish_update_jit_cache},
+    {"jit_timing", S_IFREG | 0644, .show = proc_ish_show_jit_timing, .update = proc_ish_update_jit_timing},
     {"i386_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_i386_jit_fuse, .update = proc_ish_update_i386_jit_fuse},
     {"riscv64_jit_fuse", S_IFREG | 0644, .show = proc_ish_show_riscv64_jit_fuse, .update = proc_ish_update_riscv64_jit_fuse},
     {"i386_no_cache_comm", S_IFREG | 0644, .show = proc_ish_show_i386_no_cache_comm, .update = proc_ish_update_i386_no_cache_comm},
@@ -1251,22 +2562,35 @@ struct proc_children proc_ish_children = PROC_CHILDREN({
     {"BAT0_status", .show = proc_ish_show_battery_status},
     {"UIDevice", .show = proc_ish_show_uidevice},
     {"binder", .show = binder_show_state},
+    {"applets", .show = proc_ish_show_applets},
+    {"arch", .show = proc_ish_show_arch},
     {"colors", .show = proc_ish_show_colors},
     {"cpu_features", .show = proc_ish_show_cpu_features},
     {".defaults", S_IFDIR, .readdir = proc_ish_underlying_defaults_readdir},
     {"defaults", S_IFDIR, .readdir = proc_ish_defaults_readdir},
     {"documents", .show = proc_ish_show_documents},
     {"host_info", .show = proc_ish_show_host_info},  // Add host hardware related information
+    {"host_fds", .show = proc_ish_show_host_fds},
+    {"host_ports", .show = proc_ish_show_host_ports},
+    {"host_vm", .show = proc_ish_show_host_vm},
     {"ips", .show = proc_ish_show_ips},
     {"logd", S_IFREG | 0644, .show = logd_sink_show, .update = logd_sink_update},
     {"property_area", S_IFREG | 0644, .show = property_area_show, .update = property_area_update},
+    {"languages", .show = proc_ish_show_languages},
     {"mem_guard", .show = proc_ish_show_mem_guard},
     {"mem_release_probe", S_IFREG | 0644, .show = proc_ish_show_mem_release_probe, .update = proc_ish_update_mem_release_probe},
     {"roots", S_IFREG | 0644, .show = proc_ish_show_roots, .update = proc_ish_update_roots},
     {"swap", S_IFREG | 0644, .show = proc_ish_show_swap, .update = proc_ish_update_swap},
     {"swap_evict", S_IFREG | 0644, .show = proc_ish_show_swap_evict, .update = proc_ish_update_swap_evict},
+    {"snapshot", S_IFREG | 0644, .show = proc_ish_show_snapshot, .update = proc_ish_update_snapshot},
+    {"mem_compress", S_IFREG | 0644, .show = proc_ish_show_mem_compress, .update = proc_ish_update_mem_compress},
+    {"checkpoint", S_IFREG | 0644, .show = proc_ish_show_checkpoint, .update = proc_ish_update_checkpoint},
+    {"zswap", .show = proc_ish_show_zswap},
     {"workspace", S_IFREG | 0666, .show = proc_ish_show_workspace, .update = proc_ish_update_workspace},
+    {"thermal_state", .show = proc_ish_show_thermal_state},
+    {"timezone", .show = proc_ish_show_timezone},
     {"version", .show = proc_ish_show_version},
+    {"wake_signals", .show = proc_ish_show_wake_signals},
 });
 
 void proc_ish_init(struct proc_dir_entry *root_entry) {

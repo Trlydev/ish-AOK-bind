@@ -2,7 +2,16 @@
 #include <signal.h>
 #include <string.h>
 #include "emu/cpu.h"
+#include "kernel/net_ns.h"
+#include "kernel/pid_ns.h"
+#include "kernel/user_ns.h"
+#include "kernel/rseq.h"
+#include "kernel/ipc_ns.h"
+#include "kernel/mnt_ns.h"
 #include "kernel/calls.h"
+#include "kernel/acct.h"
+#include "fs/sock.h"
+#include "kernel/checkpoint.h"
 #include "kernel/resource.h"
 #include "kernel/mm.h"
 #include "kernel/futex.h"
@@ -14,7 +23,13 @@
 #include "fs/devices.h"
 #include "fs/tty.h"
 
-static void halt_system_locked(void);
+struct halt_target {
+    struct task *task;
+    struct sighand *sighand;
+};
+static struct halt_target *halt_system_collect_locked(size_t *count);
+static void halt_system_kill(struct halt_target *targets, size_t count);
+static struct halt_target *pid_ns_collect_locked(struct pid_namespace *ns, struct tgroup *dying, size_t *count);
 
 static bool trace_session_exit_task(struct task *UNUSED(task)) {
     return false;
@@ -72,7 +87,7 @@ static bool exit_tgroup(struct task *task) {
     if (group_dead) {
         // Apply this process's SysV SEM_UNDO adjustments (threads share one
         // undo list via CLONE_SYSVSEM, so it applies at group death).
-        sysv_sem_exit(group);
+        sysv_sem_exit(task->ipc_ns, group);
         // don't need to lock the group since the only pointers to it come from:
         // - other threads' current->group, but there are none left thanks to that list_empty call
         // - locking pids_lock first, which do_exit did
@@ -111,9 +126,11 @@ static bool exit_tgroup(struct task *task) {
 // A function pointer that can be assigned to a cleanup function to be called upon task exit.
 void (*exit_hook)(struct task *task, int code) = NULL;
 
-// Optional hook invoked when init (pid 1) exits, before halt_system_locked(). The
-// standalone CLI sets this to terminate the host process with init's exit status;
-// it does not return. NULL for the iOS app (keeps the existing teardown behavior).
+// Optional hook invoked when init (pid 1) exits, before the other tasks are
+// killed (halt_system_collect_locked). Called with pids_lock and init's
+// general_lock held, so it must not take either. The standalone CLI sets this to
+// terminate the host process with init's exit status; it does not return. The
+// app's records that the guest has halted and returns.
 void (*halt_hook)(int status) = NULL;
 
 static inline bool exit_wait_needed(struct task *task) {
@@ -179,8 +196,12 @@ static struct task *find_new_parent(struct task *task) {
     // Walk up from the dying process's own parent. A subreaper that is itself
     // exiting is no use, and the loop is bounded by the tree's depth -- plus a
     // hard cap, because a corrupted parent chain must not spin here forever.
+    // ...and no further than the pid namespace: a subreaper outside it is
+    // nobody its orphans could be the children of.
     struct task *ancestor = task->group->leader != NULL ? task->group->leader->parent : NULL;
     for (int depth = 0; ancestor != NULL && depth < MAX_PID; depth++) {
+        if (ancestor->pid_ns != task->pid_ns)
+            break;
         if (ancestor->group != NULL && ancestor->group->child_subreaper &&
                 !ancestor->exiting && !ancestor->zombie)
             return ancestor;
@@ -189,7 +210,15 @@ static struct task *find_new_parent(struct task *task) {
             break;                      // self-parented: nothing above it
         ancestor = ancestor->parent;
     }
-    return pid_get_task(1);
+    // The init of its pid namespace (kernel/pid_ns.h); when that is the one
+    // dying, or gone, the init of the namespace above; and at the top the
+    // machine's.
+    for (struct pid_namespace *ns = task->pid_ns; ns != NULL; ns = ns->parent) {
+        struct task *init = pid_get_task_global((dword_t) atomic_load(&ns->init_pid));
+        if (init != NULL && init->group != task->group && !init->exiting)
+            return init;
+    }
+    return pid_get_task_global(1);
 }
 
 static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) {
@@ -209,6 +238,12 @@ static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) 
         tracee->ptrace.signal = 0;
         tracee->ptrace.trap_event = 0;
         tracee->ptrace.eventmsg = 0;
+        tracee->ptrace.seized = false;
+        // A stop still owed goes with the tracer, as on the PTRACE_DETACH path:
+        // a tracer that dies between interrupting a tracee and seeing the stop
+        // must not leave it one to take with nobody to report it to.
+        __atomic_store_n(&tracee->ptrace.trap_stop, false, __ATOMIC_RELEASE);
+        __atomic_store_n(&tracee->ptrace_trap_notify, false, __ATOMIC_RELEASE);
         if (tracee->ptrace.stopped) {
             tracee->ptrace.stopped = false;
             notify(&tracee->ptrace.cond);
@@ -217,6 +252,253 @@ static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) 
     unlock(&tracee->ptrace.lock);
 
     list_remove_safe(&tracee->ptrace_siblings);
+}
+
+// ---- who hears about an exit -----------------------------------------------
+//
+// Linux reports a traced task's exit to its TRACER first ("A zombie ptracee is
+// only visible to its ptracer", wait_consider_task). A traced thread's exit is
+// the tracer's alone: it is reaped with wait and then released. A traced
+// process whose parent is somewhere else is reaped by the tracer, untraced, and
+// only then announced to its parent (wait_task_zombie's EXIT_TRACE), which
+// reaps it as usual. A tracer that goes away holding such a zombie passes it on
+// the same way (__ptrace_detach).
+//
+// AOK did none of it. A thread was destroyed the moment it exited and a process
+// was announced to its parent alone, so a tracer never heard of an exit it was
+// not the parent of. strace -f of anything that made a thread or forked ended
+// with "wait4(__WALL): No child processes" and exit status 1, having printed
+// "+++ exited" for the top process only. Worse, a tracer waiting on a traced
+// process by pid reached reap_if_zombie and destroyed it, and the real parent's
+// waitpid then failed.
+
+// The task tracing `task`, or NULL. Caller holds pids_lock.
+//
+// Never one of its own threads. Linux refuses that attach, and so does AOK now,
+// but PTRACE_TRACEME from a thread names the thread's parent -- which here is
+// whichever thread created it, in the same process -- and a zombie held for a
+// tracer inside its own process would never be collected, and neither would
+// the process.
+static struct task *tracer_of(const struct task *task) {
+    if (!task->ptrace.traced)
+        return NULL;
+    struct task *tracer = task->ptrace.tracer != NULL ? task->ptrace.tracer : task->parent;
+    if (tracer == NULL || tracer->group == task->group)
+        return NULL;
+    return tracer;
+}
+
+// A zombie its tracer reports: every traced thread, and a traced process whose
+// tracer is not in its parent's group. A process traced by its own parent is
+// reported once, to the parent, as Linux's !ptrace_reparented case is.
+static bool zombie_is_tracers(const struct task *task) {
+    struct task *tracer = tracer_of(task);
+    if (tracer == NULL)
+        return false;
+    if (task->group->leader != task)
+        return true;
+    return task->parent == NULL || tracer->group != task->parent->group;
+}
+
+// What a zombie reports to wait. Once the process has exited as a whole the
+// process's code wins, even for a thread that died earlier with a code of its
+// own -- Linux's SIGNAL_GROUP_EXIT test in wait_task_zombie. Caller holds
+// pids_lock and task->group->lock.
+static dword_t zombie_status(const struct task *task) {
+    return task->group->doing_group_exit ? task->group->group_exit_code : task->exit_code;
+}
+
+// What an exit, or a reap, owes to other tasks: signals, which cannot be sent
+// under pids_lock because send_signal_to_process takes it, and released tasks,
+// which cannot be freed while the lists they were on are still being walked.
+// Collected under pids_lock and settled by exit_notes_settle after it.
+struct exit_signal_note {
+    struct task *to;            // holds a reference
+    int sig;
+    struct siginfo_ info;
+};
+
+struct exit_notes {
+    struct exit_signal_note inline_signals[4];
+    struct exit_signal_note *signals;
+    size_t nsignals, cap;
+    // Tasks already out of the pid table, linked through ptrace_siblings,
+    // which task_unlink_locked has just emptied.
+    struct list dead;
+};
+
+static void exit_notes_init(struct exit_notes *notes) {
+    notes->signals = notes->inline_signals;
+    notes->nsignals = 0;
+    notes->cap = sizeof(notes->inline_signals) / sizeof(notes->inline_signals[0]);
+    list_init(&notes->dead);
+}
+
+static void exit_notes_signal(struct exit_notes *notes, struct task *to, int sig,
+        struct siginfo_ info) {
+    if (to == NULL || sig == 0)
+        return;
+    // The child, as the one told knows it (kernel/pid_ns.h).
+    info.child.pid = task_pid_shown(to, info.child.pid);
+    if (notes->nsignals == notes->cap) {
+        // Only a tracer dying with many zombies outstanding gets here. The
+        // child_exit notify has gone out already, so a signal lost to a failed
+        // allocation costs a sleeping sigsuspend, not a wait.
+        size_t cap = notes->cap * 2;
+        struct exit_signal_note *grown = malloc(sizeof(*grown) * cap);
+        if (grown == NULL)
+            return;
+        memcpy(grown, notes->signals, sizeof(*grown) * notes->nsignals);
+        if (notes->signals != notes->inline_signals)
+            free(notes->signals);
+        notes->signals = grown;
+        notes->cap = cap;
+    }
+    task_ref_cnt_mod(to, 1);
+    notes->signals[notes->nsignals++] = (struct exit_signal_note) {
+        .to = to, .sig = sig, .info = info,
+    };
+}
+
+// Called without pids_lock. Returns whether `self` was among the released
+// tasks: do_exit's own struct is freed by do_exit itself, last.
+static bool exit_notes_settle(struct exit_notes *notes, struct task *self) {
+    for (size_t i = 0; i < notes->nsignals; i++) {
+        struct exit_signal_note *note = &notes->signals[i];
+        // Process-directed, as do_exit's own SIGCHLD is: whichever thread of
+        // the waiter is watching for it may take it. Sent to the waiting
+        // thread itself, whose mask alone decides whether an ignored SIGCHLD
+        // is queued.
+        send_signal_to_process(note->to, note->sig, note->info);
+        task_ref_cnt_mod(note->to, -1);
+    }
+    if (notes->signals != notes->inline_signals)
+        free(notes->signals);
+    notes->signals = notes->inline_signals;
+    notes->nsignals = 0;
+
+    bool released_self = false;
+    struct task *dead, *tmp;
+    list_for_each_entry_safe(&notes->dead, dead, tmp, ptrace_siblings) {
+        list_remove(&dead->ptrace_siblings);
+        if (dead == self) {
+            released_self = true;
+            continue;
+        }
+        // Defers by itself while the zombie's own thread is still finishing
+        // do_exit, or while anything holds a reference.
+        task_destroy_unlinked(dead, 2);
+    }
+    return released_self;
+}
+
+// The SIGCHLD (or other exit signal) payload describing `task`'s exit.
+static struct siginfo_ exit_signal_info(struct task *task, dword_t status,
+        const struct rusage_ *usage) {
+    int code, bare_status;
+    decode_wait_status(status, &code, &bare_status);
+    return (struct siginfo_) {
+        .code = code,
+        .child.pid = task->pid,
+        .child.uid = task->uid,
+        .child.status = bare_status,
+        .child.utime = usage != NULL ? clock_from_timeval(usage->utime) : 0,
+        .child.stime = usage != NULL ? clock_from_timeval(usage->stime) : 0,
+    };
+}
+
+// Take a reaped process out of the process table. Its group leaves its session
+// and process group here, as a reaping wait always did -- and as the SIGCHLD
+// autoreap path did not: it freed the group with both still linked into the
+// pid's lists. The struct itself goes on `notes`.
+static void release_process_locked(struct task *leader, struct exit_notes *notes) {
+    lock(&leader->group->lock, 0);
+    task_leave_session(leader);
+    list_remove(&leader->group->pgroup);
+    // (A group whose leader was reaped before its last member: the number
+    // was kept for the group, and now names nothing.)
+    pid_ns_unnumber_if_empty((dword_t) leader->group->pgid);
+    unlock(&leader->group->lock);
+    task_unlink_locked(leader);
+    list_add(&notes->dead, &leader->ptrace_siblings);
+}
+
+// Tell whoever waits for this process that it has exited: its tracer, when a
+// tracer from outside its parent's group holds it, and otherwise its parent.
+// Called once its last thread is gone and no thread zombie of it is left --
+// from do_exit, or from whoever released that last zombie -- and again for a
+// zombie that an exiting parent hands to another process. Linux's
+// do_notify_parent, reached from exit_notify, release_task or reparent_leader.
+//
+// The signal names the process and carries the leader's own exit code, as
+// Linux's does: when the leader went first, the last thread's tid and code
+// described a task the parent has never heard of. A parent that disclaimed
+// SIGCHLD gets no zombie -- unless the process is traced, which is never
+// autoreaped. Caller holds pids_lock; leader->parent is not NULL.
+static void exit_notify_process_locked(struct task *leader, struct exit_notes *notes) {
+    struct tgroup *group = leader->group;
+    group->exit_notify_deferred = false;
+
+    struct task *parent = leader->parent;
+    struct task *tracer = tracer_of(leader);
+    bool to_tracer = zombie_is_tracers(leader);
+    struct task *to = to_tracer ? tracer : parent;
+    int sig = to_tracer ? SIGCHLD_ : leader->exit_signal;
+
+    bool autoreap = false;
+    if (tracer == NULL && sig == SIGCHLD_ && parent->sighand != NULL) {
+        lock(&parent->sighand->lock, 0);
+        struct sigaction_ *action = &parent->sighand->action[SIGCHLD_];
+        if (action->handler == SIG_IGN_ || (action->flags & SA_NOCLDWAIT_))
+            autoreap = true;
+        // SIG_IGN sends nothing at all, as Linux's do_notify_parent does: not
+        // even a SIGCHLD queued because the parent blocks it, which is what a
+        // parent that blocked it was given. SA_NOCLDWAIT alone still sends it.
+        if (action->handler == SIG_IGN_)
+            sig = 0;
+        unlock(&parent->sighand->lock);
+    }
+
+    lock(&group->lock, 0);
+    struct rusage_ usage = group->rusage;
+    unlock(&group->lock);
+    struct siginfo_ info = exit_signal_info(leader, leader->exit_code, &usage);
+
+    leader->zombie = true;
+    notify(&to->group->child_exit);
+    pidfd_notify_exit(leader);
+    exit_notes_signal(notes, to, sig, info);
+    if (autoreap)
+        release_process_locked(leader, notes);
+}
+
+// A thread zombie reaped by its tracer, or let go by it: gone for good. The
+// last one may be what its process's announcement was waiting for.
+static void release_thread_locked(struct task *thread, struct exit_notes *notes) {
+    struct tgroup *group = thread->group;
+    task_unlink_locked(thread);
+    list_add(&notes->dead, &thread->ptrace_siblings);
+    if (--group->traced_zombies == 0 && group->exit_notify_deferred)
+        exit_notify_process_locked(group->leader, notes);
+}
+
+// `tracer` is letting go of `zombie` without reaping it: the tracer is exiting.
+// A thread is released. A process goes on to its parent, which has not heard of
+// it yet -- unless the parent was the one told, being in the tracer's own
+// group, or unless the announcement is still waiting on a thread zombie, in
+// which case it will go to the parent when it is made. Caller holds pids_lock
+// and has already detached `zombie`.
+static void zombie_untraced_locked(struct task *tracer, struct task *zombie,
+        struct exit_notes *notes) {
+    if (zombie->group->leader != zombie) {
+        release_thread_locked(zombie, notes);
+        return;
+    }
+    if (zombie->group->exit_notify_deferred)
+        return;
+    if (zombie->parent == NULL || zombie->parent->group == tracer->group)
+        return;
+    exit_notify_process_locked(zombie, notes);
 }
 
 // POSIX: when a process's exit leaves a process group ORPHANED and that group
@@ -233,7 +515,7 @@ static void ptrace_detach_from_tracer(struct task *tracer, struct task *tracee) 
 // Both helpers run under pids_lock. The signals are sent afterwards, from the
 // same place the controlling-terminal SIGHUP is (see do_exit), because
 // sending under pids_lock would take sighand->lock inside it.
-static bool pgrp_is_orphaned_locked(dword_t pgid, struct task *ignore, dword_t sid) {
+static bool pgrp_is_orphaned_locked(pid_t_ pgid, struct task *ignore, pid_t_ sid) {
     struct pid *entry;
     list_for_each_entry(&alive_pids_list, entry, alive) {
         struct task *t = entry->task;
@@ -246,6 +528,15 @@ static bool pgrp_is_orphaned_locked(dword_t pgid, struct task *ignore, dword_t s
         struct task *parent = t->parent;
         if (parent == NULL || parent == ignore || parent->group == NULL)
             continue;
+        // A member init has adopted is no way back, as in Linux, which skips
+        // any whose parent is_global_init: init resumes nobody's stopped
+        // jobs. Counted -- and in the CLI init shares the session with
+        // everything it starts -- it kept a group whose member had outlived
+        // its own parent from ever being orphaned. And do_exit asks both of
+        // its questions after handing its children on, usually to init, so
+        // no exit could have orphaned anything at all.
+        if (parent->tgid == 1)
+            continue;
         // Someone outside this group, but inside the session, can still
         // resume it -- so it is not orphaned.
         if (parent->group->sid == sid && parent->group->pgid != pgid)
@@ -254,7 +545,7 @@ static bool pgrp_is_orphaned_locked(dword_t pgid, struct task *ignore, dword_t s
     return true;
 }
 
-static bool pgrp_has_stopped_member_locked(dword_t pgid, dword_t sid) {
+static bool pgrp_has_stopped_member_locked(pid_t_ pgid, pid_t_ sid) {
     struct pid *entry;
     list_for_each_entry(&alive_pids_list, entry, alive) {
         struct task *t = entry->task;
@@ -264,6 +555,175 @@ static bool pgrp_has_stopped_member_locked(dword_t pgid, dword_t sid) {
             return true;
     }
     return false;
+}
+
+// The children's groups an exit leaves orphaned with a stopped member, each
+// owed SIGHUP and SIGCONT once pids_lock is dropped. A few fit inline -- a
+// shell's stopped jobs, one group each -- and past that the list grows; a
+// failed allocation costs that group its hangup, which is what every such
+// group got before the rule was here.
+struct orphaned_pgrps {
+    pid_t_ inline_pgids[4];
+    pid_t_ *pgids;
+    size_t count, cap;
+};
+
+static void orphaned_pgrps_init(struct orphaned_pgrps *orphans) {
+    orphans->pgids = orphans->inline_pgids;
+    orphans->count = 0;
+    orphans->cap = sizeof(orphans->inline_pgids) / sizeof(orphans->inline_pgids[0]);
+}
+
+static void orphaned_pgrps_add(struct orphaned_pgrps *orphans, pid_t_ pgid) {
+    for (size_t i = 0; i < orphans->count; i++) {
+        if (orphans->pgids[i] == pgid)
+            return;
+    }
+    if (orphans->count == orphans->cap) {
+        size_t cap = orphans->cap * 2;
+        pid_t_ *grown = malloc(sizeof(*grown) * cap);
+        if (grown == NULL)
+            return;
+        memcpy(grown, orphans->pgids, sizeof(*grown) * orphans->count);
+        if (orphans->pgids != orphans->inline_pgids)
+            free(orphans->pgids);
+        orphans->pgids = grown;
+        orphans->cap = cap;
+    }
+    orphans->pgids[orphans->count++] = pgid;
+}
+
+// Called without pids_lock. SIGHUP tells the stopped members the world they
+// were stopped in is gone, and SIGCONT is what lets them run far enough to
+// act on it. Order matters -- SIGCONT first would resume them into a session
+// with no one to talk to.
+static void orphaned_pgrp_hang_up(pid_t_ pgid) {
+    send_group_signal(pgid, SIGHUP_, SIGINFO_NIL);
+    send_group_signal(pgid, SIGCONT_, SIGINFO_NIL);
+}
+
+static void orphaned_pgrps_hang_up(struct orphaned_pgrps *orphans) {
+    for (size_t i = 0; i < orphans->count; i++)
+        orphaned_pgrp_hang_up(orphans->pgids[i]);
+    if (orphans->pgids != orphans->inline_pgids)
+        free(orphans->pgids);
+    orphaned_pgrps_init(orphans);
+}
+
+// ---- the parent-death signal -------------------------------------------------
+//
+// PR_SET_PDEATHSIG. Linux's forget_original_parent sends it for every thread
+// of every child process a dying THREAD hands on, to whoever takes the child:
+//
+//     for_each_thread(p, t) {
+//         ...
+//         if (t->pdeath_signal)
+//             group_send_sig_info(t->pdeath_signal, SEND_SIG_NOINFO, t, PIDTYPE_TGID);
+//     }
+//
+// So a child forked by a worker thread gets it when that worker exits, though
+// the process that forked it lives on -- the known gotcha, and a real one, since
+// Go forks from whichever thread its runtime is on. And again at each later
+// reparent: a subreaper that took the child and then exits sends it too.
+//
+// AOK stored the setting and never sent it, so a helper that asked to go with
+// the program that started it -- Go's SysProcAttr.Pdeathsig, systemd's
+// FORK_DEATHSIG -- outlived it.
+//
+// Collected in do_exit's reparenting loop, under pids_lock, and sent once that
+// is dropped, like every signal an exit sends. Kept by id rather than by
+// reference, as the orphaned groups are: nothing holds the child's process in
+// between, and one that has gone meanwhile is simply not found.
+struct pdeath_note {
+    pid_t_ tid, tgid;       // the thread that asked for it, and its process
+    int sig;
+};
+
+struct pdeath_notes {
+    struct pdeath_note inline_notes[4];
+    struct pdeath_note *notes;
+    size_t count, cap;
+};
+
+static void pdeath_notes_init(struct pdeath_notes *pd) {
+    pd->notes = pd->inline_notes;
+    pd->count = 0;
+    pd->cap = sizeof(pd->inline_notes) / sizeof(pd->inline_notes[0]);
+}
+
+// Caller holds pids_lock, and is the exiting task.
+static void pdeath_note_add_locked(struct pdeath_notes *pd, struct task *thread) {
+    int sig = (int) thread->pdeath_signal;
+    if (sig == 0 || thread->zombie)
+        return;
+    // Linux's group_send_sig_info asks check_kill_permission of the exiting
+    // thread, as kill() would: a parent that has since become a user who may
+    // not signal the child sends nothing. Asked here, while both are certainly
+    // still there.
+    if (!may_signal_task(thread, (dword_t) sig))
+        return;
+    if (pd->count == pd->cap) {
+        size_t cap = pd->cap * 2;
+        struct pdeath_note *grown = malloc(sizeof(*grown) * cap);
+        if (grown == NULL)
+            return;
+        memcpy(grown, pd->notes, sizeof(*grown) * pd->count);
+        if (pd->notes != pd->inline_notes)
+            free(pd->notes);
+        pd->notes = grown;
+        pd->cap = cap;
+    }
+    pd->notes[pd->count++] = (struct pdeath_note) {
+        .tid = thread->pid, .tgid = thread->tgid, .sig = sig,
+    };
+}
+
+// Every thread of the child process led by `leader` that asked for a signal
+// when its parent dies. Caller holds pids_lock.
+//
+// The leader is asked even once it has exited: it stays its process's leader,
+// and one of Linux's for_each_thread, until the last thread goes -- so a
+// process whose main thread asked and then left with pthread_exit still gets
+// it.
+static void pdeath_collect_locked(struct pdeath_notes *pd, struct task *leader) {
+    bool leader_listed = false;
+    struct task *thread;
+    list_for_each_entry(&leader->group->threads, thread, group_links) {
+        if (thread == leader)
+            leader_listed = true;
+        pdeath_note_add_locked(pd, thread);
+    }
+    if (!leader_listed)
+        pdeath_note_add_locked(pd, leader);
+}
+
+// Called without pids_lock. `info` names the exiting process as the sender,
+// as SEND_SIG_NOINFO does: SI_USER, its tgid and its real uid.
+static void pdeath_notes_send(struct pdeath_notes *pd, struct siginfo_ info) {
+    for (size_t i = 0; i < pd->count; i++) {
+        const struct pdeath_note *note = &pd->notes[i];
+        // Process-directed, sent to the thread that asked: it takes it if it
+        // can, as Linux's complete_signal prefers it, and another thread of its
+        // process otherwise -- the only choice once it has exited.
+        complex_lockt(&pids_lock, 0);
+        struct task *thread = pid_get_task_global(note->tid);
+        if (thread != NULL && thread->tgid == note->tgid)
+            task_ref_cnt_mod(thread, 1);
+        else
+            thread = NULL;
+        unlock(&pids_lock);
+        if (thread != NULL) {
+            // The parent, as its child's pid namespace knows it: 0 for one
+            // that was outside it.
+            struct siginfo_ told = info;
+            told.kill.pid = task_pid_shown(thread, info.kill.pid);
+            send_signal_to_process(thread, note->sig, told);
+            task_ref_cnt_mod(thread, -1);
+        }
+    }
+    if (pd->notes != pd->inline_notes)
+        free(pd->notes);
+    pdeath_notes_init(pd);
 }
 
 // A session leader's death takes the controlling terminal away from the whole
@@ -302,7 +762,7 @@ static void exit_hangup_session_tty(struct task *leader, struct tty_hangup_targe
     if (tty == NULL || sid != leader->pid)
         return;
 
-    struct pid *sid_pid = pid_get(sid);
+    struct pid *sid_pid = pid_get_global(sid);
     if (sid_pid == NULL)
         return;
 
@@ -321,6 +781,11 @@ static void exit_hangup_session_tty(struct task *leader, struct tty_hangup_targe
     lock(&tty->lock, 0);
     hup->fg_group = tty->fg_group;
     hup->session = 0;
+    // A terminal already hung up signalled only the leader then; its
+    // foreground group hears now, SIGHUP and SIGCONT both (Linux: the
+    // tty_old_pgrp branch of disassociate_ctty, the tty having been taken
+    // from the session by the hangup).
+    hup->exit_cont = tty->hung_up;
     tty->session = 0;
     tty->fg_group = 0;
     // Only a real terminal is hung up as a device. Doing it to a pty is what
@@ -337,6 +802,8 @@ static void exit_hangup_session_tty(struct task *leader, struct tty_hangup_targe
 // and re-parents any children. It ensures the task is not in a critical section and that
 // all locks are released before proceeding.  At least in theory
 noreturn void do_exit(struct task *task, int status) {
+    if (unlikely(guestprof_on))
+        guestprof_slot_release(task);
     if(task->reference.ready_to_be_freed) {
         // Already queued for deletion by someone else, but the struct is still
         // alive on that queue -- publish here too, or a de_thread waiting on
@@ -345,7 +812,18 @@ noreturn void do_exit(struct task *task, int status) {
         goto EXIT;
     }
     bool was_already_exiting = task->exiting;
+    // Before anything is torn down, so a zombie can still say what it ran
+    // (/proc/ish/arch). Unlocked, as `exiting` is: the task is on its way out
+    // and these are only read, not followed.
+    if (!was_already_exiting)
+        __atomic_store_n(&task->exit_arch, task_arch_name(task), __ATOMIC_RELEASE);
     task->exiting = true;
+    if (!was_already_exiting)
+        checkpoint_trace_exit(task->pid, task->comm, status);
+    // A signal queued for the whole process that this thread was told to take
+    // goes to a thread that is staying, or it would wait there unseen: no
+    // other thread looks at the process's queue until it is told to.
+    signal_exit_handoff(task);
 
     // Charge this task's final thread CPU time to its per-virtual-CPU
     // accounting slot (/proc/stat cpuN) while the host thread still exists
@@ -364,7 +842,7 @@ noreturn void do_exit(struct task *task, int status) {
         struct siginfo_ info = {
             .sig = SIGTRAP_,
             .code = SI_USER_,
-            .kill.pid = task->pid,
+            .kill.pid = current_pid_shown(task->pid),
             .kill.uid = task->uid,
         };
         ptrace_event_stop(SIGTRAP_, &info, PTRACE_EVENT_EXIT_, (qword_t) (dword_t) status);
@@ -394,6 +872,8 @@ noreturn void do_exit(struct task *task, int status) {
     // the lock words live in guest memory, and a waiter needs FUTEX_OWNER_DIED
     // written into them or it blocks for good.
     futex_exit_robust_list(task);
+    // And the PI locks it held go to their waiters (futex_exit_pi).
+    futex_exit_pi(task);
 
     guest_addr_t clear_tid = task->clear_tid;
     if (clear_tid) {
@@ -418,6 +898,7 @@ noreturn void do_exit(struct task *task, int status) {
     // Last chance to read the address space: the exit-time usage snapshot
     // below runs after this, and a peak RSS read from a released mm is 0.
     task_maxrss_kb(task);
+    rseq_exit(task);
     mm_release(task->mm);
     task->mm = NULL;
     task->mem = NULL;
@@ -442,8 +923,25 @@ noreturn void do_exit(struct task *task, int status) {
     }
     fs_info_release(task->fs);
     task->fs = NULL;
-    uts_ns_release(task->uts_ns);
+    // general_lock, held since above, is what a /proc/<pid>/ns reader takes
+    // to look at the namespace.
+    struct uts_namespace *dead_uts = task->uts_ns;
     task->uts_ns = NULL;
+    uts_ns_release(dead_uts);
+    // After the fs_info above, whose root and working directory were in it:
+    // the last task out takes the namespace's tree with it.
+    struct mnt_namespace *dead_mnt = task->mnt_ns;
+    task->mnt_ns = NULL;
+    mnt_ns_release(dead_mnt);
+    struct user_namespace *dead_user = task->user_ns;
+    task->user_ns = NULL;
+    user_ns_release(dead_user);
+    struct net_namespace *dead_net = task->net_ns;
+    task->net_ns = NULL;
+    net_ns_release(dead_net);
+    struct pid_namespace *dead_pid_for_children = task->pid_ns_for_children;
+    task->pid_ns_for_children = NULL;
+    pid_ns_release(dead_pid_for_children);
     // sighand must be released below so it can be protected by pids_lock
     // since it can be accessed by other threads
 
@@ -478,6 +976,8 @@ noreturn void do_exit(struct task *task, int status) {
     if (!task->exit_rusage_counted) {
         struct rusage_ rusage = rusage_get_current();
         rusage_add(&task->group->rusage, &rusage);
+        task->exit_utime = rusage.utime;    // see rusage_get_thread_cpu
+        task->exit_stime = rusage.stime;
         task->exit_rusage_counted = true;
     }
     struct rusage_ group_rusage = task->group->rusage;
@@ -489,26 +989,34 @@ noreturn void do_exit(struct task *task, int status) {
         exit_wait_backoff(&sighand_wait_pause);
     }
 
-    struct task *signal_parent = NULL;
     // Filled in when this task's exit takes a controlling terminal away from
     // its session; the SIGHUP goes out below, once pids_lock is released.
     struct tty_hangup_targets tty_hup = { .fg_group = 0, .session = 0 };
-    struct siginfo_ signal_info = {};
-    int signal_no = 0;
     struct sighand *old_sighand = NULL;
     bool destroy_unlinked_task = false;
-    // Set when the parent has disclaimed this child (SIGCHLD ignored or
-    // SA_NOCLDWAIT): no zombie is left behind for a wait() that will
-    // never come.
-    bool autoreap = false;
+    // Everyone this exit has to tell, and every task it releases -- this one
+    // included, when a parent that disclaimed SIGCHLD leaves no zombie, and a
+    // zombie child whose new parent disclaimed it. See "who hears about an
+    // exit".
+    struct exit_notes notes;
+    exit_notes_init(&notes);
 
-    // A child that is ALREADY a zombie when we hand it to a new parent has to
-    // be announced to that parent -- see the reparenting loop below. Collected
-    // here and sent after pids_lock is dropped, like every other signal in
-    // this function.
-    struct task *reparent_signal_parent = NULL;
-    struct siginfo_ reparent_signal_info = {};
+    // Zombies handed to a sibling thread; see the reparenting loop below.
     int reparented_zombies = 0;
+    struct halt_target *halt_targets = NULL;
+    size_t halt_target_count = 0;
+    // The groups of children this exit orphans; hung up after the locks.
+    struct orphaned_pgrps orphaned;
+    orphaned_pgrps_init(&orphaned);
+    // The parent-death signals the children's threads asked for; sent after
+    // the locks too, from this process (Linux's SEND_SIG_NOINFO).
+    struct pdeath_notes pdeath;
+    pdeath_notes_init(&pdeath);
+    struct siginfo_ pdeath_info = {
+        .code = SI_USER_,
+        .kill.pid = task->tgid,
+        .kill.uid = task->uid,
+    };
 
     complex_lockt(&pids_lock, 0);
 
@@ -535,36 +1043,54 @@ noreturn void do_exit(struct task *task, int status) {
     
     struct task *leader = task->group->leader;
 
-    // Does this exit orphan our own process group and leave stopped members
-    // in it? Computed here, while the group still describes the pre-exit
-    // state and pids_lock is held; the signals go out below, after the locks.
-    dword_t orphan_pgid = 0;
-    if (leader != NULL && leader->group != NULL) {
-        dword_t pgid = leader->group->pgid;
-        dword_t sid = leader->group->sid;
-        struct task *parent = leader->parent;
-        // Only if we were the one holding it together: a parent already in
-        // the group cannot have been the outside link.
-        if (parent != NULL && parent->group != NULL &&
-                parent->group->pgid != pgid && parent->group->sid == sid &&
-                pgrp_is_orphaned_locked(pgid, leader, sid) &&
-                pgrp_has_stopped_member_locked(pgid, sid))
-            orphan_pgid = pgid;
-    }
+    // Whether this exit ends the process: what exit_tgroup says below, known
+    // already, because every change to the thread list is made under
+    // pids_lock and it is held from here to there.
+    bool last_thread = task->group->threads.next == &task->group_links &&
+        task->group->threads.prev == &task->group_links;
 
     // reparent children
     struct task *new_parent = find_new_parent(task);
     struct task *child, *tmp;
-    
+    // Handed to another thread of this same process, a child has not changed
+    // parents in any way a program can see: wait finds it from every thread
+    // before and after, and its exit is announced to the process whichever
+    // thread created it. Linux's forget_original_parent calls reparent_leader,
+    // which resets exit_signal and announces a zombie, only when the new
+    // parent is in another thread group: "If this is a threaded reparent
+    // there is no need to notify anyone anything has happened."
+    bool to_another_process = new_parent != NULL && new_parent->group != task->group;
+
     list_for_each_entry_safe(&task->children, child, tmp, siblings) {
         ptrace_detach_from_tracer(task, child);
         child->parent = new_parent;
-        list_remove(&child->siblings);
-        list_add(&new_parent->children, &child->siblings);
+        // After the new parent's own children, in the order they were in on
+        // ours: Linux's list_splice_tail_init. A subreaper's wait reaps its
+        // own zombies first and then ours, oldest first; at the head, ours
+        // came first (tests/manual/wait_child_order.c). Not when the new
+        // parent is this task -- init, taking everything with it -- where the
+        // child is on that list already, and one moved to the end of the list
+        // being walked would be walked again, for ever.
+        if (new_parent != task) {
+            list_remove(&child->siblings);
+            list_add_tail(&new_parent->children, &child->siblings);
+        }
+        // The parent-death signal, for a child PROCESS, whoever takes it -- a
+        // thread of this same process included, which is the one case every
+        // step below skips. Not for a thread of our own process, which AOK
+        // lists here only because it makes a thread the child of the thread
+        // that created it: Linux lists no thread as anyone's child, and a
+        // thread's setting is for its process's parent, sent when that one
+        // exits. Nor when init itself is going and takes everything with it.
+        if (child->group != NULL && child->group != task->group &&
+                child->group->leader == child && new_parent != task)
+            pdeath_collect_locked(&pdeath, child);
         // As Linux's reparent_leader does, and for the reason its comment
         // gives ("we don't want people slaying init"): a child cloned with
         // some other exit_signal must not get to send that signal to whoever
-        // inherits it.
+        // inherits it. A sibling thread is not "whoever": a child cloned with
+        // SIGUSR1 by a worker that has since exited announces itself with
+        // SIGUSR1, as it would have while the worker lived.
         //
         // Leaders only. In AOK a thread is a child of whichever task created
         // it, not of the group leader's parent as on Linux, so this list can
@@ -572,7 +1098,7 @@ noreturn void do_exit(struct task *task, int status) {
         // Nothing reads a non-leader's exit_signal today (every reader goes
         // through leader->exit_signal), so this is precision rather than a
         // fix, but it keeps the line saying what it means.
-        if (child->group != NULL && child->group->leader == child)
+        if (to_another_process && child->group != NULL && child->group->leader == child)
             child->exit_signal = SIGCHLD_;
         // Moving the child is not enough when it is already dead. Its exit was
         // reported to US, and we are about to stop existing; unless the new
@@ -586,96 +1112,201 @@ noreturn void do_exit(struct task *task, int status) {
         // A manual `kill -CHLD 1` reaped all 16 at once, which is what named
         // the missing piece.
         //
-        // ONE signal, carrying the first such child's details, rather than one
-        // per child as Linux sends: SIGCHLD is a standard signal, so a second
-        // one merely coalesces into the first still-pending copy -- and it is
-        // the first one's siginfo that a Linux guest would end up seeing too.
-        // A woken reaper drains the rest with its own wait() loop, which is
-        // what every reaper has anyway for exactly this reason.
-        if (child->zombie && reparented_zombies++ == 0) {
-            int chld_code, chld_status;
-            decode_wait_status(child->exit_code, &chld_code, &chld_status);
-            reparent_signal_info = (struct siginfo_) {
-                .code = chld_code,
-                .child.pid = child->pid,
-                .child.uid = child->uid,
-                .child.status = chld_status,
-            };
+        // Announced as its own exit was, by the same routine: Linux's
+        // reparent_leader calls do_notify_parent, which exit_notify_process_locked
+        // is. So a new parent whose SIGCHLD is SIG_IGN or has SA_NOCLDWAIT has
+        // the zombie released here and now, and SIG_IGN is sent nothing -- not
+        // even a SIGCHLD queued because it blocks the signal. AOK used to send
+        // one SIGCHLD whatever the disposition and leave the zombie for a
+        // wait that a parent which disclaimed SIGCHLD never makes. One signal
+        // per zombie, as Linux sends them; they coalesce into the first
+        // still-pending copy, so it is the first one's siginfo that a new
+        // parent blocking SIGCHLD sees: the oldest, as on Linux, since this
+        // walks our children oldest first.
+        //
+        // Only a zombie that was announced to us as a process. A thread's
+        // zombie is its tracer's; a process a tracer still holds is announced
+        // by the tracer when it lets go; and one whose announcement is still
+        // waiting on a thread zombie goes to whoever is its parent by then.
+        // And only to another process: a sibling thread was told when the
+        // zombie died -- the SIGCHLD went to the process -- so a second one is
+        // news of nothing, and Linux does not call reparent_leader then.
+        if (child->zombie && child->group->leader == child && tracer_of(child) == NULL &&
+                !child->group->exit_notify_deferred) {
+            if (to_another_process && new_parent->group != NULL)
+                exit_notify_process_locked(child, &notes);
+            else
+                reparented_zombies++;
+        }
+        // The orphaned-group rule again, for the CHILD's group: Linux's
+        // reparent_leader asks it of every child handed to another process
+        // (kill_orphaned_pgrp(p, father)), as exit_notify asks it of the
+        // exiting process's own group below. A shell puts each job in a group
+        // of its own, so a shell that exits with a job stopped orphans the
+        // JOB's group and never its own; asked only about its own, AOK left
+        // the job in state T for ever.
+        //
+        // Asked once the child has moved, as Linux asks it. Our children in
+        // that group still to be moved name us as their parent, and we are a
+        // way back into the session, so the group is found orphaned only at
+        // the last of them. A thread of this same process that takes them
+        // instead is the way back that we were, which is why Linux does not
+        // ask at all when the reparent is a threaded one.
+        if (to_another_process && child->group != NULL && child->group->leader == child) {
+            pid_t_ pgid = child->group->pgid;
+            pid_t_ sid = child->group->sid;
+            if (pgid != task->group->pgid && sid == task->group->sid &&
+                    pgrp_is_orphaned_locked(pgid, NULL, sid) &&
+                    pgrp_has_stopped_member_locked(pgid, sid))
+                orphaned_pgrps_add(&orphaned, pgid);
         }
     }
-    // The condition wakes a new parent already blocked in wait4(); the signal
-    // below wakes one that is not. Both are needed, and notify() is safe to
-    // call here -- the ordinary child-exit notify a few lines down runs under
-    // this same lock.
-    //
-    // Not handled, and a narrower case than the one above: a new parent that
-    // has disclaimed SIGCHLD (SIG_IGN or SA_NOCLDWAIT) should have the zombie
-    // released outright, the way the autoreap path does for an ordinary exit.
-    // Here it keeps the zombie instead. init does not disclaim SIGCHLD, so
-    // this is not the pid-1 case, and releasing another task's struct from
-    // this side is not something to do without a reason to.
-    if (reparented_zombies > 0 && new_parent != NULL && new_parent->group != NULL) {
+
+    // A zombie handed to a sibling thread is announced to nobody, but the
+    // condition is woken all the same. It is harmless: it is the one every
+    // thread of this process waits on anyway.
+    if (reparented_zombies > 0 && new_parent != NULL && new_parent->group != NULL)
         notify(&new_parent->group->child_exit);
-        task_ref_cnt_mod(new_parent, 1);
-        reparent_signal_parent = new_parent;
-    }
-    list_for_each_entry_safe(&task->ptracees, child, tmp, ptrace_siblings)
-        ptrace_detach_from_tracer(task, child);
-    if (exit_tgroup(task)) {
-        exit_hangup_session_tty(leader, &tty_hup);
-        // notify parent that we died
+
+    // Does this exit orphan our own process group and leave stopped members
+    // in it? Computed here, while the group still describes the pre-exit
+    // state and pids_lock is held; the signals go out below, after the locks.
+    //
+    // Only when the process goes, as Linux asks it only when group_dead. The
+    // test below ignores the whole process, so asked at any thread's exit it
+    // answered for a process that was not leaving: a worker thread's exit
+    // sent SIGHUP and SIGCONT to its own group, and so killed the process
+    // itself along with the stopped child that made the group qualify.
+    //
+    // And only once the children have moved, as Linux's exit_notify asks it
+    // after forget_original_parent. Our children in our group name their new
+    // parent now: init, which is no way back, or a subreaper -- which is one
+    // when it is in the session and outside the group. Asked before the move,
+    // they named us and were passed over, and a group a subreaper could still
+    // resume was hung up under it.
+    pid_t_ orphan_pgid = 0;
+    if (last_thread && leader != NULL && leader->group != NULL) {
+        pid_t_ pgid = leader->group->pgid;
+        pid_t_ sid = leader->group->sid;
         struct task *parent = leader->parent;
+        // Only if we were the one holding it together: a parent already in
+        // the group cannot have been the outside link.
+        if (parent != NULL && parent->group != NULL &&
+                parent->group->pgid != pgid && parent->group->sid == sid &&
+                pgrp_is_orphaned_locked(pgid, leader, sid) &&
+                pgrp_has_stopped_member_locked(pgid, sid))
+            orphan_pgid = pgid;
+    }
+
+    // Let go of everything this task traces. Linux's exit_ptrace: each tracee
+    // is detached, and a zombie one goes where it would have gone untraced
+    // (__ptrace_detach). Taken from the head until the list is empty, and
+    // unlinked whatever the detach decides, so no entry can be walked twice.
+    while (!list_empty(&task->ptracees)) {
+        child = list_first_entry(&task->ptracees, struct task, ptrace_siblings);
+        bool ours = tracer_of(child) == task;
+        ptrace_detach_from_tracer(task, child);
+        list_remove_safe(&child->ptrace_siblings);
+        if (ours && child->zombie)
+            zombie_untraced_locked(task, child, &notes);
+    }
+
+    bool group_dead = exit_tgroup(task);
+    // A process leaving a cgroup other than the root changes that cgroup's
+    // "populated" (fs/tmp.c renders it from the live threads, which
+    // exit_tgroup just updated); the inotify event that tells systemd goes out
+    // below, once no lock is held.
+    char *cgroup_left = NULL;
+    if (group_dead && task->group->cgroup_path != NULL && strcmp(task->group->cgroup_path, "/") != 0)
+        cgroup_left = strdup(task->group->cgroup_path);
+
+    // Process accounting is captured here, under the locks, and WRITTEN far
+    // below once they are gone: the record has to be taken while the task is
+    // certainly still alive, and the file write cannot happen while a pid or
+    // task lock is held.
+    struct acct_record acct_rec;
+    bool acct_pending = false;
+    bool taskstats_pending = false;
+
+    // A stop this task never reported is not reported now: what its tracer
+    // hears about is the exit. Left set, a zombie's stale stop was reported
+    // ahead of its exit, and PTRACE_CONT "resumed" a dead task.
+    lock(&task->ptrace.lock, 0);
+    task->ptrace.stopped = false;
+    task->ptrace.signal = 0;
+    unlock(&task->ptrace.lock);
+
+    struct task *tracer = tracer_of(task);
+    if (tracer != NULL && task != leader) {
+        // A traced thread's exit is its tracer's to collect, with wait and
+        // __WALL, and until then it stays in the pid table as a zombie. Its
+        // process can be neither reaped nor announced before that.
+        task->zombie = true;
+        task->group->traced_zombies++;
+        notify(&tracer->group->child_exit);
+        exit_notes_signal(&notes, tracer, SIGCHLD_, exit_signal_info(task, status, &group_rusage));
+    } else if (tracer != NULL && !group_dead) {
+        // A traced leader whose other threads still run cannot be reaped yet,
+        // but Linux tells its tracer that it has exited all the same.
+        notify(&tracer->group->child_exit);
+        exit_notes_signal(&notes, tracer, SIGCHLD_, exit_signal_info(task, status, &group_rusage));
+    }
+
+    if (group_dead) {
+        // Once per PROCESS, not once per thread -- the same place Linux calls
+        // acct_process(). Costs one relaxed load when accounting is off.
+        acct_pending = acct_collect(leader, &group_rusage, status, &acct_rec);
+        // The same record, for anything that registered a taskstats cpumask
+        // instead of turning on BSD accounting. Also collected here and sent
+        // below, and for the same two reasons.
+        taskstats_pending = netlink_taskstats_exit_collect(leader, &group_rusage, status);
+        exit_hangup_session_tty(leader, &tty_hup);
+        // With no exit_group to name one, a process's exit code is the code of
+        // its last thread to exit -- Linux's synchronize_group_exit since 6.0.
+        // A leader that left early with a code of its own used to be what wait
+        // reported, where Linux reports the thread that actually ended the
+        // process.
+        lock(&task->group->lock, 0);
+        if (!task->group->doing_group_exit) {
+            task->group->doing_group_exit = true;
+            task->group->group_exit_code = status;
+        }
+        unlock(&task->group->lock);
+        struct task *parent = leader->parent;
+        // A pid namespace's init died: the namespace goes with it. Nothing
+        // more is forked into it, and every process still inside -- in it
+        // or in one made inside it -- is killed (zap_pid_ns_processes).
+        struct pid_namespace *own_ns = leader->pid_ns;
+        if (parent != NULL && own_ns != NULL &&
+                atomic_load(&own_ns->init_pid) == leader->tgid && !atomic_exchange(&own_ns->dead, true))
+            halt_targets = pid_ns_collect_locked(own_ns, task->group, &halt_target_count);
         if (parent == NULL) {
             // init died. The CLI's halt_hook exits the host process with init's
             // status (and does not return), so the host exit code mirrors the guest
             // — including for multi-threaded init (e.g. the Go runtime), whose
-            // lingering sibling pthreads would otherwise be host-SIGKILLed by
-            // halt_system_locked(), killing the whole process with signal 9 (137).
+            // lingering sibling threads would otherwise still be running.
             if (halt_hook != NULL)
                 halt_hook(status);
-            halt_system_locked();
+            halt_targets = halt_system_collect_locked(&halt_target_count);
+        } else if (task->group->traced_zombies > 0) {
+            // A zombie thread is still waiting for its tracer, this one or an
+            // earlier one. The process is dead -- /proc shows Z, and nothing
+            // can attach to it -- but it is announced, and becomes reapable,
+            // only when the last of them is released.
+            leader->zombie = true;
+            task->group->exit_notify_deferred = true;
         } else {
-            task_ref_cnt_mod(parent, 1);
-            signal_parent = parent;
-            signal_no = leader->exit_signal;
-            // POSIX/Linux autoreap: a parent that has SIGCHLD set to SIG_IGN,
-            // or SA_NOCLDWAIT on its handler, has said it will never wait --
-            // so no zombie is left for it and its wait() returns ECHILD. AOK
-            // left the zombie regardless, so a parent using the idiom
-            // accumulated one per child for the life of the process.
-            //
-            // Only when this task IS the leader: that is the ordinary "a
-            // process exited" case. When the leader died first and a sibling
-            // thread finishes last, the leader is a separate struct that this
-            // path does not own, and leaving that zombie for wait() is the
-            // safe answer rather than reaching across to free it.
-            if (task == leader && signal_no == SIGCHLD_) {
-                struct sighand *psighand = parent->sighand;
-                if (psighand != NULL) {
-                    lock(&psighand->lock, 0);
-                    struct sigaction_ *pact = &psighand->action[SIGCHLD_];
-                    // SIG_IGN outright, or a handler that asked for no zombie.
-                    if (pact->handler == SIG_IGN_ || (pact->flags & SA_NOCLDWAIT_))
-                        autoreap = true;
-                    unlock(&psighand->lock);
-                }
-            }
-            if (!autoreap)
-                leader->zombie = true;
-            notify(&parent->group->child_exit);
-            pidfd_notify_exit(leader);
-            // The SIGCHLD a handler/sigwaitinfo/signalfd sees must carry a CLD_*
-            // si_code and a bare si_status, not SI_KERNEL + the wait-encoded word.
-            int chld_code, chld_status;
-            decode_wait_status(task->exit_code, &chld_code, &chld_status);
-            signal_info = (struct siginfo_) {
-                .code = chld_code,
-                .child.pid = task->pid,
-                .child.uid = task->uid,
-                .child.status = chld_status,
-                .child.utime = clock_from_timeval(group_rusage.utime),
-                .child.stime = clock_from_timeval(group_rusage.stime),
-            };
+            // POSIX/Linux autoreap happens in here too: a parent that has
+            // SIGCHLD set to SIG_IGN, or SA_NOCLDWAIT on its handler, has said
+            // it will never wait, so no zombie is left for it. AOK once left
+            // the zombie regardless, and a parent using the idiom accumulated
+            // one per child for the life of the process. That includes the
+            // case where the leader died first and a sibling thread finishes
+            // last, which used to keep its zombie because freeing the leader
+            // from here was not safe; task_destroy_unlinked now waits for a
+            // zombie's own do_exit to finish, and task_free_final no longer
+            // reads a group through a thread.
+            exit_notify_process_locked(leader, &notes);
         }
 
         if (exit_hook != NULL)
@@ -686,12 +1317,32 @@ noreturn void do_exit(struct task *task, int status) {
 
     unlock(&task->general_lock);
     
-    if(task != leader || autoreap) {
+    if (task != leader && !task->zombie) {
         task_unlink_locked(task);
         destroy_unlinked_task = true;
     }
     
     unlock(&pids_lock);
+
+    // The first point past the locked region, so the append cannot deadlock
+    // against anything do_exit was holding.
+    if (acct_pending)
+        acct_write(&acct_rec);
+    if (cgroup_left != NULL) {
+        cgroup2_note_membership_change(cgroup_left);
+        free(cgroup_left);
+    }
+    if (taskstats_pending)
+        netlink_taskstats_exit_broadcast();
+
+    // The IPC namespace goes after exit_tgroup, which applied the process's
+    // SEM_UNDO adjustments in it, and outside every lock: the last reference
+    // destroys the namespace's objects.
+    lock(&task->general_lock, 0);
+    struct ipc_namespace *dead_ipc = task->ipc_ns;
+    task->ipc_ns = NULL;
+    unlock(&task->general_lock);
+    ipc_ns_release(dead_ipc);
 
     if (old_sighand != NULL)
         sighand_release(old_sighand);
@@ -702,35 +1353,32 @@ noreturn void do_exit(struct task *task, int status) {
         free(sigqueue);
     }
 
-    if (tty_hup.fg_group != 0)
+    if (tty_hup.fg_group != 0) {
         send_group_signal(tty_hup.fg_group, SIGHUP_, SIGINFO_NIL);
-
-    // The orphaned-group rule: SIGHUP tells the stopped members the world
-    // they were stopped in is gone, and SIGCONT is what lets them run far
-    // enough to act on it. Order matters -- SIGCONT first would resume them
-    // into a session with no one to talk to.
-    if (orphan_pgid != 0) {
-        send_group_signal(orphan_pgid, SIGHUP_, SIGINFO_NIL);
-        send_group_signal(orphan_pgid, SIGCONT_, SIGINFO_NIL);
+        if (tty_hup.exit_cont)
+            send_group_signal(tty_hup.fg_group, SIGCONT_, SIGINFO_NIL);
     }
 
-    if (reparent_signal_parent != NULL) {
-        send_signal_to_group(reparent_signal_parent->group, SIGCHLD_,
-                             reparent_signal_info);
-        task_ref_cnt_mod(reparent_signal_parent, -1);
-    }
+    // Each child's parent-death signal, then the orphaned-group rule for the
+    // children's groups, then for our own: the order Linux's exit_notify
+    // reaches them in.
+    pdeath_notes_send(&pdeath, pdeath_info);
+    orphaned_pgrps_hang_up(&orphaned);
+    if (orphan_pgid != 0)
+        orphaned_pgrp_hang_up(orphan_pgid);
 
-    if (signal_parent != NULL) {
-        // Process-directed: the parent may be multithreaded, and the thread
-        // that happens to be `leader->parent` (whichever one called fork())
-        // need not be the thread that's watching for SIGCHLD (e.g. a
-        // dedicated signalfd reaper thread). Deliver to the whole group's
-        // shared queue so any sibling can observe/dequeue it, matching Linux
-        // CLONE_THREAD signal-sharing semantics.
-        if (signal_no != 0)
-            send_signal_to_group(signal_parent->group, signal_no, signal_info);
-        task_ref_cnt_mod(signal_parent, -1);
-    }
+    // Process-directed signals: the parent may be multithreaded, and the
+    // thread that happens to be `leader->parent` (whichever one called fork())
+    // need not be the thread that's watching for SIGCHLD (e.g. a dedicated
+    // signalfd reaper thread). Delivered to the whole group's shared queue so
+    // any sibling can observe/dequeue it, matching Linux CLONE_THREAD
+    // signal-sharing semantics. This task, if it was released, is freed last,
+    // below.
+    if (exit_notes_settle(&notes, task))
+        destroy_unlinked_task = true;
+
+    if (halt_targets != NULL)
+        halt_system_kill(halt_targets, halt_target_count);
 
     // Published BEFORE the destroy below, not after: task_destroy_unlinked
     // can free(task) outright, and a store into the struct after that is a
@@ -846,33 +1494,96 @@ noreturn void do_exit_group(int status) {
     pthread_exit(NULL);
 }
 
-// always called from init process. Intended to be called when the init process exits.
-static void halt_system_locked(void) {
-    // brutally murder everything
-    // which will leave everything in an inconsistent state. I will solve this problem later.
+// Init has exited and the halt_hook, if any, returned. Only the app gets here:
+// the CLI's hook exits the process. What is left is to stop every other task.
+//
+// This used to pthread_kill(task->thread, SIGKILL) each one. A host SIGKILL is
+// not aimed at a thread -- it ends the whole process -- so in the app, running
+// `reboot` killed iSH-AOK outright whenever any task outlived init, and one
+// always did: busybox init's kill(-1, SIGKILL) takes the terminal's shell, the
+// terminal starts a new one, and init exits two seconds later (#587). It also
+// sent that signal to the saved pthread_t of leaders whose threads were gone.
+//
+// A guest SIGKILL does what was meant. Collected here under pids_lock, with a
+// reference and the sighand held, and delivered by do_exit after it has let go
+// of its locks, the way do_exit_group delivers its own. Every task, not just
+// leaders: a process whose leader already exited lives on in its other threads.
+//
+// Filesystems stay mounted. Tearing them down here freed mounts that the tasks
+// just told to die were still unwinding through; the host process outlives the
+// guest and releases them when it exits.
+static struct halt_target *halt_system_collect_locked(size_t *count) {
+    size_t cap = 0;
     for (int i = 2; i < MAX_PID; i++) {
-        struct task *task = pid_get_task(i);
-        if (task != NULL)
-            pthread_kill(task->thread, SIGKILL);
+        struct task *task = pid_get_task_global(i);
+        if (task != NULL && !task->zombie && task->sighand != NULL)
+            cap++;
     }
-
-    // unmount all filesystems
-    lock(&mounts_lock, 0);
-    struct mount *mount, *tmp;
-    list_for_each_entry_safe(&mounts, mount, tmp, mounts) {
-        mount_remove(mount);
+    *count = 0;
+    if (cap == 0)
+        return NULL;
+    struct halt_target *targets = malloc(sizeof(*targets) * cap);
+    if (targets == NULL)
+        return NULL;
+    for (int i = 2; i < MAX_PID && *count < cap; i++) {
+        struct task *task = pid_get_task_global(i);
+        if (task == NULL || task->zombie || task->sighand == NULL)
+            continue;
+        task_ref_cnt_mod(task, 1);
+        sighand_retain(task->sighand);
+        targets[*count] = (struct halt_target) {.task = task, .sighand = task->sighand};
+        (*count)++;
     }
-    unlock(&mounts_lock);
+    return targets;
 }
 
+// The same for one pid namespace: every task in `ns` or below it, other than
+// the dying init's own. Caller holds pids_lock.
+static struct halt_target *pid_ns_collect_locked(struct pid_namespace *ns, struct tgroup *dying, size_t *count) {
+    *count = 0;
+    size_t cap = 0;
+    struct halt_target *targets = NULL;
+    for (int i = 2; i < MAX_PID; i++) {
+        struct task *task = pid_get_task_global(i);
+        if (task == NULL || task->zombie || task->sighand == NULL || task->group == dying ||
+                task->pid_ns == NULL || !pid_ns_in(task->pid_ns, ns))
+            continue;
+        if (*count == cap) {
+            size_t new_cap = cap == 0 ? 16 : cap * 2;
+            struct halt_target *grown = realloc(targets, sizeof(*targets) * new_cap);
+            if (grown == NULL)
+                break;
+            targets = grown;
+            cap = new_cap;
+        }
+        task_ref_cnt_mod(task, 1);
+        sighand_retain(task->sighand);
+        targets[*count] = (struct halt_target) {.task = task, .sighand = task->sighand};
+        (*count)++;
+    }
+    return targets;
+}
+
+static void halt_system_kill(struct halt_target *targets, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        deliver_signal_with_sighand(targets[i].task, targets[i].sighand, SIGKILL_, SIGINFO_NIL);
+        sighand_release(targets[i].sighand);
+        task_ref_cnt_mod(targets[i].task, -1);
+    }
+    free(targets);
+}
+
+// Only the low byte of an exit code survives, as in Linux: exit(0x1ff) leaves a
+// wait status of 0xff00, and so does the PTRACE_EVENT_EXIT message built from
+// it. Shifting the whole value handed a tracer 0x1ff00.
 dword_t sys_exit(dword_t status) {
     STRACE("exit(%d)\n", status);
-    do_exit(current, status << 8);
+    do_exit(current, (status & 0xff) << 8);
 }
 
 dword_t sys_exit_group(dword_t status) {
     STRACE("exit_group(%d)\n", status);
-    do_exit_group(status << 8);
+    do_exit_group((status & 0xff) << 8);
 }
 
 #define WNOHANG_ (1 << 0)
@@ -880,32 +1591,69 @@ dword_t sys_exit_group(dword_t status) {
 #define WEXITED_ (1 << 2)
 #define WCONTINUED_ (1 << 3)
 #define WNOWAIT_ (1 << 24)
+#define __WNOTHREAD_ (1 << 29)
 #define __WALL_ (1 << 30)
+#define __WCLONE_ 0x80000000
 
 #define P_ALL_ 0
 #define P_PID_ 1
 #define P_PGID_ 2
 
+// A ptrace-stop is reported to the tracer and to nobody else. Linux's
+// wait_task_stopped shows a waiter that is not the tracer only a group-stop,
+// and only for WUNTRACED. reap_if_needed asked here on behalf of any parent,
+// so a parent whose child someone else traced could take that child's stop:
+// waitpid(child, 0) came back with 0x137f while the child sat stopped, and the
+// tracer, never seeing it, never resumed it. A tracer that resumes the parent
+// at each fork event, as strace -f does, lost the first stop of 17 to 37 of 200
+// forks. A hung `strace -f sh -c '... | cat | wc -l'` had wc parked in a
+// syscall-stop that strace's wait4 never reported.
+static bool waiter_is_tracer(const struct task *task) {
+    const struct task *tracer = tracer_of(task);
+    return tracer != NULL && tracer->group == current->group;
+}
+
+// The same, for one wait: with __WNOTHREAD only the waiting thread's own
+// tracees count, as Linux's ptrace pass walks only that thread's list.
+static bool wait_traces(const struct task *task, bool this_thread_only) {
+    return waiter_is_tracer(task) && (!this_thread_only || tracer_of(task) == current);
+}
+
+// A process cannot be reaped while any of its threads is still around: live
+// ones, or zombies a tracer has yet to collect. Reaping it early leaves those
+// threads pointing at freed group state -- the group is freed with the leader
+// -- and corrupts /proc consumers that still dereference task->group. Caller
+// holds task->group->lock.
+static bool process_has_threads_locked(struct task *task) {
+    return !list_empty(&task->group->threads) || task->group->traced_zombies > 0;
+}
+
 // returns false if the task cannot be reaped and true if the task was reaped
-static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct rusage_ *rusage_out, int options) {
+static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct rusage_ *rusage_out,
+        int options, struct exit_notes *notes) {
     if (!task->zombie)
+        return false;
+    // A zombie someone else traces is that tracer's to report first. Its
+    // parent waits: this answers "not yet", which is neither the child nor
+    // ECHILD.
+    if (zombie_is_tracers(task) && !waiter_is_tracer(task))
         return false;
     lock(&task->group->lock, 0);
 
-    // A thread-group leader must remain until the rest of the group exits.
-    // Reaping it early leaves live threads pointing at freed group state and
-    // corrupts /proc consumers that still dereference task->group.
-    if (!list_empty(&task->group->threads)) {
+    if (process_has_threads_locked(task)) {
         unlock(&task->group->lock);
         return false;
     }
 
-    dword_t exit_code = task->exit_code;
-    if (task->group->doing_group_exit)
-        exit_code = task->group->group_exit_code;
-    info_out->child.status = exit_code;
+    info_out->child.status = zombie_status(task);
 
+    // The child's own usage AND its reaped descendants', Linux's RUSAGE_BOTH:
+    // that is what wait4 reports, and what a parent's RUSAGE_CHILDREN and
+    // times() accumulate (wait_task_zombie: cutime += tgutime + sig->cutime).
+    // Passing on only the child's own lost every grandchild -- a parent that
+    // reaped a shell was charged nothing for the programs the shell ran.
     struct rusage_ rusage = task->group->rusage;
+    rusage_add(&rusage, &task->group->children_rusage);
     if (!(options & WNOWAIT_)) {
         lock(&current->group->lock, 0);
         rusage_add(&current->group->children_rusage, &rusage);
@@ -924,15 +1672,45 @@ static bool reap_if_zombie(struct task *task, struct siginfo_ *info_out, struct 
     // semantics stay Linux-like, but defer freeing the group object itself
     // until the task object is actually destroyed. Procfs and other refcounted
     // task readers can still legitimately dereference task->group after this.
-    lock(&task->group->lock, 0);
-    task_leave_session(task);
-    list_remove(&task->group->pgroup);
-    unlock(&task->group->lock);
-
-    task_destroy(task, 2);
+    release_process_locked(task, notes);
     return true;
 }
 
+// The tracer's side of a traced zombie (see "who hears about an exit" above).
+// A thread is reported and released. A process whose parent is the tracer is
+// an ordinary reap. Any other process is reported, untraced, and announced to
+// its parent -- which alone is charged its usage when it reaps it, as Linux
+// charges only the EXIT_DEAD reap.
+static bool reap_traced_zombie(struct task *task, struct siginfo_ *info_out,
+        struct rusage_ *rusage_out, int options, struct exit_notes *notes) {
+    if (!task->zombie || !waiter_is_tracer(task))
+        return false;
+    bool thread = task->group->leader != task;
+    if (!thread && !zombie_is_tracers(task))
+        return reap_if_zombie(task, info_out, rusage_out, options, notes);
+
+    lock(&task->group->lock, 0);
+    if (!thread && process_has_threads_locked(task)) {
+        unlock(&task->group->lock);
+        return false;
+    }
+    info_out->child.status = zombie_status(task);
+    if (rusage_out != NULL) {
+        *rusage_out = task->group->rusage;      // RUSAGE_BOTH, as reap_if_zombie
+        rusage_add(rusage_out, &task->group->children_rusage);
+    }
+    unlock(&task->group->lock);
+
+    if (options & WNOWAIT_)
+        return true;
+    if (thread) {
+        release_thread_locked(task, notes);
+        return true;
+    }
+    ptrace_detach_from_tracer(tracer_of(task), task);
+    exit_notify_process_locked(task, notes);
+    return true;
+}
 
 static bool notify_if_stopped(struct task *task, struct siginfo_ *info_out) {
     complex_lockt(&task->group->lock, 0);
@@ -963,11 +1741,17 @@ static bool notify_if_continued(struct task *task, struct siginfo_ *info_out) {
 
 static bool notify_if_ptrace_stopped(struct task *task, struct siginfo_ *info_out) {
     lock(&task->ptrace.lock, 0);
-    if (task->ptrace.stopped && task->ptrace.signal) {
+    if (task->ptrace.stopped && task->ptrace.signal && waiter_is_tracer(task)) {
         info_out->child.status = task->ptrace.trap_event << 16 | task->ptrace.signal << 8 | 0x7f;
         task->ptrace.signal = 0;
         task->ptrace.trap_event = 0;
-        task->ptrace.eventmsg = 0;
+        // Not ptrace.eventmsg: the message must outlive the wait that reports
+        // its stop, because waiting is how a tracer finds out there is a
+        // message to ask for. Clearing it here made PTRACE_GETEVENTMSG answer
+        // 0 at every event, so gdb took 0 as a new thread's pid, called
+        // waitpid(0, ...), got some other child back and died with "wait
+        // returned unexpected PID". Linux never clears it; the next stop
+        // overwrites it (ptrace_stop_common).
         unlock(&task->ptrace.lock);
         return true;
     }
@@ -975,16 +1759,56 @@ static bool notify_if_ptrace_stopped(struct task *task, struct siginfo_ *info_ou
     return false;
 }
 
-static bool reap_if_needed(struct task *task, struct siginfo_ *info_out, struct rusage_ *rusage_out, int options) {
+// What wait4 reports for a child it finds stopped, continued or in a ptrace
+// stop rather than exited: the child's own usage and its reaped descendants',
+// as it is now -- Linux's wait_task_stopped and wait_task_continued both call
+// getrusage(p, RUSAGE_BOTH). Nothing was written, and sys_wait4 copied its
+// uninitialised struct out to the guest: host stack bytes, read by every
+// tracer that asks wait4 for usage. strace -c takes its "seconds" column from
+// the ru_stime of every stop, and printed 134 seconds, and 1808599711, for a
+// program that ran for a millisecond. Caller holds pids_lock.
+static void report_live_rusage(struct task *task, struct rusage_ *rusage_out) {
+    if (rusage_out != NULL)
+        *rusage_out = rusage_get_group_both_pids_locked(task->group);
+}
+
+static bool reap_if_needed(struct task *task, struct siginfo_ *info_out, struct rusage_ *rusage_out,
+        int options, struct exit_notes *notes) {
     assert(task_is_leader(task));
-    if ((options & WUNTRACED_ && notify_if_stopped(task, info_out)) ||
-        (options & WEXITED_ && reap_if_zombie(task, info_out, rusage_out, options)) ||
-        (options & WCONTINUED_ && notify_if_continued(task, info_out))) {
+    if (options & WUNTRACED_ && notify_if_stopped(task, info_out)) {
+        report_live_rusage(task, rusage_out);
         info_out->sig = SIGCHLD_;
         return true;
     }
-    if (notify_if_ptrace_stopped(task, info_out))
+    if (options & WEXITED_ && reap_if_zombie(task, info_out, rusage_out, options, notes)) {
+        info_out->sig = SIGCHLD_;
         return true;
+    }
+    if (options & WCONTINUED_ && notify_if_continued(task, info_out)) {
+        report_live_rusage(task, rusage_out);
+        info_out->sig = SIGCHLD_;
+        return true;
+    }
+    if (notify_if_ptrace_stopped(task, info_out)) {
+        report_live_rusage(task, rusage_out);
+        return true;
+    }
+    return false;
+}
+
+// Everything a tracer can be told about one of its tracees: a stop, or its
+// exit. Tracee is an ordinary child here or not.
+static bool report_tracee(struct task *task, struct siginfo_ *info_out, struct rusage_ *rusage_out,
+        int options, struct exit_notes *notes) {
+    if (notify_if_ptrace_stopped(task, info_out)) {
+        report_live_rusage(task, rusage_out);
+        info_out->sig = SIGCHLD_;
+        return true;
+    }
+    if ((options & WEXITED_) && reap_traced_zombie(task, info_out, rusage_out, options, notes)) {
+        info_out->sig = SIGCHLD_;
+        return true;
+    }
     return false;
 }
 
@@ -1001,20 +1825,67 @@ static bool wait_interrupted_by_signal(void) {
     if (current == NULL)
         return false;
     __atomic_exchange_n(&current->wait_interrupted, false, __ATOMIC_ACQ_REL);
+    // A CHECKPOINT FREEZE ends this wait too, and it is not a signal -- so it
+    // has to be asked about here rather than found among the pending ones.
+    // This function exists to IGNORE bare pokes, which is exactly right for a
+    // TLB shootdown and exactly wrong for a freeze: the freeze needs the
+    // syscall to return so the dispatcher can rewind the program counter over
+    // it and the task can park. Without this a shell blocked in wait() never
+    // reached a boundary and froze nothing.
+    //
+    // The EINTR it produces never reaches the guest: syscall_result_should_
+    // restart turns it into a restart while the freeze is on, so the wait
+    // re-enters on the far side of the checkpoint.
+    if (checkpoint_freeze_pending())
+        return true;
+    // So does a PTRACE_EVENT_STOP the task owes its tracer, for the same
+    // reason; the restart predicates restart the wait after the stop.
+    if (task_trap_stop_pending(current))
+        return true;
     lock(&current->sighand->lock, 0);
     // See kernel/signal.h: a shim-held signal must end this wait too.
-    bool pending = !!((current->pending | current->sighand->pending) &
+    bool pending = !!((current->pending | task_group_pending(current)) &
             ~task_wake_blocked(current));
     unlock(&current->sighand->lock);
     return pending;
 }
 
+// Whether a wait is for this child at all, by how the child announces its exit
+// -- Linux's eligible_child. A child whose exit signal is anything but SIGCHLD,
+// 0 included, is a "clone child": only __WCLONE waits for those, __WCLONE waits
+// for nothing else, and __WALL waits for both. A wait that finds only children
+// it is not for fails with ECHILD, WNOHANG or not, since they are not counted.
+//
+// AOK asked nobody's exit signal, so a plain waitpid reaped a child cloned with
+// SIGUSR1 -- on Linux, ECHILD -- and __WCLONE was EINVAL.
+//
+// `leader` is a process leader: its exit signal is the process's. Not asked for
+// a child the waiter traces, which is waited for as if with __WALL -- Linux has
+// assumed that since 4.7, and does not ask in its ptrace pass (wait_traces).
+static bool wait_eligible(const struct task *leader, int options) {
+    if (options & __WALL_)
+        return true;
+    bool clone_child = leader->exit_signal != SIGCHLD_;
+    return clone_child == ((options & __WCLONE_) != 0);
+}
+
 int do_wait(int idtype, pid_t_ id, struct siginfo_ *info, struct rusage_ *rusage, int options) {
     if (idtype != P_ALL_ && idtype != P_PID_ && idtype != P_PGID_)
         return _EINVAL;
-    if (options & ~(WNOHANG_|WUNTRACED_|WEXITED_|WCONTINUED_|WNOWAIT_|__WALL_))
+    // A process group is matched by number against what each child holds,
+    // which is the machine's (kernel/pid_ns.h).
+    if (idtype == P_PGID_)
+        id = current_pid_global(id);
+    // Linux's wait4 and waitid both take __WNOTHREAD, __WCLONE and __WALL;
+    // wait4 refuses waitid's WEXITED and WNOWAIT itself.
+    if (options & ~(WNOHANG_|WUNTRACED_|WEXITED_|WCONTINUED_|WNOWAIT_|
+            __WNOTHREAD_|__WALL_|__WCLONE_))
         return _EINVAL;
+    // __WNOTHREAD: this thread's own children and tracees, not every thread's.
+    bool this_thread_only = (options & __WNOTHREAD_) != 0;
 
+    struct exit_notes notes;
+    exit_notes_init(&notes);
     complex_lockt(&pids_lock, 0);
     int err;
     bool got_signal = false;
@@ -1025,6 +1896,8 @@ retry:
             bool no_children = true;
             struct task *parent;
             list_for_each_entry(&current->group->threads, parent, group_links) {
+                if (this_thread_only && parent != current)
+                    continue;
                 struct task *task;
                 list_for_each_entry(&parent->children, task, siblings) {
                     if (!task_is_leader(task))
@@ -1036,27 +1909,38 @@ retry:
                         if (!pgid_match)
                             continue;
                     }
+                    // Before it counts as a child: one this wait is not for
+                    // leaves the answer ECHILD, not "nothing yet". Unless we
+                    // trace it: a tracee is waited for as if with __WALL, and
+                    // one that is also our child is on no ptracees list
+                    // (ptrace.c), so this is the only place it is found.
+                    if (!wait_traces(task, this_thread_only) && !wait_eligible(task, options))
+                        continue;
                     no_children = false;
-                    info->child.pid = task->pid;
-                    if (reap_if_needed(task, info, rusage, options))
+                    info->child.pid = current_pid_shown(task->pid);
+                    if (reap_if_needed(task, info, rusage, options, &notes))
                         goto found_something;
                 }
                 list_for_each_entry(&parent->ptracees, task, ptrace_siblings) {
-                    // A tracer can wait on traced threads (non-leaders), not
-                    // just process leaders, when __WALL is set -- strace -f
-                    // relies on this to follow CLONE_THREAD workers. Without it
-                    // a stopped thread's ptrace-stop is never reported, so the
-                    // tracer blocks in wait4 forever and never resumes the
-                    // thread, freezing the whole traced process (e.g. syslog-ng
-                    // under strace -f, or any pthread program).
-                    if (!task_is_leader(task) && !(options & __WALL_))
-                        continue;
-                    no_children = false;
-                    info->child.pid = task->pid;
-                    if (notify_if_ptrace_stopped(task, info)) {
-                        info->sig = SIGCHLD_;
-                        goto found_something;
+                    // Every tracee, thread or not and with or without __WALL:
+                    // Linux has assumed __WALL for a traced child since 4.7
+                    // ("wait/ptrace: assume __WALL if the child is traced"),
+                    // and measured on 6.12, a tracer's plain waitpid(-1, 0)
+                    // reports a traced thread's stops and its exit. strace -f
+                    // passes __WALL anyway; without either, a stopped thread
+                    // was never reported, the tracer never resumed it, and the
+                    // whole traced process froze.
+                    if (idtype == P_PGID_) {
+                        lock(&task->group->lock, 0);
+                        bool pgid_match = task->group->pgid == id;
+                        unlock(&task->group->lock);
+                        if (!pgid_match)
+                            continue;
                     }
+                    no_children = false;
+                    info->child.pid = current_pid_shown(task->pid);
+                    if (report_tracee(task, info, rusage, options, &notes))
+                        goto found_something;
                 }
             }
         err = _ECHILD;
@@ -1075,24 +1959,35 @@ retry:
         // the match: WNOHANG returned 0 as though the child were merely still
         // running, which tells a caller to keep polling a pid that will never
         // be reportable. A tracer may still wait on a thread it traces.
-        bool id_is_thread = !task_is_leader(task);
-        bool traced_by_us = task->ptrace.tracer != NULL &&
-            task->ptrace.tracer->group == current->group;
-        if (id_is_thread && !traced_by_us) {
-            err = _ECHILD;
-            goto error;
-        }
-        task = task->group->leader;
+        //
+        // A traced task's stop and exit belong to THAT TASK, so it is asked
+        // about itself. Resolving a thread to its leader first and testing the
+        // leader's ptrace state meant `waitpid(<tid>, ..., __WALL)` never
+        // returned: the thread was stopped, the leader was not, and the wait
+        // slept forever on child_exit. `waitpid(-1, ..., __WALL)` found the
+        // same stop immediately, via the ptracees loop above -- so the tracer
+        // that waits on -1 (strace) worked and the tracer that waits on the
+        // pid it just attached to (gdb's linux_nat_post_attach_wait) hung.
+        // Measured by tests/manual/ptrace_detach_survives.c, which failed
+        // exactly the two wait-by-tid cases and passed the six others. The same
+        // resolution let a tracer waiting on a thread's tid collect the whole
+        // PROCESS under that tid, and a tracer waiting on a process it traced
+        // but had not forked destroy it, so its real parent's waitpid failed.
+        //
+        // Linux's do_wait_pid asks the same two questions, as the parent and
+        // as the tracer. Only the parent is asked whether the wait is for a
+        // child of this kind: the tracer's is always.
         info->child.pid = id;
-        bool is_child = task->parent != NULL && task->parent->group == current->group;
-        bool is_ptrace_child = task->ptrace.tracer != NULL && task->ptrace.tracer->group == current->group;
-        if (!is_child && !is_ptrace_child)
+        bool as_parent = task_is_leader(task) && task->parent != NULL &&
+            (this_thread_only ? task->parent == current
+                              : task->parent->group == current->group) &&
+            wait_eligible(task, options);
+        bool as_tracer = wait_traces(task, this_thread_only);
+        if (!as_parent && !as_tracer)
             goto error;
-        if (is_ptrace_child && notify_if_ptrace_stopped(task, info)) {
-            info->sig = SIGCHLD_;
+        if (as_tracer && report_tracee(task, info, rusage, options, &notes))
             goto found_something;
-        }
-        if (reap_if_needed(task, info, rusage, options))
+        if (as_parent && reap_if_needed(task, info, rusage, options, &notes))
             goto found_something;
     }
 
@@ -1131,10 +2026,12 @@ found_something:
                info->child.pid, decoded, options);
     }
     unlock(&pids_lock);
+    exit_notes_settle(&notes, NULL);
     return 0;
 
 error:
     unlock(&pids_lock);
+    exit_notes_settle(&notes, NULL);
     return err;
 }
 
@@ -1161,6 +2058,10 @@ dword_t sys_waitid_guest(int_t idtype, pid_t_ id, guest_addr_t info_addr, int_t 
         int_t pid = pidfd_get_pid(id);
         if (pid < 0)
             return pid;
+        // (The wait below takes the caller's pid namespace's number.)
+        pid = current_pid_shown(pid);
+        if (pid == 0)
+            return _ECHILD;
         idtype = P_PID_;
         id = pid;
     }
@@ -1193,8 +2094,25 @@ dword_t sys_waitid_guest(int_t idtype, pid_t_ id, guest_addr_t info_addr, int_t 
 // reaped pid, or a negative errno.
 int task_wait_child(dword_t pid, int *status_out, int options) {
     struct siginfo_ info = {};
-    int idtype = (pid == (dword_t) -1) ? P_ALL_ : P_PID_;
-    int err = do_wait(idtype, (pid_t_) pid, &info, NULL, options | WEXITED_);
+    // A negative pid other than -1 is a process group, as for wait4: a restored
+    // shell waits for its foreground JOB, and a job is a group.
+    int idtype = P_PID_;
+    pid_t_ id = (pid_t_) pid;
+    if (pid == (dword_t) -1) {
+        idtype = P_ALL_;
+    } else if ((sdword_t) pid < -1) {
+        idtype = P_PGID_;
+        id = (pid_t_) -(sdword_t) pid;
+    }
+    // Blocked, as wait4 marks it (sys_wait4_guest below). Without it a native
+    // shell waiting on its foreground command -- or a restored one waiting on
+    // its job, or an exec stand-in waiting on the program it started -- read
+    // as RUNNING: `R` in ps, and one more runnable task in the load average for
+    // every such wait. An idle iPad after a restore reported a load of 1.77.
+    int err = 0;
+    TASK_MAY_BLOCK {
+        err = do_wait(idtype, id, &info, NULL, options | WEXITED_);
+    }
     if (err < 0)
         return err;
     if (status_out != NULL)
@@ -1231,7 +2149,9 @@ dword_t sys_wait4_guest(pid_t_ id, guest_addr_t status_addr, dword_t options, gu
     }
 
     struct siginfo_ info = {.child.pid = 0xbaba};
-    struct rusage_ rusage;
+    // Zeroed, so that a report that fills nothing in can never hand the guest
+    // what was on this stack (report_live_rusage).
+    struct rusage_ rusage = {};
     int_t res = 0;
     TASK_MAY_BLOCK {
         res = do_wait(idtype, id, &info, &rusage, options | WEXITED_);

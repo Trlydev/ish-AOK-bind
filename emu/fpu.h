@@ -30,6 +30,7 @@ static const float80 fpu_consts[] = {
 void fpu_pop(struct cpu_state *cpu);
 void fpu_xch(struct cpu_state *cpu, int i);
 void fpu_incstp(struct cpu_state *cpu);
+void fpu_decstp(struct cpu_state *cpu);
 
 void fpu_st(struct cpu_state *cpu, int i);
 void fpu_ist16(struct cpu_state *cpu, int16_t *i);
@@ -61,12 +62,14 @@ void fpu_ldm64(struct cpu_state *cpu, double *f);
 void fpu_ldm80(struct cpu_state *cpu, float80 *f);
 
 void fpu_prem(struct cpu_state *cpu);
+void fpu_prem1(struct cpu_state *cpu);
 void fpu_rndint(struct cpu_state *cpu);
 void fpu_scale(struct cpu_state *cpu);
 void fpu_abs(struct cpu_state *cpu);
 void fpu_chs(struct cpu_state *cpu);
 void fpu_sqrt(struct cpu_state *cpu);
 void fpu_yl2x(struct cpu_state *cpu);
+void fpu_yl2xp1(struct cpu_state *cpu);
 void fpu_2xm1(struct cpu_state *cpu);
 
 void fpu_com(struct cpu_state *cpu, int i);
@@ -76,8 +79,8 @@ void fpu_icom16(struct cpu_state *cpu, int16_t *i);
 void fpu_icom32(struct cpu_state *cpu, int32_t *i);
 void fpu_comi(struct cpu_state *cpu, int i);
 void fpu_tst(struct cpu_state *cpu);
-#define fpu_ucom fpu_com
-#define fpu_ucomi fpu_comi
+void fpu_ucom(struct cpu_state *cpu, int i);
+void fpu_ucomi(struct cpu_state *cpu, int i);
 
 void fpu_add(struct cpu_state *cpu, int srci, int dsti);
 void fpu_sub(struct cpu_state *cpu, int srci, int dsti);
@@ -114,12 +117,14 @@ void fpu_patan(struct cpu_state *cpu);
 void fpu_sin(struct cpu_state *cpu);
 void fpu_cos(struct cpu_state *cpu);
 void fpu_sincos(struct cpu_state *cpu);
+void fpu_ptan(struct cpu_state *cpu);
 void fpu_xam(struct cpu_state *cpu);
 void fpu_xtract(struct cpu_state *cpu);
 
 void fpu_stcw16(struct cpu_state *cpu, uint16_t *i);
 void fpu_stsw16(struct cpu_state *cpu, uint16_t *i);
 void fpu_ldcw16(struct cpu_state *cpu, uint16_t *i);
+void fpu_sync_control(struct cpu_state *cpu);
 void fpu_stenv32(struct cpu_state *cpu, struct fpu_env32 *env);
 void fpu_ldenv32(struct cpu_state *cpu, struct fpu_env32 *env);
 void fpu_save32(struct cpu_state *cpu, struct fpu_state32 *state);

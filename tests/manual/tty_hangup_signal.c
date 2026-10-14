@@ -1,9 +1,10 @@
-// A terminal going away signals the session leader and foreground group.
+// A terminal going away signals its session leader.
 //
 // This is how a shell learns its session is over -- an ssh disconnect, a
 // terminal window closing, the last master of a pty being closed. Linux sends
-// SIGHUP and then SIGCONT (the SIGCONT so a stopped job runs far enough to
-// notice the SIGHUP). AOK's tty_hangup woke every reader and poller and
+// the session leader SIGHUP and then SIGCONT (the SIGCONT so a stopped leader
+// runs far enough to notice the SIGHUP); the rest of its foreground group
+// hears when the leader exits (tty_hangup_leader_only.c). AOK's tty_hangup woke every reader and poller and
 // signalled nobody, so a shell sat in its read loop on a terminal that no
 // longer existed.
 //
@@ -27,6 +28,28 @@ static void nap(long ms) {
 int main(int argc, char **argv) {
     test_init(argc, argv);
     alarm(test_watchdog_secs(120));
+
+    // This test's whole verdict is "the child DIED of SIGHUP", which depends on
+    // SIGHUP still having its default action. An ignored disposition is
+    // inherited across fork and exec, so anything that starts the suite under
+    // `nohup` -- whose entire job is to set SIGHUP to SIG_IGN -- hands that
+    // ignore to the child, the hangup is delivered exactly as it should be, the
+    // child shrugs and lives, and this test reports "no SIGHUP was sent".
+    //
+    // That is a lie about the kernel, and an expensive one: it cost most of an
+    // afternoon of the 555 device leg, where the launcher used `setsid nohup`
+    // and the failure was blamed on tty_hangup, on pty reuse, on process-group
+    // bookkeeping and on a debugger, in that order. `setsid` alone is what
+    // detaches a run; nohup was never needed.
+    //
+    // So check the precondition rather than assume it, and say which it is.
+    struct sigaction hup_was;
+    if (sigaction(SIGHUP, NULL, &hup_was) == 0 && hup_was.sa_handler == SIG_IGN) {
+        printf("tty_hangup_signal: SKIP (SIGHUP is ignored in this process -- "
+               "started under nohup? an inherited SIG_IGN makes the child "
+               "survive a hangup that WAS delivered)\n");
+        return 0;
+    }
 
     int master, slave;
     if (openpty(&master, &slave, NULL, NULL, NULL) < 0) {
@@ -73,15 +96,32 @@ int main(int argc, char **argv) {
 
     int st = 0;
     pid_t w = 0;
+    // WUNTRACED, because without it a STOPPED child is reported by waitpid
+    // exactly like a running one -- 0 -- and this test would then say "no
+    // SIGHUP was sent" about a child that was signalled and stopped rather
+    // than never signalled at all. tcsetpgrp above can raise SIGTTOU, and the
+    // hangup's SIGCONT is what is supposed to bring such a child back far
+    // enough to die of its pending SIGHUP, so "stopped" is a distinct and
+    // interesting outcome and must not be reported as the other one.
     for (int i = 0; i < 60; i++) {
-        w = waitpid(c, &st, WNOHANG);
+        w = waitpid(c, &st, WNOHANG | WUNTRACED);
         if (w == c)
             break;
         nap(100);
     }
-    if (w != c) {
+    if (w == c && WIFSTOPPED(st)) {
+        failf("hangup delivers SIGHUP", (uint64_t) WSTOPSIG(st), 0, 0,
+              (uint64_t) SIGHUP, 0, 0);
+        printf("FAIL: the hangup left the child STOPPED by signal %d -- it was "
+               "signalled, but the SIGCONT that should have let it die of "
+               "SIGHUP did not arrive\n", WSTOPSIG(st));
+        kill(c, SIGCONT);
+        kill(c, SIGKILL);
+        waitpid(c, &st, 0);
+    } else if (w != c) {
         failf("hangup delivers SIGHUP", 0, 0, 0, (uint64_t) SIGHUP, 0, 0);
-        printf("FAIL: still alive 6s after the hangup -- no SIGHUP was sent\n");
+        printf("FAIL: still running 6s after the hangup, and not stopped "
+               "either -- no SIGHUP was sent\n");
         kill(c, SIGKILL);
         waitpid(c, &st, 0);
     } else {

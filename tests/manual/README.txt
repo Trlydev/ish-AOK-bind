@@ -49,6 +49,34 @@ Focused tests (arm64/, aarch64 guests):
                        three-same int, saturating, pairwise, across-lanes,
                        widening/narrowing, shifts, permute (zip/uzp/ext/tbl),
                        two-reg misc, FP arithmetic/compares/converts/FMA
+  simd_elem_moves.c    UMOV/INS/DUP-by-element/FMOV general<->FP/vector MOV at
+                       every size and lane against a byte-level model (kept
+                       lanes, cleared upper halves); the vspec gadgets
+                       (jit/guest-arm64/simd_spec.S) and, with
+                       `echo vspec=0 > /proc/ish/arm64_jit_fuse`, the generic
+                       ones. Passes natively on an Apple Silicon Mac.
+  simd_three_same.c    Every AdvSIMD three-same op and arrangement with a
+                       specialised gadget (simd_spec3.S), v5/v17/v29, and
+                       every by-element FMUL/FMULX/FMLA/FMLS/MUL/MLA/MLS
+                       arrangement and lane (element in v13), hashed
+                       against simd_three_same.golden, which an Apple Silicon
+                       Mac produces running the file natively -DPRINT_GOLDEN.
+  alu_ospec.c          Scalar add/sub/adds/subs/cmp/cmn (imm, reg, LSL),
+                       and/orr/eor/ands (reg, imm), mov and the SP-source
+                       forms, 32/64-bit, on x3/x17/x26 over carry/overflow/
+                       sign edges; result and NZCV hashed against
+                       alu_ospec.golden (native Mac, -DPRINT_GOLDEN). Covers
+                       the ospec gadgets (alu_spec.S) and, with ospec=0, the
+                       index-decoding ones.
+  ldst_lspec.c         Loads/stores with post/pre-index writeback and register
+                       offsets (LSL/SXTX, SXTW, UXTW), every size and sign
+                       extension, on x3/x17/x26, hashed against
+                       ldst_lspec.golden (native Mac, -DPRINT_GOLDEN); then a
+                       faulting post-index load and pre-index store must
+                       report their pc/address and leave the base unchanged.
+                       Also LDP/STP post/pre-index (x3/x26 pairs) and a
+                       faulting pre-index STP.
+                       lspec=0 runs the generic gadgets.
   ands_bcond_fusion.c  ANDS+B.cond gadget fusion (jit/guest-arm64/control.S
                        fused_andsi/fused_andsr): all 14 conditions x
                        {imm,reg} x {32,64-bit} x {TST,normal-Rd}, checking

@@ -9,6 +9,7 @@
 #include "fs/fix_path.h"
 #include "emu/memory.h"
 #include <dirent.h>
+#include <string.h>
 #include <sqlite3.h>
 
 struct fs_info {
@@ -47,6 +48,7 @@ struct attr {
 
 #define AT_EMPTY_PATH_ 0x1000
 #define AT_SYMLINK_NOFOLLOW_ 0x100
+#define AT_SYMLINK_FOLLOW_ 0x400
 #define AT_NO_AUTOMOUNT_ 0x800
 
 // renameat2 flags
@@ -60,12 +62,63 @@ struct fd *generic_openat(struct fd *at, const char *path, int flags, int mode);
 // RESOLVE_* constraints ride in here.
 struct fd *generic_openat_norm(struct fd *at, const char *path, int flags, int mode, int extra_norm);
 // For stored, already-normalized paths (chroot prefix included): anchors at
-// the real root instead of the caller's chroot. See fs/generic.c.
+// the real root instead of the caller's chroot, and may enter a detached
+// mount's staging point. See fs/generic.c.
 struct fd *generic_open_realroot(const char *path, int flags, int mode);
+// A new description of the file `fd` holds, opened with `flags` by the path
+// the descriptor reports -- only while that path still names that file. NULL
+// when it does not: the file was unlinked or never had a path (a memfd), the
+// name now belongs to another file, or the path would not open. What such a
+// descriptor gets instead is the caller's to decide. See fs/generic.c.
+struct fd *generic_reopen_by_path(struct fd *fd, int flags);
+// A new description of the regular file `fd` holds, opened with `flags`,
+// without a path: through the filesystem's fd_ops->reopen, for the files
+// generic_reopen_by_path cannot reach. `check_access`: face the file's
+// permissions and the mount's read-only flag as an open(2) would; exec, which
+// has already asked its own question, does not. NULL when the filesystem has
+// no way to (the caller decides what then), an ERR_PTR when it refuses.
+struct fd *generic_reopen_pathless(struct fd *fd, int flags, bool check_access);
+// Is `path` -- a descriptor's own, from generic_getpath -- still a name of the
+// file the descriptor holds? Not once the file is unlinked: the path is then
+// the name it had, which another file may have taken. See fs/generic.c.
+bool generic_path_names_fd(const char *path, struct fd *fd);
+// Linux's d_path shows a file whose name no longer reaches it -- unlinked, or
+// a directory removed -- by the name it had with " (deleted)" after it, in the
+// /proc/<pid> links and maps. Appends that to `path`, as generic_getpath_shown
+// gave it for `fd` and before any rebase against the caller's root, when it
+// applies; `size` is path's buffer. Not for getcwd, which is ENOENT there.
+void generic_mark_deleted(struct fd *fd, char *path, size_t size);
+// lstat of a stored, already-normalized path, anchored as generic_open_realroot
+// anchors one.
+int generic_lstat_realroot(const char *path, struct statbuf *stat);
+// The descriptor's full path, through the mount it was opened on: for one
+// opened through a bind, the bind's path, as Linux's d_path gives it. This is
+// the path a lookup starts from (a cwd, a dirfd), so it is always one that
+// reaches the file: in a bind that has been lazily unmounted, where no path
+// names the bind any more, it is the path through the bind's source.
 int generic_getpath(struct fd *fd, char *buf);
+// The path as a reader is shown it -- getcwd, readlink of the /proc/<pid>
+// links, /proc/<pid>/maps. The same as generic_getpath, except in a lazily
+// unmounted bind: there it is the path from the bind's own root, as Linux
+// prints it, and *unreachable is set, since no root reaches it. Never walk
+// it. `unreachable` must not be NULL.
+int generic_getpath_shown(struct fd *fd, char *buf, bool *unreachable);
+// The same file's path on the mount that backs it, ignoring any bind it was
+// opened through. For a path that has to outlive the guest's binds: a
+// checkpoint restore reopens by path in a boot that never made them.
+int generic_getpath_backing(struct fd *fd, char *buf);
 int fs_rebase_path_to_root(struct fs_info *fs, char *path);
+// The path of fs's root ("/" when not chrooted) into out (MAX_PATH + 1 bytes).
+int fs_root_path(struct fs_info *fs, char *out);
 int fs_rebase_readlink_path(struct fs_info *fs, char *path);
-int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw);
+int fs_rebase_shown_link_path(struct fs_info *fs, char *path);
+// src_norm are the fs/path.h N_* flags the SOURCE is resolved with: which of
+// N_SYMLINK_FOLLOW/N_SYMLINK_NOFOLLOW linkat's AT_SYMLINK_FOLLOW asked for,
+// plus N_REALROOT | N_DETACHED_OK when the source is a stored path rather
+// than a guest one (the AT_EMPTY_PATH case, whose source is generic_getpath's
+// answer). The DESTINATION's resolution is fixed and not the caller's
+// business.
+int generic_linkat(struct fd *src_at, const char *src_raw, struct fd *dst_at, const char *dst_raw, int src_norm);
 int generic_unlinkat(struct fd *at, const char *path);
 int generic_rmdirat(struct fd *at, const char *path);
 int generic_renameat(struct fd *src_at, const char *src, struct fd *dst_at, const char *dst, int flags);
@@ -100,12 +153,28 @@ bool procfd_statat(struct fd *at, const char *path, struct statbuf *stat, int *e
 // for the whole unit.
 bool procns_statat(struct fd *at, const char *path, struct statbuf *stat, int *err_out);
 int generic_setattrat(struct fd *at, const char *path, struct attr attr, bool follow_links);
+// The same change without the caller's permission to make it: for what the
+// kernel does on its own account -- a truncate stripping the set-id bits of a
+// file its caller may write but does not own. EROFS still applies.
+int generic_setattrat_force(struct fd *at, const char *path, struct attr attr, bool follow_links);
+// chown(path, -1, -1) asks for no change at all. Linux still resolves the path
+// and reports everything the resolution finds, so this runs exactly the lookup
+// generic_setattrat runs and then changes nothing. See sys_fchownat_common.
+int generic_setattrat_nochange(struct fd *at, const char *path, bool follow_links);
 int generic_utime(struct fd *at, const char *path, struct timespec atime, struct timespec mtime, bool follow_links);
 ssize_t generic_readlinkat(struct fd *at, const char *path, char *buf, size_t bufsize);
+// readlink(2)'s answer, which for a /proc/<pid>/{fd/N,cwd,root,exe} link is
+// generic_getpath_shown's rather than the walkable one generic_readlinkat
+// gives the path walk. See proc_readlink_shown in fs/proc.c.
+ssize_t generic_readlinkat_shown(struct fd *at, const char *path, char *buf, size_t bufsize);
 int generic_mkdirat(struct fd *at, const char *path, mode_t_ mode);
 
 int access_check(struct statbuf *stat, int check);
-int setattr_check(struct statbuf *stat, struct attr attr);
+// May change *attr: an allowed chmod can still lose its S_ISGID bit.
+int setattr_check(struct statbuf *stat, struct attr *attr);
+// Linux's in_group_p(): gid is the caller's fsgid or one of its supplementary
+// groups.
+bool current_in_group(uid_t_ gid);
 
 // Write a HOST buffer to a guest fd number. write(2) copies from guest memory
 // first; code that already holds host memory -- natively-implemented programs
@@ -116,15 +185,13 @@ ssize_t fd_write_host_buf(fd_t fd_no, const void *buf, size_t size);
 // iSH-internal mount flag, NOT part of the guest mount(2) ABI. fs/mount.c's
 // sys_mount masks incoming guest flags to MS_FLAGS before calling do_mount(),
 // so a guest process can never set or clear this bit; only native do_mount()
-// callers (see app/AppDelegate.m) do. Marks a realfs mount whose backing
-// directory is a single app-owned host area shared by every guest uid (e.g.
-// /AOK/persist, /AOK/roots) rather than a real multi-user filesystem: every
-// file in it is always owned, at the host layer, by the app's own real uid
-// regardless of which guest uid nominally created it, so iSH's normal
-// owner-vs-other permission model (kernel/fs.c:access_check) can never see
-// the guest uid as "owner" and falls back to the (usually non-writable)
-// "other" bits. realfs_open/realfs_mkdir/realfs_mknod force newly created
-// nodes world-writable under this flag so every guest uid keeps working.
+// callers (see app/AppDelegate.m, and main.c's ISH_REAL_MNT_SHARED) do. Marks
+// a realfs mount whose backing directory is a single app-owned host area
+// shared by every guest uid (e.g. /AOK/persist, /AOK/roots) rather than a real
+// multi-user filesystem: every file in it is owned, at the host, by the app's
+// own uid whichever guest uid made it, and the host can record no other
+// owner. realfs reports such a file as owned by whoever asks, and takes a
+// chown only to that owner (fs/real.c, realfs_shared_owner).
 #define MOUNT_ISH_SHARED_ (1 << 30)
 
 struct mount {
@@ -151,6 +218,8 @@ struct mount {
     // and mountinfo. df then tried to statfs a 0700 staging directory it could
     // not enter and printed "Permission denied" for a mount Linux never would
     // have shown. Listed again the moment move_mount gives it a real point.
+    // umount -l parks a mount that is still in use the same way, for good
+    // (mount_remove_lazy): see MOUNT_STAGING_DIR below.
     bool detached;
     // umount2(MNT_DETACH): taken out of the mount table immediately so no new
     // lookup can reach it, but not torn down until the last reference on it
@@ -183,10 +252,101 @@ struct mount {
     // and resolves it against bind_origin. NULL for ordinary mounts.
     struct mount *bind_origin;
     const char *bind_prefix;
+
+    // This mount's ID in /proc/self/mountinfo and statx's stx_mnt_id: handed
+    // out when the mount is made, then fixed for its whole life and never
+    // reused (fs/mount.c). 0 for the static internal mounts no listing shows
+    // (sockets and pipes, memfd); mount_id reports those as MOUNT_ID_HIDDEN.
+    int id;
+
+    // Where a busy mount was attached before umount -l parked it at a
+    // staging point (mount_remove_lazy, fs/mount.c), and NULL otherwise. Its
+    // filesystem's umount hook is shown this point again when the last user
+    // lets go: iosfs keys a mount's bookmark by it.
+    const char *attached_point;
+
+    // A mount another was mounted over: `mount -t tmpfs none /dev` hides the
+    // devpts at /dev/pts, and unmounting that tmpfs brings it back. In a
+    // table of points the two would both answer for "/dev/pts" -- the longer
+    // point wins every lookup, so the mount underneath stayed in view and the
+    // new /dev came with the old /dev/pts in it. So a covered mount is parked
+    // at a staging point, as a busy lazily-unmounted one is and for the same
+    // reason (what is open in it goes on working), with the ID of the mount
+    // that covers it and the point it returns to when that one goes.
+    // fs/mount.c, mount_cover_below_locked.
+    int covered_by;
+    const char *covered_point;
+
+    // The old root after pivot_root(".", "."), and what is mounted in it. On
+    // Linux it is stacked over the new root at "/", where no lookup goes
+    // through it (a lookup starts at the root and never climbs onto what is
+    // mounted on top of it), until umount2(".", MNT_DETACH) takes it off. In a
+    // table of points the top of a stack is what lookups find, so it is put
+    // at a hidden point inside the namespace instead (mnt_ns_pivot_root) and
+    // listed at the point it is stacked at, `stacked_point`. pivot_over is
+    // the new root's ID, on the old root alone: an unmount of the new root's
+    // point takes the old root instead, as it does on Linux.
+    int pivot_over;
+    const char *stacked_point;
+
+    // Copied into a mount namespace owned by a less privileged user
+    // namespace than the one it came from (mnt_ns_copy): not to be unmounted
+    // by itself there, nor to lose the restrictive flags it arrived with.
+    bool locked;
+    int locked_flags;
+
+    // Propagation (fs/mount.c, "Propagation"). shared_id is the peer group
+    // the mount is in, 0 for none: a mount or unmount under one member is
+    // repeated under every other. master_id is the peer group it receives
+    // from without giving back (a slave), 0 for none; a mount can have both.
+    // Neither: private. unbindable is private, and not to be bound either.
+    // What /proc/self/mountinfo prints as shared:N, master:N and unbindable.
+    int shared_id;
+    int master_id;
+    bool unbindable;
 };
 extern lock_t mounts_lock;
-// mount_id with mounts_lock already held by the caller.
-int mount_id_locked(struct mount *target);
+
+// Where detached mounts are parked, at "/.ish-fsmount/<n>": a mount fsmount()
+// has made and move_mount() not yet placed, and a mount umount -l took out of
+// the tree while something was still using it. The string model of paths
+// needs SOME path to a mount -- a descriptor's path is its mount's point plus
+// the path inside it, and every relative lookup starts there -- so a
+// detached mount keeps one, at a point no other path can collide with. It is
+// not a directory on any filesystem, the guest cannot walk into it
+// (N_DETACHED_OK, fs/path.h), `..` at a staging point stays there, and a
+// path shown to the guest is from the mount's own root, as Linux shows it.
+#define MOUNT_STAGING_DIR "/.ish-fsmount"
+// Where pivot_root(".", ".") keeps the old root, inside the new one, while it
+// is stacked over it (struct mount's stacked_point); the new root's ID follows.
+#define MOUNT_PIVOT_OLD "/.ish-pivot-old."
+
+// If the first `len` bytes of the real-root path `path` start with a staging
+// point -- MOUNT_STAGING_DIR, a slash, and one more component -- the length
+// of that point, else 0.
+static inline size_t mount_staging_point_len(const char *path, size_t len) {
+    const size_t dir_len = sizeof(MOUNT_STAGING_DIR) - 1;
+    if (len <= dir_len + 1 || memcmp(path, MOUNT_STAGING_DIR "/", dir_len + 1) != 0)
+        return 0;
+    size_t end = dir_len + 1;
+    while (end < len && path[end] != '/')
+        end++;
+    return end > dir_len + 1 ? end : 0;
+}
+
+// The ID of a mount no mountinfo lists: on Linux, the rootfs that the root
+// mount itself is mounted on. It lies outside every process's root, so the
+// root mount names it as its parent and nothing names it as its own ID (camd:
+// "29 1 254:0 / / rw ..."). Never handed to a real mount.
+#define MOUNT_ID_HIDDEN 1
+
+// The mounts a listing shows, in the order it shows them; see fs/mount.c.
+// Caller holds mounts_lock and frees the array.
+struct mount **mounts_listed_locked(size_t *count_out);
+struct mount **mounts_listed_locked_covered(size_t *count_out, bool covered);
+// Where a listed mount is in its tree: its point, or for a covered one the
+// point it is covered at.
+const char *mount_listed_point(const struct mount *mount);
 
 // returns a reference, which must be released
 struct mount *mount_find(char *path);
@@ -209,8 +369,19 @@ struct mount_info {
     struct mount *mount; // for identity only; do not deref without the lock
 };
 int mount_snapshot(struct mount_info **out, size_t *count_out);
-// mountinfo/statx mount ID (1-based list position); see fs/mount.c
+// A mount's ID, as mountinfo and statx report it; see fs/mount.c.
 int mount_id(struct mount *mount);
+// Rewrite an origin-relative path to its full path through `bind`, a bind
+// mount of `origin` the caller holds a reference on. A lazily unmounted bind
+// has no path: with `detached` NULL that is false, and otherwise the path is
+// from the bind's root and *detached says so. Takes mounts_lock. See
+// fs/mount.c.
+bool mount_path_through_bind(struct mount *bind, const struct mount *origin, char *path,
+                             bool *detached);
+// Put the point of the mount with ID `id` in front of `path`, a path on it;
+// false if there is no such mount any more, or it is detached. Takes
+// mounts_lock. See fs/mount.c.
+bool mount_path_by_id(int id, char *path);
 // The st_dev files on this mount report, i.e. mountinfo's device field; asks
 // the filesystem rather than assuming, since only backing-less filesystems use
 // mount->fake_dev. Follows a bind to its origin. See fs/mount.c.
@@ -218,6 +389,8 @@ dev_t_ mount_dev(struct mount *mount);
 
 // O_PATH|O_NOFOLLOW fd referring to a symlink itself; see fs/generic.c
 bool fd_is_opath_link(struct fd *fd);
+bool fd_is_opath_held(struct fd *fd);
+struct fd *fd_opath_held_target(struct fd *fd);
 struct fd *opath_link_fd_create(struct mount *mount, const char *path);
 int opath_link_fstat(struct fd *fd, struct statbuf *stat);
 struct mount *opath_link_get_mount(struct fd *fd);
@@ -237,9 +410,16 @@ int mount_set_display_source(const char *point, const char *display_source);
 // root). Takes mounts_lock, so call it without the lock held.
 bool mount_exists_at_point(const char *point);
 
+// Bind directory SOURCE onto directory POINT, as the kernel's own act (no
+// capability check). Takes mounts_lock itself.
+int mount_bind_dir(const char *source, const char *point);
+// A directory, opened as chdir() and chroot() open one (search permission).
+struct fd *fs_open_dir(const char *path);
+
 // must hold mounts_lock while calling these, or traversing mounts
 int do_mount(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags);
 int do_umount(const char *point);
+int do_umount_lazy(const char *point);
 int mount_remove(struct mount *mount);
 extern struct list mounts;
 
@@ -249,6 +429,10 @@ extern struct list mounts;
 // change themselves, so call them WITHOUT the lock held. See fs/mount.c.
 int mount_attach(const struct fs_ops *fs, const char *source, const char *point, const char *info, int flags);
 int mount_detach(const char *point);
+// mount_detach of `point` and, lazily, of everything mounted below it; EBUSY
+// without touching anything while `point` itself is in use. For the app's
+// root rename and delete. See fs/mount.c.
+int mount_detach_tree(const char *point);
 
 bool mount_param_flag(const char *info, const char *flag);
 
@@ -267,6 +451,10 @@ bool mount_param_flag(const char *info, const char *flag);
 #define O_TRUNC_ (1 << 9)
 #define O_APPEND_ (1 << 10)
 #define O_NONBLOCK_ (1 << 11)
+// O_LARGEFILE (0100000; arm64 relocates it, calls.c). Every open by a 64-bit
+// task gets it (Linux's force_o_largefile in build_open_flags) and F_GETFL
+// reports it; a 32-bit task has it only if it asked, which musl always does.
+#define O_LARGEFILE_ (1 << 15)
 #define O_DIRECTORY_ (1 << 16)
 #define O_NOFOLLOW_ (1 << 17)
 #define O_CLOEXEC_ (1 << 19)
@@ -279,6 +467,10 @@ bool mount_param_flag(const char *info, const char *flag);
 // links" for /etc/os-release and, fatally, the /etc/localtime timezone
 // watch during Arch aarch64 boot).
 #define O_PATH_ (1 << 21)
+// All an O_PATH open keeps (Linux's O_PATH_FLAGS): it performs no permission
+// check, so it does nothing the check would have guarded -- no access mode, no
+// O_TRUNC, no O_CREAT. open() and openat() drop the rest; openat2() refuses it.
+#define O_PATH_FLAGS_ (O_PATH_ | O_DIRECTORY_ | O_NOFOLLOW_ | O_CLOEXEC_)
 // O_TMPFILE is this bit PLUS O_DIRECTORY, on every ABI: the directory bit is
 // what makes an old kernel reject it rather than create a file called
 // whatever the path said. The arm64 translation relocates O_DIRECTORY and
@@ -305,10 +497,26 @@ struct fs_ops {
     // global lock while waiting on a daemon whose own filesystem work needs
     // that lock is a deadlock, and even without the cycle it would wedge every
     // other file operation in the emulator behind one slow daemon.
+    //
+    // And for one whose operations wait on the kernel's own locks: procfs,
+    // whose handlers take a task's lock, pids_lock and memory locks (fs/proc.c
+    // has the ring that made it one).
     bool may_block;
 
     int (*mount)(struct mount *mount);
     int (*umount)(struct mount *mount);
+    // Optional. Called when an existing mount moves from old_point to
+    // new_point: move_mount(2), and mount(2)'s MS_MOVE. For a filesystem that
+    // keeps anything keyed by where it is mounted. A mount made through the
+    // new mount API is created at a private staging path (/.ish-fsmount/<n>)
+    // and only moved into place afterwards, so what it saw at ->mount is not
+    // where it ends up. Called without mounts_lock, holding a reference.
+    void (*relocated)(struct mount *mount, const char *old_point, const char *new_point);
+    // Optional. The option string of mount(2)'s MS_REMOUNT, or what fsconfig
+    // set before FSCONFIG_CMD_RECONFIGURE, for a filesystem with parameters a
+    // live mount can change (tmpfs's size=). Called with mounts_lock held; an
+    // error leaves the mount as it was.
+    int (*remount)(struct mount *mount, const char *info);
     int (*statfs)(struct mount *mount, struct statfsbuf *stat);
 
     struct fd *(*open)(struct mount *mount, const char *path, int flags, int mode); // required
@@ -349,13 +557,67 @@ struct fs_ops {
     void (*inode_orphaned)(struct mount *mount, ino_t inode);
 };
 
+// Extended attributes (kernel/xattr.c). Kept out of struct fs_ops on purpose:
+// app/iOSFS.m defines fs_ops tables of its own, and a field appended there
+// would be read past the end of any stale object the Xcode build did not
+// recompile. Which filesystems keep attributes is xattr_ops_for_mount's list.
+//
+// These only store. Every check Linux makes above the filesystem -- the name
+// and size limits, permission, the namespace rules, security.capability's
+// shape -- has already been made when they are called. The object is `fd`
+// when it is not NULL (the f* calls, and a /proc/PID/fd link) and `path` on
+// `mount` otherwise; `fd` must work on an unlinked file. get and list follow
+// getxattr(2)'s size rules: with `size` 0 the answer is the size needed, and a
+// nonzero size too small for it is ERANGE. set takes XATTR_CREATE and
+// XATTR_REPLACE, which it must decide atomically with the write.
+struct xattr_ops {
+    ssize_t (*get)(struct mount *mount, const char *path, struct fd *fd,
+            const char *name, void *value, size_t size);
+    int (*set)(struct mount *mount, const char *path, struct fd *fd,
+            const char *name, const void *value, size_t size, int flags);
+    ssize_t (*list)(struct mount *mount, const char *path, struct fd *fd,
+            char *list, size_t size);
+    int (*remove)(struct mount *mount, const char *path, struct fd *fd,
+            const char *name);
+};
+extern const struct xattr_ops fakefs_xattr_ops;
+extern const struct xattr_ops tmpfs_xattr_ops;
+// NULL for a filesystem without extended attributes (and for no mount at
+// all: a pipe, a socket, an anonymous descriptor).
+const struct xattr_ops *xattr_ops_for_mount(struct mount *mount);
+// The object an xattr call names by path (kernel/xattr.c): resolved as stat
+// resolves it -- a /proc/PID/fd/N link that is followed reaches the open file
+// it names, as on Linux -- into either that file (*fd_out, retained) or a mount
+// (*mount_out, retained) with the mount-relative path and its mount flags.
+// guest_path_out gets the full path for inotify, or "" for the fd case. Both
+// path buffers are MAX_PATH. *stat is what the permission checks look at.
+int generic_xattr_lookup(struct fd *at, const char *path_raw, bool follow,
+        struct fd **fd_out, struct mount **mount_out, char *path_out,
+        int *mount_flags_out, char *guest_path_out, struct statbuf *stat);
+
 struct mount *find_mount_and_trim_path(char *path);
 // Same, but also reports the mount flags governing the path. For a bind these
 // are NOT the returned mount's own -- see fs/generic.c. Pass NULL to ignore.
 struct mount *find_mount_and_trim_path_flags(char *path, int *mount_flags);
+// Same again, and also which mount the path is ON as mountinfo lists it: for a
+// bind, the bind itself, where the returned mount is the origin backing it.
+// `seen_id` receives its mount ID and `seen_root` whether the path is that
+// mount's root. `seen_bind`, for a path on a bind, receives the bind with a
+// reference the caller must release, and NULL otherwise. Any of the four may
+// be NULL.
+struct mount *find_mount_and_trim_path_seen(char *path, int *mount_flags, int *seen_id,
+                                            bool *seen_root, struct mount **seen_bind);
 
 // adhoc fs
 struct fd *adhoc_fd_create(const struct fd_ops *ops);
+// The next adhoc inode, for two fds that must SHARE one -- fs/pipe.c, where
+// both ends of a pipe are one object to everything that reads /proc/<pid>/fd,
+// and the only thing that tells kernel/checkpoint.c they are a pair.
+qword_t adhoc_next_inode(void);
+// Both ends of a fresh pipe, uninstalled, sharing `shared_inode`. For
+// kernel/checkpoint.c -- see the definition in fs/pipe.c.
+int pipe_create_pair(struct fd **read_end, struct fd **write_end,
+        qword_t shared_inode);
 // this is for the "wtf is apple smoking" section
 bool is_adhoc_fd(struct fd *fd);
 
@@ -380,7 +642,12 @@ extern const struct fs_ops cgroup2fs;
 // talk to, can find one.
 extern const struct fs_ops selinuxfs;
 
+// IN_MODIFY on cgroup.events of a cgroup2 cgroup and its ancestors, in every
+// cgroup2 mount (fs/tmp.c). For membership changes: a process moved, or a
+// process in that cgroup exited. Call with no locks held.
+void cgroup2_note_membership_change(const char *cgroup_path);
 extern const struct fs_ops fusefs;
+extern const struct fs_ops mqueuefs;
 void fs_register(const struct fs_ops *fs);
 const struct fs_ops *fs_lookup(const char *name); // by registered name, NULL if unknown
 char* get_filesystems(void); // For /proc/filesystems

@@ -1,0 +1,122 @@
+// What clone() and unshare() answer, as root, for each namespace flag.
+//
+// On Linux as root both succeed, and so they do here for the namespaces AOK
+// has (UTS, IPC, mount, user, PID, network). For a type it does not have
+// (cgroup) each entry point must fail with the errno its consumers read as
+// "no sandbox here, carry on", and those differ:
+//
+//   clone:   EINVAL (Linux's answer for a namespace type it was built
+//            without). systemd forks its generator sandbox with
+//            raw_clone(SIGCHLD|CLONE_NEWNS) and falls back on
+//            EPERM/EACCES/EINVAL only; 557 answered ENOSYS and PID 1 froze at
+//            "Failed to start up manager" on Arch Linux ARM. (Mount
+//            namespaces are real now, and that clone succeeds.)
+//   unshare: ENOSYS. systemd's namespace setup for a service falls back on
+//            EPERM/EACCES/EOPNOTSUPP/ENOSYS, and treats EINVAL as a failure.
+//
+// EPERM would satisfy both, but says "you may not" to a root caller who may,
+// so it is refused too.
+//
+// And /proc/self/ns/<kind> exists exactly when that kind can be made (net is
+// the case that taught it; cgroup and time were listed without being there):
+// systemd's ns_type_supported() reads that file, and when it existed while
+// unshare(CLONE_NEWNET) failed, every PrivateNetwork=yes unit (hostnamed,
+// localed, shadow) failed at step NETWORK. A kernel built without network
+// namespaces has no ns/net, which is what AOK presented until it had them
+// (kernel/net_ns.h); now it has both.
+//
+// Each probe runs in its own child, so a namespace that does get created (on
+// Linux) never touches the test itself.
+//
+// Root only: as anyone else both say EPERM, which proves nothing.
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdbool.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include "test_common.h"
+
+// 0 for success, else the errno.
+static int try_clone(int flag) {
+    long pid = syscall(SYS_clone, flag | SIGCHLD, 0, 0, 0, 0);
+    if (pid == 0)
+        _exit(0);
+    if (pid < 0)
+        return errno;
+    waitpid((pid_t) pid, NULL, 0);
+    return 0;
+}
+
+static int try_unshare(int flag) {
+    pid_t pid = fork();
+    if (pid == 0)
+        _exit(unshare(flag) == 0 ? 0 : (errno & 0xff));
+    int status;
+    waitpid(pid, &status, 0);
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static const char *describe(int e) {
+    return e ? strerror(e) : "succeeds";
+}
+
+int main(int argc, char **argv) {
+    test_init(argc, argv);
+    if (geteuid() != 0) {
+        printf("namespace_errno: SKIP (needs root)\n");
+        return 0;
+    }
+    static const struct { int flag; const char *name; } ns[] = {
+        {CLONE_NEWNS, "CLONE_NEWNS"}, {CLONE_NEWPID, "CLONE_NEWPID"},
+        {CLONE_NEWNET, "CLONE_NEWNET"}, {CLONE_NEWUSER, "CLONE_NEWUSER"},
+        {CLONE_NEWCGROUP, "CLONE_NEWCGROUP"}, {CLONE_NEWUTS, "CLONE_NEWUTS"},
+        {CLONE_NEWIPC, "CLONE_NEWIPC"},
+    };
+    int fails = 0;
+    for (unsigned i = 0; i < sizeof ns / sizeof ns[0]; i++) {
+        int c = try_clone(ns[i].flag), u = try_unshare(ns[i].flag);
+        if (c != 0 && c != EINVAL) {
+            printf("FAIL: %s: clone %s, want success or EINVAL\n", ns[i].name, describe(c));
+            fails++;
+        }
+        if (u != 0 && u != ENOSYS) {
+            printf("FAIL: %s: unshare %s, want success or ENOSYS\n", ns[i].name, describe(u));
+            fails++;
+        }
+        // A namespace one entry point can make, the other must make too.
+        if ((c == 0) != (u == 0)) {
+            printf("FAIL: %s: clone %s but unshare %s\n", ns[i].name, describe(c), describe(u));
+            fails++;
+        }
+        test_logf("%s: clone %s, unshare %s\n", ns[i].name, describe(c), describe(u));
+    }
+    // Each kind's file exists exactly when the kind can be made: what
+    // systemd's ns_type_supported() and bubblewrap's --unshare-cgroup-try
+    // read to decide whether to ask.
+    static const struct { int flag; const char *file; } files[] = {
+        {CLONE_NEWNET, "net"}, {CLONE_NEWCGROUP, "cgroup"}, {CLONE_NEWUTS, "uts"},
+        {CLONE_NEWIPC, "ipc"}, {CLONE_NEWNS, "mnt"}, {CLONE_NEWPID, "pid"},
+        {CLONE_NEWUSER, "user"},
+#ifdef CLONE_NEWTIME
+        {CLONE_NEWTIME, "time"},
+#endif
+    };
+    for (unsigned i = 0; i < sizeof files / sizeof files[0]; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), "/proc/self/ns/%s", files[i].file);
+        bool has_file = access(path, F_OK) == 0;
+        bool can_unshare = try_unshare(files[i].flag) == 0;
+        if (has_file != can_unshare) {
+            printf("FAIL: %s %s, but unshare of it %s\n", path,
+                   has_file ? "exists" : "is absent", can_unshare ? "succeeds" : "fails");
+            fails++;
+        }
+    }
+    printf("namespace_errno: %s\n", fails ? "FAIL" : "PASS");
+    return fails != 0;
+}

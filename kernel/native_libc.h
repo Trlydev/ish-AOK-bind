@@ -59,7 +59,9 @@
 #ifndef NATIVE_LIBC_OWN_GLOB
 #include <glob.h>
 #endif
+#include <fnmatch.h>
 #include <poll.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <syslog.h>
 #include <sys/mman.h>
@@ -107,6 +109,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifdef __cplusplus
@@ -143,6 +146,10 @@ int nlibc_dirfd(DIR *dir);
 
 /* --- mutation ----------------------------------------------------------- */
 int nlibc_unlink(const char *path);
+int nlibc_remove(const char *path);
+int nlibc_linux_mount(const char *source, const char *target, const char *type,
+                      unsigned long flags, const void *data);
+int nlibc_linux_umount2(const char *target, int flags);
 int nlibc_rmdir(const char *path);
 int nlibc_mkdir(const char *path, mode_t mode);
 /* The *at forms. Rust's std and rustix prefer them -- they are the ones
@@ -187,6 +194,13 @@ int nlibc_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 int nlibc_puts(const char *s);
 int nlibc_putchar(int c);
 void nlibc_perror(const char *s);
+/* glibc's wording for an error number: the guest's tools print glibc's
+ * messages, and Darwin words a dozen errnos differently (EBUSY "Resource
+ * busy", EXDEV "Cross-device link", ERANGE "Result too large", ...). */
+char *nlibc_strerror(int err);
+#if defined(__APPLE__)
+int nlibc_strerror_r(int err, char *buf, size_t len);
+#endif
 /* Flush the wrapped standard streams; see the note in nlibc_std_stream. */
 void nlibc_flush_std(void);
 /* Flush without ever waiting on a lock. What a shutdown path wants in place of
@@ -219,6 +233,13 @@ char *nlibc_setlocale(int category, const char *name);
 
 /* The host's exit() would end the whole app; a native program is a task. */
 noreturn void nlibc_exit(int status);
+/* And so would the host's abort(): the program dies of SIGABRT, as on Linux,
+ * and the app goes on. A Rust panic ends here too (deps/rust-native is
+ * panic=abort), and so does a failed assert(), through Darwin's handler. */
+noreturn void nlibc_abort(void);
+#if defined(__APPLE__)
+noreturn void nlibc_assert_rtn(const char *func, const char *file, int line, const char *expr);
+#endif
 
 /* Identity: the GUEST's, not the device's. whoami said "mobile" before this. */
 uid_t nlibc_getuid(void);
@@ -260,6 +281,29 @@ char *nlibc_crypt(const char *key, const char *salt);
 int nlibc_sigaction(int sig, const struct sigaction *act, struct sigaction *oact);
 void (*nlibc_signal(int sig, void (*handler)(int)))(int);
 int nlibc_sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int nlibc_pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
+int nlibc_getloadavg(double loadavg[], int nelem);
+/* BSD sigsetmask/sigblock/siggetmask -- 4.2BSD's signal mask, as an int with
+ * one bit per signal, still shipped by every libc and still used. dash's
+ * sigclearmask() is `sigsetmask(0)` whenever configure finds it, which is
+ * always here.
+ *
+ * These are not a convenience. An unrouted sigsetmask reaches the HOST, where
+ * it changes the calling thread's mask and touches neither the guest task's
+ * mask nor native_prog_blocked -- so the shim goes on believing the program
+ * has everything blocked. The visible failure was exact and awful: dash's
+ * `wait` builtin worked once per shell and then blocked forever, because
+ * nlibc_sigsuspend computes what may wake it from native_prog_blocked, and
+ * after the first wait that set said "everything". A foreground command was
+ * unaffected -- it uses a blocking wait3 and never goes near this -- so it
+ * looked like a bug in `wait` rather than in the mask.
+ *
+ * The int mask holds signals 1..31 as bit (sig - 1), in HOST numbering, which
+ * is what a native program sees (nlibc_signal_to_guest translates on the way
+ * down). */
+int nlibc_sigsetmask(int mask);
+int nlibc_sigblock(int mask);
+int nlibc_siggetmask(void);
 int nlibc_sigpending(sigset_t *set);
 int nlibc_sigwait(const sigset_t *set, int *sig);
 /* Runs whatever handlers are pending. Called from native_checkpoint. */
@@ -276,6 +320,10 @@ bool nlibc_stdio_defer_fatal(void);
 bool nlibc_delivery_deferred(void);
 /* The same, reporting how many handlers ran -- see nlibc_sigsuspend. */
 int nlibc_deliver_signals_count(void);
+// How many handlers this thread has run, ever. It only counts up, so two
+// readings tell a caller whether a handler ran in between -- which is what a
+// wait about to start has to know (native_syscall_wait).
+unsigned long nlibc_handlers_run(void);
 
 /* Session and process group: plain kernel state, so plain syscalls. */
 pid_t nlibc_setsid(void);
@@ -343,6 +391,7 @@ struct timespec;
 int nlibc_ppoll(void *fds, unsigned nfds, const struct timespec *timeout);
 int nlibc_select(int nfds, void *r, void *w, void *e, void *timeout);
 int nlibc_fork(void);
+int nlibc_vfork(void);
 int nlibc_execl(const char *path, const char *arg0, ...);
 /* execl's PATH-searching twin. execv, execvp, execl and execve were all routed
  * and this one was not -- the single form that BOTH takes varargs and walks
@@ -359,10 +408,36 @@ int nlibc_mknod(const char *path, mode_t mode, dev_t dev);
 int nlibc_mkstemp(char *template);
 int nlibc_utimes(const char *path, const struct timeval times[2]);
 int nlibc_futimes(int fd, const struct timeval times[2]);
+int nlibc_utimensat(int dirfd, const char *path, const struct timespec times[2], int flags);
+/* Local time in the GUEST's zone (kernel/native_tz.c), not the host's. */
+struct tm *nlibc_localtime_r(const time_t *t, struct tm *out);
+struct tm *nlibc_localtime(const time_t *t);
+time_t nlibc_mktime(struct tm *tm);
+void nlibc_tzset(void);
+char *nlibc_ctime_r(const time_t *t, char *buf);
+char *nlibc_ctime(const time_t *t);
+/* State the host C library keeps in ONE place for the whole process. Native
+ * programs are threads of that process, so two of them calling one of these
+ * at the same moment shared it: Darwin's basename() returns a pointer into a
+ * single buffer, and SmallCLUE picks its applet with basename(argv[0]) -- an
+ * applet starting beside another could run as the other (`sha256sum | cut
+ * -c1-32` printing "sha256sum: unsupported option '-c1-32'";
+ * tests/manual/native_applet_race.c). Each gets its state per thread here. */
+char *nlibc_strtok(char *str, const char *sep);
+struct tm *nlibc_gmtime(const time_t *t);
+char *nlibc_asctime(const struct tm *tm);
+#ifdef __APPLE__
+/* glibc's two, the GNU one and libgen's, work in the caller's own string. */
+char *nlibc_basename(char *path);
+char *nlibc_dirname(char *path);
+#endif
+int nlibc_futimens(int fd, const struct timespec times[2]);
 int nlibc_statfs(const char *path, void *buf);
 #ifndef NATIVE_LIBC_OWN_GLOB
 int nlibc_glob(const char *pattern, int flags, void *errfunc, void *pglob);
 #endif
+/* glibc's pattern rules, not Darwin's: kernel/native_fnmatch.c. */
+int nlibc_fnmatch(const char *pattern, const char *string, int flags);
 
 /* Host-global state: clock, hostname, mount table, power. See the .c. */
 struct timespec;
@@ -782,6 +857,8 @@ const char *nlibc_dlerror(void);
 #define dirfd       nlibc_dirfd
 
 #define unlink      nlibc_unlink
+/* Function-like: libgit2's diff_stats.c has a local variable called remove. */
+#define remove(p)   nlibc_remove(p)
 #define rmdir       nlibc_rmdir
 #define mkdir       nlibc_mkdir
 #define mkdirat     nlibc_mkdirat
@@ -821,7 +898,14 @@ const char *nlibc_dlerror(void);
 #define printf      nlibc_printf
 #define puts        nlibc_puts
 #define putchar     nlibc_putchar
+/* vprintf writes to the HOST's stdout, which is not the guest's: route it to
+ * the stream stdout names here (vfprintf on our FILE is pure). */
+#define vprintf(f, a) vfprintf(nlibc_stdout(), (f), (a))
 #define perror      nlibc_perror
+#define strerror    nlibc_strerror
+#if defined(__APPLE__)
+#define strerror_r  nlibc_strerror_r
+#endif
 #define fileno      nlibc_fileno
 /* The GUEST's kernel ring buffer. There is no host klogctl on Darwin at all,
  * and on Linux the host's would be the wrong kernel; see the .c. */
@@ -857,6 +941,7 @@ const char *nlibc_dlerror(void);
 #define kevent(a, b, c, d, e, f) nlibc_kevent((a), (b), (c), (d), (e), (f))
 #define select      nlibc_select
 #define fork        nlibc_fork
+#define vfork       nlibc_vfork
 #define execl       nlibc_execl
 #define execlp      nlibc_execlp
 #define chroot      nlibc_chroot
@@ -878,12 +963,31 @@ const char *nlibc_dlerror(void);
 #define _ssh_mkstemp nlibc_mkstemp
 #define utimes      nlibc_utimes
 #define futimes     nlibc_futimes
+#define utimensat   nlibc_utimensat
+#define localtime_r nlibc_localtime_r
+#define localtime   nlibc_localtime
+#define gmtime      nlibc_gmtime
+#define asctime     nlibc_asctime
+#define strtok      nlibc_strtok
+#ifdef __APPLE__
+#define basename    nlibc_basename
+#define dirname     nlibc_dirname
+#endif
+#define mktime      nlibc_mktime
+#define timelocal   nlibc_mktime
+#define tzset       nlibc_tzset
+#define ctime_r     nlibc_ctime_r
+#define ctime       nlibc_ctime
+#define futimens    nlibc_futimens
 /* Function-like, as with stat above: `statfs` names both a function and a
  * struct tag, and an object-like macro would rewrite `struct statfs` too. */
 #define statfs(a, b) nlibc_statfs((a), (b))
 #ifndef NATIVE_LIBC_OWN_GLOB
 #define glob        nlibc_glob
 #endif
+/* Darwin's refuses a `[` that opens no bracket expression, which glibc and
+ * POSIX match as itself (`find -name 'a[b'`); see kernel/native_fnmatch.c. */
+#define fnmatch     nlibc_fnmatch
 
 /* Function-like: `mount` is also a struct tag in places, and these should only
  * ever rewrite an actual call. */
@@ -910,6 +1014,10 @@ char *nlibc_strchrnul(const char *s, int c);
 #define exit                     nlibc_exit
 #define _exit                    nlibc_exit
 #define _Exit                    nlibc_exit
+#define abort                    nlibc_abort
+#if defined(__APPLE__)
+#define __assert_rtn             nlibc_assert_rtn
+#endif
 #define getuid                   nlibc_getuid
 #define geteuid                  nlibc_geteuid
 #define getgid                   nlibc_getgid
@@ -991,8 +1099,35 @@ char *nlibc_strchrnul(const char *s, int c);
 #define sigaction(a, b, c)       nlibc_sigaction((a), (b), (c))
 #define signal                   nlibc_signal
 #define sigprocmask              nlibc_sigprocmask
+#define pthread_sigmask          nlibc_pthread_sigmask
+#define getloadavg               nlibc_getloadavg
+#define sigsetmask               nlibc_sigsetmask
+#define sigblock                 nlibc_sigblock
+#define siggetmask               nlibc_siggetmask
 #define sigpending               nlibc_sigpending
 #define sigwait                  nlibc_sigwait
+/* Non-local jumps that leave the host signal mask alone. Darwin's longjmp, and
+ * siglongjmp from a buffer saved with a mask, put the saved mask back with
+ * sigprocmask -- which on Darwin sets the mask of EVERY thread in the process.
+ * Every guest task is a thread of this one process, so native dash raising an
+ * exception (its `exit` builtin is one), or a SmallCLUE applet returning
+ * through its exit override, rewrote the host mask of every task in the app:
+ * unblocking the wake signal where AOK holds it blocked on purpose, blocking it
+ * where a task must be woken. util/sync.h has the kernel's half of this.
+ *
+ * Nothing guest-visible is lost. The mask such a jump saved was the HOST
+ * thread's, never the program's own -- that lives in the guest task and is
+ * reached through nlibc_sigprocmask -- and Linux's setjmp does not save a mask
+ * at all. tools/check-native-libc.py keeps the mask-saving names off its
+ * allowlist, so a program that escapes these macros fails the check. */
+#if defined(__APPLE__)
+int _setjmp(jmp_buf) __attribute__((__returns_twice__));
+void _longjmp(jmp_buf, int) __attribute__((__noreturn__));
+#define setjmp(env)              _setjmp(env)
+#define longjmp(env, val)        _longjmp((env), (val))
+#define sigsetjmp(env, savemask) _setjmp(env)
+#define siglongjmp(env, val)     _longjmp((env), (val))
+#endif
 #define setsid                   nlibc_setsid
 #define setpgid                  nlibc_setpgid
 #define getpgid                  nlibc_getpgid

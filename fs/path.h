@@ -1,8 +1,16 @@
 #ifndef PATH_H
 #define PATH_H
 
+struct fd;
+struct statbuf;
+
 #define AT_PWD (struct fd *) -2
 
+// Whether a symlink SPELLED AS THE FINAL COMPONENT is followed. Every other
+// component is followed either way. NOFOLLOW still RESOLVES that component --
+// it looks the name up and checks what it is -- it just stops at the link
+// rather than chasing it. A caller that must not resolve it at all adds
+// N_PARENT_ONLY below.
 #define N_SYMLINK_FOLLOW 1
 #define N_SYMLINK_NOFOLLOW 2
 // Resolve an absolute path against the REAL filesystem root, ignoring the
@@ -47,6 +55,74 @@
 // must not use this flag and instead performs its own check gated on whether
 // it actually created a new entry. See generic_openat in fs/generic.c.
 #define N_PARENT_DIR_WRITE 4
+// A trailing slash is a request for a DIRECTORY, and these two say what the
+// caller does about that. Both are decided after the parent has been walked
+// and before the final component is looked at, which is where Linux decides
+// them; see the comments at the use sites in fs/path.c.
+//
+// N_SLASH_NOT_A_DIR: the caller creates a name that is not a directory
+// (mknod, mkfifo, symlink, link's new name, and a unix socket bind, which
+// Linux routes through vfs_mknod too). A name spelled with a trailing slash
+// that does not already exist is ENOENT. Not for mkdir, whose whole business
+// is the directory a trailing slash asks for.
+#define N_SLASH_NOT_A_DIR 128
+// N_SLASH_EISDIR: open(O_CREAT). A trailing slash is EISDIR whether or not
+// the name exists, and whatever kind of thing is there.
+#define N_SLASH_EISDIR 256
+// N_PARENT_ONLY: Linux's LOOKUP_PARENT. Walk everything the final component is
+// reached THROUGH and stop: do not look the component itself up, do not follow
+// a symlink there, and do not spend a trailing slash on it. The create and
+// remove families resolve their name this way -- filename_create(),
+// do_unlinkat(), do_rmdir(), do_renameat2() all call filename_parentat() --
+// and then apply their OWN rule to the leftover slash, which is why those
+// rules differ from each other and from a plain lookup's.
+//
+// Without this, N_SYMLINK_NOFOLLOW had to mean both things at once, and the
+// resolution could only serve one of them: it skipped the final component
+// entirely, so the must-be-a-directory check that spends a trailing slash
+// never ran for ANY nofollow caller. lstat("file/") succeeded and
+// unlink("file/") deleted the file. Running that check for every nofollow
+// caller instead is the other wrong answer -- mkdir("dangling-link/") would
+// follow the link and create its target where Linux says EEXIST.
+#define N_PARENT_ONLY 512
+// N_SLASH_UNLINK: unlink() on a name spelled with a trailing slash, which is
+// its own answer again -- do_unlinkat()'s `slashes:` label: EISDIR for a
+// directory, ENOENT for a name that is not there, ENOTDIR for anything else.
+#define N_SLASH_UNLINK 1024
+// N_DETACHED_OK: the walk may enter MOUNT_STAGING_DIR (kernel/fs.h), where
+// detached mounts are parked. No path the guest spells may: on Linux nothing
+// reaches a detached mount by name, only through a descriptor already in it.
+// So this is for walks that ARE that descriptor -- fsmount() opening the
+// mount it made, a /proc/<pid>/{cwd,root,fd/N} link being followed, which
+// Linux jumps through to the file itself, and a descriptor's own path opened
+// again (generic_open_realroot: a /proc/self/fd/N reopen, execveat(fd, "",
+// AT_EMPTY_PATH)) or linked (linkat(fd, "", ..., AT_EMPTY_PATH)) -- and
+// fs/path.c sets it for itself on a relative symlink inside a detached mount,
+// whose target is re-walked from the top.
+#define N_DETACHED_OK 2048
+// N_IN_ROOT: openat2's RESOLVE_IN_ROOT. The directory the walk starts from is
+// its root for the length of the walk, as if the caller had chroot()ed to it:
+// an absolute path starts there, an absolute symlink target starts there, and
+// `..` does not climb above it. It is the chroot rule with a different
+// directory, and holds exactly as well as chroot does here.
+#define N_IN_ROOT 4096
+// N_NO_MAGICLINKS: openat2's RESOLVE_NO_MAGICLINKS. A procfs link that names
+// a file rather than spelling a path -- /proc/<pid>/{cwd,root,exe,fd/N,ns/*}
+// -- is ELOOP instead of being followed. /proc/self and its like are ordinary
+// links and are followed. N_IN_ROOT refuses the same links with EXDEV, as
+// Linux does for any scoped walk: where they land is outside the scope by
+// construction.
+#define N_NO_MAGICLINKS 8192
+// N_BENEATH: openat2's RESOLVE_BENEATH. Like N_IN_ROOT the walk may not leave
+// the directory it starts from, but leaving is refused (EXDEV) where N_IN_ROOT
+// turns it back: an absolute path, an absolute symlink target, a `..` at the
+// starting directory, and a link that names a file rather than a path.
+#define N_BENEATH 16384
+// N_NO_XDEV: openat2's RESOLVE_NO_XDEV. The walk stays on the mount it starts
+// on: stepping onto a mount point, a `..` out of a mount's root, an absolute
+// symlink followed from a mount that is not the root's, and any link that
+// names a file are all EXDEV. A bind mount is a mount like any other.
+#define N_NO_XDEV 32768
 
 // Normalizes the path specified and writes the result into the out buffer.
 //
@@ -77,6 +153,32 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags);
 // into this directory", so the command worked for root and failed for every
 // normal user.
 int path_final_dot(const char *path);
+
+// The parent walk that has to happen BEFORE path_final_dot's answer is given:
+// Linux's filename_create()/do_unlinkat()/do_rmdir() all run
+// filename_parentat() first and only then look at the final component's type,
+// so a parent that is missing, is a regular file, or cannot be searched
+// reports its own error and this rule reports nothing. AOK answered the rule
+// with nothing resolved at all, which made mknod("gone/.") EEXIST where Linux
+// says ENOENT. Returns 0 if the walk arrived, else the error to report.
+// Only meaningful for a path whose final component is "." or ".."; see the
+// definition in fs/path.c.
+int path_parent_walk(struct fd *at, const char *path_raw);
+
+// Was `path` spelled with a trailing slash -- Linux's
+// `nd->last.name[nd->last.len]`, the character sitting where the final
+// component ends? The whole trailing-slash family of rules turns on it.
+bool path_trailing_slash(const char *path);
+
+// Look the FINAL component up the way a LOOKUP_PARENT caller does after its
+// walk -- lookup_one_qstr_excl() -- and report what kind of thing is there: no
+// symlink followed, no trailing slash spent, a dangling symlink counted as a
+// name that IS there. Returns 0 with `stat` filled, the parent walk's error,
+// or _ENOENT for a negative dentry. Only rename needs it, because its
+// trailing-slash rule is the one that reads the type of a name OTHER than the
+// one the slash is on; see generic_renameat.
+int path_lookup_final(struct fd *at, const char *path_raw, struct statbuf *stat);
+
 bool path_is_normalized(const char *path);
 
 // Helper function for iterating through a normalized path.

@@ -43,7 +43,7 @@ PURE = {
     "strncmp", "strcasecmp", "strncasecmp", "strchr", "strrchr", "strstr",
     "strcasestr", "strdup", "strndup", "strspn", "strcspn", "strpbrk", "strtok",
     "strtok_r", "strsep", "strerror", "strsignal", "basename", "dirname",
-    "fnmatch", "mbrtowc", "wcwidth", "swab",
+    "mbrtowc", "wcwidth", "swab",
     # allocation
     "malloc", "calloc", "realloc", "free", "reallocf", "posix_memalign",
     "open_memstream",   # memory-backed FILE; touches nothing
@@ -103,6 +103,17 @@ PURE = {
     # reason to revisit would be a guest with a deliberately controlled RNG -- a
     # seeded rootfs for reproducible tests -- which this silently bypasses.
     "arc4random_buf",
+    # arc4random_stir, the fourth of that family and the easy one. On Darwin
+    # it is a single `ret` -- disassembled from libsystem_c, not assumed -- so
+    # there is no state behind it to observe, host or guest. Its one caller is
+    # entropy.c's reseed_prngs() after fork ("noop on recent arc4random()
+    # implementations", upstream's own comment), and the arc4random_buf on the
+    # next line is what actually notices the new pid. Routing it would mean
+    # inventing a guest meaning for a name Linux never had: glibc has no
+    # arc4random_stir, so on a Linux build config.h leaves
+    # HAVE_ARC4RANDOM_STIR undefined and openbsd-compat.h makes the call an
+    # empty macro. Only the Darwin build references the symbol at all.
+    "arc4random_stir",
     # ctype
     "isalnum", "isalpha", "isascii", "isblank", "iscntrl", "isdigit", "isgraph",
     "islower", "isprint", "ispunct", "isspace", "isupper", "isxdigit",
@@ -169,9 +180,13 @@ PURE = {
     # The gz* family is emphatically NOT here and must never be. Those are the
     # half of zlib that opens files and reads descriptors, and being a host
     # dylib is exactly why they cannot be allowed to -- see the header. This is
-    # a list of seven functions, not permission to link zlib and call it.
+    # a list of eight functions, not permission to link zlib and call it.
+    # crc32 is arithmetic over a buffer the caller hands it (gzip writes its
+    # own header and trailer).
     "deflate", "deflateEnd", "deflateInit2_",
-    "inflate", "inflateEnd", "inflateInit2_", "inflateReset",
+    "inflate", "inflateEnd", "inflateInit2_", "inflateReset", "crc32",
+    # The same, as libgit2 spells them: default-window init, and reset.
+    "deflateInit_", "deflateReset", "inflateInit_",
     # termios helpers that only edit a struct in memory. Not tcgetattr or
     # tcsetattr, which talk to a terminal and are redirected: these set or read
     # fields, and the redirected calls translate the result on its way to the
@@ -220,9 +235,10 @@ PURE = {
     # and the host's database is Darwin's, so a name has to be translated
     # rather than passed through -- C.UTF-8 exists on Linux and macOS but not
     # on iOS, which is a warning on every shell start.
-    "localeconv", "strftime", "strptime", "mktime", "timegm",
-    "gmtime", "gmtime_r", "localtime", "localtime_r", "difftime", "asctime",
-    "ctime", "tzset",
+    "localeconv", "strftime", "strptime", "timegm",
+    "gmtime", "gmtime_r", "difftime", "asctime", "asctime_r",
+    # NOT localtime, localtime_r, mktime, ctime or tzset: those convert in a
+    # zone, and the host's is the app's, not the guest's. kernel/native_tz.c.
     # Thread primitives. Creation is redirected -- a new thread needs the task
     # propagated onto it -- but locking and joining touch nothing the guest can
     # observe.
@@ -233,7 +249,25 @@ PURE = {
     "pthread_detach", "pthread_self", "pthread_equal", "pthread_attr_init",
     "pthread_attr_destroy", "pthread_attr_setstacksize",
     "pthread_attr_setdetachstate", "pthread_once", "pthread_key_create",
-    "pthread_getspecific", "pthread_setspecific",
+    "pthread_getspecific", "pthread_setspecific", "pthread_key_delete",
+    "pthread_rwlock_init", "pthread_rwlock_destroy", "pthread_rwlock_rdlock",
+    "pthread_rwlock_wrlock", "pthread_rwlock_unlock",
+    # A monotonic tick count for timing (libgit2's git_time_monotonic and its
+    # random seed). Host time IS the guest's time source; nothing to route.
+    "mach_absolute_time",
+    # libgit2's HTTPS (streams/stransport.c), deliberately the host's:
+    # SecureTransport is a TLS engine that never touches a descriptor itself --
+    # its I/O goes through the SSLSetIOFuncs callbacks, which libgit2 points at
+    # its own socket stream, and that stream is routed. Certificate trust is
+    # iOS's own store, the same choice curl and wget make through NSURLSession
+    # (deps/smallclue-shim). The CF calls only read what Security hands back.
+    "SSLCreateContext", "SSLSetIOFuncs", "SSLSetConnection",
+    "SSLSetPeerDomainName", "SSLSetProtocolVersionMin", "SSLSetSessionOption",
+    "SSLHandshake", "SSLRead", "SSLWrite", "SSLClose", "SSLCopyPeerTrust",
+    "SecTrustEvaluate", "SecTrustGetCertificateAtIndex",
+    "SecCertificateCopyData", "SecCopyErrorMessageString",
+    "CFRelease", "CFDataGetBytePtr", "CFDataGetLength", "CFStringGetLength",
+    "CFStringGetCString", "CFStringGetCStringPtr",
     # The calling HOST thread's own stack bounds, which is the only correct
     # answer for a stack-overflow guard: what is about to overflow is the host
     # stack the native program is running on, not anything the guest models.
@@ -241,8 +275,13 @@ PURE = {
     # questions for the same reason; deps/zsh/Src/aok_fork.c is the caller that
     # made them show up here.
     "pthread_get_stackaddr_np", "pthread_get_stacksize_np",
-    # non-local jumps: control flow within the program
-    "setjmp", "longjmp", "sigsetjmp", "siglongjmp", "_setjmp", "_longjmp",
+    # Non-local jumps: control flow within the program -- but only the two that
+    # leave the signal mask alone. setjmp/longjmp and sigsetjmp/siglongjmp
+    # save and restore a mask, and Darwin restores it with sigprocmask, which
+    # sets the mask of EVERY host thread in the app. kernel/native_libc.h maps
+    # all four onto these; one of them showing up here means a program escaped
+    # that mapping.
+    "_setjmp", "_longjmp",
     # Reading the clock. The guest's time IS the host's, so this is not a leak.
     "clock_gettime", "gettimeofday", "time", "clock",
     # Wide characters and multibyte conversion. Every one of these transforms a
@@ -294,18 +333,16 @@ PURE = {
     # Darwin's strmode differs from openbsd's on 4096 of 65536 modes. It is
     # compiled from openbsd-compat now (HAVE_STRMODE undefined) and so is no
     # longer a host symbol at all.
-    # Rust's two pieces of runtime plumbing.
-    #
-    # __assert_rtn is Darwin's assert-failure handler: it prints and aborts, so
-    # it qualifies on the same terms as abort() below -- a crash either way, and
-    # no way to observe or change the host.
+    # Rust's piece of runtime plumbing. (__assert_rtn, Darwin's assert-failure
+    # handler, was here beside abort() as "a crash either way". Both are routed
+    # now: the crash was the app's, and build 558 had one from the field.)
     #
     # rust_eh_personality is the unwinder's personality routine. It is called
     # by the unwind machinery while walking frames and reads only the tables
     # the compiler emitted alongside the code. The crate is built panic=abort,
     # so nothing here should reach it at all; it is referenced because std is
     # compiled once for both panic strategies.
-    "__assert_rtn", "rust_eh_personality",
+    "rust_eh_personality",
     # sysctlbyname, and only as Rust's std_detect uses it.
     #
     # This is the one name in the routed Rust archive that llvm-objcopy cannot
@@ -322,11 +359,6 @@ PURE = {
     # prepared to give it. The split is what makes this entry safe; without it
     # this would be a hole.
     "sysctlbyname",
-    # abort() raises SIGABRT on the calling thread. It ends the app rather than
-    # the task, which is wrong, but it is a crash either way and not a way to
-    # observe or change the host -- routing it would be an improvement, not a
-    # correctness fix.
-    "abort",
 }
 
 # Compiler and runtime plumbing rather than calls the program made.
@@ -367,6 +399,9 @@ INTERNAL = {
     "__snprintf_chk", "__sprintf_chk", "__vsnprintf_chk",
     "__strcat_chk", "__strcpy_chk", "__strncpy_chk",
     "__strlcat_chk", "__strlcpy_chk",
+    # stpcpy/stpncpy's, which arrived with dash -- same wrappers, same
+    # reasoning; they were simply not in any archive on this list before.
+    "__stpcpy_chk", "__stpncpy_chk",
     "__darwin_check_fd_set_overflow",
     # errno. Darwin expands errno to (*__error()), which returns a pointer to
     # the CALLING THREAD's copy -- and a native program runs on its guest
@@ -460,14 +495,14 @@ def _symbols(path, args):
 # receiver is. Calling it pure would hand back precisely the matched-on-form
 # hole the note below describes, and one entry would exempt every Objective-C
 # call in any future file. So the archive stays out, and what appears here
-# instead is the seven-name interface it presents -- names a reader can follow
+# instead is the eight-name interface it presents -- names a reader can follow
 # to one file and one written justification.
 #
 # The cost, stated so it is not discovered later: nothing checks that file. It
 # is 570 lines and it is on the reviewer.
 SHIM_TO_HOST = {
     "curl_easy_init", "curl_easy_setopt", "curl_easy_perform",
-    "curl_easy_cleanup", "curl_easy_strerror",
+    "curl_easy_cleanup", "curl_easy_strerror", "curl_easy_getinfo",
     "curl_slist_append", "curl_slist_free_all",
 }
 
@@ -521,8 +556,9 @@ HOST_THREAD_RUNTIME = {
     "madvise", "mlock", "munlock",
 }
 
-DEFAULT_TARGETS = ("build/libsmallclue.a", "build/libnextvi.a",
-                   "build/libbash.a", "build/libzsh.a", "build/libopenssh.a",
+DEFAULT_TARGETS = ("build/libsmallclue.a", "build/libnextvi.a", "build/libgit2.a",
+                   "build/libbash.a", "build/libzsh.a", "build/libdash.a",
+                   "build/libopenssh.a",
                    "build/libopenssh_scp.a", "build/libopenssh_stubs.a",
                    "build/libopenssh_smult_curve25519_ref.a",
                    # AOK's own single-file native programs. Each is built into
@@ -603,6 +639,17 @@ def main():
     if not targets:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         targets = [os.path.join(root, t) for t in DEFAULT_TARGETS]
+        # `ninja -C build ish` links SmallCLUE's objects without ever making
+        # its archive, and a missing target used to be skipped in silence --
+        # so the gate said "clean" about code it had not looked at, while cp
+        # called the host's utimensat (2026-10-01). SmallCLUE is in every
+        # build; its absence is an error, not a pass.
+        smallclue = os.path.join(root, "build/libsmallclue.a")
+        if not os.path.exists(smallclue):
+            print("check-native-libc: build/libsmallclue.a is not built -- run "
+                  "ninja -C build libsmallclue.a (ninja ish does not make it)",
+                  file=sys.stderr)
+            return 2
         targets = [t for t in targets if os.path.exists(t)]
         if not targets:
             print("check-native-libc: nothing built yet -- run ninja -C build, "

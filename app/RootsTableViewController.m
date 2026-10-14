@@ -17,14 +17,14 @@
 #import "WorkspaceViewController.h"
 #include "kernel/fs.h"
 
-@interface RootsTableViewController ()
+@interface RootsTableViewController () <WorkspaceTextScaledPage>
 // Archives found in the shared /AOK/persist/roots directory, shown as the
 // "Root Cached Filesystems" section. Cached so the table data source is stable
 // within a reload; refreshed on appear and when roots change.
 @property (nonatomic, copy) NSArray<NSURL *> *cachedRootArchives;
 @end
 
-@interface RootDetailViewController : UITableViewController <UIDocumentPickerDelegate, UITextFieldDelegate>
+@interface RootDetailViewController : UITableViewController <UIDocumentPickerDelegate, UITextFieldDelegate, WorkspaceTextScaledPage>
 
 @property (nonatomic) NSString *rootName;
 @property (nonatomic) NSURL *exportURL;
@@ -35,6 +35,54 @@
 
 @end
 
+// A root the app is holding open: the one booted as / this session, or the one
+// set to boot next. Neither can be renamed or deleted; Roots refuses both, and
+// the controls should not offer what will be refused. See -[RootDetailView-
+// Controller isInUseRoot] for why it is both and not only the default.
+static BOOL RootNameIsInUse(NSString *rootName) {
+    return [rootName isEqualToString:Roots.instance.defaultRoot] ||
+        [rootName isEqualToString:Roots.instance.bootedRoot];
+}
+
+// Asks, then deletes. The one confirmation behind both ways of deleting a
+// machine -- the Delete Filesystem row on its own screen and a swipe on its row
+// in the list (#575) -- so the two say the same thing and refuse the same
+// roots. The title names the root: from the list, a swipe can land on the row
+// next to the one meant. done(YES) once the root is gone; done(NO) on Cancel,
+// or on a failure, which has already been shown.
+static void RootConfirmAndDelete(UIViewController *host, NSString *rootName,
+                                 void (^done)(BOOL deleted)) {
+    if (RootNameIsInUse(rootName)) {
+        done(NO);
+        return;
+    }
+    NSString *message = NSLocalizedString(@"I can't be bothered to implement any undo or regret UI so this is irreversible.", @"Delete filesystem confirmation message (deliberately informal)");
+    // Its saved sessions go with it (Roots destroyRootNamed), so say so.
+    NSUInteger sessions = ISHSessionCountForRoot(ISHSessionRootIdentityNamed(rootName));
+    if (sessions > 0)
+        message = [message stringByAppendingFormat:@"\n\n%@",
+                   sessions == 1
+                       ? NSLocalizedString(@"The saved session from this filesystem will be deleted too.", @"Delete filesystem confirmation, one saved session")
+                       : [NSString stringWithFormat:NSLocalizedString(@"%lu saved sessions from this filesystem will be deleted too.", @"Delete filesystem confirmation; %lu is the number of saved sessions"),
+                          (unsigned long) sessions]];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:[NSString stringWithFormat:NSLocalizedString(@"Delete \u201c%@\u201d?", @"Delete filesystem alert title; %@ is the filesystem name"), rootName]
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"Alert button") style:UIAlertActionStyleCancel handler:^(UIAlertAction *action) {
+        done(NO);
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Delete", @"Alert button that deletes a filesystem") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        NSError *error;
+        if (![Roots.instance destroyRootNamed:rootName error:&error]) {
+            [host presentError:error title:NSLocalizedString(@"Delete failed", @"Error alert title")];
+            done(NO);
+        } else {
+            done(YES);
+        }
+    }]];
+    [host presentViewController:alert animated:YES completion:nil];
+}
+
 @implementation RootsTableViewController
 
 - (BOOL)_bundledChoiceRequiresAMD64Bringup:(NSDictionary<NSString *, NSString *> *)choice {
@@ -42,21 +90,23 @@
 }
 
 - (NSString *)_bundledChoiceSubtitle:(NSDictionary<NSString *, NSString *> *)choice {
+    if ([Roots bundledRootChoiceIsNative:choice])
+        return NSLocalizedString(@"Built-in programs only (zsh, SmallCLUE, ssh, editors). No download, no package manager.", @"Distribution row subtitle for the built-in native filesystem");
     NSString *subtitle;
     if ([self _bundledChoiceRequiresAMD64Bringup:choice]) {
-        subtitle = @"x86_64 (amd64) guest rootfs.";
+        subtitle = NSLocalizedString(@"x86_64 (amd64) guest rootfs.", @"Distribution row subtitle: architecture");
     } else if ([choice[@"guestABI"] isEqualToString:@"arm64"]) {
-        subtitle = @"arm64 (native AArch64) guest rootfs.";
+        subtitle = NSLocalizedString(@"arm64 (native AArch64) guest rootfs.", @"Distribution row subtitle: architecture");
     } else if ([choice[@"guestABI"] isEqualToString:@"riscv64"]) {
-        subtitle = @"riscv64 (RISC-V) guest rootfs.";
+        subtitle = NSLocalizedString(@"riscv64 (RISC-V) guest rootfs.", @"Distribution row subtitle: architecture");
     } else {
-        subtitle = @"i386 guest rootfs.";
+        subtitle = NSLocalizedString(@"i386 guest rootfs.", @"Distribution row subtitle: architecture");
     }
     if ([Roots.instance bundledRootChoiceNeedsDownload:choice]) {
         NSString *size = choice[@"downloadSize"];
         subtitle = size.length != 0
-            ? [subtitle stringByAppendingFormat:@" Downloads %@.", size]
-            : [subtitle stringByAppendingString:@" Downloads on use."];
+            ? [NSString stringWithFormat:NSLocalizedString(@"%@ Downloads %@.", @"Distribution row subtitle; first %@ is the architecture sentence, second the download size"), subtitle, size]
+            : [NSString stringWithFormat:NSLocalizedString(@"%@ Downloads on use.", @"Distribution row subtitle; %@ is the architecture sentence"), subtitle];
     }
     return subtitle;
 }
@@ -79,7 +129,7 @@
 }
 
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)bundledChoices {
-    return Roots.instance.bundledRootChoices;
+    return Roots.instance.offeredRootChoices;
 }
 
 // Groups bundledChoices by distro family (kBundledRootFamilyKey in Roots.m) so
@@ -218,7 +268,7 @@
     NSString *initialWindow = choice[@"initialWindow"];
 
     ProgressReportViewController *progressVC = [self.storyboard instantiateViewControllerWithIdentifier:@"progress"];
-    progressVC.title = [NSString stringWithFormat:@"Importing %@", displayName];
+    progressVC.title = [NSString stringWithFormat:NSLocalizedString(@"Importing %@", @"Progress screen title; %@ is a distribution name"), displayName];
     [self presentViewController:progressVC animated:YES completion:nil];
 
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
@@ -228,7 +278,7 @@
             [progressVC dismissViewControllerAnimated:YES completion:^{
                 if (!success) {
                     if (error != nil)
-                        [self presentError:error title:@"Import failed"];
+                        [self presentError:error title:NSLocalizedString(@"Import failed", @"Error alert title")];
                     return;
                 }
                 NSString *currentInitialWindow =
@@ -252,25 +302,12 @@
     });
 }
 
-- (void)_configurePopoverForAlert:(UIAlertController *)alert sender:(id)sender {
-    UIPopoverPresentationController *popover = alert.popoverPresentationController;
-    if (popover != nil) {
-        if ([sender isKindOfClass:UIBarButtonItem.class]) {
-            popover.barButtonItem = sender;
-        } else if ([sender isKindOfClass:UIView.class]) {
-            popover.sourceView = sender;
-            popover.sourceRect = ((UIView *) sender).bounds;
-        } else {
-            popover.sourceView = self.view;
-            popover.sourceRect = CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
-        }
-    }
-}
-
 // One-line label for an architecture variant when offering it as a sub-choice
 // under a distro-family row -- distinct from _bundledChoiceSubtitle, which is
 // a full sentence used under a single-variant family's own row.
 - (NSString *)_archChoiceActionTitle:(NSDictionary<NSString *, NSString *> *)choice {
+    if ([Roots bundledRootChoiceIsNative:choice])
+        return NSLocalizedString(@"Native (Bundled)", @"Architecture choice for the built-in native filesystem");
     NSString *abi = choice[@"guestABI"];
     NSString *label;
     if ([abi isEqualToString:@"amd64"]) {
@@ -285,10 +322,10 @@
     if ([Roots.instance bundledRootChoiceNeedsDownload:choice]) {
         NSString *size = choice[@"downloadSize"];
         return size.length != 0
-            ? [NSString stringWithFormat:@"%@ — Downloads %@", label, size]
-            : [NSString stringWithFormat:@"%@ — Downloads on first use", label];
+            ? [NSString stringWithFormat:NSLocalizedString(@"%@ — Downloads %@", @"Architecture choice; first %@ is the architecture, second the download size"), label, size]
+            : [NSString stringWithFormat:NSLocalizedString(@"%@ — Downloads on first use", @"Architecture choice; %@ is the architecture"), label];
     }
-    return [NSString stringWithFormat:@"%@ (Bundled)", label];
+    return [NSString stringWithFormat:NSLocalizedString(@"%@ (Bundled)", @"Architecture choice; %@ is the architecture"), label];
 }
 
 // Distro-family rows with more than one architecture variant present an
@@ -302,47 +339,42 @@
         return;
     }
 
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:group[@"displayName"]
-                                             message:@"Choose an architecture."
-                                      preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:group[@"displayName"]
+                                                         message:NSLocalizedString(@"Choose an architecture.", @"Action sheet message")];
     for (NSDictionary<NSString *, NSString *> *choice in variants) {
-        [alert addAction:[UIAlertAction actionWithTitle:[self _archChoiceActionTitle:choice]
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:[self _archChoiceActionTitle:choice]
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self _confirmBundledImportChoiceIfNeeded:choice];
-        }]];
+        }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
-    [self _configurePopoverForAlert:alert sender:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert addActionWithTitle:NSLocalizedString(@"Cancel", @"Action sheet button")
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)presentImportOptionsFromSender:(id)sender {
-    UIAlertController *alert =
-        [UIAlertController alertControllerWithTitle:@"Import Filesystem"
-                                            message:@"Choose a distribution or import a root archive from Files."
-                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    ISHActionSheet *alert = [ISHActionSheet actionSheetWithTitle:NSLocalizedString(@"Import Filesystem", @"Action sheet title")
+                                                         message:NSLocalizedString(@"Choose a distribution or import a root archive from Files.", @"Action sheet message")];
 
     NSArray<NSDictionary<NSString *, id> *> *groups =
         [self.officialFamilyGroups arrayByAddingObjectsFromArray:self.communityFamilyGroups];
     for (NSDictionary<NSString *, id> *group in groups) {
         NSString *displayName = group[@"displayName"];
         NSString *title = [group[@"tier"] isEqualToString:@"community"]
-            ? [NSString stringWithFormat:@"%@ (Community)", displayName]
+            ? [NSString stringWithFormat:NSLocalizedString(@"%@ (Community)", @"Import menu item; %@ is a community distribution name"), displayName]
             : displayName;
-        [alert addAction:[UIAlertAction actionWithTitle:title
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(__unused UIAlertAction *action) {
+        [alert addActionWithTitle:title
+                            style:UIAlertActionStyleDefault
+                          handler:^(__unused UIAlertAction *action) {
             [self _chooseArchitectureForGroup:group sender:sender];
-        }]];
+        }];
     }
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Browse Files…"
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *action) {
+    [alert addActionWithTitle:NSLocalizedString(@"Browse Files…", @"Import menu action: pick an archive in Files")
+                        style:UIAlertActionStyleDefault
+                      handler:^(__unused UIAlertAction *action) {
         UIDocumentPickerViewController *picker = [[UIDocumentPickerViewController alloc]
                                                   initWithDocumentTypes:@[@"public.tar-archive", @"org.gnu.gnu-zip-archive", @"public.bzip2-archive"]
                                                   inMode:UIDocumentPickerModeImport];
@@ -351,14 +383,13 @@
             picker.shouldShowFileExtensions = YES;
         }
         picker.delegate = self;
-    }]];
+    }];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                                              style:UIAlertActionStyleCancel
-                                            handler:nil]];
+    [alert addActionWithTitle:NSLocalizedString(@"Cancel", @"Action sheet button")
+                        style:UIAlertActionStyleCancel
+                      handler:nil];
 
-    [self _configurePopoverForAlert:alert sender:sender];
-    [self presentViewController:alert animated:YES completion:nil];
+    [alert presentFromViewController:self source:sender];
 }
 
 - (void)updateEmptyState {
@@ -378,13 +409,14 @@
         label.textColor = UIColor.grayColor;
     }
     label.font = [UIFont preferredFontForTextStyle:UIFontTextStyleBody];
+    ISHWorkspaceScaleTextFont(label, ISHWorkspaceTextScaleForViewController(self));
     if (Roots.instance.initialBundledRootImportInProgress) {
-        label.text = @"Extracting the bundled filesystem.\nThis can take a moment on first launch.";
+        label.text = NSLocalizedString(@"Extracting the bundled filesystem.\nThis can take a moment on first launch.", @"Filesystems list empty-state text");
     } else if (Roots.instance.initialBundledRootImportError != nil) {
-        label.text = [NSString stringWithFormat:@"%@\n\nTap Import to add a filesystem manually after freeing space.",
+        label.text = [NSString stringWithFormat:NSLocalizedString(@"%@\n\nTap Import to add a filesystem manually after freeing space.", @"Filesystems list empty-state text; %@ is the import error"),
                       Roots.instance.initialBundledRootImportError.localizedDescription];
     } else {
-        label.text = @"No filesystems are available.\nTap Import to add a root filesystem.";
+        label.text = NSLocalizedString(@"No filesystems are available.\nTap Import to add a root filesystem.", @"Filesystems list empty-state text");
     }
     label.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -419,6 +451,7 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
     [self reloadCachedRootArchives];
     [Roots.instance observe:@[@"roots", @"defaultRoot", @"initialBundledRootImportInProgress", @"initialBundledRootImportError"]
                     options:0 owner:self usingBlock:^(typeof(self) self) {
@@ -426,7 +459,19 @@
         [self updateEmptyState];
         [self.tableView reloadData];
     }];
+    // A refresh that lands while this screen is up rewrites the distribution
+    // rows under the user, so redraw when the catalogue changes rather than
+    // leaving them looking at the list the app was built with.
+    [NSNotificationCenter.defaultCenter addObserver:self
+                                           selector:@selector(rootCatalogDidChange:)
+                                               name:RootsCatalogDidChangeNotification
+                                             object:nil];
     [self updateEmptyState];
+}
+
+- (void)rootCatalogDidChange:(__unused NSNotification *)notification {
+    [self updateEmptyState];
+    [self.tableView reloadData];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -435,6 +480,9 @@
     // (wget/scp/Files) since this screen was last shown.
     [self reloadCachedRootArchives];
     [self.tableView reloadData];
+    // Opening this screen is the moment the catalogue matters, so check for a
+    // newer one. Rate-limited inside, so flipping back and forth is free.
+    [Roots.instance refreshRootCatalogFromNetwork];
 }
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
@@ -464,19 +512,19 @@
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
     if ([self sectionShowsInstalledRoots:section]) {
         if (self.showsOfficialChoicesSection || self.showsCommunityChoicesSection || self.showsCachedRootsSection)
-            return @"Installed Filesystems";
-        return self.choosesRootOnSelection ? @"Choose a Filesystem" : nil;
+            return NSLocalizedString(@"Installed Filesystems", @"Section header");
+        return self.choosesRootOnSelection ? NSLocalizedString(@"Choose a Filesystem", @"Section header") : nil;
     }
     if ([self sectionShowsCachedRoots:section]) {
-        return @"Root Cached Filesystems (/AOK/persist/roots)";
+        return NSLocalizedString(@"Root Cached Filesystems (/AOK/persist/roots)", @"Section header");
     }
     if ([self sectionShowsOfficialChoices:section]) {
         if (self.showsInstalledRootsSection || self.showsCachedRootsSection || self.showsCommunityChoicesSection)
-            return @"Official Distributions";
-        return @"Choose a Filesystem";
+            return NSLocalizedString(@"Official Distributions", @"Section header");
+        return NSLocalizedString(@"Choose a Filesystem", @"Section header");
     }
     if ([self sectionShowsCommunityChoices:section]) {
-        return @"Community Distributions";
+        return NSLocalizedString(@"Community Distributions", @"Section header");
     }
     return nil;
 }
@@ -495,28 +543,25 @@ static BOOL ISHRunningAsIOSAppOnMac(void) {
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if ([self sectionShowsInstalledRoots:section]) {
         if (ISHRunningAsIOSAppOnMac()) {
-            NSString *note = @"Browsing these from the Files app isn't available on a Mac — "
-                              "Apple's File Provider framework doesn't support the kind of "
-                              "extension iSH-AOK uses, so it has been turned off here rather "
-                              "than left to fail. Everything else works as usual.";
+            NSString *note = NSLocalizedString(@"Browsing these from the Files app isn't available on a Mac — Apple's File Provider framework doesn't support the kind of extension iSH-AOK uses, so it has been turned off here rather than left to fail. Everything else works as usual.", @"Section footer shown when running on a Mac");
             if (self.choosesRootOnSelection)
-                return [@"Tap a filesystem to make it active and continue booting.\n\n" stringByAppendingString:note];
+                return [NSString stringWithFormat:@"%@\n\n%@", NSLocalizedString(@"Tap a filesystem to make it active and continue booting.", @"Section footer"), note];
             return note;
         }
     }
     if ([self sectionShowsInstalledRoots:section] && self.choosesRootOnSelection) {
-        return @"Tap a filesystem to make it active and continue booting.";
+        return NSLocalizedString(@"Tap a filesystem to make it active and continue booting.", @"Section footer");
     }
     if ([self sectionShowsCachedRoots:section]) {
-        return @"Archives in /AOK/persist/roots (shared across all filesystems). Tap one to install it as a new filesystem. Swipe to delete.";
+        return NSLocalizedString(@"Archives in /AOK/persist/roots (shared across all filesystems). Tap one to install it as a new filesystem. Swipe to delete.", @"Section footer");
     }
     if ([self sectionShowsOfficialChoices:section]) {
         if (!self.showsInstalledRootsSection)
-            return @"Choose a distribution below (you'll be asked which architecture if more than one is available), or tap Import to browse for another archive.";
-        return @"Maintained and regression-tested as part of iSH-AOK. Can be imported again at any time.";
+            return NSLocalizedString(@"Choose a distribution below (you'll be asked which architecture if more than one is available), or tap Import to browse for another archive.", @"Section footer");
+        return NSLocalizedString(@"Maintained and regression-tested as part of iSH-AOK. Can be imported again at any time.", @"Section footer for official distributions");
     }
     if ([self sectionShowsCommunityChoices:section]) {
-        return @"Contributed or experimental, without the same support guarantees as the official distributions above. Downloaded on first use into /AOK/persist/roots, where they can be deleted afterward.";
+        return NSLocalizedString(@"Contributed or experimental, without the same support guarantees as the official distributions above. Downloaded on first use into /AOK/persist/roots, where they can be deleted afterward.", @"Section footer for community distributions");
     }
     return nil;
 }
@@ -557,7 +602,22 @@ static UIColor *RootRowInUseAccentColor(void) {
     }];
 }
 
+// At the text size of the Workspace window this list is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are. Applied
+// after the branch below has set its own fonts, to every branch alike, so a
+// dequeued cell cannot carry one row's size into another.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    [self updateEmptyState];
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if ([self sectionShowsOfficialChoices:indexPath.section] || [self sectionShowsCommunityChoices:indexPath.section]) {
         UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"BundledRootChoice"];
         if (cell == nil)
@@ -581,7 +641,7 @@ static UIColor *RootRowInUseAccentColor(void) {
                 else
                     [archLabels addObject:@"i386"];
             }
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu architectures: %@",
+            cell.detailTextLabel.text = [NSString stringWithFormat:NSLocalizedString(@"%lu architectures: %@", @"Distribution row subtitle; %lu is a count, %@ a list of architectures"),
                                           (unsigned long) variants.count,
                                           [archLabels componentsJoinedByString:@", "]];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -664,7 +724,8 @@ static UIColor *RootRowInUseAccentColor(void) {
     //
     // The point sizes match the storyboard prototype (17 and 11); the bold
     // weight and the accent are the only differences, so nothing reflows
-    // between the two states.
+    // between the two states. A Workspace window's text size scales both
+    // alike afterwards, in -tableView:cellForRowAtIndexPath:.
     if (isBootedRoot) {
         cell.backgroundColor = RootRowInUseBackgroundColor();
         cell.textLabel.font = [UIFont boldSystemFontOfSize:17];
@@ -673,7 +734,7 @@ static UIColor *RootRowInUseAccentColor(void) {
         // A filled dot as well as the colour: the same distinction has to
         // survive greyscale, and a colour-blind reader gets no cue from green.
         cell.detailTextLabel.text =
-            @"\u25cf IN USE \u2014 mounted at / \u00b7 can't be deleted";
+            NSLocalizedString(@"\u25cf IN USE \u2014 mounted at / \u00b7 can't be deleted", @"Filesystem row subtitle for the running filesystem");
     } else {
         // secondarySystemGrouped, not nil: this is a grouped table, and a nil
         // background is transparent rather than default -- the cell would lose
@@ -682,9 +743,13 @@ static UIColor *RootRowInUseAccentColor(void) {
         cell.textLabel.font = [UIFont systemFontOfSize:17];
         cell.detailTextLabel.font = [UIFont systemFontOfSize:11];
         cell.detailTextLabel.textColor = UIColor.secondaryLabelColor;
-        cell.detailTextLabel.text = mounted
-            ? [NSString stringWithFormat:@"Mounted at %@", mountPoint]
-            : nil;
+        NSString *where = mounted ? [NSString stringWithFormat:NSLocalizedString(@"Mounted at %@", @"Filesystem row subtitle; %@ is a mount point"), mountPoint] : nil;
+        // The default that is not yet running -- "Next Launch" on its screen
+        // leaves exactly this -- needs saying, or the choice is invisible
+        // until the next launch acts on it.
+        if (isDefaultRoot)
+            where = where != nil ? [NSString stringWithFormat:NSLocalizedString(@"Boots next \u00b7 %@", @"Filesystem row subtitle; %@ is the Mounted at text"), where] : NSLocalizedString(@"Boots next", @"Filesystem row subtitle: this filesystem boots at the next launch");
+        cell.detailTextLabel.text = where;
     }
 
     if (isDefaultRoot) {
@@ -694,12 +759,15 @@ static UIColor *RootRowInUseAccentColor(void) {
     }
     if (isBootedRoot)
         cell.accessibilityLabel = [NSString stringWithFormat:
-            @"%@, in use, mounted at /, can't be deleted", rootName];
+            NSLocalizedString(@"%@, in use, mounted at /, can't be deleted", @"Accessibility label for the running filesystem row; %@ is its name"), rootName];
     else if (mounted)
-        cell.accessibilityLabel = [NSString stringWithFormat:
-            @"%@, mounted at %@", rootName, mountPoint];
+        cell.accessibilityLabel = isDefaultRoot
+            ? [NSString stringWithFormat:NSLocalizedString(@"%@, boots next, mounted at %@", @"Accessibility label for a filesystem row; first %@ is its name, second its mount point"), rootName, mountPoint]
+            : [NSString stringWithFormat:NSLocalizedString(@"%@, mounted at %@", @"Accessibility label for a filesystem row; first %@ is its name, second its mount point"), rootName, mountPoint];
     else
-        cell.accessibilityLabel = [NSString stringWithFormat:@"%@, not mounted", rootName];
+        cell.accessibilityLabel = isDefaultRoot
+            ? [NSString stringWithFormat:NSLocalizedString(@"%@, boots next, not mounted", @"Accessibility label for a filesystem row; %@ is its name"), rootName]
+            : [NSString stringWithFormat:NSLocalizedString(@"%@, not mounted", @"Accessibility label for a filesystem row; %@ is its name"), rootName];
     return cell;
 }
 
@@ -731,7 +799,43 @@ static UIColor *RootRowInUseAccentColor(void) {
 }
 
 - (BOOL)tableView:(UITableView *)tableView canEditRowAtIndexPath:(NSIndexPath *)indexPath {
-    return [self sectionShowsCachedRoots:indexPath.section];
+    return [self sectionShowsCachedRoots:indexPath.section] ||
+        [self deletableRootAtIndexPath:indexPath] != nil;
+}
+
+// #575: deleting a machine used to be reachable only from its own screen, and
+// swiping its row here did nothing at all -- only the cached archives could be
+// edited -- so the list read as having no delete. The row the app is holding
+// open (see RootNameIsInUse) still has none; its own row already says why.
+- (NSString *)deletableRootAtIndexPath:(NSIndexPath *)indexPath {
+    if (self.choosesRootOnSelection || ![self sectionShowsInstalledRoots:indexPath.section])
+        return nil;
+    NSOrderedSet<NSString *> *roots = Roots.instance.roots;
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger) roots.count)
+        return nil;
+    NSString *rootName = roots[indexPath.row];
+    return RootNameIsInUse(rootName) ? nil : rootName;
+}
+
+- (UISwipeActionsConfiguration *)tableView:(UITableView *)tableView
+    trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)indexPath {
+    NSString *rootName = [self deletableRootAtIndexPath:indexPath];
+    // nil keeps the standard Delete (commitEditingStyle) for the cached archives.
+    if (rootName == nil)
+        return nil;
+    UIContextualAction *delete = [UIContextualAction
+        contextualActionWithStyle:UIContextualActionStyleDestructive
+                            title:NSLocalizedString(@"Delete", @"Swipe action that deletes a filesystem")
+                          handler:^(UIContextualAction *action, UIView *sourceView, void (^completion)(BOOL)) {
+        // NO, and at once: the answer comes from the alert, and a Delete there
+        // removes the row through the roots observer's reload. A destructive
+        // action that reported YES would have the table remove it as well.
+        completion(NO);
+        RootConfirmAndDelete(self, rootName, ^(BOOL deleted) {});
+    }];
+    UISwipeActionsConfiguration *config = [UISwipeActionsConfiguration configurationWithActions:@[delete]];
+    config.performsFirstActionWithFullSwipe = NO;
+    return config;
 }
 
 - (void)tableView:(UITableView *)tableView commitEditingStyle:(UITableViewCellEditingStyle)editingStyle forRowAtIndexPath:(NSIndexPath *)indexPath {
@@ -744,7 +848,7 @@ static UIColor *RootRowInUseAccentColor(void) {
     NSURL *archiveURL = self.cachedRootArchives[indexPath.row];
     NSError *error = nil;
     if (![NSFileManager.defaultManager removeItemAtURL:archiveURL error:&error]) {
-        [self presentError:error title:@"Delete failed"];
+        [self presentError:error title:NSLocalizedString(@"Delete failed", @"Error alert title")];
         return;
     }
     // A full reload rather than an animated row delete: removing the last
@@ -809,7 +913,7 @@ static UIColor *RootRowInUseAccentColor(void) {
     }
 
     ProgressReportViewController *progressVC = [self.storyboard instantiateViewControllerWithIdentifier:@"progress"];
-    progressVC.title = [NSString stringWithFormat:@"Importing %@", name];
+    progressVC.title = [NSString stringWithFormat:NSLocalizedString(@"Importing %@", @"Progress screen title; %@ is an archive name"), name];
     [self presentViewController:progressVC animated:YES completion:nil];
     BOOL wasInitialSelection = Roots.instance.needsInitialRootSelection;
 
@@ -824,7 +928,7 @@ static UIColor *RootRowInUseAccentColor(void) {
             [progressVC dismissViewControllerAnimated:YES completion:^{
                 if (!success) {
                     if (error != nil)
-                        [self presentError:error title:@"Import failed"];
+                        [self presentError:error title:NSLocalizedString(@"Import failed", @"Error alert title")];
                     return;
                 }
                 if (self.choosesRootOnSelection) {
@@ -839,7 +943,15 @@ static UIColor *RootRowInUseAccentColor(void) {
 
 @end
 
-@implementation RootDetailViewController
+@implementation RootDetailViewController {
+    CGFloat _nameFieldInset;   // the storyboard's, before any text scale
+    BOOL _hasNameFieldInset;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
+}
 
 - (void)viewWillAppear:(BOOL)animated {
     self.nameField.text = self.rootName;
@@ -851,10 +963,62 @@ static UIColor *RootRowInUseAccentColor(void) {
     self.navigationItem.title = self.rootName;
     self.nameField.enabled = !locked;
     self.nameField.clearButtonMode = locked ? UITextFieldViewModeNever : UITextFieldViewModeAlways;
-    self.nameField.accessibilityLabel = @"Filesystem Name";
+    self.nameField.accessibilityLabel = NSLocalizedString(@"Filesystem Name", @"Accessibility label for the filesystem name field");
     self.deleteLabel.enabled = !locked;
     self.deleteCell.selectionStyle = !locked ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
     [self.tableView reloadData];
+}
+
+// At the text size of the Workspace window this page is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    if (indexPath.section == 1 && indexPath.row == 0) {
+        BOOL inert = self.bootRowIsInert;
+        for (UIView *view in cell.contentView.subviews)
+            if ([view isKindOfClass:UILabel.class])
+                ((UILabel *) view).enabled = !inert;
+        cell.selectionStyle = inert ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
+        if (inert)
+            cell.accessibilityTraits |= UIAccessibilityTraitNotEnabled;
+        else
+            cell.accessibilityTraits &= ~UIAccessibilityTraitNotEnabled;
+    }
+    CGFloat scale = ISHWorkspaceTextScaleForViewController(self);
+    ISHWorkspaceScaleTableViewCell(cell, scale);
+    if ([self.nameField isDescendantOfView:cell])
+        [self scaleNameFieldInset:scale];
+    return cell;
+}
+
+// Every row is one line, but the Name row also lays out its field with
+// constraints that do not reach the bottom of the cell, so its height cannot be
+// trusted to follow the text. 44 points at the scale holds a line at every step.
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return ISHWorkspaceTextScaledRowHeight([super tableView:tableView heightForRowAtIndexPath:indexPath],
+                                           ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (void)workspaceTextScaleDidChange {
+    CGFloat scale = ISHWorkspaceTextScaleForViewController(self);
+    [self scaleNameFieldInset:scale];
+    ISHWorkspaceRescaleTableView(self.tableView, scale);
+}
+
+// The storyboard starts the name field 75 points in, room for "Name" at 17
+// points. A larger "Name" would run under a long filesystem name.
+- (void)scaleNameFieldInset:(CGFloat)scale {
+    if (!_hasNameFieldInset && scale <= 1.0)
+        return;
+    for (NSLayoutConstraint *constraint in self.nameField.superview.constraints) {
+        if (constraint.firstItem != self.nameField || constraint.firstAttribute != NSLayoutAttributeLeading)
+            continue;
+        if (!_hasNameFieldInset) {
+            _nameFieldInset = constraint.constant;
+            _hasNameFieldInset = YES;
+        }
+        constraint.constant = _nameFieldInset * MAX(1.0, scale);
+    }
 }
 
 - (IBAction)nameChanged:(id)sender {
@@ -862,7 +1026,7 @@ static UIColor *RootRowInUseAccentColor(void) {
     NSError *err;
     if (![Roots.instance renameRoot:self.rootName toName:newName error:&err]) {
         self.nameField.text = self.rootName;
-        [self presentError:err title:@"Rename failed"];
+        [self presentError:err title:NSLocalizedString(@"Rename failed", @"Error alert title")];
         return;
     }
     self.rootName = newName;
@@ -878,6 +1042,16 @@ static UIColor *RootRowInUseAccentColor(void) {
     return [self.rootName isEqualToString:Roots.instance.defaultRoot];
 }
 
+- (BOOL)isBootedRoot {
+    return [self.rootName isEqualToString:Roots.instance.bootedRoot];
+}
+
+// Running from it and booting it next: Boot From This Filesystem has nothing
+// left to do.
+- (BOOL)bootRowIsInert {
+    return self.isBootedRoot && self.isDefaultRoot;
+}
+
 // Renaming or deleting a root moves or removes its backing store, so neither
 // is allowed for a root the app is holding open: the one booted as / this
 // session, and the one chosen to boot next (whose store the next launch will
@@ -887,16 +1061,26 @@ static UIColor *RootRowInUseAccentColor(void) {
 // only the default left the running root editable. Roots enforces this too;
 // this just keeps the controls from offering something that will be refused.
 - (BOOL)isInUseRoot {
-    return self.isDefaultRoot ||
-        [self.rootName isEqualToString:Roots.instance.bootedRoot];
+    return RootNameIsInUse(self.rootName);
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
-    if (section == 2) { // delete
-        if ([self.rootName isEqualToString:Roots.instance.bootedRoot])
-            return @"This filesystem can't be deleted or renamed because it's currently mounted as the root.";
+    if (section == 1) { // boot
+        if (self.bootRowIsInert)
+            return NSLocalizedString(@"iSH-AOK is running from this filesystem, and boots it next time too.", @"Filesystem detail footer (boot section)");
+        if (self.isBootedRoot)
+            return NSLocalizedString(@"iSH-AOK is running from this filesystem, but another one is set to boot next.", @"Filesystem detail footer (boot section)");
         if (self.isDefaultRoot)
-            return @"This filesystem can't be deleted or renamed because it's the one set to boot next.";
+            return NSLocalizedString(@"This filesystem boots the next time iSH-AOK opens.", @"Filesystem detail footer (boot section)");
+        return NSLocalizedString(@"Takes effect the next time iSH-AOK opens. You choose whether that is now.", @"Filesystem detail footer (boot section)");
+    }
+    if (section == 2) { // delete
+        // The rule and then the way out of it (#575): without the second
+        // sentence this read as "iSH-AOK cannot delete machines".
+        if ([self.rootName isEqualToString:Roots.instance.bootedRoot])
+            return NSLocalizedString(@"This filesystem can't be deleted or renamed because it's currently mounted as the root. To delete it, choose Boot From This Filesystem on another one; once iSH-AOK is running from that one, this one can go.", @"Filesystem detail footer (delete section)");
+        if (self.isDefaultRoot)
+            return NSLocalizedString(@"This filesystem can't be deleted or renamed because it's the one set to boot next. To delete it, choose Boot From This Filesystem on another one first.", @"Filesystem detail footer (delete section)");
     }
     return [super tableView:tableView titleForFooterInSection:section];
 }
@@ -914,24 +1098,36 @@ static UIColor *RootRowInUseAccentColor(void) {
 }
 
 - (void)browseFiles {
+    // Files shows a filesystem through the File Provider extension, which
+    // reads it out of the shared App Group container. A copy of the app
+    // re-signed without that group -- a sideloaded one, usually -- has no
+    // such container and registers no domain (Roots.m), and iOS then has no
+    // storage URL to give. NSURLComponents throws on a nil URL, and that was
+    // this row aborting the app (#625).
     NSURL *url;
     if (ContainerIsSharedAppGroup()) {
-        // The root now lives one level down, inside the single "iSH-AOK" domain.
+        // The root lives one level down, inside the single "iSH-AOK" domain.
         url = [[NSFileProviderManager.defaultManager.documentStorageURL
                 URLByAppendingPathComponent:@"iSH-AOK"]
                URLByAppendingPathComponent:self.rootName];
     } else {
-        // No App Group means no File Provider extension, so that domain does
-        // not exist and browsing it opens nothing. On such a build the roots
-        // live in the app's own Documents directory instead, which Files shows
-        // under "On My iPhone" -> iSH-AOK.
+        // This fork: with no App Group the roots live in the app's own
+        // Documents directory instead (AppGroup.m's fallback), which Files
+        // shows under "On My iPhone" -> iSH-AOK, so browse that. Only if even
+        // that is unavailable does the alert below explain why not.
         url = [[ContainerURL() URLByAppendingPathComponent:@"roots"]
                URLByAppendingPathComponent:self.rootName];
     }
-    if (url == nil)
-        return;
-    NSURLComponents *components = [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO];
+    NSURLComponents *components = url != nil ? [NSURLComponents componentsWithURL:url resolvingAgainstBaseURL:NO] : nil;
     components.scheme = @"shareddocuments";
+    if (components.string == nil) {
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:NSLocalizedString(@"Files Can’t Show This Filesystem", @"Alert title: Browse Files is unavailable")
+                                                                       message:NSLocalizedString(@"This copy of iSH-AOK was installed without its shared App Group, as a re-signed (sideloaded) copy usually is, so the Files app has no way to reach its filesystems. Export still works.", @"Alert message: Browse Files is unavailable")
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"OK", @"Alert button") style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+        return;
+    }
     [UIApplication openURL:components.string];
 }
 
@@ -944,7 +1140,7 @@ static UIColor *RootRowInUseAccentColor(void) {
                                             attributes:nil
                                                  error:nil];
     ProgressReportViewController *progressVC = [self.storyboard instantiateViewControllerWithIdentifier:@"progress"];
-    progressVC.title = [NSString stringWithFormat:@"Exporting %@", self.rootName];
+    progressVC.title = [NSString stringWithFormat:NSLocalizedString(@"Exporting %@", @"Progress screen title; %@ is a filesystem name"), self.rootName];
     [self presentViewController:progressVC animated:YES completion:nil];
 
     // witness the callback hell
@@ -955,7 +1151,7 @@ static UIColor *RootRowInUseAccentColor(void) {
             [progressVC dismissViewControllerAnimated:YES completion:^{
                 if (!success) {
                     if (err != nil)
-                        [self presentError:err title:@"Export failed"];
+                        [self presentError:err title:NSLocalizedString(@"Export failed", @"Error alert title")];
                     return;
                 }
 
@@ -977,32 +1173,62 @@ static UIColor *RootRowInUseAccentColor(void) {
     _exportURL = exportURL;
 }
 
+// This used to quit iSH-AOK on the spot: one tap, no question, every running
+// program ended, under a footer that promised a restart iOS does not let an app
+// perform -- it landed on the home screen. The choice only takes effect at a
+// launch either way, so ask whether that launch is now or whenever it comes.
 - (void)bootThis {
-    Roots.instance.defaultRoot = self.rootName;
-    AppDelegate *appDelegate = (AppDelegate *) UIApplication.sharedApplication.delegate;
-    if ([appDelegate isKindOfClass:AppDelegate.class]) {
-        [appDelegate exitApp];
+    if (self.bootRowIsInert)
+        return;
+    NSString *name = self.rootName;
+    NSString *title, *message;
+    BOOL offerLater = YES, offerQuit = YES;
+    if (self.isBootedRoot) {
+        // Running from it, with another set to boot next: all that is left to
+        // choose is booting it next time too. Quitting would only bring the
+        // same root back.
+        title = [NSString stringWithFormat:NSLocalizedString(@"Keep booting \u201c%@\u201d?", @"Alert title; %@ is a filesystem name"), name];
+        message = NSLocalizedString(@"iSH-AOK is running from it now, but another filesystem is set to boot next. Next Launch makes this one boot next time instead.", @"Boot filesystem alert message");
+        offerQuit = NO;
+    } else if (self.isDefaultRoot) {
+        title = [NSString stringWithFormat:NSLocalizedString(@"\u201c%@\u201d boots next", @"Alert title; %@ is a filesystem name"), name];
+        message = NSLocalizedString(@"It boots the next time iSH-AOK opens. Quit Now closes iSH-AOK, ending every running program, so that it boots when you open it again.", @"Boot filesystem alert message");
+        offerLater = NO;
     } else {
-        exit(0);
+        title = [NSString stringWithFormat:NSLocalizedString(@"Boot \u201c%@\u201d from now on?", @"Alert title; %@ is a filesystem name"), name];
+        message = NSLocalizedString(@"iSH-AOK can't restart itself. Next Launch keeps everything running and switches the next time iSH-AOK opens. Quit Now closes it, ending every running program, and boots this filesystem when you open it again.", @"Boot filesystem alert message");
     }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                   message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    if (offerLater) {
+        UIAlertAction *later = [UIAlertAction actionWithTitle:NSLocalizedString(@"Next Launch", @"Alert button: switch filesystem at the next launch") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            Roots.instance.defaultRoot = name;
+            [self update];
+        }];
+        [alert addAction:later];
+        alert.preferredAction = later;
+    }
+    if (offerQuit) {
+        [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Quit Now", @"Alert button: quit the app to switch filesystem") style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+            Roots.instance.defaultRoot = name;
+            AppDelegate *appDelegate = (AppDelegate *) UIApplication.sharedApplication.delegate;
+            if ([appDelegate isKindOfClass:AppDelegate.class]) {
+                [appDelegate exitApp];
+            } else {
+                exit(0);
+            }
+        }]];
+    }
+    [alert addAction:[UIAlertAction actionWithTitle:NSLocalizedString(@"Cancel", @"Alert button") style:UIAlertActionStyleCancel handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)deleteFilesystem {
-    if (self.isInUseRoot)
-        return;
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Really delete?"
-                                                                   message:@"I can't be bothered to implement any undo or regret UI so this is irreversable."
-                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
-        NSError *error;
-        if (![Roots.instance destroyRootNamed:self.rootName error:&error]) {
-            [self presentError:error title:@"Delete failed"];
-        } else {
+    RootConfirmAndDelete(self, self.rootName, ^(BOOL deleted) {
+        if (deleted)
             [self.navigationController popViewControllerAnimated:YES];
-        }
-    }]];
-    [self presentViewController:alert animated:YES completion:nil];
+    });
 }
 
 - (void)dealloc {

@@ -48,6 +48,7 @@ struct elf_header {
 #define PT_PHDR 6
 #define PT_TLS 7
 #define PT_NUM 8
+#define PT_GNU_STACK 0x6474e551
 
 struct prg_header {
     uint32_t type;
@@ -128,6 +129,7 @@ struct aux64_ent {
 #define AX_EXECFN 31
 #define AX_SYSINFO 32
 #define AX_SYSINFO_EHDR 33
+#define AX_MINSIGSTKSZ 51
 
 struct dyn_ent {
     dword_t tag;

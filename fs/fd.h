@@ -27,6 +27,28 @@ struct fd {
     // F_SETOWN/F_GETOWN are valid on any fd type on Linux, not just sockets.
     pid_t_ owner;
 
+    // Who opened this description, as much of Linux's f_cred as AOK has
+    // anything to compare. One caller asks: linkat(fd, "", ..., AT_EMPTY_PATH)
+    // names an inode with no path for it, and Linux allows that only to a
+    // caller holding CAP_DAC_READ_SEARCH or still running on the very cred
+    // object the open ran on -- so that handing somebody a descriptor does not
+    // also hand them the right to give its inode a name they can reach
+    // afterwards. Linux compares that object by pointer, which AOK has no
+    // equivalent of; a fork gets a fresh one, CLONE_THREAD shares one, and any
+    // credential change replaces one. The thread group plus the credential
+    // values reproduce all three -- measured on Linux 6.12: a sibling thread
+    // is allowed, a forked child is ENOENT, a setresuid that changes nothing
+    // stays allowed. An execve is the fourth, and the one that moves no value
+    // at all: a process that opens a descriptor and then execs ITSELF keeps
+    // its pid, its thread group and every uid, and Linux still answers ENOENT.
+    // task->exec_gen is carried here for exactly that case.
+    struct {
+        bool known; // false for a descriptor created with no task running
+        pid_t_ tgid;
+        unsigned exec_gen;
+        uid_t_ uid, gid, euid, egid, suid, sgid, fsuid, fsgid;
+    } open_creds;
+
     // fd data
     union {
         // tty
@@ -43,12 +65,15 @@ struct fd {
         struct {
             struct poll *poll;
         } epollfd;
-        // /proc/<pid>/ns/<type>. Only an index into fs/proc/pid.c's
-        // proc_ns_types, because AOK has exactly one namespace of each type
-        // and the fd's whole identity is which type it names. Read by the
-        // nsfs ioctls (NS_GET_NSTYPE and friends).
+        // /proc/<pid>/ns/<type>. An index into fs/proc/pid.c's
+        // proc_ns_types, read by the nsfs ioctls (NS_GET_NSTYPE and
+        // friends). UTS and IPC namespaces are real, so for those two the fd
+        // also holds a reference to the one it names (a struct uts_namespace
+        // or struct ipc_namespace), which is what setns() installs; every
+        // other kind has only its initial namespace, and `ns` is NULL.
         struct {
             unsigned type_index;
+            void *ns;
         } nsfs;
         struct {
             uint64_t val;
@@ -60,6 +85,10 @@ struct fd {
         struct {
             struct timer *timer;
             uint64_t expirations;
+            // The guest clockid; see struct posix_timer's `clock`.
+            uint_t clock;
+            // Armed TFD_TIMER_ABSTIME; see struct posix_timer's `abstime`.
+            bool abstime;
         } timerfd;
         // O_PATH|O_NOFOLLOW fd referring to a symlink itself (see
         // generic_openat). Owns one reference on the mount and a malloc'd
@@ -69,7 +98,48 @@ struct fd {
             struct mount *mount;
             char *path;
         } opath_link;
+        // An O_PATH handle opened through a /proc link on what has no name to
+        // reopen by -- a pipe, a socket, an anonymous inode, a directory
+        // removed while held (fs/generic.c procfd_open_path). Holds the
+        // description; fstat and the /proc link text are the target's.
         struct {
+            struct fd *target;
+        } opath_held;
+        struct {
+            // The network namespace the socket was made in (kernel/net_ns.h),
+            // NULL for the initial one. Owns a reference, for the life of
+            // the socket: set where the socket is made and nowhere else.
+            struct net_namespace *net_ns;
+            // An inet stream or datagram socket of a private network
+            // namespace: its host socket is an AF_UNIX one, through which the
+            // namespace's loopback traffic travels (fs/sock.c, "Loopback in a
+            // private network namespace"). net_emul_id names its binding's
+            // host path while it is bound; net_emul_dest_port is a connected
+            // datagram socket's destination, in network order, or 0.
+            bool net_emul;
+            bool net_emul_bound;
+            uint16_t net_emul_dest_port;
+            uint32_t net_emul_id;
+            // A raw ICMP socket there (also net_emul): nothing is bound or
+            // looked up for it. What it sends to the loopback is answered
+            // by the kernel, into net_emul_icmp_fd -- the other end of the
+            // host socket pair it reads. net_emul_icmp_filter is its
+            // ICMP_FILTER (a set bit is a type not wanted).
+            // (IPV6_V6ONLY, as set: an IPv6 socket bound to the wildcard
+            // without it takes IPv4's traffic for the port as well.)
+            bool net_emul_v6only;
+            bool net_emul_icmp;
+            int net_emul_icmp_fd;
+            uint32_t net_emul_icmp_filter;
+            // The far end's address once connected or accepted (its port is
+            // net_emul_dest_port): loopback, or across a veth (fs/net_vif.h).
+            // IPv4 in the first four bytes.
+            bool net_emul_peer_set;
+            bool net_emul_peer_v6;
+            uint8_t net_emul_peer_addr[16];
+            // A raw ICMP socket's: where each message queued to it came from,
+            // in order, for the address a receive reports (fs/sock.c).
+            struct net_emul_icmp_from *net_emul_icmp_from;
             int domain;
             int type;
             int protocol;
@@ -88,6 +158,12 @@ struct fd {
             // Queue of struct scm for sending file descriptors
             // locked by fd->lock
             struct list unix_scm;
+            // Cookie this socket's connect() put on the wire, while it is
+            // still unconsumed. Non-zero means "connected, but no accept has
+            // linked unix_peer yet", which is when SCM_RIGHTS parcels have to
+            // wait with the cookie rather than on a peer that does not exist.
+            // Locked by unix_token_lock.
+            uint64_t unix_peer_cookie;
             struct ucred_ {
                 pid_t_ pid;
                 uid_t_ uid;
@@ -134,6 +210,23 @@ struct fd {
             // readable -- chronyd at 106% of one core, 47496 failing recvmmsg
             // in 12 seconds. A dead connection reports itself once.
             bool conn_dead;
+            // An AF_UNIX datagram socket the guest connected (socketpair or
+            // connect), which Linux keeps pointed at its peer even after the
+            // peer closes: its next send without an address fails
+            // ECONNREFUSED, and only that send disconnects it (ENOTCONN from
+            // then on). Darwin disconnects it at the peer's close, so this is
+            // the only record left that it was connected. Set by
+            // socketpair/connect, cleared by the first send that reports it.
+            bool dgram_peer_set;
+            // This socket was rebuilt by a checkpoint restore and has no peer
+            // and no address -- the host object it stands for died with the
+            // process that owned it. The descriptor underneath is a
+            // socketpair whose other end is already closed, so reads, writes
+            // and poll all behave the way a vanished peer behaves; this flag
+            // is what stops getsockname/getpeername from reporting THAT
+            // socket's AF_UNIX identity instead of the one the guest knows it
+            // by. See fs/sock_ckpt.h.
+            bool ckpt_hungup;
             dword_t ip_mtu_discover;
             dword_t ipv6_mtu_discover;
             dword_t ipv6_mtu;
@@ -202,6 +295,20 @@ struct fd {
             // what a caller checks after setting it.
             char so_bindtodevice[16];
 
+            // AF_UNIX SOCK_SEQPACKET carried as framed messages on a host
+            // stream, because the host has no SEQPACKET (fs/sock.c, struct
+            // unix_seqpacket_hdr). The send lock keeps one frame's write whole
+            // against another sender's, and the receive lock one frame's
+            // read against another reader's; seqpacket_lowat is the
+            // SO_SNDLOWAT last set on the host, so an unchanged frame size
+            // costs no syscall; seqpacket_host_buf is the host send buffer,
+            // which bounds the largest frame that can go out whole.
+            bool seqpacket_framed;
+            lock_t seqpacket_send_lock;
+            lock_t seqpacket_recv_lock;
+            int seqpacket_lowat;
+            int seqpacket_host_buf;
+
             // A TCP bind() that has NOT been handed to the host yet. Linux
             // refuses connections to a bound-but-not-listening socket (RST);
             // Darwin silently drops the SYN, so the client hangs for ~8s
@@ -234,6 +341,15 @@ struct fd {
             char *netlink_reply;
             size_t netlink_reply_len;
             size_t netlink_reply_off;
+            // Datagram boundaries inside netlink_reply: each entry is the END
+            // offset of one datagram, and bytes past the last entry are a
+            // datagram still being built. A netlink socket is a datagram
+            // socket, so one recvmsg returns ONE of these -- see
+            // netlink_reply_seal_locked in fs/sock.c for why a dump's
+            // NLMSG_DONE has to arrive in a datagram of its own.
+            size_t *netlink_reply_bounds;
+            size_t netlink_reply_nbounds;
+            size_t netlink_reply_bounds_cap;
             // Guards the three netlink_reply* fields above (and the
             // notification-append path below) against a background
             // notifier thread racing the guest thread's own sendmsg/
@@ -242,12 +358,29 @@ struct fd {
             // from more than one thread before that feature existed, so
             // there was previously no lock here at all.
             lock_t netlink_reply_lock;
+            // A blocking receive with nothing queued waits here, under
+            // netlink_reply_lock; netlink_append_nlmsg notifies it.
+            cond_t netlink_reply_cond;
+            // SO_RCVTIMEO/SO_SNDTIMEO: no host fd to hold them. `set` with a
+            // zero value is Linux's zero-jiffy timeout, what a NEGATIVE
+            // timeval gives: never wait. Unset is no timeout at all. Only the
+            // receive side is ever consulted -- a netlink send never waits --
+            // but both read back as set.
+            struct timespec netlink_rcvtimeo;
+            struct timespec netlink_sndtimeo;
+            bool netlink_rcvtimeo_set;
+            bool netlink_sndtimeo_set;
             // Membership in the process-wide list of netlink sockets
             // subscribed to at least one multicast group (netlink_groups
             // != 0), maintained in fs/sock.c. Only valid while
             // netlink_notify_registered is true.
             struct list netlink_notify_link;
             bool netlink_notify_registered;
+            // Set by TASKSTATS_CMD_ATTR_REGISTER_CPUMASK. Rides the same
+            // registry as the notify subscribers above -- registration and
+            // lifetime are already correct there, and a second list would be a
+            // second chance to leak a dead fd.
+            bool netlink_taskstats_listener;
             bool netlink_cap_ack;
             bool netlink_ext_ack;
             bool netlink_get_strict_chk;
@@ -288,6 +421,11 @@ struct fd {
             // dereferenced NULL -- the emulator segfaulted closing an fd, and
             // the tmpfs dirent reference taken at open leaked besides.
             struct list link;
+            // The sequence number of the record at fd->offset. Every record
+            // /dev/kmsg emits carries one, and the reader just counts up: it
+            // is recovered from the byte position only at open and lseek,
+            // where the position can jump (kernel/log.c, ish_log_line_seek).
+            uint64_t seq;
         } kmsg;
 
         // can fit anything in here
@@ -305,6 +443,15 @@ struct fd {
             // registers mountinfo in epoll with EPOLLIN|EPOLLET and relies on
             // a new edge per mount change). Null links for other proc fds.
             struct list mountinfo_link;
+            // The rendering in `data` belongs to ONE read pass, exactly as
+            // Linux's single_open seq_file buffer does (fs/proc.c,
+            // proc_data_for_read). data_valid says the buffer holds a
+            // rendering at all; data_pos is the file offset the next read has
+            // to start at to be served from it, i.e. one past the last byte
+            // handed out. Zeroed by fd_create, so a fresh fd renders on its
+            // first read.
+            bool data_valid;
+            off_t data_pos;
         } proc;
         struct {
             int num;
@@ -315,6 +462,14 @@ struct fd {
             // readdir phase: 0 = emit ".", 1 = emit "..", 2 = children (dir_pos)
             unsigned dots_pos;
         } tmpfs;
+        struct {
+            // The node, packed by fs/proc/root.c's sysfs_encode_node.
+            void *node;
+            // Read since it was opened. An attribute says "may have changed"
+            // (POLLPRI|POLLERR) until then and not after, the way kernfs
+            // compares the file's event count with the one its last read saw.
+            bool read;
+        } sysfs;
         void *fs_data;
     };
 
@@ -330,6 +485,15 @@ struct fd {
     // Whether the setuid/setgid strip on first write has already been done for
     // this descriptor. See file_remove_privs in kernel/fs.c.
     bool privs_checked;
+    // Which of the HOST's own standard streams this descriptor is, as the
+    // entry point handed it over (create_piped_stdio): 1 + the stream, so 1,
+    // 2 or 3, and 0 for every other descriptor. real_fd cannot say it: a
+    // checkpoint restore wraps a COPY of the host's stream, above 2, and the
+    // classifier that asked real_fd refused the resumed session's next save
+    // on its own stdin. See ckpt_classify_fd in kernel/checkpoint.c. Here, in
+    // the padding before `dir`, so no other field moves and the struct keeps
+    // its size.
+    uint8_t host_stdio;
     DIR *dir;
     struct inode_data *inode;
     ino_t fake_inode;
@@ -349,12 +513,73 @@ struct fd {
     // Separate from `lock` above because tmpfs_readdir takes that one itself
     // to guard its own dir_pos, and this has to wrap the readdir call.
     lock_t dir_pos_lock;
+
+    // The mount this fd was opened through, as mountinfo, statx and fdinfo
+    // name it, and whether it was opened at that mount's root. Not `mount`'s:
+    // for a bind, `mount` is the ORIGIN the bind aliases, while the bind is a
+    // mount of its own with its own ID. 0 for a descriptor not opened by path,
+    // which reports mount_id(mount). See find_mount_and_trim_path_seen.
+    // At the end, so app code built against an older fd.h keeps its offsets.
+    int mnt_id;
+    bool mnt_root;
+
+    // The bind mount this descriptor was opened through, or NULL. A
+    // reference, dropped by fd_close: `mount` is the bind's ORIGIN and holds
+    // only that, so without this nothing held the bind itself, and umount of
+    // a bind with files open and cwds in it succeeded where Linux says EBUSY.
+    // It also keeps a lazily unmounted bind (mount_remove_lazy) alive for as
+    // long as it is used, which is what lets generic_getpath_shown name paths
+    // from its root the way Linux does. Set by generic_openat_norm, for the
+    // O_PATH pseudo-descriptors too. At the end, for the same reason as
+    // mnt_id.
+    struct mount *bind_mount;
+
+    // realfs/fakefs: this description's file position is `offset`, not the
+    // host descriptor's, and its access mode and status flags are `flags`,
+    // not the host's. Set on a description realfs_reopen made of a file no
+    // path reaches: Darwin cannot open an unlinked file afresh, so its host
+    // descriptor is a dup of the one it was made from, sharing that one's
+    // position and flags, and every read, write and seek goes by position
+    // instead. At the end, for the same reason as mnt_id.
+    bool realfs_own_offset;
+    // pwritev2's RWF_APPEND / RWF_NOAPPEND for the one call in progress (set
+    // and cleared under `lock`); see fd_pwrite_appends.
+    enum fd_pwrite_append { FD_PWRITE_APPEND_DEFAULT, FD_PWRITE_APPEND_FORCE,
+        FD_PWRITE_APPEND_NEVER } pwrite_append;
+    // realfs/fakefs: a host named FIFO's reader/writer accounting, which
+    // Darwin does not report (fs/host_fifo.c). NULL for anything else. At the
+    // end, for the same reason as mnt_id.
+    struct host_fifo *host_fifo;
+    // A FIFO read end: its FIFO's writer count (Linux's w_counter) at this
+    // open. Hung up only once that has moved. fs/host_fifo.c and fs/fifo.c.
+    unsigned fifo_version;
+    int host_fifo_accmode;        // O_ACCMODE_ bits this description counts as
+    struct list host_fifo_fds;    // on host_fifo->fds
+    // fakefs: the mount-relative path this description was opened by (owned,
+    // freed by fakefs_close), or NULL. A file with several hard links has one
+    // inode and so no one path the metadata can name; Linux names the one it
+    // was opened by -- /proc/<pid>/exe above all, which uutils' multicall
+    // coreutils checks against argv[0] (Ubuntu 25.10's coreutils are 115 hard
+    // links of one binary, and every one refused to run). fakefs_getpath uses
+    // it while it still names the same inode. At the end, for the same reason
+    // as mnt_id.
+    char *fake_open_path;
 };
+
+// Whether a positioned write (an fd_ops pwrite) goes to end of file. Linux
+// appends on an O_APPEND description whatever offset it was given (man 2
+// pwrite, BUGS); pwritev2's RWF_APPEND and RWF_NOAPPEND override that for one
+// call (fd->pwrite_append). musl 1.2.6 sends every pwrite() as
+// pwritev2(..., RWF_NOAPPEND) to get POSIX's write-at-the-offset.
+bool fd_pwrite_appends(const struct fd *fd);
 
 typedef sdword_t fd_t;
 #define AT_FDCWD_ -100
 
 struct fd *fd_create(const struct fd_ops *ops);
+// Is the caller still running on the credentials this descriptor was opened
+// with? See open_creds above; linkat(AT_EMPTY_PATH) is the only caller.
+bool fd_open_creds_match(struct fd *fd);
 struct fd *fd_retain(struct fd *fd);
 // Like fd_retain, but for promoting a non-owning pointer found via a
 // secondary lookup structure (e.g. a global registry keyed off fd->data)
@@ -369,10 +594,17 @@ int fd_getflags(struct fd *fd);
 int fd_setflags(struct fd *fd, int flags);
 
 #define NAME_MAX 255
+// name is sized for what a host directory can hold, not for the guest's
+// NAME_MAX. APFS limits a name to 255 UTF-16 units, so a non-ASCII name runs
+// to 765 bytes of UTF-8, and exFAT volumes are the same. Linux lists names
+// like that: fs/readdir.c refuses only a name of PATH_MAX bytes or more, and
+// FUSE allows 1024. 1024 is the size of Darwin's d_name, so realfs_readdir
+// can pass every Darwin host name through whole.
+#define DIR_ENTRY_NAME_SIZE 1024
 struct dir_entry {
     qword_t inode;
     byte_t type;
-    char name[NAME_MAX + 1];
+    char name[DIR_ENTRY_NAME_SIZE];
 };
 
 static inline byte_t dir_entry_type_for_mode(mode_t_ mode) {
@@ -458,10 +690,43 @@ struct fd_ops {
     // handle F_SETFL, i.e. set O_NONBLOCK
     int (*setflags)(struct fd *fd, dword_t arg);
 
-    // For adhoc fds shown in /proc/<pid>/fd as "anon_inode:[<class>]"
-    // (eventfd, eventpoll, signalfd, timerfd, inotify). NULL when the type is
+    // For adhoc fds shown in /proc/<pid>/fd as "anon_inode:<class>", the
+    // class spelled as Linux spells it ("[eventfd]", "[timerfd]", "inotify");
+    // one beginning with '/' is shown whole ("/dmabuf:"). NULL when the type is
     // taken from stat.mode instead (sockets -> socket:, pipes -> pipe:).
     const char *anon_inode_class;
+
+    // Which family this is, for anything that has to reason about descriptors
+    // by KIND rather than by behaviour. Set by every fd_ops in the tree.
+    //
+    // Added for the checkpoint inventory (/proc/ish/checkpoint), which has to
+    // answer "what is actually open in a real session, and could it be brought
+    // back" -- and the honest answer differs per family, from "re-open the path
+    // and seek" to "cannot be restored, only rebuilt". Most fd_ops are static
+    // to their own file, so a reader outside cannot compare pointers to
+    // identify one; guessing from stat.mode conflates families that share a
+    // mode. A name is the smallest thing that makes the question answerable.
+    const char *name;
+
+    // ->read and ->write make their own SA_RESTART decision: _ERESTART for an
+    // interruption a handler may restart, _EINTR only for one it may not. The
+    // read/write dispatchers (kernel/fs.c) then leave an _EINTR alone instead
+    // of deciding again, which is all that makes a never-restarted wait
+    // expressible through them.
+    //
+    // Set by sockets, where the answer depends on the wait: signal(7) never
+    // restarts one with SO_RCVTIMEO/SO_SNDTIMEO armed, and only the op knows
+    // whether the wait that was interrupted had a timeout.
+    bool decides_restart;
+
+    // A new description of the regular file `fd` holds, for a file no path
+    // reaches -- a memfd, an unlinked file -- where Linux opens the inode
+    // afresh and AOK has no name to open it by. Only the filesystem's own
+    // state is set up here, from `fd`'s; the rest is generic_reopen_pathless's
+    // (fs/generic.c), which calls this. `flags` is the open's: the access mode
+    // is all an implementation needs to look at, to refuse one it cannot give
+    // (EACCES). Optional; NULL means such a file has no second description.
+    struct fd *(*reopen)(struct fd *fd, int flags);
 };
 
 struct fdtable {
@@ -471,6 +736,9 @@ struct fdtable {
     bits_t *cloexec;
     lock_t lock;
 };
+
+// Re-record fd->open_creds from `current`. See fs/fd.c.
+void fd_open_creds_stamp(struct fd *fd);
 
 struct fdtable *fdtable_new(int size);
 struct fdtable *fdtable_retain(struct fdtable *table);
@@ -496,6 +764,12 @@ struct fd *f_get_retain(fd_t f);
 // steals a reference to the fd, gives it to the table on success and destroys it on error
 // flags is checked for O_CLOEXEC and O_NONBLOCK
 fd_t f_install(struct fd *fd, int flags);
+// Whether f_install would find a descriptor now (accept4 asks first).
+bool f_has_room(void);
+// Install at an exact number rather than the lowest free one, growing the
+// table if needed. For kernel/checkpoint.c, where the number is part of what
+// is being restored. Takes ownership of `fd` either way.
+int fdtable_install_at(struct fdtable *table, fd_t f, struct fd *fd, bool cloexec);
 int f_close(fd_t f);
 
 // Write a FUSE file's shared mapping back to its daemon (fs/fuse.c). A no-op

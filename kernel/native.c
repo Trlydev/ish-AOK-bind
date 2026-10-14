@@ -1,21 +1,26 @@
 // Dispatch and registry for natively-implemented programs. See kernel/native.h
 // for the execution model; this file is the table and the plumbing.
 
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "emu/fpenv.h"
 #include "kernel/errno.h"
 
 #include "kernel/calls.h"
 #include "kernel/fs.h"
+#include "kernel/checkpoint.h"
 #include "kernel/native.h"
 #include "kernel/native_io.h"
 #include "kernel/signal.h"
 #include "kernel/native_libc.h"
 #include "kernel/native_syscall.h"
 #include "kernel/task.h"
+#include "fs/tty.h"
 #include "debug.h"
+#include "util/lockstats.h"
 
 // Everything a native program prints has to go through iSH's fd layer, not the
 // host's stdio -- see the libc warning in kernel/native.h.
@@ -237,6 +242,45 @@ static int smallclue_real_main(int argc, char *const argv[], char *const envp[])
     return status;
 }
 
+// The setuid-root applets, each as its own /AOK/native program.
+//
+// This is the whole reason a native su/sudo/passwd can be setuid when
+// /usr/bin/smallclue cannot. SmallCLUE is a multicall binary: it picks its
+// applet from argv[0], so a setuid copy would run `sh` as root for anyone who
+// asked. Here argv[0] is OURS -- supplied at the call site, never read from
+// the caller -- so /AOK/native/sudo can only ever be sudo. Taking the name
+// from the caller would reopen exactly the hole this avoids.
+//
+// argv[0] is replaced rather than prepended: these are invoked AS the applet,
+// so the caller's own argv[0] is the name it used and carries no argument.
+static int native_suid_applet(const char *applet, int argc, char *const argv[]) {
+    if (argc < 1)
+        return 127;
+    char **v = calloc((size_t) argc + 1, sizeof(char *));
+    if (v == NULL)
+        return 127;
+    v[0] = (char *) applet;
+    for (int i = 1; i < argc; i++)
+        v[i] = argv[i];
+    int status = smallclueMain(argc, v);
+    free(v);
+    nlibc_flush_std();
+    return status;
+}
+
+static int native_sudo_main(int argc, char *const argv[], char *const envp[]) {
+    (void) envp;
+    return native_suid_applet("sudo", argc, argv);
+}
+static int native_su_main(int argc, char *const argv[], char *const envp[]) {
+    (void) envp;
+    return native_suid_applet("su", argc, argv);
+}
+static int native_passwd_main(int argc, char *const argv[], char *const envp[]) {
+    (void) envp;
+    return native_suid_applet("passwd", argc, argv);
+}
+
 // bash (kernel/bash_glue.c), which is only in the build when the deps/bash
 // submodule is populated. WEAK rather than a build-wide define: the address is
 // simply NULL when nothing defines it, so the table below says what programs
@@ -250,6 +294,13 @@ int native_bash_main(int argc, char *const argv[], char *const envp[]);
 // zsh (kernel/zsh_glue.c), on the same terms as bash: the define and the glue
 // file are both decided by meson's `have_zsh`, so the table and the archive
 // cannot disagree. Off by default -- see meson_options.txt.
+#ifdef ISH_NATIVE_DASH
+// dash, kernel/dash_glue.c. Registered under BOTH names deliberately: `dash` is
+// what it is, and `sh` is what scripts ask for. They are the same entry point
+// -- dash does not change behaviour by argv[0] the way bash does -- so this is
+// two table rows rather than two programs.
+int native_dash_main(int argc, char *const argv[], char *const envp[]);
+#endif
 #ifdef ISH_NATIVE_ZSH
 int native_zsh_main(int argc, char *const argv[], char *const envp[]);
 // zsh's MULTIOS byte pump, also kernel/zsh_glue.c. A program of its own rather
@@ -279,6 +330,9 @@ int helix_native_main(int argc, char *const argv[], char *const envp[]);
 // a licence question with them.
 int native_motepad_main(int argc, char *const argv[], char *const envp[]);
 int native_bmm_main(int argc, char *const argv[], char *const envp[]);
+// Presents the Wayland desktop to the app directly (kernel/native_wlpresent.c);
+// start-wayland.sh runs it when the compositor draws on the GPU.
+int native_wlpresent_main(int argc, char *const argv[], char *const envp[]);
 int native_bmt_main(int argc, char *const argv[], char *const envp[]);
 
 // ktop (kernel/ktop_glue.c), compiled from the same opt/AOK/tools/ktop/ktop.c
@@ -289,12 +343,18 @@ int native_ktop_main(int argc, char *const argv[], char *const envp[]);
 
 static const struct native_program native_programs[] = {
     { "smallclue", smallclue_real_main },
+    // Setuid-root, unlike the multicall entry above -- see native_suid_applet
+    // for why that is safe here and would not be there.
+    { "sudo", native_sudo_main, .setuid_root = true },
+    { "su", native_su_main, .setuid_root = true },
+    { "passwd", native_passwd_main, .setuid_root = true },
     { "motepad", native_motepad_main },
     // Same program as /AOK/tools/ktop, compiled as host code. Measured 2.7x
     // faster per refresh on an i386 guest -- worthwhile rather than dramatic,
     // because most of a refresh is kernel-side /proc work that was never
     // emulated to begin with. See ktop_glue.c.
     { "ktop", native_ktop_main },
+    { "wl-present", native_wlpresent_main },
     // The /AOK/tools benchmarks, so the same workload can be timed with and
     // without emulation. kernel/native_bench.c explains what that comparison
     // is, and what it is not.
@@ -316,8 +376,29 @@ static const struct native_program native_programs[] = {
     { "bash", native_bash_main },
 #endif
 #ifdef ISH_NATIVE_ZSH
-    { "zsh", native_zsh_main },
-    { "zsh-multio", native_zsh_multio_main },
+    // zsh is the one native program that can describe itself completely: its
+    // fork-by-relaunch already turns a live shell into a state script, and a
+    // checkpoint wants exactly that (deps/zsh/Src/aok_fork.c, kernel/
+    // zsh_glue.c). AOK_ZSH_STATE_FD is the channel its re-launched children
+    // already read a state from, so a restored one needs nothing new taught
+    // to it.
+    //
+    // DESIGNATED, because the third member of this struct is `setuid_root`,
+    // not ckpt_dump. Writing these positionally put native_zsh_ckpt_dump into
+    // the bool (a pointer is always true, so native zsh ran SETUID ROOT), the
+    // "AOK_ZSH_STATE_FD" literal into ckpt_dump, and nothing into
+    // ckpt_state_var. checkpoint_native_park then CALLED that string: the
+    // crash was an instruction fetch at an unaligned address inside
+    // __cstring, every time the app was backgrounded with a native zsh
+    // running. -w hid all three diagnostics.
+    { "zsh", native_zsh_main, .ckpt_dump = native_zsh_ckpt_dump,
+      .ckpt_state_var = "AOK_ZSH_STATE_FD" },
+    { "zsh-multio", native_zsh_multio_main, .ckpt_dump = native_zsh_ckpt_dump,
+      .ckpt_state_var = "AOK_ZSH_STATE_FD" },
+#endif
+#ifdef ISH_NATIVE_DASH
+    { "dash", native_dash_main },
+    { "sh", native_dash_main },
 #endif
 };
 
@@ -327,6 +408,10 @@ size_t native_program_count(void) {
         if (native_programs[i].main != NULL)
             n++;
     return n;
+}
+
+const struct native_program *native_program_running(struct task *task) {
+    return task != NULL ? task->native_running : NULL;
 }
 
 const struct native_program *native_program_at(size_t index) {
@@ -381,11 +466,33 @@ static void native_free_vector(char **vec) {
     free(vec);
 }
 
+// The array alone, the strings still `vec`'s: what a program is handed as its
+// argv and envp when it may be abandoned mid-run (native_exec_run_one). A
+// program owns the array it is given, and zsh rewrites every argv slot on the
+// way in -- metafy, into zsh's own heap -- so freeing the kernel's copy through
+// the program's array hands free() pointers malloc never gave out. A program
+// that returns from main never showed it: zsh exits instead. One that execs
+// in place comes back through the free, and killed the whole app with "BUG IN
+// CLIENT OF LIBMALLOC: invalid address". NULL if there is no memory, and the
+// caller hands over the kernel's copy as it always did.
+static char **native_shallow_vector(char *const vec[]) {
+    size_t count = 0;
+    while (vec[count] != NULL)
+        count++;
+    char **copy = malloc((count + 1) * sizeof(*copy));
+    if (copy != NULL)
+        memcpy(copy, vec, (count + 1) * sizeof(*copy));
+    return copy;
+}
+
 struct native_exec_pending {
     const struct native_program *prog;
     int argc;
     char **argv;
     char **envp;
+    // Set by native_exec_mark_restored for a task a checkpoint re-launched.
+    bool restored;
+    dword_t standin_child;
 };
 
 static void native_pending_free(struct native_exec_pending *pending) {
@@ -430,6 +537,82 @@ int native_exec_set_pending(const struct native_program *prog, int argc,
     return 0;
 }
 
+// True for exactly the call of a native program that a checkpoint restore
+// re-launched (native_exec_mark_restored), on that program's own thread. A
+// supervisor -- SmallCLUE's init and runit -- is re-launched from its argv like
+// any native program, and must not start again what it started before: its
+// children were restored too. An environment variable would have said the
+// same thing to everything the program later ran.
+static __thread bool native_run_restored;
+
+bool native_program_was_restored(void) {
+    return native_run_restored;
+}
+
+void native_exec_mark_restored(dword_t standin_child) {
+    struct native_exec_pending *pending = current != NULL ? current->native_exec : NULL;
+    if (pending == NULL)
+        return;
+    pending->restored = true;
+    pending->standin_child = standin_child;
+}
+
+#define NATIVE_WAIT_UNTRACED (1 << 1)   // WUNTRACED; kernel/exit.c's WUNTRACED_
+
+// A shell coming back from a checkpoint while one of its jobs held the
+// terminal.
+//
+// A native shell is re-launched, not resumed, so it has no job table: it starts
+// at the top, prompts, and reads the terminal. With a job still in the
+// foreground that read is EIO, and an interactive shell exits on it -- which is
+// what took the whole window with it: the shell that owned a restored `ktop`
+// read EIO and quit, and its login was left a zombie with nothing under it.
+//
+// So before the program runs, do what the shell was doing when it was frozen:
+// wait for the foreground job, and take the terminal back once it has finished
+// or stopped. Only for a job made of this task's OWN children -- the wait finds
+// none otherwise, and then the terminal is left alone, because taking it would
+// steal it from a process group that is not ours to reclaim it from. A stopped
+// job stays stopped and is simply no longer in the shell's job table, which is
+// as much as a re-launch can do.
+static void native_restored_wait_for_foreground_job(void) {
+    struct tty *tty;
+    pid_t_ pgid, sid;
+    lock(&current->group->lock, 0);
+    tty = current->group->tty;
+    pgid = current->group->pgid;
+    sid = current->group->sid;
+    unlock(&current->group->lock);
+    if (tty == NULL)
+        return;
+
+    bool waited = false;
+    for (;;) {
+        lock(&tty->lock, 0);
+        pid_t_ fg = tty->fg_group;
+        unlock(&tty->lock);
+        if (fg <= 0 || fg == pgid)
+            return;
+        int status = 0;
+        int res = native_waitpid((dword_t) -fg, &status, NATIVE_WAIT_UNTRACED);
+        if (res == _EINTR) {
+            native_checkpoint();
+            continue;
+        }
+        if (res < 0)
+            break;          // no child of ours left in that group
+        waited = true;
+        if ((status & 0xff) == 0x7f)
+            break;          // stopped: the terminal comes back to the shell
+    }
+    if (!waited)
+        return;
+    lock(&tty->lock, 0);
+    if (tty->session == sid)
+        tty->fg_group = pgid;
+    unlock(&tty->lock);
+}
+
 // argv, flattened the way /proc/<pid>/cmdline is defined: each argument
 // NUL-terminated, back to back. See struct task's native_cmdline.
 static void native_cmdline_publish(int argc, char *const argv[]) {
@@ -467,15 +650,51 @@ void native_cmdline_discard(struct task *task) {
     free(old);
 }
 
-void native_exec_run_pending(void) {
-    struct native_exec_pending *pending = current != NULL ? current->native_exec : NULL;
-    if (pending == NULL)
-        return;
+// Where native_exec_in_place comes back to: the frame of
+// native_exec_run_pending that called the program's main. One per thread, and
+// only while a main it called is running; `task` is the task that main runs
+// for, which a thread impersonating another (native_spawn_opts) is not.
+struct native_landing {
+    sigjmp_buf env;
+    struct task *task;
+    unsigned lockstats_depth;
+};
+static __thread struct native_landing *native_landing;
 
+bool native_exec_landing_available(void) {
+    return current != NULL && native_landing != NULL && native_landing->task == current;
+}
+
+bool native_exec_in_place_wanted(void) {
+    return current != NULL && current->ptrace.traced &&
+        native_exec_landing_available() &&
+        !native_frames_live() &&
+        __atomic_load_n(&current->native_helper_threads, __ATOMIC_ACQUIRE) == 0 &&
+        !nlibc_in_stdio();
+}
+
+// The exec has committed and the native program is gone: leave its C stack
+// for good and resume in native_exec_run_pending as though main had returned.
+// Nothing below here may be left holding a lock or a shim frame, which is
+// what native_exec_in_place checks before it commits.
+//
+// savemask 0: Darwin's siglongjmp would restore the mask with sigprocmask,
+// which sets every thread's (see sigunwind_start in util/sync.h).
+void native_exec_land(void) {
+    struct native_landing *landing = native_landing;
+    siglongjmp(landing->env, 1);
+}
+
+// Runs the program `pending` records, and ends the task with its status. It
+// returns only when the program exec'd in place instead (native_exec_in_place),
+// and the task runs on as whatever that exec loaded.
+static void native_exec_run_one(struct native_exec_pending *pending) {
     const struct native_program *prog = pending->prog;
     int argc = pending->argc;
     char **argv = pending->argv;
     char **envp = pending->envp;
+    bool restored = pending->restored;
+    dword_t standin_child = pending->standin_child;
     // Detached before running: the program must not see a stale record, and
     // task teardown must not double-free what is about to run.
     current->native_exec = NULL;
@@ -504,12 +723,88 @@ void native_exec_run_pending(void) {
     // run's.
     nlibc_invocation_token_assign();
 
-    int status = prog->main(argc, argv, envp);
+    // Which program this is, for as long as it runs. kernel/checkpoint.c asks
+    // through native_program_running() so it can find the ckpt_dump for a task
+    // it has frozen, rather than matching argv[0] back against the table.
+    current->native_running = prog;
 
+    // Coming back from a checkpoint. A stand-in was only ever a wait, so it
+    // goes straight back to waiting; the program it stood in for is restored
+    // as its child, and running the program here would run the command twice.
+    if (standin_child != 0)
+        nlibc_exec_standin_resume(standin_child);
+    if (restored)
+        native_restored_wait_for_foreground_job();
+
+    // A traced exec leaves its tracer a SIGTRAP to take before the new image
+    // runs an instruction (exec_report_to_tracer). A native program yields
+    // only at a checkpoint, and waiting for its first syscall would let it run
+    // -- or exit -- before its tracer had seen the exec at all.
+    if (current->ptrace.traced)
+        native_checkpoint();
+
+    // An in-place exec (native_exec_in_place) comes back here instead of
+    // returning from main. Nothing assigned between the sigsetjmp and the
+    // siglongjmp is read afterwards but `landing`, which lives in this frame.
+    //
+    // The program gets arrays of its own, so that the kernel's copy of argv
+    // and envp is still the kernel's when the program is abandoned
+    // (native_shallow_vector) -- and when it returns. It was only done for a
+    // traced task, on the reasoning that a program that finishes exits before
+    // the free below; but one that RETURNS from main reaches that free with
+    // whatever it left in its argv. SmallCLUE's sum wrote "-" into argv[argc]
+    // (the terminator slot), and `sum < f` aborted the whole app: "pointer
+    // being freed was not allocated" in native_free_vector (2026-10-01).
+    char **main_argv = native_shallow_vector(argv);
+    char **main_envp = native_shallow_vector(envp);
+    if (main_argv != NULL)
+        current->native_argv = main_argv;
+    struct native_landing landing = { .task = current, .lockstats_depth = lockstats_depth };
+    struct native_landing *outer = native_landing;
+    bool replaced = false;
+    int status = 0;
+    // A new image starts in the default floating-point environment, and the
+    // guest image this replaced left its own on the host FPU (emu/fpenv.c).
+    fpenv_host_default();
+    native_run_restored = restored;
+    if (sigsetjmp(landing.env, 0) == 0) {
+        native_landing = &landing;
+        status = prog->main(argc, main_argv != NULL ? main_argv : argv,
+                main_envp != NULL ? main_envp : envp);
+    } else {
+        // Abandoned frames opened no lockstats frame that is still open --
+        // native_exec_in_place holds no lock -- but put the depth back as
+        // sigunwind_start does, so that stays true by construction.
+        lockstats_depth = landing.lockstats_depth;
+        replaced = true;
+    }
+    native_landing = outer;
+    native_run_restored = false;
+
+    current->native_running = NULL;
     current->native_argv = NULL;
     current->native_argc = 0;
-    native_free_vector(argv);
-    native_free_vector(envp);
+    free(main_argv);
+    free(main_envp);
+    // Through the program's own array only when it was handed the kernel's:
+    // abandoned, it may have left anything in a slot, so without a copy of
+    // its own the strings are left to leak with the rest of its heap.
+    if (!replaced || main_argv != NULL)
+        native_free_vector(argv);
+    if (!replaced || main_envp != NULL)
+        native_free_vector(envp);
+
+    // The program exec'd in place. Its image is gone and the task runs on: a
+    // native program recorded by that exec is run by the next pass, and an
+    // ELF one is what this returns to -- the execve syscall that started the
+    // first program, which hands its 0 to the new image, or
+    // task_run_current, which starts it.
+    if (replaced) {
+        native_env_discard(current);
+        native_cmdline_discard(current);
+        nlibc_program_state_reset();
+        return;
+    }
 
     // The syscall marshalling arena this thread has been using lives in the
     // guest address space, and nothing below needs it. Handing it back here
@@ -529,6 +824,17 @@ void native_exec_run_pending(void) {
     // Same encoding sys_exit_group uses: the wait status carries the exit code
     // in its high byte.
     do_exit_group((status & 0xff) << 8);
+}
+
+void native_exec_run_pending(void) {
+    // More than one pass only when a program exec'd in place into another
+    // native program, which the exec recorded like any other.
+    for (;;) {
+        struct native_exec_pending *pending = current != NULL ? current->native_exec : NULL;
+        if (pending == NULL)
+            return;
+        native_exec_run_one(pending);
+    }
 }
 
 // -------------------------------------------------------------- environment
@@ -645,10 +951,11 @@ int native_env_set(const char *name, const char *value, bool overwrite) {
             strchr(name, '=') != NULL)
         return _EINVAL;
 
-    char *entry = malloc(strlen(name) + strlen(value) + 2);
+    size_t size = strlen(name) + strlen(value) + 2;
+    char *entry = malloc(size);
     if (entry == NULL)
         return _ENOMEM;
-    sprintf(entry, "%s=%s", name, value);
+    snprintf(entry, size, "%s=%s", name, value);
 
     ssize_t at = native_env_find(name);
     if (at >= 0) {
@@ -699,7 +1006,9 @@ void native_checkpoint(void) {
     // something is actually deliverable. This runs on every read and write a
     // native program makes, so the common case has to cost almost nothing.
     sigset_t_ pending = __atomic_load_n(&current->pending, __ATOMIC_ACQUIRE);
-    sigset_t_ group_pending = __atomic_load_n(&current->sighand->pending, __ATOMIC_ACQUIRE);
+    // The process's shared queue only once this task is told to take it; a
+    // told task always goes through receive_signals (see handle_interrupt).
+    bool group_told = __atomic_load_n(&current->group_sigpending, __ATOMIC_ACQUIRE);
     sigset_t_ blocked = __atomic_load_n(&current->blocked, __ATOMIC_ACQUIRE);
     bool has_saved_mask = __atomic_load_n(&current->has_saved_mask, __ATOMIC_ACQUIRE);
 
@@ -713,7 +1022,14 @@ void native_checkpoint(void) {
     // callbacks in kernel/native_libc.c for the whole story.
     bool defer = nlibc_stdio_defer_fatal();
 
-    if (has_saved_mask || ((pending | group_pending) & ~blocked) != 0) {
+    // A PTRACE_EVENT_STOP the tracer is owed comes before any signal, as it
+    // does in handle_interrupt. Not deferred inside stdio: a stop runs no
+    // handler and exits nothing, and parking with a stream lock held is fine,
+    // as for group_stop_wait below.
+    ptrace_trap_stop_if_pending();
+
+    if (has_saved_mask || group_told || current->group_handoff != 0 ||
+            (pending & ~blocked) != 0) {
         // receive_signals runs the default action, which for SIGINT means
         // do_exit_group -- so this call may not return, and that is the point:
         // ^C on a native program has to end it the way it ends any other.
@@ -729,6 +1045,18 @@ void native_checkpoint(void) {
     // its tracer and the tracer's wait4 hung forever. Parking WHILE holding a
     // stdio lock is fine -- the owner is alive and will release it on SIGCONT.
     group_stop_wait();
+    ptrace_trap_stop_if_pending();
+
+    // The checkpoint freezer's parking place for a native program. It never
+    // reaches task_run_current's loop -- that loop is for translated code --
+    // so this is where the machine stops for it, and where it is asked to
+    // describe itself. See kernel/checkpoint.c.
+    checkpoint_native_park();
+    // And the request half: `echo suspend > /proc/ish/checkpoint` from a
+    // native shell is deferred like any other, and this is the only place that
+    // shell comes back through -- task_run_current's loop, where an emulated
+    // task's deferred checkpoint is taken, is not on its path at all.
+    checkpoint_run_pending();
 
     // Signals the program installed a handler for. Those are kept blocked in
     // the kernel -- it cannot jump host code -- so receive_signals above skips

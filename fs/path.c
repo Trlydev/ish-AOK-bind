@@ -3,12 +3,32 @@
 #include "kernel/calls.h"
 #include "fs/path.h"
 
+// The mount the first `len` bytes of `path` -- a normalized global path, ""
+// for the root -- are on: its id, or -1 for none.
+static int path_prefix_mount_id(const char *path, size_t len) {
+    char prefix[MAX_PATH];
+    if (len >= sizeof(prefix))
+        return -1;
+    memcpy(prefix, path, len);
+    prefix[len] = '\0';
+    struct mount *mount = mount_find(prefix);
+    if (mount == NULL)
+        return -1;
+    int id = mount_id(mount);
+    mount_release(mount);
+    return id;
+}
+
 static int __path_normalize(const char *root_path, const char *at_path, const char *path, char *out, int flags, int levels) {
     // you must choose one
     if (flags & N_SYMLINK_FOLLOW)
         assert(!(flags & N_SYMLINK_NOFOLLOW));
     else
         assert(flags & N_SYMLINK_NOFOLLOW);
+    // N_PARENT_ONLY never resolves the final component, so there is nothing
+    // for N_SYMLINK_FOLLOW to follow there; asking for both is a caller that
+    // has not decided which walk it wants.
+    assert(!((flags & N_PARENT_ONLY) && (flags & N_SYMLINK_FOLLOW)));
 
     const char *p = path;
     char *o = out;
@@ -17,6 +37,9 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
 
     if (path[0] == '\0')
         return _ENOENT;
+
+    // The process's root, when it is not the real one: `..` stops there.
+    size_t root_len = root_path != NULL && strcmp(root_path, "/") != 0 ? strlen(root_path) : 0;
 
     if (at_path != NULL && strcmp(at_path, "/") != 0) {
         // Bolt: Hoist strlen() and replace strcpy/strlen/strlen with memcpy
@@ -39,12 +62,37 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                     p++;
                 continue;
             } else if (p[1] == '.' && (p[2] == '\0' || p[2] == '/')) {
-                // double dot path component, delete the last component
-                if (o != out) {
+                // double dot path component, delete the last component --
+                // unless the walk is standing on the process's root, where
+                // `..` is the root itself (Linux's follow_dotdot stops at
+                // nd->root). Popping it lexically let every chrooted process
+                // out: after chroot("/jail"), chdir("/"), a plain chdir("..")
+                // landed in the real /, and so did "/..", openat(root_fd,
+                // ".."), and a symlink to "../..". A cwd left outside the
+                // root by chroot-without-chdir walks `..` freely, as on
+                // Linux; only reaching the root stops it.
+                bool at_root = root_len != 0 && (size_t) (o - out) == root_len &&
+                    memcmp(out, root_path, root_len) == 0;
+                // Nor above the root of a detached mount, which has no parent
+                // to climb to: Linux's follow_dotdot finds nothing mounted
+                // above it and stays. The walk is standing on one exactly when
+                // what it has so far is a staging point (kernel/fs.h).
+                size_t staging = mount_staging_point_len(out, (size_t) (o - out));
+                if (staging != 0 && staging == (size_t) (o - out))
+                    at_root = true;
+                // N_BENEATH: above the starting directory is out of bounds,
+                // not the starting directory again.
+                if ((flags & N_BENEATH) && (at_root || o == out))
+                    return _EXDEV;
+                if (o != out && !at_root) {
+                    int below = (flags & N_NO_XDEV) ? path_prefix_mount_id(out, (size_t) (o - out)) : 0;
                     do {
                         o--;
                         n++;
                     } while (*o != '/');
+                    // N_NO_XDEV: out of the root of a mount.
+                    if ((flags & N_NO_XDEV) && path_prefix_mount_id(out, (size_t) (o - out)) != below)
+                        return _EXDEV;
                 }
                 p += 2;
                 while (*p == '/')
@@ -66,7 +114,70 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
         if (n == 0)
             return _ENAMETOOLONG;
 
-        if ((flags & N_SYMLINK_FOLLOW) || *p != '\0') {
+        // MOUNT_STAGING_DIR, at the top of the real root, is where detached
+        // mounts are parked (kernel/fs.h). A walk that starts in one never
+        // spells it -- its at_path is copied in above, not walked -- so this
+        // is a walk trying to get IN, and only N_DETACHED_OK's may. For them
+        // the directory itself is not looked up: it exists on no filesystem.
+        // For everyone else anything below it is not there, so no name the
+        // guest spells reaches a mount Linux would give no name at all.
+        // Inside a chroot the same spelling is an ordinary name: `out` then
+        // starts with the chroot's path.
+        const size_t staging_dir_len = sizeof(MOUNT_STAGING_DIR) - 1;
+        if (c == out + 1 && (size_t) (o - c) == staging_dir_len - 1 &&
+                memcmp(c, &MOUNT_STAGING_DIR[1], staging_dir_len - 1) == 0) {
+            if ((flags & N_DETACHED_OK) && *p != '\0')
+                continue;
+        } else if (c == out + staging_dir_len + 1 &&
+                memcmp(out, MOUNT_STAGING_DIR "/", staging_dir_len + 1) == 0) {
+            if (!(flags & N_DETACHED_OK))
+                return _ENOENT;
+        }
+
+        // N_NO_XDEV: a name that is a mount point is the root of another
+        // mount, the last name of the path included.
+        if ((flags & N_NO_XDEV) && path_prefix_mount_id(out, (size_t) (o - out)) !=
+                path_prefix_mount_id(out, (size_t) (c - 1 - out)))
+            return _EXDEV;
+
+        // N_SLASH_EISDIR: open(O_CREAT) on a name spelled with a trailing
+        // slash. Linux answers EISDIR from open_last_lookups() --
+        // `if (unlikely(nd->last.name[nd->last.len])) return ERR_PTR(-EISDIR)`
+        // -- which sits after the parent walk and BEFORE the final lookup, so
+        // it does not matter whether the name exists, what kind of thing it
+        // is, or whether the parent may be written. This is that spot: the
+        // components before this one have already been resolved and checked,
+        // and nothing has looked at this one yet.
+        //
+        // It has to be here rather than in the caller because the checks that
+        // would otherwise run on the final component answer first and answer
+        // differently: `open("file/", O_CREAT|O_WRONLY)` collected ENOTDIR
+        // from the block below, and `open("dir/", O_CREAT|O_RDONLY)` simply
+        // succeeded.
+        if (*p == '\0' && *(p - 1) == '/' && (flags & N_SLASH_EISDIR))
+            return _EISDIR;
+
+        // Which components get looked up at all. Everything before the last
+        // one always does. The LAST one does when the caller asked to follow
+        // a final symlink -- and also when it was spelled with a trailing
+        // slash, because Linux's lookup_last() turns that slash into
+        // LOOKUP_FOLLOW | LOOKUP_DIRECTORY:
+        //
+        //     if (nd->last_type == LAST_NORM && nd->last.name[nd->last.len])
+        //             nd->flags |= LOOKUP_FOLLOW | LOOKUP_DIRECTORY;
+        //
+        // so "link/" follows the link and requires a directory even for an
+        // lstat, a readlink or an open(O_NOFOLLOW) -- measured on Linux 6.12:
+        // lstat("link-to-dir/") reports the DIRECTORY, readlink("link-to-dir/")
+        // is EINVAL, and open("link-to-dir/", O_NOFOLLOW) succeeds. AOK skipped
+        // this whole block for every nofollow caller, so the slash was ignored
+        // outright and lstat("file/") succeeded.
+        //
+        // lookup_last() is reached only from path_lookupat(), never from
+        // path_parentat() -- which is exactly N_PARENT_ONLY, whose callers
+        // spend the slash with their own rules instead.
+        if ((flags & N_SYMLINK_FOLLOW) || *p != '\0' ||
+                (*(p - 1) == '/' && !(flags & N_PARENT_ONLY))) {
             // this buffer is used to store the path that we're readlinking, then
             // if it turns out to point to a symlink it's reused as the buffer
             // passed to the next path_normalize call
@@ -77,6 +188,13 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
             if (mount == NULL)
                 return _ENOENT;
             assert(path_is_normalized(possible_symlink));
+            // Asked before the link's text lands on top of this component:
+            // is the directory holding it inside a detached mount? And is it
+            // a procfs link, which Linux follows by jumping to the file it
+            // names (nd_jump_link) rather than by walking its text?
+            size_t parent_len = (size_t) (c - 1 - out);
+            bool in_staging = mount_staging_point_len(out, parent_len) != 0;
+            bool magic = mount->fs == &procfs;
             int res = _EINVAL;
             if (mount->fs->readlink)
                 res = mount->fs->readlink(mount, possible_symlink, c, MAX_PATH - (c - out));
@@ -87,6 +205,18 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 // something to follow.
                 if (flags & N_NO_SYMLINKS)
                     return _ELOOP;
+                // A link under /proc/<pid>/ names a file, not a path (Linux's
+                // nd_jump_link): RESOLVE_NO_MAGICLINKS refuses it with ELOOP,
+                // and a scoped walk with EXDEV, in that order.
+                if (magic && possible_symlink[0] == '/' &&
+                        possible_symlink[1] >= '0' && possible_symlink[1] <= '9') {
+                    if (flags & N_NO_MAGICLINKS)
+                        return _ELOOP;
+                    // (For N_NO_XDEV Linux asks whether the file is on the
+                    // mount the walk is on; refusing them all asks less.)
+                    if (flags & (N_IN_ROOT | N_BENEATH | N_NO_XDEV))
+                        return _EXDEV;
+                }
                 // Linux's MAXSYMLINKS. Five was low enough that ordinary
                 // /etc/alternatives-style chains hit ELOOP: `levels` counts
                 // every link followed across the whole resolution, including
@@ -100,6 +230,20 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                     return _ELOOP;
                 // readlink does not null terminate
                 c[res] = '\0';
+                // A procfs link to a file outside the caller's root reads
+                // "(unreachable)<global path>" (fs_rebase_readlink_path): its
+                // global path, walked inside the chroot, would name a different
+                // file. Linux jumps straight to the file (nd_jump_link), so a
+                // chrooted process reaches a descriptor it holds from outside
+                // -- /bin/sh /dev/fd/3/script in a chroot. So walk that global
+                // path from the real root; the process's root still bounds
+                // `..` and anchors any absolute link met further on.
+                static const char unreachable[] = "(unreachable)";
+                bool jump_real_root = magic &&
+                    strncmp(c, unreachable, sizeof(unreachable) - 1) == 0 &&
+                    c[sizeof(unreachable) - 1] == '/';
+                if (jump_real_root)
+                    memmove(c, c + sizeof(unreachable) - 1, strlen(c) - (sizeof(unreachable) - 1) + 1);
                 // If the symlink target is absolute, it must be re-anchored at the
                 // calling process's root (root_path -- e.g. a chroot), not the real
                 // filesystem root. Previously this dropped the accumulated `out`
@@ -111,6 +255,17 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                 // /i386root/bin/busybox, causing execve() to fail with ENOENT (no
                 // such absolute path in the real root) or resolve the wrong file.
                 bool absolute_target = *c == '/';
+                // An absolute target starts over at the root: outside an
+                // N_BENEATH walk by definition, and outside an N_NO_XDEV one
+                // unless the link is on the root's own mount.
+                if (absolute_target && !jump_real_root) {
+                    if (flags & N_BENEATH)
+                        return _EXDEV;
+                    if ((flags & N_NO_XDEV) && path_prefix_mount_id(out, parent_len) !=
+                            path_prefix_mount_id(root_path != NULL ? root_path : "",
+                                root_path != NULL && strcmp(root_path, "/") != 0 ? strlen(root_path) : 0))
+                        return _EXDEV;
+                }
                 if (absolute_target)
                     memmove(out, c, strlen(c) + 1);
                 char *expanded_path = possible_symlink;
@@ -124,9 +279,52 @@ static int __path_normalize(const char *root_path, const char *at_path, const ch
                         return _ENAMETOOLONG;
                     expanded_path[out_len] = '/';
                     memcpy(expanded_path + out_len + 1, p, p_len + 1);
+                } else if (*(p - 1) == '/') {
+                    // A FINAL symlink component spelled with a trailing slash.
+                    // Nothing follows it, so the branch above does not run and
+                    // the slash -- which says "and this is a directory" -- was
+                    // simply dropped: the recursion below then resolved a path
+                    // that had never been spelled with one, and
+                    // open("dangling-link-to-a-file/") opened the file.
+                    //
+                    // Linux keeps it because the slash belongs to the NAME,
+                    // not to the walk: trailing_slashes turns into
+                    // LOOKUP_DIRECTORY, which survives the symlink being
+                    // followed and is spent on whatever it lands on. Carrying
+                    // it into the expanded path spends it the same way, at the
+                    // must-be-a-directory block below, one level down --
+                    // measured on Linux 6.12, open("link-to-file/") is ENOTDIR
+                    // and open("dangling-link/") is ENOENT, where the same two
+                    // without the slash succeed and report ENOENT
+                    // respectively. A link to a directory is unaffected, which
+                    // is the case everything actually relies on.
+                    if (out_len + 1 >= MAX_PATH)
+                        return _ENAMETOOLONG;
+                    expanded_path[out_len] = '/';
+                    expanded_path[out_len + 1] = '\0';
                 }
-                const char *next_at_path = absolute_target ? root_path : NULL;
-                return __path_normalize(root_path, next_at_path, expanded_path, out, flags, levels + 1);
+                const char *next_at_path = absolute_target && !jump_real_root ? root_path : NULL;
+                // N_NO_XDEV, a relative target: walked from the link's own
+                // directory instead of again from the top, which would count
+                // every mount the way here crossed as crossed by this walk.
+                // That directory is the first `parent_len` bytes of the
+                // expanded path, and has no link left in it.
+                if ((flags & N_NO_XDEV) && !absolute_target) {
+                    expanded_path[parent_len] = '\0';
+                    next_at_path = expanded_path;
+                    expanded_path += parent_len + 1;
+                }
+                // The target is walked again from the top, through
+                // MOUNT_STAGING_DIR when it is in a detached mount (see the
+                // entry rule above). A relative target in one is: `..` cannot
+                // leave the mount, so it stays there. An absolute one starts
+                // from the process's root, like any other, and may not get
+                // back in -- except through a procfs link, whose text is the
+                // path of a descriptor the reader was allowed to see.
+                int next_flags = flags & ~N_DETACHED_OK;
+                if (magic || (!absolute_target && in_staging))
+                    next_flags |= N_DETACHED_OK;
+                return __path_normalize(root_path, next_at_path, expanded_path, out, next_flags, levels + 1);
             }
 
             // A slash after this component means it must be a directory. It
@@ -188,6 +386,70 @@ int path_final_dot(const char *path) {
     return 0;
 }
 
+// Walk everything the final component is reached THROUGH, the way Linux's
+// filename_parentat() does, and report only what that walk had to say: 0 if it
+// arrived, else its error (a missing parent's ENOENT, a parent that is a
+// regular file's ENOTDIR, an unsearchable one's EACCES).
+//
+// For a path whose final component is "." or ".." -- the only caller, see
+// path_final_dot() -- normalizing the whole path IS that walk and nothing
+// more: such a component names no entry, and __path_normalize consumes it
+// lexically (skip, or pop the last component) without ever looking it up. The
+// components before it are the parent, and each is checked exactly as Linux
+// checks it: it must exist, be a directory, and be searchable.
+//
+// No N_PARENT_DIR_WRITE and no create flags, deliberately. This is the walk,
+// not the operation: Linux answers the final-"." rule between the two, so the
+// parent's write permission must not be consulted yet.
+//
+// N_PARENT_ONLY is what makes it a walk rather than a lookup, and it matters
+// for a caller whose path is not dotty after all -- a trailing slash on the
+// final component must stay unspent here, so the caller's own rule gets to
+// answer it.
+int path_parent_walk(struct fd *at, const char *path_raw) {
+    char scratch[MAX_PATH];
+    return path_normalize(at, path_raw, scratch, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY);
+}
+
+// Linux's `nd->last.name[nd->last.len]`: the character where the final
+// component ends, which is '/' exactly when the name was spelled with a
+// trailing slash. path_normalize() rejects "" before any caller gets here.
+bool path_trailing_slash(const char *path) {
+    size_t len = strlen(path);
+    return len > 0 && path[len - 1] == '/';
+}
+
+// What does the already-normalized path `normalized` name? An lstat (fs->stat
+// is AT_SYMLINK_NOFOLLOW), so a dangling symlink counts as a name that is
+// there -- which is what a lookup of the final component answers, and Linux
+// decides EEXIST from exactly that.
+static bool path_target_lstat(const char *normalized, struct statbuf *stat) {
+    char copy[MAX_PATH];       // find_mount_and_trim_path mutates its argument
+    strcpy(copy, normalized);
+    struct mount *mount = find_mount_and_trim_path(copy);
+    if (mount == NULL)
+        return false;
+    int err = mount->fs->stat(mount, copy, stat);
+    mount_release(mount);
+    return err == 0;
+}
+
+// Does it name anything at all?
+static bool path_target_exists(const char *normalized) {
+    struct statbuf stat;
+    return path_target_lstat(normalized, &stat);
+}
+
+int path_lookup_final(struct fd *at, const char *path_raw, struct statbuf *stat) {
+    char path[MAX_PATH];
+    int err = path_normalize(at, path_raw, path, N_SYMLINK_NOFOLLOW | N_PARENT_ONLY);
+    if (err < 0)
+        return err;
+    if (!path_target_lstat(path, stat))
+        return _ENOENT;
+    return 0;
+}
+
 int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     // A genuinely-NULL dirfd (distinct from the AT_PWD sentinel (struct fd *)-2)
     // reaches here when an *at syscall is handed a bad/closed dirfd. Linux
@@ -208,7 +470,20 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     if (flags & N_REALROOT)
         root = NULL;
     bool absolute = path[0] == '/';
-    if (absolute)
+    // N_IN_ROOT: the starting directory is the root of this walk, for an
+    // absolute path too.
+    // N_BENEATH: the same starting point and the same bound, with nothing
+    // above it to be had; an absolute path asks for the root, which is.
+    if ((flags & N_BENEATH) && absolute) {
+        unlock(&current->fs->lock);
+        return _EXDEV;
+    }
+    bool in_root = (flags & (N_IN_ROOT | N_BENEATH)) != 0;
+    if (in_root) {
+        if (at == AT_PWD)
+            at = current->fs->pwd;
+        root = at;
+    } else if (absolute)
         at = root;
     else if (at == AT_PWD)
         at = current->fs->pwd;
@@ -245,7 +520,13 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         // Linux does not perform. The case this exists to stop -- openat()
         // through a dirfd on a directory with no search permission, and a cwd
         // whose search bit was removed -- is exactly the relative case.
-        if (!absolute) {
+        //
+        // An N_IN_ROOT walk starts at the dirfd whatever the path looks
+        // like, so the same holds for its absolute paths -- except that
+        // search permission is needed only to descend, and "/" alone names
+        // the directory itself.
+        bool descends = path[strspn(path, "/")] != '\0';
+        if (!absolute || in_root) {
             struct statbuf at_stat;
             if (at->mount != NULL && at->mount->fs->fstat != NULL &&
                     at->mount->fs->fstat(at, &at_stat) >= 0) {
@@ -258,7 +539,7 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
                 // looking at permissions rather than at the fd it passed.
                 if (!S_ISDIR(at_stat.mode))
                     return _ENOTDIR;
-                int perm_err = access_check(&at_stat, AC_X);
+                int perm_err = descends ? access_check(&at_stat, AC_X) : 0;
                 if (perm_err < 0)
                     return perm_err;
             }
@@ -270,8 +551,13 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     // when `path` didn't start with '/'), so an absolute symlink inside a
     // chroot (e.g. /bin/uname -> /bin/busybox under `chroot /i386root`)
     // re-resolves against /i386root instead of escaping to the real root.
+    // For an absolute path `at` IS the root and at_path already holds this
+    // answer; on fakefs every getpath is a database query, and asking twice
+    // was ~30% of the CPU an lstat("/etc") cost (26 us -> 18.5 us).
     char root_path[MAX_PATH];
-    if (root != NULL) {
+    if (root != NULL && at == root) {
+        strcpy(root_path, at_path);
+    } else if (root != NULL) {
         int err = generic_getpath(root, root_path);
         if (err < 0)
             return err;
@@ -282,6 +568,63 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
     if (err < 0)
         return err;
 
+    // N_SLASH_NOT_A_DIR: the caller creates a name that is not a directory,
+    // and the caller's name was spelled with a trailing slash, which asks for
+    // one. Linux's filename_create() suppresses LOOKUP_CREATE for such a name
+    // (`if (last.name[last.len] && !want_dir) create_flags = 0`) and then, on
+    // the negative dentry that comes back, answers ENOENT -- "you had / on
+    // the end, you've been asking for (non-existent) directory".
+    //
+    // The order matters as much as the errno. This sits after
+    // __path_normalize, so every error the parent walk can raise (a missing
+    // parent's ENOENT, a non-directory parent's ENOTDIR, an unsearchable
+    // one's EACCES) still answers first, exactly as filename_parentat()'s do.
+    // And it sits before N_PARENT_DIR_WRITE below, because Linux only asks
+    // may_create() for the parent's write permission afterwards, inside
+    // vfs_mknod/vfs_symlink/vfs_link -- so an unwritable parent reports this
+    // ENOENT, not EACCES.
+    //
+    // A name that DOES exist is left alone: the lookup gives a positive
+    // dentry and filename_create() answers EEXIST before ever reaching the
+    // trailing-slash test, whatever kind of thing is there -- file,
+    // directory, or dangling symlink. The caller's own existence check
+    // reports that, the same way N_CREATE_EEXIST_FIRST relies on.
+    //
+    // Without this, mknod("d/fifo/"), mkfifo, symlink and link all created
+    // the name WITHOUT the slash and reported success, so a guest could not
+    // tell a request for a directory from a request for a fifo.
+    if ((flags & N_SLASH_NOT_A_DIR) && path_trailing_slash(path) &&
+            !path_target_exists(out))
+        return _ENOENT;
+
+    // N_SLASH_UNLINK: unlink() on a name spelled with a trailing slash. Linux
+    // has a whole label for it, and it answers three different things:
+    //
+    //     slashes:
+    //             if (d_is_negative(dentry))      error = -ENOENT;
+    //             else if (d_is_dir(dentry))      error = -EISDIR;
+    //             else                            error = -ENOTDIR;
+    //
+    // reached from do_unlinkat() on `if (last.name[last.len] || ...)`. The
+    // dentry is the one a LOOKUP_PARENT walk's own lookup produced, so no
+    // symlink was followed to get it: unlink("link-to-a-dir/") is ENOTDIR, not
+    // EISDIR, because the LINK is what the name names.
+    //
+    // Same seat as N_SLASH_NOT_A_DIR above, and for the same reason: after
+    // __path_normalize, so the parent walk's errors still answer first
+    // (unlink("unsearchable/f/") is EACCES), and before N_PARENT_DIR_WRITE,
+    // because may_delete() only runs inside vfs_unlink() afterwards -- so
+    // unlink("unwritable/f/") is ENOTDIR and not EACCES. Measured.
+    //
+    // Without it the slash was ignored outright and unlink("file/") DELETED
+    // the file, which is the one outcome a caller cannot undo.
+    if ((flags & N_SLASH_UNLINK) && path_trailing_slash(path)) {
+        struct statbuf stat;
+        if (!path_target_lstat(out, &stat))
+            return _ENOENT;
+        return S_ISDIR(stat.mode) ? _EISDIR : _ENOTDIR;
+    }
+
     if (flags & N_PARENT_DIR_WRITE) {
         // out is fully resolved and normalized here (begins with '/' or is
         // empty, no ".", "..", or unresolved symlinks in the final
@@ -291,6 +634,9 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
         // any operation that creates or removes a directory entry.
         char parent[MAX_PATH];
         size_t len = strlen(out);
+        // The root of a detached mount is a root too: `.` from a cwd there.
+        if (len != 0 && mount_staging_point_len(out, len) == len)
+            return 0;
         if (len == 0) {
             // out == "" means the target itself is the root directory, e.g.
             // mkdir("/") or rmdir("/"). There is no parent to check write
@@ -348,18 +694,9 @@ int path_normalize(struct fd *at, const char *path, char *out, int flags) {
                 // a `set -e` script (tests/manual/setup-regressions.sh's cache
                 // store) killed the whole run with no diagnostic.
                 //
-                // fs->stat is an lstat (AT_SYMLINK_NOFOLLOW), so a dangling
-                // symlink still counts as a name that exists and is removable.
-                bool target_exists = false;
-                char out_copy[MAX_PATH];   // find_mount_and_trim_path mutates it
-                strcpy(out_copy, out);
-                struct mount *target_mount = find_mount_and_trim_path(out_copy);
-                if (target_mount != NULL) {
-                    struct statbuf target_stat;
-                    int target_err = target_mount->fs->stat(target_mount, out_copy, &target_stat);
-                    mount_release(target_mount);
-                    target_exists = target_err == 0;
-                }
+                // path_target_exists is an lstat, so a dangling symlink still
+                // counts as a name that exists and is removable.
+                bool target_exists = path_target_exists(out);
                 if ((flags & N_CREATE_EEXIST_FIRST) && target_exists)
                     return 0;           // caller's own check reports EEXIST
                 if ((flags & N_REMOVE_ENOENT_FIRST) && !target_exists)

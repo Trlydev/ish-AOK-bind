@@ -18,6 +18,14 @@
 // See kernel/calls.c: cancels a pending _ERESTART_NOHAND rewind.
 void cancel_syscall_restart(void);
 void handle_interrupt(int interrupt);
+
+// Which guest faults get a report in the kernel log (kernel/calls.c, above
+// handle_page_fault_interrupt): 0 none, 1 those that will kill the program
+// (the default), 2 all. /proc/ish/fault_reports.
+int guest_fault_reports_get(unsigned long *suppressed);
+void guest_fault_reports_set(int mode);
+int guest_fault_reports_parse(const char *text, size_t len);
+const char *guest_fault_reports_name(int mode);
 // One syscall on behalf of a natively-compiled program (kernel/native.h),
 // reached from host code instead of from a guest trap. Numbering is
 // asm-generic; see the definition in kernel/calls.c.
@@ -29,6 +37,12 @@ int must_check user_read(guest_addr_t addr, void *buf, size_t count);
 int must_check user_write(guest_addr_t addr, const void *buf, size_t count);
 int must_check user_read_task(struct task *task, guest_addr_t addr, void *buf, size_t count);
 int must_check user_read_task_mem(struct task *task, struct mem *mem, guest_addr_t addr, void *buf, size_t count);
+// A debugger's forced reads and writes (PTRACE_PEEK*/POKE*, /proc/<pid>/mem):
+// through the tracee's page protections for that one access, as Linux's
+// FOLL_FORCE. A forced write copies a private page it may not write and leaves
+// it exactly as protected as it was (MEM_WRITE_PTRACE, emu/memory.c).
+int must_check user_read_task_ptrace(struct task *task, guest_addr_t addr, void *buf, size_t count);
+int must_check user_read_task_ptrace_mem(struct task *task, struct mem *mem, guest_addr_t addr, void *buf, size_t count);
 int must_check user_write_task_mem(struct task *task, struct mem *mem, guest_addr_t addr, const void *buf, size_t count);
 int must_check user_write_task(struct task *task, guest_addr_t addr, const void *buf, size_t count);
 int must_check user_write_task_ptrace(struct task *task, guest_addr_t addr, const void *buf, size_t count);
@@ -47,6 +61,7 @@ dword_t sys_clone_guest(qword_t flags, guest_addr_t stack, guest_addr_t ptid, gu
 dword_t sys_clone3(addr_t uargs_addr, dword_t size);
 dword_t sys_clone3_guest(guest_addr_t uargs_addr, dword_t size);
 dword_t sys_unshare(dword_t flags);
+dword_t sys_setns(fd_t fd, dword_t flags);
 dword_t sys_kcmp(pid_t_ pid1, pid_t_ pid2, dword_t type, dword_t idx1, dword_t idx2);
 dword_t sys_fork(void);
 dword_t sys_vfork(void);
@@ -88,6 +103,11 @@ guest_addr_t sys_brk_guest(guest_addr_t new_brk);
 #define PROT_SEM_ 0x8
 #define MMAP_FIXED 0x10
 #define MMAP_ANONYMOUS 0x20
+// x86-64's only (arch/x86 uapi): the mapping in the first 2 GB, as JITs that
+// keep 32-bit pointers or rel32 branches into it ask for (kernel/mmap.c).
+#define MMAP_32BIT 0x40
+// The same value on every guest architecture (asm-generic, which x86 shares).
+#define MMAP_LOCKED 0x2000
 #define MMAP_FIXED_NOREPLACE 0x100000
 addr_t sys_mmap(addr_t args_addr);
 addr_t sys_mmap_amd64(addr_t addr, dword_t len, dword_t prot, dword_t flags, fd_t fd_no, dword_t offset);
@@ -113,6 +133,8 @@ long sys_set_mempolicy_guest(int mode, guest_addr_t nodemask_addr, qword_t maxno
 
 int_t sys_mlock(addr_t addr, dword_t len);
 int_t sys_mlock_guest(guest_addr_t addr, qword_t len);
+int_t sys_mlock2(addr_t addr, dword_t len, dword_t flags);
+int_t sys_mlock2_guest(guest_addr_t addr, qword_t len, dword_t flags);
 int_t sys_munlock(addr_t addr, dword_t len);
 int_t sys_munlock_guest(guest_addr_t addr, qword_t len);
 int_t sys_mlockall(dword_t flags);
@@ -260,8 +282,8 @@ dword_t arm64_open_flags_to_internal(qword_t flags);
 dword_t sys_close(fd_t fd);
 dword_t sys_link(addr_t src_addr, addr_t dst_addr);
 dword_t sys_link_guest(guest_addr_t src_addr, guest_addr_t dst_addr);
-dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr);
-dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr);
+dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr, int_t flags);
+dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags);
 dword_t sys_unlink(addr_t path_addr);
 dword_t sys_unlink_guest(guest_addr_t path_addr);
 dword_t sys_unlinkat(fd_t at_f, addr_t path_addr, int_t flags);
@@ -416,6 +438,8 @@ dword_t sys_mount(addr_t source_addr, addr_t target_addr, addr_t type_addr, dwor
 dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t target_addr, guest_addr_t type_addr, dword_t flags, guest_addr_t data_addr);
 dword_t sys_umount2(addr_t target_addr, dword_t flags);
 dword_t sys_umount2_guest(guest_addr_t target_addr, dword_t flags);
+dword_t sys_pivot_root(addr_t new_root_addr, addr_t put_old_addr);
+dword_t sys_pivot_root_guest(guest_addr_t new_root_addr, guest_addr_t put_old_addr);
 // New mount API (fsopen/fsconfig/fsmount/move_mount), fs/mount.c -- see its
 // implementation comment for scope (systemd's per-service credentials tmpfs).
 fd_t sys_fsopen(addr_t fsname_addr, dword_t flags);
@@ -425,16 +449,35 @@ dword_t sys_fsconfig_guest(fd_t f, dword_t cmd, guest_addr_t key_addr, guest_add
 fd_t sys_fsmount(fd_t f, dword_t flags, dword_t attr_flags);
 fd_t sys_fsmount_guest(fd_t f, dword_t flags, dword_t attr_flags);
 dword_t sys_move_mount(fd_t from_dfd, addr_t from_path_addr, fd_t to_dfd, addr_t to_path_addr, dword_t flags);
+dword_t sys_mount_setattr(fd_t dfd, addr_t path_addr, dword_t flags, addr_t attr_addr, dword_t size);
+dword_t sys_mount_setattr_guest(fd_t dfd, guest_addr_t path_addr, dword_t flags, guest_addr_t attr_addr, guest_addr_t size);
 dword_t sys_move_mount_guest(fd_t from_dfd, guest_addr_t from_path_addr, fd_t to_dfd, guest_addr_t to_path_addr, dword_t flags);
 
-dword_t sys_xattr_stub(addr_t path_addr, addr_t name_addr, addr_t value_addr, dword_t size, dword_t flags);
-dword_t sys_setxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr, guest_addr_t value_addr, dword_t size, dword_t flags);
-dword_t sys_fsetxattr_guest(fd_t fd, guest_addr_t name_addr, guest_addr_t value_addr, dword_t size, dword_t flags);
-dword_t sys_getxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr, guest_addr_t value_addr, dword_t size);
-dword_t sys_fgetxattr_guest(fd_t fd, guest_addr_t name_addr, guest_addr_t value_addr, dword_t size);
-dword_t sys_listxattr_guest(guest_addr_t path_addr, guest_addr_t list_addr, dword_t size);
-dword_t sys_flistxattr_guest(fd_t fd, guest_addr_t list_addr, dword_t size);
+// kernel/xattr.c. The i386 table's forms take its 32-bit words; the _guest
+// forms are what the 64-bit dispatchers call, with the size at full width.
+dword_t sys_setxattr(addr_t path, addr_t name, addr_t value, dword_t size, dword_t flags);
+dword_t sys_lsetxattr(addr_t path, addr_t name, addr_t value, dword_t size, dword_t flags);
+dword_t sys_fsetxattr(fd_t fd, addr_t name, addr_t value, dword_t size, dword_t flags);
+dword_t sys_getxattr(addr_t path, addr_t name, addr_t value, dword_t size);
+dword_t sys_lgetxattr(addr_t path, addr_t name, addr_t value, dword_t size);
+dword_t sys_fgetxattr(fd_t fd, addr_t name, addr_t value, dword_t size);
+dword_t sys_listxattr(addr_t path, addr_t list, dword_t size);
+dword_t sys_llistxattr(addr_t path, addr_t list, dword_t size);
+dword_t sys_flistxattr(fd_t fd, addr_t list, dword_t size);
+dword_t sys_removexattr(addr_t path, addr_t name);
+dword_t sys_lremovexattr(addr_t path, addr_t name);
+dword_t sys_fremovexattr(fd_t fd, addr_t name);
+dword_t sys_setxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr, guest_addr_t value_addr, qword_t size, dword_t flags);
+dword_t sys_lsetxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr, guest_addr_t value_addr, qword_t size, dword_t flags);
+dword_t sys_fsetxattr_guest(fd_t fd, guest_addr_t name_addr, guest_addr_t value_addr, qword_t size, dword_t flags);
+dword_t sys_getxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr, guest_addr_t value_addr, qword_t size);
+dword_t sys_lgetxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr, guest_addr_t value_addr, qword_t size);
+dword_t sys_fgetxattr_guest(fd_t fd, guest_addr_t name_addr, guest_addr_t value_addr, qword_t size);
+dword_t sys_listxattr_guest(guest_addr_t path_addr, guest_addr_t list_addr, qword_t size);
+dword_t sys_llistxattr_guest(guest_addr_t path_addr, guest_addr_t list_addr, qword_t size);
+dword_t sys_flistxattr_guest(fd_t fd, guest_addr_t list_addr, qword_t size);
 dword_t sys_removexattr_guest(guest_addr_t path_addr, guest_addr_t name_addr);
+dword_t sys_lremovexattr_guest(guest_addr_t path_addr, guest_addr_t name_addr);
 dword_t sys_fremovexattr_guest(fd_t fd, guest_addr_t name_addr);
 
 // process information
@@ -515,8 +558,10 @@ dword_t sys_chroot(addr_t path_addr);
 dword_t sys_chroot_guest(guest_addr_t path_addr);
 dword_t sys_fchdir(fd_t f);
 int_t sys_personality(dword_t pers);
-int task_set_thread_area(struct task *task, addr_t u_info);
+int task_set_thread_area(struct task *task, int idx, addr_t u_info, bool can_allocate);
+int task_get_thread_area(struct task *task, int idx, addr_t u_info);
 int sys_set_thread_area(addr_t u_info);
+int sys_get_thread_area(addr_t u_info);
 int sys_set_tid_address(addr_t blahblahblah);
 int sys_set_tid_address_guest(guest_addr_t tid);
 dword_t sys_setsid(void);
@@ -525,9 +570,37 @@ dword_t sys_getsid(pid_t_ pid);
 int_t sys_sched_yield(void);
 int_t sys_prctl(dword_t option, uint_t arg2, uint_t arg3, uint_t arg4, uint_t arg5);
 int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t arg4, qword_t arg5);
+// kernel/seccomp.c. The legacy-table form; 64-bit ABIs call sys_seccomp_guest.
+int_t sys_seccomp(dword_t op, dword_t flags, addr_t uargs);
 int_t sys_arch_prctl(int_t code, addr_t addr);
 int_t sys_arch_prctl_guest(int_t code, guest_addr_t addr);
 int_t sys_rseq(addr_t rseq_addr, dword_t rseq_len, dword_t flags, dword_t sig);
+dword_t sys_getcpu(addr_t cpu_addr, addr_t node_addr, addr_t tcache);
+int_t sys_pidfd_getfd(fd_t pidfd, fd_t targetfd, dword_t flags);
+// kernel/mqueue.c
+fd_t sys_mq_open(addr_t name_addr, dword_t oflag, mode_t_ mode, addr_t attr_addr);
+fd_t sys_mq_open_guest(guest_addr_t name_addr, dword_t oflag, mode_t_ mode, guest_addr_t attr_addr);
+dword_t sys_mq_unlink(addr_t name_addr);
+dword_t sys_mq_unlink_guest(guest_addr_t name_addr);
+dword_t sys_mq_timedsend(fd_t mqd, addr_t msg_addr, dword_t len, dword_t prio, addr_t timeout_addr);
+dword_t sys_mq_timedsend_time64(fd_t mqd, addr_t msg_addr, dword_t len, dword_t prio, addr_t timeout_addr);
+dword_t sys_mq_timedsend_guest(fd_t mqd, guest_addr_t msg_addr, qword_t len, dword_t prio, guest_addr_t timeout_addr);
+dword_t sys_mq_timedreceive(fd_t mqd, addr_t msg_addr, dword_t len, addr_t prio_addr, addr_t timeout_addr);
+dword_t sys_mq_timedreceive_time64(fd_t mqd, addr_t msg_addr, dword_t len, addr_t prio_addr, addr_t timeout_addr);
+dword_t sys_mq_timedreceive_guest(fd_t mqd, guest_addr_t msg_addr, qword_t len, guest_addr_t prio_addr, guest_addr_t timeout_addr);
+dword_t sys_mq_notify(fd_t mqd, addr_t sev_addr);
+dword_t sys_mq_notify_guest(fd_t mqd, guest_addr_t sev_addr);
+dword_t sys_mq_getsetattr(fd_t mqd, addr_t new_addr, addr_t old_addr);
+dword_t sys_mq_getsetattr_guest(fd_t mqd, guest_addr_t new_addr, guest_addr_t old_addr);
+// /proc/sys/fs/mqueue/<name> of the calling task's IPC namespace, or NULL.
+unsigned *mqueue_sysctl(const char *name);
+// The process a pidfd names, with a reference the caller drops
+// (task_ref_cnt_mod): NULL with *err EBADF for a descriptor that is not a
+// pidfd, ESRCH once the process has been reaped. kernel/pidfd.c.
+struct task *pidfd_task_ref(fd_t pidfd, int *err);
+dword_t sys_process_madvise_guest(fd_t pidfd, guest_addr_t vec, qword_t vlen, dword_t advice, dword_t flags);
+dword_t sys_process_madvise(fd_t pidfd, addr_t vec, dword_t vlen, dword_t advice, dword_t flags);
+dword_t sys_getcpu_guest(guest_addr_t cpu_addr, guest_addr_t node_addr, guest_addr_t tcache);
 int_t sys_rseq_guest(guest_addr_t rseq_addr, dword_t rseq_len, dword_t flags, dword_t sig);
 int_t sys_reboot(int_t magic, int_t magic2, int_t cmd);
 
@@ -591,6 +664,7 @@ dword_t sys_futex(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2,
 dword_t sys_futex_time64(addr_t uaddr, dword_t op, dword_t val, addr_t timeout_or_val2, addr_t uaddr2, dword_t val3);
 dword_t sys_futex_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2, guest_addr_t uaddr2, dword_t val3);
 dword_t sys_futex_time64_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2, guest_addr_t uaddr2, dword_t val3);
+dword_t sys_futex_amd64_guest(guest_addr_t uaddr, dword_t op, dword_t val, guest_addr_t timeout_or_val2, guest_addr_t uaddr2, dword_t val3);
 int_t sys_set_robust_list(addr_t robust_list, dword_t len);
 int_t sys_set_robust_list_guest(guest_addr_t robust_list, dword_t len);
 int_t sys_set_robust_list_amd64(addr_t robust_list, dword_t len);
@@ -631,7 +705,8 @@ int_t sys_semtimedop_guest(int_t semid, guest_addr_t sops, uint_t nsops, guest_a
 int_t sys_semctl(int_t semid, int_t semnum, int_t cmd, addr_t arg);
 int_t sys_semctl_guest(int_t semid, int_t semnum, int_t cmd, guest_addr_t arg);
 struct tgroup;
-void sysv_sem_exit(struct tgroup *group);
+struct ipc_namespace;
+void sysv_sem_exit(struct ipc_namespace *ns, struct tgroup *group);
 
 // Which registers an arm64 page fault dumps guest memory around, as a comma
 // separated list of register numbers ("19,20"). Backs /proc/ish/arm64_faultdump
@@ -644,5 +719,9 @@ void arm64_faultdump_show(char *out, size_t size);
 // amd64 keeps a separate bring-up path because it needs different syscall
 // numbers and a different register ABI.
 typedef dword_t (*syscall_t)(dword_t, dword_t, dword_t, dword_t, dword_t, dword_t);
+
+// The syscall number a blocked task entered with, or -1. See kernel/calls.c.
+struct task;
+long task_blocked_syscall(struct task *task, const char **abi_name);
 
 #endif

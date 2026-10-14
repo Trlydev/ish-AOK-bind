@@ -80,6 +80,7 @@ are not editable in place.
 |---|---|
 | **Font** and **Font Size** | the terminal typeface and its size |
 | **Line Height** | vertical spacing, 0.70 to 1.30 in steps of 0.05 — see [proc-ish.md](proc-ish.md) |
+| **Bottom Padding** | space left clear below the terminal, 0 to 120 points, so its last rows are out of the Home indicator's swipe area; only while no on-screen keyboard is up, and not in Workspace windows (559) |
 | **Color Scheme** | which of the theme's palettes the terminal uses: Light, Dark, or follow the system |
 | **Cursor Style** and **Blink Cursor** | shape, and whether it blinks |
 | **Status Bar**, **Terminal Buttons** | whether those are shown |

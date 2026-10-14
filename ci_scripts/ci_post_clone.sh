@@ -41,26 +41,65 @@ note_problem() { problems="$problems
 # Every submodule URL is a public GitHub repo, verified, so this needs no
 # credentials.
 git submodule update --init || note_problem "git submodule update --init failed"
+# And the three of smallclue's own submodules the app is built from, which a
+# non-recursive update leaves out -- the same line the Actions jobs run:
+# openssh (ssh, scp, sftp), nextvi (vi) and libgit2 (git). Without them meson
+# swaps in stubs and the archive succeeds without them.
+git -C deps/smallclue submodule update --init third-party/openssh third-party/nextvi third-party/libgit2 \
+    || note_problem "smallclue's openssh/nextvi/libgit2 submodules failed"
+
+# --- generated sources the checkout does not carry -----------------------
+# The two steps the Actions macOS job runs between checkout and xcodebuild, and
+# which this script lacked -- the dash one was added to ci.yml on 2026-09-16,
+# after this script was written, and every cloud archive since failed on it at
+# meson.build ("-Dnative_dash=enabled but deps/dash is not a prepared dash
+# tree"), where only the ExternalBuildToolExecution failure reached the summary.
+#
+# deps/dash's config.h: the fork commits dash's generated sources but not
+# config.h. Configure only; never dash's own make (tools/configure-dash.sh says
+# why).
+(cd deps/dash && ../../tools/configure-dash.sh --quiet) \
+    || note_problem "configuring deps/dash failed"
+# hterm_all.js: the terminal's JavaScript bundle, a build artifact of libapps
+# that the app target copies in as a resource.
+(cd deps/libapps/hterm && python3 bin/mkdist) \
+    || note_problem "building hterm_all.js (deps/libapps/hterm bin/mkdist) failed"
 
 # --- Homebrew packages --------------------------------------------------
 # meson and ninja must come from brew rather than pip: both legacy targets put
 # only Homebrew's and /usr/local's bin on PATH and look nowhere else, so a pip
 # install into a user directory would be invisible to them.
 # llvm is for llvm-objcopy, which Xcode does not ship and meson.build probes at
-# the Homebrew keg path. lld and libarchive are parity with the Actions job and
-# are not referenced by meson.build, so they are best effort.
+# the Homebrew keg path, and for the clang vdso/meson.build compiles the i386
+# vDSO with. lld is for that vDSO's link: vdso/meson.build passes
+# -fuse-ld=lld, so clang needs ld.lld on PATH, and xcode-meson.sh puts
+# /opt/homebrew/bin there. lld is not keg-only, so it lands there.
+#
+# This script once skipped lld, on the belief that nothing referenced it. The
+# build then failed at the Meson target with "clang: error: invalid linker name
+# in argument '-fuse-ld=lld'" -- the exact error vdso/check-cc.sh gives
+# with ld.lld off PATH. libarchive stays out: the app builds deps/libarchive
+# itself, and meson.build does not ask for Homebrew's.
 if command -v brew >/dev/null 2>&1; then
-    for formula in meson ninja llvm; do
+    for formula in meson ninja llvm lld; do
         brew install "$formula" || note_problem "brew install $formula failed"
     done
-    # lld and libarchive are deliberately NOT installed. The Actions job takes
-    # them, but nothing in meson.build references either, and here they are not
-    # free: lld depends on llvm, so asking for it drags the largest formula in
-    # the set through dependency resolution a second time, and Xcode Cloud
-    # caches no Homebrew state between builds, so every one of those bytes is
-    # paid for again on every single run.
 else
     note_problem "brew is not on PATH, so no dependency could be installed"
+fi
+
+# --- Metal toolchain ----------------------------------------------------
+# Since Xcode 26 the Metal compiler is a separately downloaded component, not
+# part of Xcode, and the Xcode Cloud image does not carry it. The app compiles
+# one shader (app/DisplayRFBShaders.metal), so without it the archive fails at
+# "Command CompileMetalFile failed with a nonzero exit code" -- which is where
+# every cloud build ended once lld was in place. GitHub's macOS runners ship it,
+# which is why the Actions job never needed this step.
+if xcodebuild -showComponent MetalToolchain 2>/dev/null | grep -q 'Status: installed'; then
+    echo "Metal toolchain already installed"
+else
+    xcodebuild -downloadComponent MetalToolchain \
+        || note_problem "xcodebuild -downloadComponent MetalToolchain failed"
 fi
 
 # --- Rust ---------------------------------------------------------------
@@ -71,45 +110,47 @@ fi
 # rustup is required even when the image already ships cargo: the iOS std has
 # to be added, only rustup can add it, and a cargo without it builds the crate
 # for the host, whose objects will not link into an iOS binary.
-rustup_bin=""
-if [ -x "$HOME/.cargo/bin/rustup" ]; then
-    rustup_bin="$HOME/.cargo/bin/rustup"
-elif command -v rustup >/dev/null 2>&1; then
-    rustup_bin=$(command -v rustup)
-fi
-
-if [ -z "$rustup_bin" ] && command -v brew >/dev/null 2>&1; then
-    # Homebrew's rustup formula is keg-only, so rustup-init is not on PATH.
-    brew install rustup || note_problem "brew install rustup failed"
-    rustup_init=""
-    for candidate in "$(brew --prefix rustup 2>/dev/null)/bin/rustup-init" "$(command -v rustup-init 2>/dev/null)"; do
-        if [ -n "$candidate" ] && [ -x "$candidate" ]; then
-            rustup_init="$candidate"
-            break
-        fi
-    done
-    if [ -n "$rustup_init" ]; then
-        "$rustup_init" -y --no-modify-path --default-toolchain stable \
-            || note_problem "rustup-init failed"
-        [ -x "$HOME/.cargo/bin/rustup" ] && rustup_bin="$HOME/.cargo/bin/rustup"
+#
+# The toolchain goes in $HOME/.cargo, installed by rustup's own installer,
+# because that is where meson looks: find_program('cargo', <cargo_home>/bin/cargo)
+# with -Dcargo_home=$HOME/.cargo, and xcodebuild's PATH has neither ~/.cargo/bin
+# nor a Homebrew keg in it.
+#
+# This used to go through Homebrew's rustup formula, and stopped working when
+# the formula changed under it. 1.29 no longer ships rustup-init -- it installs
+# the same binary as `rustup` -- and keeps cargo and rustc as proxies in its
+# unlinked keg. That put a rustup on PATH, but installing a toolchain through it
+# never puts cargo in ~/.cargo/bin. Every cloud build ended "the build cannot
+# proceed without: cargo". Homebrew bought nothing here anyway: the toolchain
+# itself is downloaded from static.rust-lang.org whichever rustup asks for it.
+rustup_bin="$HOME/.cargo/bin/rustup"
+if [ ! -x "$rustup_bin" ]; then
+    rustup_init=$(mktemp "${TMPDIR:-/tmp}/rustup-init.XXXXXX")
+    if curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o "$rustup_init"; then
+        sh "$rustup_init" -y --no-modify-path --profile minimal --default-toolchain stable \
+            || note_problem "the rustup installer (sh.rustup.rs) failed"
     else
-        note_problem "rustup-init not found after installing the rustup formula"
+        note_problem "could not download the rustup installer from sh.rustup.rs"
     fi
+    rm -f "$rustup_init"
 fi
 
-if [ -n "$rustup_bin" ]; then
+if [ -x "$rustup_bin" ]; then
+    # A rustup that was already here may have no toolchain of its own yet.
+    "$rustup_bin" default >/dev/null 2>&1 || "$rustup_bin" default stable \
+        || note_problem "rustup default stable failed"
     # The Archive action builds for the device only.
     "$rustup_bin" target add aarch64-apple-ios \
         || note_problem "rustup target add aarch64-apple-ios failed"
 else
-    note_problem "no rustup, so the aarch64-apple-ios std cannot be installed"
+    note_problem "no rustup in \$HOME/.cargo/bin, so there is no cargo for meson and no aarch64-apple-ios std"
 fi
 
 # --- report -------------------------------------------------------------
 set +x
 echo "=============== ci_post_clone toolchain report ==============="
 # cargo is found by meson at -Dcargo_home/bin, not necessarily on PATH.
-for tool in meson ninja python3 cargo rustup llvm-objcopy; do
+for tool in meson ninja python3 cargo rustup llvm-objcopy ld.lld; do
     path=$(command -v "$tool" 2>/dev/null || true)
     if [ -z "$path" ] && [ -x "$HOME/.cargo/bin/$tool" ]; then
         path="$HOME/.cargo/bin/$tool"
@@ -125,6 +166,7 @@ done
 for probe in /opt/homebrew/opt/llvm/bin/llvm-objcopy /usr/local/opt/llvm/bin/llvm-objcopy; do
     [ -x "$probe" ] && echo "  llvm-objcopy (meson probe path): $probe"
 done
+echo "  Metal toolchain: $(xcodebuild -showComponent MetalToolchain 2>/dev/null | sed -n 's/^Status: //p' | head -1)"
 echo "  deps/helix: $([ -d deps/helix/.git ] || [ -f deps/helix/.git ] && echo checked-out || echo EMPTY)"
 echo "  PATH=$PATH"
 
@@ -137,6 +179,11 @@ command -v ninja  >/dev/null 2>&1 || missing="$missing ninja"
     || [ -x /usr/local/opt/llvm/bin/llvm-objcopy ] \
     || command -v llvm-objcopy >/dev/null 2>&1 \
     || missing="$missing llvm-objcopy"
+command -v ld.lld >/dev/null 2>&1 || missing="$missing ld.lld"
+xcodebuild -showComponent MetalToolchain 2>/dev/null | grep -q 'Status: installed' \
+    || missing="$missing MetalToolchain"
+[ -f deps/dash/config.h ] || missing="$missing deps/dash/config.h"
+[ -f deps/libapps/hterm/dist/js/hterm_all.js ] || missing="$missing hterm_all.js"
 
 if [ -n "$problems" ]; then
     echo "  steps that reported a problem:$problems"

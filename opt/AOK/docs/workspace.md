@@ -12,6 +12,10 @@ guest Linux processes; the window chrome, dock, and most applets are pure
 native code. That's also why Workspace works on iPhone, not just iPad: it
 doesn't depend on iOS Scenes or Stage Manager multi-window support.
 
+With a hardware keyboard, ⌘← and ⌘→ (or ⌃⌥← and ⌃⌥→) switch Desktops and
+⌃Tab switches windows; every shortcut is listed in
+[keyboard-shortcuts.md](keyboard-shortcuts.md).
+
 ## Reaching the applets
 
 Which controls you get depends on the **Workspace Style** preference. The
@@ -30,8 +34,44 @@ Terminal lists your sessions and Utils lists every applet, in five groups:
   described in [roots.md](roots.md).
 - **Support** — Settings, Diagnostics.
 
+**Quick Actions** is a small panel of one-tap buttons for the things you reach
+for most: Layout Manager (save or restore this workspace), Desktops, Session
+Shell and System Console (each opens that window, or brings it forward),
+Sessions, Storage, Themes, Boot Images, Clock and, on iPad, New Workspace. From a
+guest shell, `ws-quickactions` opens it. It is not related to Apple's Shortcuts
+app, which is covered in [shortcuts.md](shortcuts.md).
+
+The menu **Utilities…** sits in — the ☰ button, the desktop long press, and
+each window's own ☰ all raise it — also has **Snippets…**, your library of
+saved command lines. In a plain terminal those hang off a long press on the
+Paste key, or Cmd-J, both of which want the keyboard up; here they are one tap
+from anywhere on the desktop. A snippet goes to the terminal window whose ☰ you
+used, or to the frontmost one when you opened the menu from the desktop or the
+corner button — and that window comes to the front before the list appears, so
+you can see where the text is about to land. With no terminal window open the
+list still opens, to read and edit; it says so at the top, and a tap opens the
+snippet rather than inserting it.
+
+A terminal window has its own way in as well: the **Switch Terminal** button,
+the one showing overlapping rectangles, lists **Snippets…** too. That is the
+route to use with a hardware keyboard, which hides the accessory bar the Paste
+key lives in — the same button then floats over the bottom-right of the
+terminal. Cmd-J opens the list from the keyboard.
+
 Window arrangements can be bookmarked and saved, so a favorite layout of
-terminals and applets can be recalled later.
+terminals and applets can be recalled later. Restoring one after a relaunch
+opens fresh terminals where the saved ones were — the shells themselves ended
+with the app — with as many tabs as each had.
+
+## Terminal tabs
+
+A Terminal window holds its terminals as tabs. Open one with ⌘T, the **+** in
+the tab strip, or the window menu's **New Tab**; close one with ⌘W, its **Close
+Tab**, or `exit` in it — closing the last closes the window. ⌘1 to ⌘9 and
+⌘⇧[ / ⌘⇧] switch. The strip of numbered tabs appears once there are two.
+Focus, text size, [Snippets](snippets.md) and the dock all act on the tab
+showing. Saved layouts and [suspend to disk](suspend.md) keep every tab, in
+order, with the one that was showing still selected.
 
 ## MotePad
 
@@ -61,34 +101,367 @@ An audio player applet with two kinds of sources:
 
 Playlists are saved as JSON under `/AOK/persist/playlists`.
 
+**Equalizer** (the Music menu's Equalizer…, the Workspace group in Utilities,
+the Launcher, or `ws-eq`) shapes what Music plays: ten bands from 31 Hz to
+16 kHz, ±12 dB each, an on/off switch and presets (Flat, Bass Boost, Treble
+Boost, Vocal, Loudness, Rock). Settings are kept and apply as the sliders move.
+Sound from guest programs does not pass through it.
+
+## Browser
+
+A web browser with tabs (as many as the device's memory allows). It also shows
+the guest's own files: tap an `.html`, `.svg` or `.pdf` file in the File Manager,
+or run `ws-browser page.html`, and it opens in a new tab of the Browser already
+open. A local page's stylesheets, images and links to other pages are read from
+the guest too. `ws-browser https://…` opens a web address the same way.
+
+## Video Player
+
+Plays a video opened from the File Manager (mp4, mov, m4v; mkv and webm open
+and say whether AVFoundation can play them), and streams from the web:
+
+- **Open URL**, above the picture, takes a video's address, an HLS stream
+  (`.m3u8`), or an `.m3u` playlist.
+- A **playlist** of several entries — the shape of an IPTV channel list, one
+  address per line with `#EXTINF` names — becomes a searchable list; the
+  **Channels** button brings it back. One with a single entry just plays. An
+  address counts as a playlist when it ends in `.m3u` or `.m3u8`, or its query
+  names the format (`get.php?…&type=m3u_plus`).
+- An `.m3u` or `.m3u8` file in the guest opens from the File Manager the same
+  way; entries that are relative paths are read from the playlist's directory.
+  An HLS stream saved as a file cannot play from there — its segments are
+  fetched relative to its web address — so open that address instead.
+- From a shell: `ws-videoplayer https://…/live.m3u8` or
+  `ws-videoplayer ~/channels.m3u`.
+
 ## The Wayland applet
 
 The **Wayland** applet is the one window here whose contents are drawn by guest
 programs rather than by UIKit. A wlroots compositor, a terminal and a VNC server
-run as ordinary processes inside your root, and the applet is a native RFB
-client connected to them over localhost. It can also be the window the app opens
-on, rather than the terminal.
+run as ordinary processes inside your root. With the [GPU](#the-gpu) set up, the
+app takes the desktop's frames straight from the compositor through
+`wl-present` and sends your keys, pointer and clipboard back the same way;
+without it, the applet is a native RFB client connected to the VNC server over
+localhost. It can also be the window the app opens on, rather than the terminal.
 
-It needs those programs installed in the guest first, and two scripts do that:
+The session moves between full screen and Workspace without ending: **Open
+Workspace…** from full screen parks it and the Workspace's Wayland window takes it
+over, and **Wayland Full Screen** in the Workspace corner menu does the reverse.
+If you change **Open Everything as Default User**, the view offers to restart the session
+as the right user.
+
+A finger on the desktop is the pointer: where you touch is where it goes, and
+the touch is the left button. On a phone the targets are smaller than a
+fingertip, so the view's menu (**···**) has **Touchpad Mode** (build 559),
+which treats the whole view as a laptop's touchpad instead:
+
+| Gesture | What it does |
+|---|---|
+| Drag one finger | Moves the pointer from where it is: one for one when slow, further when fast |
+| Tap | Left click where the pointer is |
+| Tap twice | Double click |
+| Tap, then touch again at once and drag | Drags with the left button held |
+| Drag two fingers | Scrolls, the content following the fingers |
+| Tap with two fingers | Right click |
+| Tap with three fingers | Middle click |
+
+A mouse, a trackpad and a pencil are unaffected: they already point.
+
+It needs those programs installed in the guest first. From build 559 the app
+does that for you: **Settings → Wayland Desktop → Install a Desktop…**, which
+is also in the display's own **···** menu — where its "not found" message
+appears when a filesystem has no desktop yet. The page lists the desktops with
+what is installed and which one starts; tapping one that is not installed runs
+its setup script and shows what it prints, and tapping one that is makes it the
+desktop the next session starts. **More Programs** installs the games, tools,
+X11 support and GPU drivers described below. It installs into the filesystem
+that is running, takes several minutes, and needs iSH-AOK left open meanwhile.
+
+The same scripts can be run by hand:
 
 ```sh
-sudo sh /AOK/tools/setup-wayland.sh   # once: labwc, sway, wofi, foot, wayvnc
+sudo sh /AOK/tools/setup-wayland.sh   # once: labwc, sway, wofi, foot, wayvnc, waybar
 sh /AOK/tools/start-wayland.sh        # the applet runs this for you
 ```
 
 `labwc` is the default compositor and `foot` the first app; `sway` is installed
-as a `WAYLAND_COMPOSITOR_CMD=sway` alternative. `start-wayland.sh` also honours
-`WAYVNC_PORT` and `ISH_DISPLAY_READY_FILE`.
+as an alternative (`sudo sh /AOK/tools/select-desktop.sh sway` picks it). Two fuller desktops can take labwc's place (see **Other
+desktops**, below). `start-wayland.sh` also honours `WAYVNC_PORT`,
+`ISH_DISPLAY_READY_FILE`, and `WAYLAND_COMPOSITOR_CMD`, which overrides the
+chosen desktop.
 
-Two caveats worth knowing before you start. Only **amd64/x86_64** guests have
-been bring-up-tested — the packages exist for the other architectures in Devuan
-and may well work, but nobody has run them. And Devuan (apt) and Arch (pacman)
-install the same stack under the same package names, while Alpine (apk) is a
-documented follow-up rather than a supported path.
+One Wayland desktop runs at a time. While one is open, `start-wayland.sh`
+refuses to start another and exits 1 with "a Wayland session is already
+running (pid N)", leaving the open desktop alone. The same goes for a Wayland
+applet opened in a second Workspace window: it shows that message instead of a
+desktop. The dock, the Launcher and `ws-wayland` bring the running desktop
+forward rather than starting one. A desktop that is closing is waited for, so
+closing the applet and opening it again straight away still works.
 
-You may also come across `wayland_workspace_plan.md` in the project's design
+The desktop gets its own session D-Bus when `dbus-daemon` is installed, which
+`setup-wayland.sh` also does. Everything started inside it finds that bus
+through `DBUS_SESSION_BUS_ADDRESS`, so programs that need one, such as waybar
+and Qt apps, work without you starting a bus or setting `DISPLAY`. On a root set
+up before this, install it once with `sudo apt install dbus-daemon` (Devuan) or
+`sudo apk add dbus` (Alpine), then reopen the applet.
+
+`waybar`, a panel along the top of the desktop, is installed too, with the Font
+Awesome font its icons use: a taskbar, the clock, CPU, memory, disk, network and
+battery. It starts with the desktop. To turn it off, right-click the desktop and
+pick **Applications › Hide Panel**; it stays off in later sessions until
+**Show Panel** turns it back on. If your own `~/.config/labwc/autostart` starts
+waybar, the desktop leaves that to it.
+
+The first session after it is installed writes a config that suits labwc to
+`~/.config/waybar/config.jsonc`. It is written only when you have no waybar config
+of your own, and it is yours to edit. Debian's default in `/etc/xdg/waybar` is
+written for sway, and several of its modules switch themselves off here. A
+`style.css` is written beside it the same way: waybar's own style, with the text
+font ahead of Font Awesome, since the Font Awesome 7 that Alpine and Arch ship
+would otherwise draw every letter as an icon. Two log lines are expected and
+harmless: `basic_string::_M_create`, a waybar 0.12 bug that native Linux prints
+too, and a warning that it cannot reach the system bus, which it only uses to
+notice suspend. On a root set up before this, install it with
+`sudo apt install waybar fonts-font-awesome` (Devuan) or
+`sudo apk add waybar font-awesome` (Alpine).
+
+Right-click the desktop for its menu. **New Terminal** opens foot, **Launcher**
+searches the installed programs, and **Applications** has a submenu for each
+category: Games, Graphics, Internet and so on. labwc menus do not scroll, so a
+category with more than 24 programs is split into parts named by their first
+letters, such as **Games (A–N)**. The same actions have keys: Alt+Return opens a
+terminal, Alt+Shift+D the launcher, Alt+Tab switches windows, Alt+Shift+Q closes
+one, Alt+Shift+R reloads labwc's settings and Alt+Shift+E ends the session.
+
+The Applications menu and the launcher follow the freedesktop override rule: an
+entry in `/usr/local/share/applications`, then `~/.local/share/applications`,
+replaces the one of the same name in `/usr/share/applications`, and one of your
+own appears beside them. So `NoDisplay=true` in a copy there hides an entry, and
+a `.desktop` file of your own adds one.
+
+The desktop has four desktops of its own. Ctrl+Alt+Left and Ctrl+Alt+Right
+move between them, adding Shift takes the focused window along, and
+Ctrl+Alt+1 to 4 goes straight to one. (Cmd+Left and Cmd+Right switch
+Workspace's own Desktops, around the window; all the keys are in
+[keyboard-shortcuts.md](keyboard-shortcuts.md).)
+
+The menu and the keys live in `~/.config/labwc/menu.xml` and `rc.xml`, which are
+yours to edit: a file you have changed is never replaced. One still exactly as an
+earlier AOK wrote it is brought up to date, which is how an existing desktop gets
+the Launcher.
+
+More programs that run well on this desktop come in three optional sets:
+
+```sh
+sudo sh /AOK/tools/setup-wayland-extras.sh games   # puzzles, solitaire, Mines, Chess, terminal games
+sudo sh /AOK/tools/setup-wayland-extras.sh tools   # launcher, notifications, clipboard, screenshots, viewers, editor, files, browser
+sudo sh /AOK/tools/setup-wayland-extras.sh x11     # Xwayland, xterm and the X fonts, for X11-only programs
+```
+
+Name several sets at once, or `all`. The Launcher is fuzzel once **tools** is
+installed, and wofi before. Program names differ between distributions and a
+few programs are missing from Alpine and Arch; the script installs what each has
+and lists what it could not. X11 programs run from the menu and from the first
+terminal alike, since the session sets `DISPLAY`; Xwayland starts with the first
+one, which takes a few seconds. SDL games are told to use Wayland, and
+`/usr/games`, where Devuan puts games, is on `PATH`.
+
+Two caveats worth knowing before you start. It has been run on **amd64** and
+**arm64** guests — the packages exist for the other architectures in Devuan and
+may well work, but nobody has run them. And it has been run on **Devuan** (apt)
+and **Alpine** (apk); **Arch** (pacman) installs the same stack under the same
+names, and its packages resolve, but no one has run a session on it.
+
+### Other desktops: Wayfire and Xfce
+
+Two fuller desktops install beside the default one, and either can be the one
+the Wayland window starts:
+
+```sh
+sudo sh /AOK/tools/setup-wayfire.sh   # Wayfire, composited on the GPU
+sudo sh /AOK/tools/setup-xfce.sh      # the Xfce 4.20 desktop
+sh /AOK/tools/select-desktop.sh       # which one starts, and what is installed
+sudo sh /AOK/tools/select-desktop.sh labwc   # back to the default
+```
+
+Each setup script installs the base desktop first if it is missing, and makes
+its desktop the one that starts; `--no-select` installs without choosing it.
+The choice is kept in `/etc/aok-desktop.conf` and takes effect the next time the
+Wayland window opens.
+
+- **Wayfire** is the desktop that puts the GPU to work: wobbly windows, a
+  desktop cube (hold Ctrl+Alt and drag), expo (Alt+Shift+W shows every
+  desktop at once), and animations, with wf-shell's panel and wallpaper and
+  `wcm`, a settings window for all of it. It draws with OpenGL ES, so it
+  needs the GPU ([The GPU](#the-gpu)): `setup-wayfire.sh` runs `setup-gpu.sh`
+  when the drivers are missing. Wayfire also refuses to run as root, as it
+  does on any Linux, so it needs **Open Everything as Default User** turned on
+  in Settings. A session without the GPU, or a root one, starts labwc instead
+  and says why. It runs on Devuan 6 of **any** architecture: on a root that
+  is not arm64, `setup-wayfire.sh` installs Wayfire, its shell and its
+  settings window as arm64 through Debian multiarch, with arm64's GPU drivers,
+  and iSH-AOK runs that arm64 Wayfire on the GPU there -- in a riscv64 or i386
+  root, whose own Mesa has no GPU driver, as in an arm64 one. The terminal, the
+  VNC bridge and the X server stay the root's own. Arch packages Wayfire, and
+  from build 559 its Mesa can use the GPU for OpenGL ES (see
+  [The GPU](#the-gpu)), so `setup-wayfire.sh` no longer refuses there -- but
+  nobody has run a Wayfire session on Arch yet. Alpine does not package it.
+  Wayfire's panel is your choice, and `setup-wayfire.sh` asks (or takes
+  `--panel fast|waybar|both|stock`): **fast** is wf-shell's panel with a
+  menu that reopens at once -- the packaged one rebuilds every entry each time
+  it opens, which takes seconds on older iPads -- and comes prebuilt in
+  `/AOK/bundled`, built for arm64 and used on a Devuan root of any
+  architecture: on one that is not arm64, setup adds arm64 as a Debian
+  multiarch architecture and installs the panel's libraries for it, and
+  iSH-AOK runs the arm64 panel there as it would in an arm64 root (a
+  wf-shell it was not built for builds one instead, which takes a while);
+  **waybar** is the panel the labwc desktop has, with an
+  **Apps** button opening wofi's application list; **both** installs the two,
+  and `sudo sh /AOK/tools/select-desktop.sh --panel waybar` (or `wf-panel`)
+  swaps between them for the next session.
+- **Xfce** is the complete desktop: its panel with the applications menu,
+  desktops and clock, desktop icons, the Thunar file manager and the settings
+  manager. The desktop's wallpaper does not draw yet, so it is black behind
+  the icons. It runs as Xfce 4.20's Wayland session, with labwc
+  drawing the windows (Xfce's own window manager is X11-only), so it needs no
+  GPU, and uses it when it is there. Devuan, Alpine and Arch all carry it.
+
+Both keep the labwc desktop's keys, since the app keeps the Command key for
+itself: Alt+Return opens a terminal, Alt+Shift+D the launcher (Xfce's app
+finder), Alt+Shift+Q closes a window and Ctrl+Alt+Left and Right change
+desktops. Their settings are in `~/.config/wayfire.ini` and in
+`~/.config/xfce4/labwc/` (Xfce's own settings are in its settings manager);
+each is written on the desktop's first session and never replaced after that.
+
+### Programs that need root
+
+Menu entries that need root — Synaptic's, GParted's, anything whose
+launcher runs `pkexec` — open a small **Administrator password** terminal.
+Your password goes to `sudo`, the program starts as root on the desktop, and
+the terminal closes. A distro desktop would ask through polkit, but polkit
+only talks to an authentication agent registered for a login session, and
+there are none here, so the desktop puts its own `pkexec` first on `PATH`.
+Your account needs a `sudo` rule, as for `sudo` anywhere. If you run the
+desktop as root, the program starts straight away.
+
+### The GPU
+
+The desktop draws on the device's GPU when the guest has what that takes: the
+GPU device (`/dev/dri/renderD128`) and Mesa's Vulkan driver for it, with zink.
+One script installs them, with vulkaninfo, vkcube and the Mesa demos, adds a
+`gpu-run` command, and checks the result (Devuan 6, Alpine 3.24 and Arch Linux
+ARM carry the packages — Devuan on all four guest architectures, Alpine on arm64
+and amd64 only; Alpine 3.23 has no GPU driver, and the script says so):
+
+```sh
+sudo sh /AOK/tools/setup-gpu.sh            # add --demos for glmark2
+sh /AOK/tools/setup-gpu.sh --check         # what works, without installing
+```
+
+With those, `start-wayland.sh` composites on the GPU, and Vulkan programs
+render on it and hand their frames over without copying — vkcube and the
+like need nothing set. If the compositor cannot use the GPU it says so and
+falls back to drawing in software, as it always has; `ISH_DISPLAY_GPU=0`
+keeps it in software from the start.
+
+On the GPU the app also takes the desktop's frames straight from the
+compositor, up to 60 a second, and sends it the keyboard, pointer, clipboard
+and window size the same way, so the VNC server has nothing to do and stops
+copying the screen. `ISH_DISPLAY_DIRECT=0` leaves all of that to VNC, as
+before.
+
+On Devuan the desktop runs the VNC server iSH-AOK carries in `/AOK/bundled`,
+wayvnc 0.10.2, rather than Devuan's 0.9.1, which can crash when the app takes
+the desktop over. It is built for aarch64, x86_64 and riscv64, and the aarch64
+one is tried first on any Devuan root that has arm64's libraries.
+`setup-wayland.sh` installs the libraries it needs; until it has, the desktop
+uses Devuan's, and starts it again if it crashes. `ISH_DISPLAY_BUNDLED_WAYVNC=0`
+keeps Devuan's.
+
+**From build 559 OpenGL can use the GPU with a current Mesa too.** Mesa 25.2
+and later -- Alpine 3.24's 26.1, and Arch's -- refuse to start zink without a
+Vulkan feature (robustness2's `nullDescriptor`) that iSH-AOK's GPU did not
+offer before 559, so on those roots every OpenGL program rendered in software
+and only Devuan 6's Mesa 25.0 reached the GPU. It is offered now, and
+`setup-gpu.sh --check` passes on Alpine 3.24; a full OpenGL program or
+compositor on such a root has had little testing yet. On an older app build
+the script still says that OpenGL is in software, rather than reporting a GL
+version from the software renderer.
+
+Where zink works, OpenGL programs still render in software by default: on this GPU zink offers
+only OpenGL 2.1 and OpenGL ES 2.0, where software rendering offers 4.5, so a
+program needing more would fail on the GPU instead of running slowly. Put one
+on the GPU with `gpu-run`, which suits older and simpler programs (glmark2
+runs about twenty times as fast):
+
+```sh
+gpu-run glmark2-wayland
+```
+
+`sudo sh /AOK/tools/setup-gpu.sh --gl-default` makes the GPU the desktop's
+default for every OpenGL program from its next session, and `--gl-software`
+puts it back. On Devuan this works on all four guest architectures (riscv64
+is checked on an A10X iPad; i386 has the driver, not yet tried); Alpine's
+riscv64 and i386 builds have no Vulkan driver for the device and stay in
+software.
+
+### Games
+
+One script installs a set of free games tested here -- Freedoom (the free
+Doom, on Chocolate Doom), Beneath a Steel Sky (the freeware ScummVM
+adventure), Warzone 2100, Armagetron Advanced, Chromium B.S.U., Blobby
+Volley 2, Neverball and Trigger Rally -- and sets each up to play sound
+through the app and to draw on the GPU where the GPU can (Devuan roots):
+
+```sh
+sudo sh /AOK/tools/setup-games.sh          # --minimal: Freedoom and Beneath a Steel Sky only
+sh /AOK/tools/setup-games.sh --check       # --software keeps them off the GPU
+```
+
+Start them from the desktop's menu, or by name in a terminal there
+(`freedoom1`, `freedoom2`, `sky`, `warzone2100`, `armagetronad`,
+`chromium-bsu`, `blobby`, `neverball`, `trigger-rally`). Each goes through `/usr/local/bin/aok-sdl-game`, and
+`/etc/aok-games.conf` lists the ones that draw on the GPU. Doom's keys: the
+arrow keys move and turn, Ctrl fires, Space opens doors, Shift runs, Alt with
+the arrows strafes, 1-7 pick a weapon, Tab shows the map and Esc the menu. In
+Beneath a Steel Sky, left-click walks and looks at things, right-click uses
+them, and F5 opens the menu.
+
+Chocolate Doom's package also adds menu entries for Heretic, Hexen and Strife,
+which are commercial and need their own data files (IWADs). Without one each
+only opens an error box, so `setup-games.sh` hides them, with an override in
+`/usr/local/share/applications`; install the IWAD and run it again to show that
+game. Extreme Tux Racer is left out of the set for now — its pointer is out of
+step at the desktop's scale on the GPU — though `aok-sdl-game` still handles
+`etr` if you install it yourself.
+
+You may also come across `docs/historical/wayland_workspace_plan.md` in the project's design
 docs. That is the forward design document this applet came out of; where it and
 the shipped applet disagree, the applet is right.
+
+## Storage
+
+**Utilities → Storage → Open Storage** (or `ws-storage` from a shell, or
+`{storage}` in the Launcher) shows where the app's disk has gone. The top of
+the list is every place the app keeps data, largest first: each installed
+filesystem, the shared `/AOK/fakefs` files, `/AOK/persist`, saved sessions,
+caches and temporary files, and swap while it is on. The line above it gives
+the device's free space and the total across filesystems.
+
+Tap a row to go into it. Inside a filesystem the list is its directories and
+files by their guest paths, again largest first, with the item count under
+each directory; keep tapping to follow the space down to what is using it, and
+**‹ Back** to come up. A filesystem also has a **Filesystem metadata** row: the
+database that holds every file's owner, mode and device number.
+
+The sizes are what the files occupy on the device — whole blocks, a hard link
+counted once — which is what `du` reports and can differ from the lengths
+`ls -l` shows. **Refresh** reads everything again and returns to the directory
+you were in. A big filesystem takes a few seconds to read the first time; its
+row says **Scanning…** until it has been.
+
+To free space, delete from inside the guest (or remove a whole filesystem in
+Settings → Filesystems); this window only reports.
 
 ## `/proc/ish/workspace`: asking the app to open something
 
@@ -141,7 +514,8 @@ whitespace, so a filename with spaces in it needs no quoting here — but it mus
 be **absolute**. A relative path has no meaning by the time the request reaches
 the app: the guest's working directory is not the app's, and the process may be
 gone before the window appears. `motepad` and the `ws-*` launchers resolve yours
-for you.
+for you. The one exception is the video player, which also takes an `http://`
+or `https://` address (`open videoplayer https://…/live.m3u8`).
 
 The file is `0666` and owned by root — unlike `/proc/ish/roots`, which is
 `0644`. Reading *and writing* work for any uid, and that asymmetry is
@@ -155,3 +529,48 @@ so the presenting is handed to the main queue and the write returns — and it h
 to, because blocking a guest write on the UI queue is how you deadlock a
 terminal that is itself being drawn by that UI. If Workspace goes away between
 your write and the main thread getting to it, the request is dropped.
+
+## `/proc/ish/applets`: what is open
+
+The applets are not processes, and `ps`, `top`, `htop` and
+[`ktop`](ktop.md) do not show them. File Manager, MotePad, LLM Chat, Music,
+Settings, the Wayland display and the rest are iOS interface running inside
+the app. They have no pid, no address space, and nothing a signal could reach.
+A guest process shows up in those tools because it *is* one. Giving an applet a
+made-up pid would put an entry in every process list that `kill -9` could not
+stop, which no real system does, and every tool would pass the lie along.
+What a guest runs *inside* a terminal window is a process, and it shows up as
+usual.
+
+To see which applets are open, read `/proc/ish/applets`:
+
+```sh
+$ cat /proc/ish/applets
+ID TOOL DESKTOP STATE AGE TITLE
+3 workspaces * shown 54 Desktops
+5 clock 1 shown 3 Clock
+6 motepad 1 shown 2 MotePad
+7 audio 1 front 1 Music
+```
+
+Switch to Desktop 2 and the three on Desktop 1 read `hidden`. The Desktops
+applet stays `shown`, because every Desktop shares it.
+
+One line per applet, in the order they were opened:
+
+- `ID` is a number no other window this run has had, so two reads can be
+  matched up. It does not survive a relaunch.
+- `TOOL` is the name `/proc/ish/workspace` uses for it.
+- `DESKTOP` is numbered as the Desktops applet numbers them, from 1. `*` marks
+  the Launcher and the Desktops applet, which every Desktop shares.
+- `STATE` is `front` for the window on top of the Desktop you are looking at,
+  `shown` for the rest of what is on screen, and `hidden` for one open on
+  another Desktop.
+- `AGE` is seconds since the window opened.
+- `TITLE` is the window's title and runs to the end of the line, because
+  titles have spaces in them. `awk '{print $2}'` gets the tools.
+
+Terminal windows are not listed, because their programs are already in `ps`.
+With nothing open, or with no Workspace at all (a plain terminal, or the
+command-line build), the file is the header alone. It is read-only. Closing an
+applet is done on screen, not with a signal.

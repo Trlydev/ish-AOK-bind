@@ -1,6 +1,7 @@
 #include "jit/jit.h"
 #include "jit/frame.h"
 #include "emu/cpu.h"
+#include "emu/cpuid.h"
 #include "emu/tlb.h"
 #include "emu/mmu.h"
 
@@ -26,8 +27,12 @@ void cpu() {
     OFFSET(CPU, cpu_state, eip);
     OFFSET(CPU, cpu_state, amd64_regs);
     OFFSET(CPU, cpu_state, amd64_rip);
-    OFFSET(CPU, cpu_state, gs);
+    OFFSET(CPU, cpu_state, i386_fs_base);
+    OFFSET(CPU, cpu_state, i386_sreg);
+    OFFSET(CPU, cpu_state, i386_tls);
     OFFSET(CPU, cpu_state, tls_ptr);
+    OFFSET(CPU, cpu_state, amd64_gs_base);
+    OFFSET(CPU, cpu_state, amd64_sreg);
 
     OFFSET(CPU, cpu_state, eflags);
     OFFSET(CPU, cpu_state, of);
@@ -38,7 +43,34 @@ void cpu() {
     OFFSET(CPU, cpu_state, flags_res);
     OFFSET(CPU, cpu_state, df_offset);
     OFFSET(CPU, cpu_state, fsw);
+    OFFSET(CPU, cpu_state, fcw);
+    OFFSET(CPU, cpu_state, fp);
+    OFFSET(CPU, cpu_state, x87_valid);
     OFFSET(CPU, cpu_state, xmm);
+    OFFSET(CPU, cpu_state, ymm_hi);
+    OFFSET(CPU, cpu_state, zmm_hi);
+    OFFSET(CPU, cpu_state, xmm_ext);
+    OFFSET(CPU, cpu_state, avx512_k);
+    OFFSET(CPU, cpu_state, mxcsr);
+    OFFSET(CPU, cpu_state, tsc_aux);
+    OFFSET(CPU, cpu_state, umip_report);
+    OFFSET(CPU, cpu_state, umip_report_addr);
+    MACRO(XCR0_X87_);
+    MACRO(XCR0_SSE_);
+    MACRO(XCR0_YMM_);
+    MACRO(XCR0_OPMASK_);
+    MACRO(XCR0_ZMM_HI256_);
+    MACRO(XCR0_HI16_ZMM_);
+    MACRO(XCR0_SUPPORTED_);
+    MACRO(XSAVE_LEGACY_SIZE_);
+    MACRO(XSAVE_YMM_OFFSET_);
+    MACRO(XSAVE_YMM_SIZE_);
+    MACRO(XSAVE_OPMASK_OFFSET_);
+    MACRO(XSAVE_OPMASK_SIZE_);
+    MACRO(XSAVE_ZMM_HI_OFFSET_);
+    MACRO(XSAVE_ZMM_HI_SIZE_);
+    MACRO(XSAVE_HI16_OFFSET_);
+    MACRO(XSAVE_HI16_SIZE_);
     MACRO(PF_RES);
     MACRO(ZF_RES);
     MACRO(SF_RES);
@@ -55,8 +87,10 @@ void cpu() {
     OFFSET(LOCAL, jit_frame, last_block);
     OFFSET(LOCAL, jit_frame, chain_budget);
     OFFSET(LOCAL, jit_frame, ret_cache);
+    OFFSET(LOCAL, jit_frame, i386_cache);
     OFFSET(CPU, cpu_state, segfault_addr);
     OFFSET(CPU, cpu_state, segfault_was_write);
+    OFFSET(CPU, cpu_state, segfault_reported);
     OFFSET(CPU, cpu_state, poked_ptr);
     MACRO(MEM_READ);
     MACRO(MEM_WRITE);
@@ -69,6 +103,7 @@ void cpu() {
     OFFSET(JIT_BLOCK, jit_block, is_jetsam);
 
     OFFSET(TLB, tlb, entries);
+    OFFSET(TLB, tlb, victim);
     OFFSET(TLB, tlb, mmu);
     OFFSET(TLB, tlb, mem_changes);
     OFFSET(TLB, tlb, dirty_page);
@@ -119,4 +154,10 @@ void riscv64() {
     OFFSET(CPU, cpu_state, riscv64_res_val);
     OFFSET(CPU, cpu_state, riscv64_f);
     OFFSET(CPU, cpu_state, riscv64_fcsr);
+    OFFSET(CPU, cpu_state, riscv64_v);
+    OFFSET(CPU, cpu_state, riscv64_vl);
+    OFFSET(CPU, cpu_state, riscv64_vtype);
+    OFFSET(CPU, cpu_state, riscv64_vstart);
+    OFFSET(CPU, cpu_state, riscv64_vxrm);
+    OFFSET(CPU, cpu_state, riscv64_vxsat);
 }

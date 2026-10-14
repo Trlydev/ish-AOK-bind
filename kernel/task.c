@@ -1,11 +1,20 @@
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
+#include "kernel/user_ns.h"
+#include "kernel/acct.h"
+#include "kernel/pid_ns.h"
+#include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
 #include "kernel/native.h"
 #include "kernel/task.h"
+#include "kernel/seccomp.h"
+#include "kernel/checkpoint.h"
+#include "kernel/hostinfo.h"
 #include "emu/memory.h"
 #include "emu/tlb.h"
 #include "jit/jit.h"
@@ -29,7 +38,11 @@
 extern lock_t atomic_l_lock;
 time_t boot_time;  // Store the boot time.
 
-struct list tasks_pending_deletion_queue;
+// Self-pointing from load, for the same reason as alive_pids_list below: a
+// bare global starts NULL/NULL, list_for_each_entry has no NULL check, and
+// cleanup_pending_deletions walks this one. init_pending_queues still
+// list_inits it, which is a no-op on an already-empty list.
+struct list tasks_pending_deletion_queue = LIST_INITIALIZER(tasks_pending_deletion_queue);
 pthread_mutex_t tasks_pending_deletion_lock = PTHREAD_MUTEX_INITIALIZER;
 
 int iOSMajorRelease;
@@ -47,27 +60,47 @@ __thread struct task *current;
 static dword_t last_allocated_pid = 0;
 static struct pid pids[MAX_PID + 1] = {};
 
-// The pid the allocator wraps at, which /proc/sys/kernel/pid_max sets. The
-// table is sized at compile time, so this can only ever be lowered from
-// MAX_PID -- but lowering it is what the knob is actually used for (keeping a
-// container's pids in a small range), and a knob that refuses every write while
-// advertising mode 0644 is worse than one with a ceiling.
+// /proc/sys/kernel/pid_max. The table is sized at compile time (MAX_PID), so
+// the allocator wraps at the smaller of the two (task_pid_wrap) -- lowering
+// the knob is what it is usually used for (keeping a container's pids in a
+// small range). Raising it is accepted up to Linux's PID_MAX_LIMIT on a 64-bit
+// kernel and remembered, though no pid above the table is ever handed out:
+// pid_max is a ceiling, and staying under it is within the contract. It was
+// EINVAL above MAX_PID, and systemd ships /usr/lib/sysctl.d/50-pid-max.conf
+// with kernel.pid_max = 4194304, so systemd-sysctl.service failed on every
+// Arch boot and left the system "degraded".
 static _Atomic dword_t pid_max_value = MAX_PID;
 
 dword_t task_pid_max(void) {
     return atomic_load_explicit(&pid_max_value, memory_order_relaxed);
 }
 
+static dword_t task_pid_wrap(void) {
+    dword_t max = task_pid_max();
+    return max < MAX_PID ? max : MAX_PID;
+}
+
 int task_set_pid_max(dword_t value) {
-    // Linux's own floor is 301 (PIDS_PER_CPU_MIN); above the table size there
-    // is nothing to hand out, so that is the ceiling.
-    if (value < 301 || value > MAX_PID)
+    // Linux's own floor is 301 (PIDS_PER_CPU_MIN), its ceiling PID_MAX_LIMIT.
+    if (value < 301 || value > PID_MAX_LIMIT)
         return _EINVAL;
     atomic_store_explicit(&pid_max_value, value, memory_order_relaxed);
     return 0;
 }
 lock_t pids_lock;
-struct list alive_pids_list;
+// Statically self-pointing, NOT left zeroed for become_first_process to
+// list_init (kernel/init.c). A bare global starts as NULL/NULL, and
+// list_for_each_entry has no NULL check -- so anything that walked this list
+// before the guest booted followed `next` into 0 and faulted at
+// 0xfffffffffffffff8 on the FIRST iteration. That is reachable: the app's
+// background save calls checkpoint_save_external without requiring a booted
+// guest, and the session-resume picker defers the boot until someone answers
+// it. ckpt_check_scope does refuse with "there is no guest running", but it
+// has to call task_snapshot_collect to learn that, and that call was the
+// crash. An empty list must READ as empty before boot, not fault.
+// init.c's list_init stays: re-initialising an empty list is a no-op, and it
+// still matters if the kernel is ever brought up twice.
+struct list alive_pids_list = LIST_INITIALIZER(alive_pids_list);
 
 void init_pending_queues(void) {
 // Initialize the pending deletion queues.  Tasks, memory and file descriptors (eventually)
@@ -122,11 +155,244 @@ static bool pid_empty(struct pid *pid) {
 
 _Atomic uint64_t total_forks = 0;
 
-struct pid *pid_get(dword_t id) {
+struct pid *pid_get_global(dword_t id) {
     if (id >= sizeof(pids)/sizeof(pids[0]))
         return NULL;
     struct pid *pid = &pids[id];
     if (pid_empty(pid))
+        return NULL;
+    return pid;
+}
+
+struct task *pid_get_task_zombie_global(dword_t id) {
+    struct pid *pid = pid_get_global(id);
+    if (pid == NULL)
+        return NULL;
+    struct task *task = pid->task;
+    return task;
+}
+
+struct task *pid_get_task_global(dword_t id) {
+    struct task *task = pid_get_task_zombie_global(id);
+    if (task != NULL && task->zombie)
+        return NULL;
+    return task;
+}
+
+struct task *pid_get_task_global_ref(dword_t id) {
+    complex_lockt(&pids_lock, 0);
+    struct task *task = pid_get_task_global(id);
+    if (task != NULL)
+        task_ref_cnt_mod(task, 1);
+    unlock(&pids_lock);
+    return task;
+}
+
+// Same, but a zombie counts as existing. A task that has exited and not yet
+// been reaped is still a process: it holds its pid, wait() can still find it,
+// and pidfd_open(2) on Linux succeeds for one -- an immediately-readable
+// pidfd is how a pidfd reports an exit at all.
+struct task *pid_get_task_zombie_global_ref(dword_t id) {
+    complex_lockt(&pids_lock, 0);
+    struct task *task = pid_get_task_zombie_global(id);
+    if (task != NULL)
+        task_ref_cnt_mod(task, 1);
+    unlock(&pids_lock);
+    return task;
+}
+
+// ---- Pid namespaces (kernel/pid_ns.h) --------------------------------------
+
+struct pid_namespace *pid_ns_retain(struct pid_namespace *ns) {
+    if (ns != NULL)
+        atomic_fetch_add(&ns->refcount, 1);
+    return ns;
+}
+
+void pid_ns_release(struct pid_namespace *ns) {
+    while (ns != NULL && atomic_fetch_sub(&ns->refcount, 1) == 1) {
+        struct pid_namespace *parent = ns->parent;
+        acct_pid_ns_gone(ns);
+        user_ns_release(ns->user_ns);
+        free(ns->nr_of);
+        free(ns->by_nr);
+        free(ns);
+        ns = parent;
+    }
+}
+
+struct pid_namespace *pid_ns_new(struct pid_namespace *parent, struct user_namespace *owner, int *err) {
+    if (parent != NULL && parent->level >= PID_NS_MAX_LEVEL) {
+        *err = _EINVAL;
+        return NULL;
+    }
+    struct pid_namespace *ns = calloc(1, sizeof(*ns));
+    if (ns == NULL) {
+        *err = _ENOMEM;
+        return NULL;
+    }
+    ns->nr_of = calloc(MAX_PID + 1, sizeof(*ns->nr_of));
+    ns->by_nr = calloc(MAX_PID + 1, sizeof(*ns->by_nr));
+    if (ns->nr_of == NULL || ns->by_nr == NULL) {
+        free(ns->nr_of);
+        free(ns->by_nr);
+        free(ns);
+        *err = _ENOMEM;
+        return NULL;
+    }
+    atomic_init(&ns->refcount, 1);
+    ns->inode = ns_alloc_inum();
+    ns->parent = pid_ns_retain(parent);
+    ns->level = parent != NULL ? parent->level + 1 : 1;
+    ns->user_ns = user_ns_retain(owner);
+    return ns;
+}
+
+// Take back every number machine pid `id` has: in the namespace that
+// numbered it and in each one above. Caller holds pids_lock.
+void pid_ns_unnumber(dword_t id) {
+    if (id > MAX_PID)
+        return;
+    struct pid *slot = &pids[id];
+    struct pid_namespace *innermost = slot->numbered_ns;
+    if (innermost == NULL)
+        return;
+    slot->numbered_ns = NULL;
+    for (struct pid_namespace *ns = innermost; ns != NULL; ns = ns->parent) {
+        pid_t_ nr = ns->nr_of[id];
+        if (nr > 0 && nr <= MAX_PID && ns->by_nr[nr] == (pid_t_) id)
+            ns->by_nr[nr] = 0;
+        ns->nr_of[id] = 0;
+    }
+    pid_ns_release(innermost);
+}
+
+void pid_ns_unnumber_if_empty(dword_t id) {
+    if (id <= MAX_PID && pid_empty(&pids[id]))
+        pid_ns_unnumber(id);
+}
+
+// The next free number in `ns`, from the one after the last handed out and
+// round again at the machine's limit, as Linux allocates them. 0 when the
+// namespace is full. Caller holds pids_lock.
+static pid_t_ pid_ns_next_nr(struct pid_namespace *ns) {
+    pid_t_ limit = (pid_t_) task_pid_wrap();
+    for (pid_t_ tries = 1; tries < limit; tries++) {
+        pid_t_ nr = ns->last_nr + 1;
+        if (nr >= limit)
+            nr = 1;
+        ns->last_nr = nr;
+        pid_t_ holder = ns->by_nr[nr];
+        // Free, or left behind by a slot that has since been given away.
+        if (holder == 0 || ns->nr_of[holder] != nr || pid_empty(&pids[holder]))
+            return nr;
+    }
+    return 0;
+}
+
+int pid_ns_number_task(struct task *task) {
+    dword_t id = (dword_t) task->pid;
+    if (id > MAX_PID)
+        return _EINVAL;
+    pid_ns_unnumber(id);
+    if (task->pid_ns == NULL)
+        return 0;
+    for (struct pid_namespace *ns = task->pid_ns; ns != NULL; ns = ns->parent) {
+        pid_t_ nr = pid_ns_next_nr(ns);
+        if (nr == 0) {
+            // Undo what this call numbered: the namespaces from the task's
+            // down to this one.
+            for (struct pid_namespace *done = task->pid_ns; done != ns; done = done->parent) {
+                pid_t_ was = done->nr_of[id];
+                if (was > 0 && done->by_nr[was] == (pid_t_) id)
+                    done->by_nr[was] = 0;
+                done->nr_of[id] = 0;
+            }
+            return _EAGAIN;
+        }
+        ns->nr_of[id] = nr;
+        ns->by_nr[nr] = (pid_t_) id;
+    }
+    pids[id].numbered_ns = pid_ns_retain(task->pid_ns);
+    return 0;
+}
+
+bool pid_ns_in(const struct pid_namespace *ns, const struct pid_namespace *ancestor) {
+    for (;;) {
+        if (ns == ancestor)
+            return true;
+        if (ns == NULL)
+            return false;
+        ns = ns->parent;
+    }
+}
+
+struct pid_namespace *current_pid_ns(void) {
+    return current != NULL ? current->pid_ns : NULL;
+}
+
+pid_t_ pid_ns_shown(struct pid_namespace *viewer, pid_t_ pid) {
+    if (viewer == NULL || pid <= 0)
+        return pid;
+    return pid <= MAX_PID ? viewer->nr_of[pid] : 0;
+}
+
+pid_t_ pid_ns_global(struct pid_namespace *viewer, pid_t_ pid) {
+    if (viewer == NULL || pid <= 0)
+        return pid;
+    if (pid > MAX_PID)
+        return PID_NS_NO_PID;
+    pid_t_ machine = viewer->by_nr[pid];
+    // (An entry a slot left behind names nothing: see pid_ns_next_nr.)
+    if (machine <= 0 || machine > MAX_PID || viewer->nr_of[machine] != pid)
+        return PID_NS_NO_PID;
+    return machine;
+}
+
+pid_t_ current_pid_shown(pid_t_ pid) { return pid_ns_shown(current_pid_ns(), pid); }
+pid_t_ current_pid_global(pid_t_ pid) { return pid_ns_global(current_pid_ns(), pid); }
+pid_t_ task_pid_shown(struct task *task, pid_t_ pid) { return pid_ns_shown(task->pid_ns, pid); }
+
+bool task_visible(struct task *task) {
+    return pid_ns_in(task->pid_ns, current_pid_ns());
+}
+
+bool task_is_init_seen_from_inside(struct task *task) {
+    struct pid_namespace *ns = task->pid_ns;
+    if (ns == NULL || task->tgid != atomic_load(&ns->init_pid))
+        return false;
+    return pid_ns_in(current_pid_ns(), ns);
+}
+
+// The namespace a pid slot's holder is in: its task's, or -- a group or
+// session that has outlived its leader keeps the number -- a member's.
+// Caller holds pids_lock.
+static bool pid_slot_visible(struct pid *pid, struct pid_namespace *viewer) {
+    struct task *task = pid->task;
+    if (task == NULL && !list_empty(&pid->pgroup))
+        task = list_first_entry(&pid->pgroup, struct tgroup, pgroup)->leader;
+    if (task == NULL && !list_empty(&pid->session))
+        task = list_first_entry(&pid->session, struct tgroup, session)->leader;
+    return task != NULL && pid_ns_in(task->pid_ns, viewer);
+}
+
+pid_t_ current_pid_shown_or_zero(pid_t_ pid) {
+    struct pid_namespace *viewer = current_pid_ns();
+    if (viewer == NULL || pid <= 0)
+        return pid;
+    complex_lockt(&pids_lock, 0);
+    struct pid *slot = pid_get_global((dword_t) pid);
+    bool visible = slot != NULL && pid_slot_visible(slot, viewer);
+    unlock(&pids_lock);
+    return visible ? pid_ns_shown(viewer, pid) : 0;
+}
+
+struct pid *pid_get(dword_t id) {
+    struct pid_namespace *viewer = current_pid_ns();
+    if (viewer == NULL)
+        return pid_get_global(id);
+    struct pid *pid = pid_get_global((dword_t) pid_ns_global(viewer, (pid_t_) id));
+    if (pid != NULL && !pid_slot_visible(pid, viewer))
         return NULL;
     return pid;
 }
@@ -155,10 +421,6 @@ struct task *pid_get_task_ref(dword_t id) {
     return task;
 }
 
-// Same, but a zombie counts as existing. A task that has exited and not yet
-// been reaped is still a process: it holds its pid, wait() can still find it,
-// and pidfd_open(2) on Linux succeeds for one -- an immediately-readable
-// pidfd is how a pidfd reports an exit at all.
 struct task *pid_get_task_zombie_ref(dword_t id) {
     complex_lockt(&pids_lock, 0);
     struct task *task = pid_get_task_zombie(id);
@@ -166,6 +428,41 @@ struct task *pid_get_task_zombie_ref(dword_t id) {
         task_ref_cnt_mod(task, 1);
     unlock(&pids_lock);
     return task;
+}
+
+// do_exit() takes the exiting task's general_lock and, still holding it, waits
+// in exit_wait_needed() for every other reference on the task to go. So a
+// caller that holds a reference -- which is every caller reaching another task
+// through a pid -- and then blocks on that lock waits for the exit while the
+// exit waits for it, and both stop for good: the reader, the exiting process,
+// and whoever waits for that process. c0ccaed3 found it in /proc/meminfo and
+// /proc/net, fs/sock.c in the socket walks, and /proc/<pid>/* had a dozen more
+// copies, one per handler.
+//
+// Any other holder is an ordinary critical section and is waited out -- a busy
+// process must not drop out of a listing, and a zombie, whose lock do_exit
+// released, must stay readable even while another reader holds it. Only the
+// exiting task holding its OWN lock is the teardown, and then the answer is
+// false: whatever the caller wanted (mm, fd table, fs, credentials) is being
+// released, and the caller treats it as the process having gone.
+static bool task_lock_held_by_its_exit(struct task *task) {
+    if (!task->exiting)
+        return false;
+    // The CLI's first task runs on the main thread and never had task->thread
+    // pointed at it, so there is nothing to compare the owner with.
+    if (!task->host_thread_started)
+        return true;
+    return pthread_equal(__atomic_load_n(&task->general_lock.owner, __ATOMIC_RELAXED),
+                         task->thread);
+}
+
+bool task_lock_unless_exiting(struct task *task) {
+    while (trylock(&task->general_lock) != 0) {
+        if (task_lock_held_by_its_exit(task))
+            return false;
+        nanosleep(&lock_pause, NULL);
+    }
+    return true;
 }
 
 void task_snapshot_release(struct task_snapshot *snapshot) {
@@ -176,13 +473,16 @@ void task_snapshot_release(struct task_snapshot *snapshot) {
     snapshot->count = 0;
 }
 
-int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only) {
+static int task_snapshot_collect_common(struct task_snapshot *snapshot,
+        bool leaders_only, bool with_leaving) {
     unsigned cap = 0;
     complex_lockt(&pids_lock, 0);
     struct pid *pid_entry;
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
         struct task *task = pid_entry->task;
-        if (task == NULL || task->zombie || task->exiting)
+        if (task == NULL)
+            continue;
+        if (!with_leaving && (task->zombie || task->exiting))
             continue;
         if (leaders_only && !task_is_leader(task))
             continue;
@@ -202,6 +502,38 @@ int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only) {
     }
     unlock(&pids_lock);
     return 0;
+}
+
+int task_snapshot_collect(struct task_snapshot *snapshot, bool leaders_only) {
+    return task_snapshot_collect_common(snapshot, leaders_only, false);
+}
+
+// Zombies and tasks inside or past do_exit too. A checkpoint needs both: a
+// zombie is a status its parent has not collected, and a thread group's
+// leader that exited ahead of its threads stays in the pid table as the task
+// the group's exit is reported as (kernel/exit.c). The collection above skips
+// both -- right for everything else that walks tasks, and it is how a save
+// silently lost every zombie in the image.
+int task_snapshot_collect_all(struct task_snapshot *snapshot) {
+    return task_snapshot_collect_common(snapshot, false, true);
+}
+
+// "aarch64(n)" on every Apple device: what a program compiled into iSH-AOK
+// and running as host code (/AOK/native) is, whichever root is booted.
+#if defined(__aarch64__)
+#define NATIVE_ARCH_ENTRY "aarch64(n)"
+#elif defined(__x86_64__)
+#define NATIVE_ARCH_ENTRY "x86_64(n)"
+#else
+#define NATIVE_ARCH_ENTRY "native(n)"
+#endif
+
+const char *task_arch_name(struct task *task) {
+    if (task->native_running != NULL)
+        return NATIVE_ARCH_ENTRY;
+    if (task->mm == NULL)
+        return "-";
+    return guest_abi_desc(task->abi).uname_machine;
 }
 
 struct pid *pid_get_last_allocated(void) {
@@ -257,12 +589,71 @@ dword_t task_count_for_uid(uid_t_ uid) {
     dword_t count = 0;
     complex_lockt(&pids_lock, 0);
     for (dword_t id = 1; id < MAX_PID; id++) {
-        struct task *task = pid_get_task(id);
+        struct task *task = pid_get_task_global(id);
         if (task != NULL && task->uid == uid && task->pid == task->tgid)
             count++;
     }
     unlock(&pids_lock);
     return count;
+}
+
+// Would one more process for `task` take some user past RLIMIT_NPROC? Linux
+// counts processes per (user namespace, real uid), and charges each one at
+// every level up to the initial namespace: in its own namespace under its own
+// uid, and in each namespace above under the owner of the namespace below it
+// (inc_rlimit_ucounts). The limit at the first level is the task's own soft
+// limit; at each one above, the one the namespace below was made with
+// (user_namespace.nproc_max) -- so raising the soft limit inside a namespace
+// buys nothing past what its creator had (is_rlimit_overlimit). Processes,
+// not threads, as everywhere here.
+bool task_nproc_exceeded(struct task *task, rlim_t_ soft) {
+    struct user_namespace *chain_ns[USER_NS_MAX_LEVEL + 2];
+    uid_t_ chain_uid[USER_NS_MAX_LEVEL + 2];
+    rlim_t_ chain_max[USER_NS_MAX_LEVEL + 2];
+    dword_t count[USER_NS_MAX_LEVEL + 2] = {0};
+    int levels = 0;
+    struct user_namespace *ns = task->user_ns;
+    uid_t_ uid = task->uid;
+    rlim_t_ max = soft;
+    for (;;) {
+        chain_ns[levels] = ns;
+        chain_uid[levels] = uid;
+        chain_max[levels] = max;
+        levels++;
+        if (ns == NULL || levels == USER_NS_MAX_LEVEL + 2)
+            break;
+        uid = ns->owner;
+        max = ns->nproc_max;
+        ns = ns->parent;
+    }
+    bool limited = false;
+    for (int i = 0; i < levels; i++)
+        limited |= chain_max[i] != RLIM_INFINITY_;
+    if (!limited)
+        return false;
+    complex_lockt(&pids_lock, 0);
+    for (dword_t id = 1; id < MAX_PID; id++) {
+        struct task *other = pid_get_task_global(id);
+        if (other == NULL || other->pid != other->tgid)
+            continue;
+        // Up its chain, against ours.
+        struct user_namespace *at = other->user_ns;
+        uid_t_ as = other->uid;
+        for (int depth = 0; depth < USER_NS_MAX_LEVEL + 2; depth++) {
+            for (int i = 0; i < levels; i++)
+                if (chain_ns[i] == at && chain_uid[i] == as)
+                    count[i]++;
+            if (at == NULL)
+                break;
+            as = at->owner;
+            at = at->parent;
+        }
+    }
+    unlock(&pids_lock);
+    for (int i = 0; i < levels; i++)
+        if (chain_max[i] != RLIM_INFINITY_ && count[i] >= chain_max[i])
+            return true;
+    return false;
 }
 
 dword_t get_count_of_blocked_tasks(void) {
@@ -291,40 +682,552 @@ dword_t get_count_of_alive_tasks(void) {
     return res;
 }
 
-// Linux-style load average computed over the guest's OWN runnable tasks, so
-// /proc/loadavg reflects the guest rather than the host load that the platform
-// getloadavg returns. The EMA is advanced lazily on read, one step per elapsed
-// 5-second interval (the classic calc_load cadence).
+// ---- the guest's clock -----------------------------------------------------
+//
+// Uptime is the time since the GUEST booted -- kernel/init.c's
+// become_first_process, which is what sets boot_time -- measured on a
+// monotonic host clock.
+//
+// It used to be `(gettimeofday().tv_sec - boot_time) * 100`: whole seconds of
+// WALL clock. /proc/uptime only ever read N.0, it would have jumped had the
+// host clock been set, and everything derived from it inherited the
+// one-second steps. Most visibly /proc/stat's idle time, which is capacity
+// minus busy time: busy time grows continuously, so between two reads inside
+// the same second idle SHRANK. A waybar survey measured idle going backward in
+// 65 of 74 samples taken 50 ms apart; native Linux, 0 of 80.
+//
+// The host clock is the one the guest's own CLOCK_BOOTTIME reads
+// (clockid_to_real in kernel/time.c): CLOCK_BOOTTIME where the host has one,
+// which is Linux, and CLOCK_MONOTONIC on Darwin, which keeps counting through
+// sleep there. Measured on macOS, Darwin's CLOCK_MONOTONIC is gettimeofday()
+// minus kern.boottime: across 200000 paired reads REALTIME minus MONOTONIC
+// never exceeded kern.boottime and stayed within 22 microseconds of it, the
+// width of the gap between the two reads. So it is slewed along with the wall
+// clock and not stepped by it, which is the relationship Linux's CLOCK_BOOTTIME
+// has to CLOCK_REALTIME. CLOCK_MONOTONIC_RAW is NOT that clock: after 14 days
+// of host uptime it was 1.7 s behind CLOCK_MONOTONIC, and btime, which
+// fs/proc/root.c derives as "realtime minus uptime", would drift with it.
+//
+// The origin is placed so that the realtime at uptime zero is boot_time
+// exactly, a whole second. That is what keeps btime from flickering: root.c
+// computes it as floor(realtime - uptime), which comes out as boot_time for
+// every fraction of a second the uptime has run into only if the boot instant
+// has no fraction of its own.
+#ifdef CLOCK_BOOTTIME
+#define GUEST_UPTIME_HOST_CLOCK CLOCK_BOOTTIME
+#else
+#define GUEST_UPTIME_HOST_CLOCK CLOCK_MONOTONIC
+#endif
+#define NSEC_PER_SEC_U64 1000000000ull
+#define NSEC_PER_TICK 10000000ull   // USER_HZ is 100: /proc/stat's unit
+
+// Uptime is not the only thing the guest measures from its own boot. Linux
+// guarantees CLOCK_BOOTTIME and CLOCK_MONOTONIC are boot-relative too --
+// CLOCK_BOOTTIME *is* uptime (measured on Devuan 6 / Linux 6.12:
+// /proc/uptime and CLOCK_BOOTTIME agreed to within the gap between the two
+// reads, and floor(CLOCK_REALTIME - uptime) was btime exactly) -- so every
+// boot-relative clock the guest can read needs an origin of its own, placed
+// the same way and at the same instant.
+//
+// Handing the guest the HOST's reading instead leaks the host's uptime, and
+// not only as a cosmetic wrong number: anything that reconstructs a wall-clock
+// instant as "now minus CLOCK_BOOTTIME" lands that far in the past. util-linux
+// dmesg does exactly that in get_boot_time_hires, so `dmesg -T` in a Devuan
+// guest on a Mac up 14.6 days printed timestamps 14.6 days early -- Sep 3 for
+// records logged on Sep 17. Relative measurements were all fine, which is why
+// this survived so long.
+//
+// They cannot share ONE origin, because the host clocks they ride on do not
+// advance together: CLOCK_MONOTONIC stops across host suspend and
+// CLOCK_BOOTTIME does not, and CLOCK_MONOTONIC_RAW is unslewed (measured
+// 2.04 s behind CLOCK_MONOTONIC at 14.6 days of host uptime). Each gets its
+// own, all subtracted
+// from the same `since_boot`, which keeps the Linux relation
+// MONOTONIC <= BOOTTIME: both read `since_boot` at the rebase instant and
+// thereafter advance at their own host clock's rate.
+//
+// The origins belong to the GUEST's clocks, not to the host clocks under them.
+// On Darwin, which has no CLOCK_BOOTTIME, the guest's MONOTONIC and BOOTTIME
+// both ride the host's CLOCK_MONOTONIC and used to share one origin -- right
+// until a checkpoint is restored, which has to move them apart: MONOTONIC goes
+// on from where it was, and BOOTTIME also counts the time the machine spent
+// stopped. See guest_clock_resume.
+enum guest_clock {
+    GUEST_CLOCK_MONOTONIC,
+    GUEST_CLOCK_BOOTTIME,
+    GUEST_CLOCK_RAW,
+    GUEST_CLOCK_COUNT,
+};
+
+// The host clock under each, which must be the one clockid_to_real in
+// kernel/time.c reads for the same guest clock.
+static const clockid_t guest_clock_host_id[GUEST_CLOCK_COUNT] = {
+    [GUEST_CLOCK_MONOTONIC] = CLOCK_MONOTONIC,
+    [GUEST_CLOCK_BOOTTIME] = GUEST_UPTIME_HOST_CLOCK,
+#ifdef CLOCK_MONOTONIC_RAW
+    [GUEST_CLOCK_RAW] = CLOCK_MONOTONIC_RAW,
+#else
+    [GUEST_CLOCK_RAW] = CLOCK_MONOTONIC,
+#endif
+};
+
+// Which origin a guest clockid is measured from, or -1 for a clock with none
+// -- CLOCK_REALTIME and its variants, CLOCK_TAI and the CPU-time clocks, which
+// the guest reads straight through.
+static int guest_clock_index(uint_t clock) {
+    switch (clock) {
+        case CLOCK_MONOTONIC_:
+        case CLOCK_MONOTONIC_COARSE_:
+            return GUEST_CLOCK_MONOTONIC;
+        case CLOCK_BOOTTIME_:
+        case CLOCK_BOOTTIME_ALARM_:
+            return GUEST_CLOCK_BOOTTIME;
+        case CLOCK_MONOTONIC_RAW_:
+            return GUEST_CLOCK_RAW;
+        default:
+            return -1;
+    }
+}
+
+static pthread_mutex_t guest_clock_lock = PTHREAD_MUTEX_INITIALIZER;
+// The boot_time the origins below were placed for. boot_time changes when the
+// guest boots (run_at_boot seeds it earlier, and a guest can be booted again
+// in the same process), and the origins move with it. A re-boot therefore
+// restarts the guest's monotonic clocks near zero, which is what a reboot
+// means -- and in AOK it happens in become_first_process, before any guest
+// task exists to see it. A checkpoint restore sets both itself, under
+// guest_clock_lock, and a restore is not a boot.
+static _Atomic time_t guest_clock_boot = (time_t) -1;
+// Each guest clock's origin: the reading of its host clock, in ns, at which
+// the guest clock read zero.
+static _Atomic int64_t guest_clock_origin_ns[GUEST_CLOCK_COUNT];
+
+static int64_t timespec_to_ns(struct timespec ts) {
+    return (int64_t) ts.tv_sec * (int64_t) NSEC_PER_SEC_U64 + ts.tv_nsec;
+}
+
+// Place every origin, once per boot. Called with guest_clock_lock held.
+static void guest_clock_place_origins(time_t boot) {
+    // Realtime first, then the host clocks: the gap between the reads can then
+    // only make uptime smaller, so btime never comes out a second EARLY. The
+    // extra microsecond covers Darwin, which reports both clocks in whole
+    // microseconds.
+    int64_t real = timespec_to_ns(timespec_now(CLOCK_REALTIME));
+    int64_t since_boot = real - (int64_t) boot * (int64_t) NSEC_PER_SEC_U64;
+    for (int i = 0; i < GUEST_CLOCK_COUNT; i++) {
+        int64_t host = timespec_to_ns(timespec_now(guest_clock_host_id[i]));
+        // Origin before boot, so a reader that sees the new boot sees it.
+        atomic_store_explicit(&guest_clock_origin_ns[i], host - since_boot + 1000,
+                              memory_order_release);
+    }
+    atomic_store_explicit(&guest_clock_boot, boot, memory_order_release);
+}
+
+// Rebase one host reading onto the guest's origin for that clock: the host's
+// reading minus the origin. A pure offset within a boot, so the result never
+// runs backward and never changes rate -- which is what lets the timer layer
+// go on working entirely in host time, with only the guest-facing conversions
+// below moved.
+static int64_t guest_clock_rebase_ns(int idx, int64_t host_ns) {
+    // boot_time is written by kernel/init.c without a lock, once per boot;
+    // every reader of it reads it like this.
+    time_t boot = boot_time;
+    if (atomic_load_explicit(&guest_clock_boot, memory_order_acquire) != boot) {
+        pthread_mutex_lock(&guest_clock_lock);
+        // Read again under the lock. The one taken above can be stale by now:
+        // a restore that moved the clocks while this thread waited here set
+        // boot_time too, and placing the origins for the old value would put
+        // every clock back to a fresh boot's.
+        boot = boot_time;
+        if (atomic_load_explicit(&guest_clock_boot, memory_order_acquire) != boot)
+            guest_clock_place_origins(boot);
+        pthread_mutex_unlock(&guest_clock_lock);
+    }
+    int64_t up = host_ns - atomic_load_explicit(&guest_clock_origin_ns[idx],
+                                                memory_order_acquire);
+    return up > 0 ? up : 0;
+}
+
+static struct timespec ns_to_timespec(int64_t ns) {
+    return (struct timespec) {
+        .tv_sec = (time_t) (ns / (int64_t) NSEC_PER_SEC_U64),
+        .tv_nsec = (long) (ns % (int64_t) NSEC_PER_SEC_U64),
+    };
+}
+
+struct timespec guest_clock_from_host(uint_t clock, struct timespec host) {
+    int idx = guest_clock_index(clock);
+    if (idx < 0)
+        return host;                        // no boot origin: realtime, cpu clocks
+    return ns_to_timespec(guest_clock_rebase_ns(idx, timespec_to_ns(host)));
+}
+
+struct timespec guest_clock_now(uint_t clock, clockid_t host_clock) {
+    int idx = guest_clock_index(clock);
+    if (idx < 0)
+        return timespec_now(host_clock);
+    // The origin's own host clock, which is what host_clock is for every
+    // caller that got it from clockid_to_real.
+    return ns_to_timespec(guest_clock_rebase_ns(
+        idx, timespec_to_ns(timespec_now(guest_clock_host_id[idx]))));
+}
+
+uint64_t guest_uptime_ns(void) {
+    // Deliberately the same origin the guest's own CLOCK_BOOTTIME goes
+    // through, on the same host clock, so the two are not merely close but
+    // identical -- that identity is what makes "realtime minus
+    // CLOCK_BOOTTIME", which is what util-linux's dmesg computes, come out as
+    // btime.
+    return (uint64_t) guest_clock_rebase_ns(
+        GUEST_CLOCK_BOOTTIME,
+        timespec_to_ns(timespec_now(guest_clock_host_id[GUEST_CLOCK_BOOTTIME])));
+}
+
+void guest_clock_read(struct guest_clock_reading *out) {
+    int64_t host[GUEST_CLOCK_COUNT];
+    for (int i = 0; i < GUEST_CLOCK_COUNT; i++)
+        host[i] = timespec_to_ns(timespec_now(guest_clock_host_id[i]));
+    // The wall clock LAST, for the reason guest_clock_place_origins reads it
+    // first: realtime minus uptime then comes out no earlier than the boot
+    // instant, so btime is still boot_time's second when this is resumed.
+    int64_t real = timespec_to_ns(timespec_now(CLOCK_REALTIME));
+    int64_t guest[GUEST_CLOCK_COUNT];
+    for (int i = 0; i < GUEST_CLOCK_COUNT; i++)
+        guest[i] = guest_clock_rebase_ns(i, host[i]);
+    // After the rebasing, which places the origins if nothing has yet this
+    // boot, so this is the boot they were placed for.
+    time_t boot = atomic_load_explicit(&guest_clock_boot, memory_order_acquire);
+    *out = (struct guest_clock_reading) {
+        .monotonic_ns = guest[GUEST_CLOCK_MONOTONIC],
+        .boottime_ns = guest[GUEST_CLOCK_BOOTTIME],
+        .raw_ns = guest[GUEST_CLOCK_RAW],
+        .realtime_ns = real,
+        .boot_time = (int64_t) boot,
+    };
+}
+
+// A restored machine's clocks have to go on from the image, not from zero.
+// Its programs hold ABSOLUTE deadlines on them in their own memory, which the
+// image carries verbatim: Python's time.sleep is clock_nanosleep(
+// CLOCK_MONOTONIC, TIMER_ABSTIME), and so are glibc's CLOCK_MONOTONIC
+// condition variables and every event loop's timer wheel. Restarted at zero,
+// every one of those deadlines lay "uptime at the save" in the future -- a
+// restored Python daemon on the iPad woke a minute late, and after hours of
+// uptime it would have been hours. `uptime` read "up 0 min" after every
+// restore.
+//
+// Linux's answer for a machine that stopped and came back is hibernation's,
+// and this copies it: MONOTONIC and MONOTONIC_RAW do not count the time the
+// machine was stopped, so they continue from their saved values; BOOTTIME does,
+// so it also advances by the host's wall-clock time between the save and now.
+// That keeps MONOTONIC <= BOOTTIME, keeps uptime (which IS BOOTTIME) from
+// ever going backward, and leaves btime -- realtime minus uptime -- exactly
+// where it was, as it is after a resume from hibernation. A wall clock that
+// went BACKWARD in between counts as no time at all rather than as negative
+// time. boot_time comes back too, so everything dated from it still agrees.
+//
+// The rebasing sites only ever compute "guest now" from these origins, so
+// moving them here, before any restored task runs, is all a deadline needs:
+// the task that was frozen inside clock_nanosleep re-executes it after the
+// restore, and its deadline is interpreted against the continued clock.
+int64_t guest_clock_resume(const struct guest_clock_reading *saved) {
+    int64_t value[GUEST_CLOCK_COUNT] = {
+        [GUEST_CLOCK_MONOTONIC] = saved->monotonic_ns,
+        [GUEST_CLOCK_BOOTTIME] = saved->boottime_ns,
+        [GUEST_CLOCK_RAW] = saved->raw_ns,
+    };
+    pthread_mutex_lock(&guest_clock_lock);
+    // Realtime first and the host clocks after it, which is the order that
+    // keeps btime on its second (see guest_clock_read).
+    int64_t stopped = timespec_to_ns(timespec_now(CLOCK_REALTIME)) - saved->realtime_ns;
+    if (stopped < 0)
+        stopped = 0;
+    value[GUEST_CLOCK_BOOTTIME] += stopped;
+    for (int i = 0; i < GUEST_CLOCK_COUNT; i++) {
+        if (value[i] < 0)
+            value[i] = 0;
+        int64_t host = timespec_to_ns(timespec_now(guest_clock_host_id[i]));
+        atomic_store_explicit(&guest_clock_origin_ns[i], host - value[i],
+                              memory_order_release);
+    }
+    // The key before boot_time, both after the origins: a reader that sees
+    // boot_time match the key sees these origins, and one that sees it not
+    // match takes this lock and finds them already placed.
+    atomic_store_explicit(&guest_clock_boot, (time_t) saved->boot_time,
+                          memory_order_release);
+    boot_time = (time_t) saved->boot_time;
+    pthread_mutex_unlock(&guest_clock_lock);
+    return stopped;
+}
+
+void guest_clock_restart(time_t boot) {
+    pthread_mutex_lock(&guest_clock_lock);
+    guest_clock_place_origins(boot);
+    boot_time = boot;
+    pthread_mutex_unlock(&guest_clock_lock);
+}
+
+uint64_t guest_uptime_ticks(void) {
+    // USER_HZ ticks, Linux's 100 Hz. (It was rounded to tenths while
+    // /proc/uptime printed its hundredths without zero-padding.)
+    return guest_uptime_ns() / NSEC_PER_TICK;
+}
+
+// ---- the guest's load average ---------------------------------------------
+//
+// Linux's calc_load over the guest's OWN runnable tasks, so /proc/loadavg and
+// sysinfo(2) describe the guest rather than the host.
+//
+// It read 0.00 under load: after 65 s of one busy loop, still 0.00, where Linux
+// reads 0.66. The count was "alive minus io-blocked minus one", the one being
+// the reader -- but a task reading /proc/loadavg is inside read(2), and
+// TASK_MAY_BLOCK has already marked it io-blocked, so it was subtracted twice
+// and one busy task counted as none. sysinfo(2) arrived with its caller NOT
+// blocked, so there the same "- 1" was right. guest_count_runnable() now
+// leaves out `current` by identity, which is right for both, whether or not
+// the caller happens to be marked blocked when it counts.
+//
+// The average also used to advance only when somebody read it, applying the
+// reader's instantaneous count to every 5-second step it had missed. For a
+// steady load and a frequent poller that is the same answer, but a load that
+// ended just before a read was never seen at all (15 s of a busy loop, then a
+// read 2 s after it stopped: 0.00 with the count fixed, where Linux reads the
+// decaying average), and a reader that polls every 10 s samples at half
+// Linux's rate, and only ever at the instant it wakes. So, as on Linux, a timer
+// takes the samples: a detached thread that wakes every 5 s, the same shape as
+// the netlink link watcher (fs/sock.c), started when the first process is
+// created. A reader still applies an overdue sample itself, so if that thread
+// cannot be created, or has not been scheduled yet, the average degrades to
+// the old read-driven behaviour rather than freezing.
 #define GUEST_LOAD_FSHIFT 11
 #define GUEST_LOAD_FIXED_1 (1u << GUEST_LOAD_FSHIFT)
-void get_guest_loadavg(uint64_t out[3]) {
-    static const unsigned exp[3] = {1884, 2014, 2037}; // 1/exp(5s/{1,5,15}min) in FIXED_1
-    static lock_t load_lock = LOCK_INITIALIZER;
-    static uint64_t load[3];
-    static time_t last_sec;
+#define GUEST_LOAD_PERIOD_NS (5 * NSEC_PER_SEC_U64)  // Linux's LOAD_FREQ
+#define GUEST_LOAD_MAX_STEPS 64
 
-    // Runnable tasks = alive minus io-blocked, excluding this reader itself.
-    long active = (long) get_count_of_alive_tasks() - (long) get_count_of_blocked_tasks() - 1;
-    if (active < 0)
-        active = 0;
-    struct timespec now = timespec_now(CLOCK_MONOTONIC);
+static lock_t guest_load_lock = LOCK_INITIALIZER;
+static uint64_t guest_load[3];       // FIXED_1-scaled; under guest_load_lock
+static uint64_t guest_load_due_ns;   // uptime of the next sample; 0 = not started
+// guest_load_due_ns, readable without the lock by the fast path.
+static _Atomic uint64_t guest_load_due_hint;
 
-    lock(&load_lock, 0);
-    if (last_sec == 0)
-        last_sec = now.tv_sec;
-    long steps = (now.tv_sec - last_sec) / 5;
-    if (steps > 0) {
-        long do_steps = steps > 64 ? 64 : steps;
-        for (long s = 0; s < do_steps; s++)
-            for (int i = 0; i < 3; i++)
-                load[i] = (load[i] * exp[i] +
-                           (uint64_t) active * GUEST_LOAD_FIXED_1 * (GUEST_LOAD_FIXED_1 - exp[i]))
-                          >> GUEST_LOAD_FSHIFT;
-        last_sec = steps > 64 ? now.tv_sec : last_sec + steps * 5;
+// Runnable in Linux's sense, as near as AOK can tell: alive, not parked in a
+// blocking call, and not the caller. A task sampling the average is running at
+// that instant only BECAUSE it is sampling, so counting it would put a floor
+// of 1.00 under an idle guest; the timer thread has no `current` and excludes
+// nothing. Zombies and exiting tasks stay on alive_pids_list until they are
+// reaped, and do not run. Nor does a task parked by a checkpoint freeze
+// (checkpoint_park_if_frozen), which waits on a condition variable of its own
+// with io_block clear: counted, a guest frozen for a save would have added
+// every one of its tasks to the average once the timer took samples on its
+// own.
+static long guest_count_runnable(void) {
+    long count = 0;
+    complex_lockt(&pids_lock, 0);
+    struct pid *pid_entry;
+    list_for_each_entry(&alive_pids_list, pid_entry, alive) {
+        struct task *task = pid_entry->task;
+        if (task == NULL || task == current || task->io_block ||
+                task->zombie || task->exiting ||
+                atomic_load_explicit(&task->ckpt_frozen, memory_order_relaxed))
+            continue;
+        count++;
     }
+    unlock(&pids_lock);
+    return count;
+}
+
+// Linux's calc_load, including the round-up that lets a rising average
+// actually reach the count instead of stalling a fraction below it.
+static uint64_t guest_calc_load(uint64_t load, uint64_t exp, uint64_t active) {
+    uint64_t newload = load * exp + active * (GUEST_LOAD_FIXED_1 - exp);
+    if (active >= load)
+        newload += GUEST_LOAD_FIXED_1 - 1;
+    return newload / GUEST_LOAD_FIXED_1;
+}
+
+// Take whatever samples are due. Cheap when none is: one clock read and one
+// atomic load, no lock.
+static void guest_loadavg_sample(void) {
+    static const uint64_t exp[3] = {1884, 2014, 2037}; // exp(-5s/{1,5,15}min) in FIXED_1
+    uint64_t now = guest_uptime_ns();
+    uint64_t due = atomic_load_explicit(&guest_load_due_hint, memory_order_acquire);
+    if (due != 0 && now < due && due - now <= GUEST_LOAD_PERIOD_NS)
+        return;
+
+    // Counted before guest_load_lock, which therefore never nests pids_lock.
+    uint64_t active = (uint64_t) guest_count_runnable() * GUEST_LOAD_FIXED_1;
+    lock(&guest_load_lock, 0);
+    // The clock again, under the lock. A `now` read before it could predate a
+    // catch-up another caller has just applied, and a schedule that moved past
+    // a stale `now` by more than a period looks exactly like a new boot below
+    // -- which would zero the average.
+    now = guest_uptime_ns();
+    if (guest_load_due_ns == 0 || guest_load_due_ns > now + GUEST_LOAD_PERIOD_NS) {
+        // The first sample of this boot -- or uptime restarted under a new
+        // one, and the old machine's average is not this one's.
+        memset(guest_load, 0, sizeof(guest_load));
+        guest_load_due_ns = (now / GUEST_LOAD_PERIOD_NS + 1) * GUEST_LOAD_PERIOD_NS;
+    } else if (now >= guest_load_due_ns) {
+        // Several due at once means the sampler was not running (an app that
+        // was suspended, or no sampler at all); like Linux catching up after a
+        // tickless idle, apply the present count to each, up to a limit.
+        uint64_t steps = 1 + (now - guest_load_due_ns) / GUEST_LOAD_PERIOD_NS;
+        uint64_t apply = steps < GUEST_LOAD_MAX_STEPS ? steps : GUEST_LOAD_MAX_STEPS;
+        for (uint64_t s = 0; s < apply; s++)
+            for (int i = 0; i < 3; i++)
+                guest_load[i] = guest_calc_load(guest_load[i], exp[i], active);
+        guest_load_due_ns += steps * GUEST_LOAD_PERIOD_NS;
+    }
+    atomic_store_explicit(&guest_load_due_hint, guest_load_due_ns, memory_order_release);
+    unlock(&guest_load_lock);
+}
+
+static void *guest_loadavg_thread(void *unused) {
+    (void) unused;
+    // Darwin names the calling thread and takes only the name; see
+    // update_thread_name and kernel/swap.c's kswapd.
+#if __APPLE__
+    pthread_setname_np("loadavg");
+#else
+    pthread_setname_np(pthread_self(), "loadavg");
+#endif
+    for (;;) {
+        guest_loadavg_sample();
+        uint64_t now = guest_uptime_ns();
+        uint64_t due = atomic_load_explicit(&guest_load_due_hint, memory_order_acquire);
+        uint64_t wait = due > now ? due - now : 0;
+        if (wait > GUEST_LOAD_PERIOD_NS)
+            wait = GUEST_LOAD_PERIOD_NS;
+        // A millisecond past the boundary, so the sample is due when it looks.
+        wait += 1000000;
+        struct timespec nap = {
+            .tv_sec = (time_t) (wait / NSEC_PER_SEC_U64),
+            .tv_nsec = (long) (wait % NSEC_PER_SEC_U64),
+        };
+        nanosleep(&nap, NULL);
+    }
+    return NULL;
+}
+
+static void guest_loadavg_start(void) {
+    static atomic_bool started;
+    if (atomic_exchange_explicit(&started, true, memory_order_acq_rel))
+        return;
+    guest_loadavg_sample();   // starts the schedule at this boot
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, guest_loadavg_thread, NULL) == 0)
+        pthread_detach(thread);
+    else
+        printk("WARNING: no load average sampler thread; the average advances only when read\n");
+}
+
+void get_guest_loadavg(uint64_t out[3]) {
+    guest_loadavg_sample();   // nothing to do unless a sample is overdue
+    lock(&guest_load_lock, 0);
     for (int i = 0; i < 3; i++)
-        out[i] = load[i] << (16 - GUEST_LOAD_FSHIFT);
-    unlock(&load_lock);
+        out[i] = guest_load[i] << (16 - GUEST_LOAD_FSHIFT);
+    unlock(&guest_load_lock);
+}
+
+// ---- CPU time counters that never run backward ------------------------------
+//
+// /proc/stat's user/system/idle must only ever grow, and each line's total
+// should grow with the clock. AOK measures busy time (host thread or process
+// CPU time) and has no scheduler to measure idle with, so idle is capacity
+// minus busy. Two things make that subtraction go negative, and both are
+// normal:
+//
+//  - Sampling skew. A thread's CPU time as another thread reads it advances
+//    in steps. Measured on macOS, a busy thread's CPU time grew up to 3.1 ms
+//    MORE than the wall clock over the same 50 ms interval (and up to 5.5 ms
+//    less).
+//  - More work than capacity. A slot here is pid % ncpu, not a real CPU, so
+//    two busy tasks can share one; and the aggregate line is process CPU time,
+//    which can span more host cores than the guest is told it has.
+//
+// So each line keeps a ledger. Idle only takes what capacity is left after
+// busy, and never gives any back. Busy may run ahead of the capacity left for
+// it by CPU_TIME_SLACK_NS -- the skew, which the next read repays -- and
+// anything beyond that is DISCARDED, not owed: a slot at 200% for ten seconds
+// reads 100% busy, and when it goes idle it reads idle, rather than reading
+// 100% busy for ten more seconds while idle waited out the debt.
+#define CPU_TIME_SLACK_NS (2 * NSEC_PER_TICK)
+
+struct cpu_time_ledger {
+    uint64_t capacity;                     // at the last update
+    uint64_t user, system, idle;           // reported; each only grows
+    uint64_t dropped_user, dropped_system; // busy time discarded as over capacity
+};
+
+static void cpu_time_ledger_update(struct cpu_time_ledger *l, uint64_t capacity,
+                                   uint64_t slack, uint64_t raw_user, uint64_t raw_system) {
+    // Capacity only goes backward when uptime restarted under a new boot.
+    if (capacity < l->capacity)
+        *l = (struct cpu_time_ledger) {0};
+    l->capacity = capacity;
+
+    uint64_t user = raw_user > l->dropped_user ? raw_user - l->dropped_user : 0;
+    uint64_t system = raw_system > l->dropped_system ? raw_system - l->dropped_system : 0;
+    // A sample can dip (a thread whose times the host would not report this
+    // once); what was already reported stands.
+    if (user < l->user)
+        user = l->user;
+    if (system < l->system)
+        system = l->system;
+
+    uint64_t room = (capacity > l->idle ? capacity - l->idle : 0) + slack;
+    if (user + system > room) {
+        // Only this update's growth is cut, in proportion. What was reported
+        // before always fits, because every update leaves
+        // user + system + idle <= capacity + slack.
+        uint64_t excess = user + system - room;
+        uint64_t grew_user = user - l->user, grew_system = system - l->system;
+        uint64_t grew = grew_user + grew_system;
+        uint64_t cut_user = grew == 0 ? 0 :
+            (uint64_t) ((double) excess * ((double) grew_user / (double) grew));
+        if (cut_user > grew_user)
+            cut_user = grew_user;
+        uint64_t cut_system = excess - cut_user;
+        if (cut_system > grew_system) {
+            cut_user += cut_system - grew_system;
+            cut_system = grew_system;
+            if (cut_user > grew_user)
+                cut_user = grew_user;
+        }
+        user -= cut_user;
+        system -= cut_system;
+        l->dropped_user += cut_user;
+        l->dropped_system += cut_system;
+    }
+
+    uint64_t idle = capacity > user + system ? capacity - user - system : 0;
+    if (idle < l->idle)
+        idle = l->idle;
+    l->user = user;
+    l->system = system;
+    l->idle = idle;
+}
+
+static void cpu_time_ledger_ticks(const struct cpu_time_ledger *l, struct cpu_usage *out) {
+    out->user_ticks = l->user / NSEC_PER_TICK;
+    out->system_ticks = l->system / NSEC_PER_TICK;
+    out->idle_ticks = l->idle / NSEC_PER_TICK;
+    out->nice_ticks = 0;
+}
+
+static lock_t cpu_total_lock = LOCK_INITIALIZER;
+static struct cpu_time_ledger cpu_total_ledger;   // under cpu_total_lock
+
+void guest_cpu_usage_total(uint64_t user_ns, uint64_t system_ns, struct cpu_usage *out) {
+    int ncpu = get_cpu_count();
+    if (ncpu < 1)
+        ncpu = 1;
+    uint64_t capacity = (uint64_t) ncpu * guest_uptime_ns();
+    lock(&cpu_total_lock, 0);
+    cpu_time_ledger_update(&cpu_total_ledger, capacity, (uint64_t) ncpu * CPU_TIME_SLACK_NS,
+                           user_ns, system_ns);
+    cpu_time_ledger_ticks(&cpu_total_ledger, out);
+    unlock(&cpu_total_lock);
 }
 
 // ---- per-emulated-CPU time accounting (for /proc/stat's cpuN lines) --------
@@ -343,8 +1246,13 @@ void get_guest_loadavg(uint64_t out[3]) {
 // for what these lines are for (top/htop-style meters).
 
 #define CPU_SLOTS_MAX 64
+// Nanoseconds, like everything the ledgers above work in. They were ticks, and
+// every exiting task gave up the fraction of a tick it had run past its last
+// whole one -- up to 10 ms each, which a compile's thousands of short-lived
+// processes turn into seconds of busy time that never appeared.
 static _Atomic uint64_t cpu_slot_dead_user[CPU_SLOTS_MAX];
 static _Atomic uint64_t cpu_slot_dead_system[CPU_SLOTS_MAX];
+static struct cpu_time_ledger cpu_slot_ledger[CPU_SLOTS_MAX];   // under cpu_slots_lock
 
 // Serializes banking against the /proc/stat reader. Without this, a task
 // exiting mid-read could be counted twice in one snapshot: sampled live
@@ -365,9 +1273,28 @@ static int task_cpu_slot(struct task *task, int ncpu) {
     return (int) (task->pid % (dword_t) ncpu);
 }
 
-void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned long *out_stime) {
-    *out_utime = 0;
-    *out_stime = 0;
+// The calling host thread's CPU time by its own clock, the one a guest's
+// CLOCK_THREAD_CPUTIME_ID reads.
+//
+// thread_info is the only way to another thread's time, and to the split
+// between user and system. But asked by a thread about ITSELF, older Darwin
+// kernels leave out the run on the CPU it is in the middle of: on an A10X
+// (iPadOS 17) a thread that had spun 9ms since it last slept read 6.9ms less
+// from thread_info than from its clock; an M4 on iPadOS 26 and macOS read the
+// same from both. A thread CPU timer takes "now" on its own thread when it is
+// armed, so there a 5ms timer was anchored that far back and fired with 1.2 to
+// 3.7ms used (tests/manual/timer_thread_cpu_early, 27-30 rounds of 30, and the
+// same on an A9). So a thread's reading of itself is topped up to this.
+uint64_t host_thread_cpu_ns_self(void) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0)
+        return 0;
+    return (uint64_t) ts.tv_sec * NSEC_PER_SEC_U64 + (uint64_t) ts.tv_nsec;
+}
+
+void task_thread_cpu_time_ns(struct task *task, uint64_t *user_ns, uint64_t *system_ns) {
+    *user_ns = 0;
+    *system_ns = 0;
 #ifdef __APPLE__
     mach_port_t mach_thread = pthread_mach_thread_np(task->thread);
     if (mach_thread != MACH_PORT_NULL) {
@@ -375,19 +1302,23 @@ void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned 
         mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
         if (thread_info(mach_thread, THREAD_BASIC_INFO,
                         (thread_info_t) &info, &count) == KERN_SUCCESS) {
-            *out_utime = (unsigned long) info.user_time.seconds * 100
-                         + (unsigned long) info.user_time.microseconds / 10000;
-            *out_stime = (unsigned long) info.system_time.seconds * 100
-                         + (unsigned long) info.system_time.microseconds / 10000;
+            *user_ns = (uint64_t) info.user_time.seconds * NSEC_PER_SEC_U64
+                       + (uint64_t) info.user_time.microseconds * 1000;
+            *system_ns = (uint64_t) info.system_time.seconds * NSEC_PER_SEC_U64
+                         + (uint64_t) info.system_time.microseconds * 1000;
         }
+    }
+    if (pthread_equal(task->thread, pthread_self())) {
+        uint64_t own = host_thread_cpu_ns_self();
+        if (own > *user_ns + *system_ns)
+            *user_ns = own - *system_ns;
     }
 #else
     clockid_t clkid;
     if (pthread_getcpuclockid(task->thread, &clkid) == 0) {
         struct timespec ts;
         if (clock_gettime(clkid, &ts) == 0)
-            *out_utime = (unsigned long) ts.tv_sec * 100
-                         + (unsigned long) (ts.tv_nsec / 10000000);
+            *user_ns = (uint64_t) ts.tv_sec * NSEC_PER_SEC_U64 + (uint64_t) ts.tv_nsec;
     }
 #endif
 }
@@ -395,11 +1326,11 @@ void task_thread_cpu_time(struct task *task, unsigned long *out_utime, unsigned 
 void task_bank_cpu_time(struct task *task) {
     lock(&cpu_slots_lock, 0);
     if (!task->cpu_time_banked) {
-        unsigned long utime, stime;
-        task_thread_cpu_time(task, &utime, &stime);
-        int slot = task_cpu_slot(task, get_cpu_count());
-        atomic_fetch_add(&cpu_slot_dead_user[slot], utime);
-        atomic_fetch_add(&cpu_slot_dead_system[slot], stime);
+        uint64_t user_ns, system_ns;
+        task_thread_cpu_time_ns(task, &user_ns, &system_ns);
+        int slot = task_cpu_slot(task, get_cpu_count_allowed());
+        atomic_fetch_add(&cpu_slot_dead_user[slot], user_ns);
+        atomic_fetch_add(&cpu_slot_dead_system[slot], system_ns);
         task->cpu_time_banked = true;
     }
     unlock(&cpu_slots_lock);
@@ -412,6 +1343,7 @@ int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage) {
     struct cpu_usage *cpus = calloc((size_t) ncpu, sizeof(*cpus));
     if (cpus == NULL)
         return _ENOMEM;
+    uint64_t busy_user[CPU_SLOTS_MAX] = {0}, busy_system[CPU_SLOTS_MAX] = {0};
 
     complex_lockt(&pids_lock, 0);
     // Hold cpu_slots_lock across BOTH the live walk and the dead-slot loads:
@@ -430,24 +1362,28 @@ int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage) {
         // retract it on the next read (backward counters).
         if (task == NULL || task->cpu_time_banked || !task->host_thread_started)
             continue;
-        unsigned long utime, stime;
-        task_thread_cpu_time(task, &utime, &stime);
-        int slot = task_cpu_slot(task, ncpu);
-        cpus[slot].user_ticks += utime;
-        cpus[slot].system_ticks += stime;
+        uint64_t user_ns, system_ns;
+        task_thread_cpu_time_ns(task, &user_ns, &system_ns);
+        int slot = task_cpu_slot(task, get_cpu_count_allowed());
+        busy_user[slot] += user_ns;
+        busy_system[slot] += system_ns;
     }
 
-    // Each virtual CPU has uptime ticks of capacity; whatever its tasks
-    // didn't use was idle.
-    uint64_t uptime_ticks = get_uptime().uptime_ticks;
+    // Each virtual CPU has the guest's uptime of capacity; whatever its tasks
+    // did not use was idle. Read after the walk, so it covers every sample the
+    // walk took. The ledgers keep each field from ever running backward.
+    uint64_t capacity = guest_uptime_ns();
     for (int i = 0; i < ncpu; i++) {
-        if (i < CPU_SLOTS_MAX) {
-            cpus[i].user_ticks += atomic_load(&cpu_slot_dead_user[i]);
-            cpus[i].system_ticks += atomic_load(&cpu_slot_dead_system[i]);
+        if (i >= CPU_SLOTS_MAX) {
+            // task_cpu_slot never charges a task here: idle all along.
+            cpus[i].idle_ticks = capacity / NSEC_PER_TICK;
+            continue;
         }
-        uint64_t busy = cpus[i].user_ticks + cpus[i].system_ticks;
-        cpus[i].idle_ticks = uptime_ticks > busy ? uptime_ticks - busy : 0;
-        cpus[i].nice_ticks = 0;
+        busy_user[i] += atomic_load(&cpu_slot_dead_user[i]);
+        busy_system[i] += atomic_load(&cpu_slot_dead_system[i]);
+        cpu_time_ledger_update(&cpu_slot_ledger[i], capacity, CPU_TIME_SLACK_NS,
+                               busy_user[i], busy_system[i]);
+        cpu_time_ledger_ticks(&cpu_slot_ledger[i], &cpus[i]);
     }
     unlock(&cpu_slots_lock);
     unlock(&pids_lock);
@@ -455,32 +1391,71 @@ int get_emulated_per_cpu_usage(struct cpu_usage **cpus_usage) {
     return 0;
 }
 
-struct task *task_create_(struct task *parent) {
+static struct task *task_create_pid_(struct task *parent, pid_t_ want_pid) {
     struct task *task = malloc(sizeof(struct task));
     if (task == NULL)
         return NULL;
 
     *task = (struct task) {};
     if (parent != NULL)
-        *task = *parent; // uts_ns is only aliased here; copy_task retains or copies it
+        *task = *parent; // uts_ns and ipc_ns are only aliased here; copy_task retains or copies them
     else {
         task->uts_ns = uts_ns_retain(&init_uts_ns);
-        // Treat init/root as starting with the full Linux capability set so
-        // guest helpers such as setpriv can drop or reshuffle capabilities
-        // without tripping over uninitialized state.
+        task->ipc_ns = ipc_ns_retain(&init_ipc_ns);
+        // init starts as Linux's does: every capability permitted, effective
+        // and in the bounding set, and nothing inheritable or ambient
+        // (/proc/1/status on 6.12: CapInh 0, CapPrm/CapEff/CapBnd full). The
+        // inheritable set used to be full too, which would hand anything a
+        // file lists as inheritable (+i) to every process descended from init.
         task->abi = GUEST_ABI_I386;
-        task->cap_effective[0] = task->cap_effective[1] = UINT32_MAX;
-        task->cap_permitted[0] = task->cap_permitted[1] = UINT32_MAX;
-        task->cap_inheritable[0] = task->cap_inheritable[1] = UINT32_MAX;
+        task->cap_effective[0] = task->cap_permitted[0] =
+            task->cap_bounding[0] = CAP_FULL_LOW_;
+        task->cap_effective[1] = task->cap_permitted[1] =
+            task->cap_bounding[1] = CAP_FULL_HIGH_;
+        task->cap_inheritable[0] = task->cap_inheritable[1] = 0;
         // Every other task inherits this through the struct copy above.
         strcpy(task->security.current, TASK_SECURITY_DEFAULT_CONTEXT);
     }
+    // NOT inherited: which native program is running, and what it said about
+    // itself.
+    //
+    // `*task = *parent` above copies both, and native_running is set only
+    // while prog->main() is on the stack -- so a child forked by a native
+    // shell came out claiming to BE that shell. kernel/checkpoint.c then asked
+    // it for zsh's state, on a task that has none, and read zsh's trap table
+    // through a null pointer: EXC_BAD_ACCESS at address 0x84, on the thread of
+    // an emulated /bin/sh. The state pointer would have been a double free by
+    // the same route.
+    task->ckpt_restored = false;
+    task->ckpt_syscalls_traced = 0;
+    task->native_running = NULL;
+    task->ckpt_native_state = NULL;
+
+    // Every task's poke flag is its OWN, from the moment it exists.
+    //
+    // poked_ptr points into its own cpu_state (&cpu->_poked), and each engine's
+    // entry sets it -- but `*task = *parent` above copies the parent's whole
+    // cpu_state, POINTER INCLUDED, so until the child first entered the
+    // emulator its "stop executing" flag was its parent's. A task whose image
+    // is a native program never enters the emulator at all, so its flag stayed
+    // NULL and poking it dereferenced NULL: an app that vanished rather than a
+    // guest that reported anything.
+    task->cpu.poked_ptr = &task->cpu._poked;
+    task->cpu._poked = false;
+    task->prof_slot = -1; // never inherited; see the field's comment
     task->cpu_time_banked = false; // per-task, not inherited via the parent copy
     task->host_thread_started = false; // ditto; task_start sets it
     task->exit_rusage_counted = false; // ditto; do_exit sets it
     // Not inherited either: the copy above would give a child its parent's
     // age. /proc/<pid>/stat field 22, which was hardcoded 0.
-    task->start_time_ticks = get_uptime().uptime_ticks;
+    //
+    // The first process is created AT boot, and is 0 by definition. Reading
+    // the clock for it was wrong, not merely redundant: kernel/init.c creates
+    // it and only THEN sets boot_time, so this read measured from run_at_boot's
+    // earlier seed -- on a device, from the app's launch, possibly long before
+    // the session picker let the guest boot -- and pid 1 started in the future
+    // of the uptime that restarted a moment later.
+    task->start_time_ticks = parent == NULL ? 0 : get_uptime().uptime_ticks;
     atomic_fetch_add_explicit(&total_forks, 1, memory_order_relaxed);
     list_init(&task->group_links);
     list_init(&task->children);
@@ -504,7 +1479,15 @@ struct task *task_create_(struct task *parent) {
     task->exit_finished = false;
     task->io_block = false;
     task->vfork = NULL;
-    task->exit_signal = 0;
+    // SIGCHLD until told otherwise. clone sets its own (copy_task) and a
+    // restore puts back the saved one; what keeps this default is a process
+    // construct_task makes for init -- every terminal session, the app's
+    // one-shot commands, the fallback console shell. Each stands for a child
+    // init forked, and was 0 here: a "clone child", which init's plain wait
+    // skips now that wait asks (wait_eligible), and whose exit a SysV init,
+    // reaping only on SIGCHLD, was never sent a signal for. Set before the
+    // task is linked to its parent below, so that no wait sees it without one.
+    task->exit_signal = SIGCHLD_;
     // A peak is the CHILD's own, not something it starts life owing to its
     // parent. Linux gives a new process a fresh ru_maxrss -- its high-water
     // mark tracks its own mm from now on -- and `*task = *parent` above had
@@ -622,22 +1605,44 @@ struct task *task_create_(struct task *parent) {
     list_init(&task->sockrestart.listen);
 
     task->waiting_cond = NULL;
+    task->waiting_interruptible = false;
     task->waiting_lock = NULL;
     task->waiting_interrupt_flag = NULL;
     task->wait_interrupted = false;
     task->restart_interrupted_syscall = false;
     task->restart_interrupted_syscall_nohand = false;
+    // Nothing queued for the process has been handed to a thread that did not
+    // exist, as Linux's copy_process clears TIF_SIGPENDING.
+    task->group_sigpending = false;
+    task->group_handoff = 0;
     task->poll_restart_valid = false;
     task->sleep_restart_valid = false;
     task->restart_nohand_pending = false;
+    task->restart_sys_pending = false;
     task->futex_restart_futex = NULL;
     task->futex_restart_uaddr = 0;
     task->futex_restart_wake_seq = 0;
+    task->futex_restart_timed = false;
     task->poll_notify_fd = -1;
     lock_init(&task->waiting_cond_lock, "task_creat_wait\0");
     cond_init(&task->pause);
 
     task->ptrace = (typeof(task->ptrace)) {};
+    task->ptrace_link_capable = false;
+    task->ptrace_trap_notify = false;
+    task->native_helper_threads = 0;
+    task->native_delivering = 0;
+    task->mnt_ns = NULL; // copy_task gives a clone its parent's
+    task->user_ns = NULL; // likewise
+    task->pid_ns = NULL;
+    task->pid_ns_for_children = NULL;
+    task->net_ns = NULL;
+    atomic_store_explicit(&task->split_lock_stamp, 0, memory_order_relaxed);
+    task->split_lock_wait = false;
+    task->split_lock_stood_aside = 0;
+    task->exit_arch = NULL;
+    memset(task->ptrace_debugreg, 0, sizeof(task->ptrace_debugreg));
+    task->ptrace_singlestep = false;
     lock_init(&task->ptrace.lock, "task_creat_ptr\0");
     cond_init(&task->ptrace.cond);
 
@@ -647,14 +1652,32 @@ struct task *task_create_(struct task *parent) {
     task->reference.ready_to_be_freed = false;
 
     complex_lockt(&pids_lock, 0);
-    do {
-        last_allocated_pid++;
-        if (last_allocated_pid >= task_pid_max()) last_allocated_pid = 1;
-        // Reserved for a synthetic kernel thread: handing it to a real task
-        // would make two different processes answer to one pid.
-    } while (!pid_empty(&pids[last_allocated_pid]) ||
-             pid_is_kthread(last_allocated_pid, NULL));
+    if (want_pid != 0) {
+        // A CHOSEN pid, for a restore (kernel/checkpoint.c). Refused rather
+        // than quietly given a different one: a process that comes back under
+        // another number is not the process that was saved, and everything
+        // holding its old pid -- its parent's wait, a shell's $!, a pidfile --
+        // is then wrong in a way nothing would report.
+        if ((dword_t) want_pid >= task_pid_wrap() || !pid_empty(&pids[want_pid]) ||
+                pid_is_kthread(want_pid, NULL)) {
+            unlock(&pids_lock);
+            free(task);
+            return NULL;
+        }
+        last_allocated_pid = want_pid;
+    } else {
+        do {
+            last_allocated_pid++;
+            if (last_allocated_pid >= task_pid_wrap()) last_allocated_pid = 1;
+            // Reserved for a synthetic kernel thread: handing it to a real task
+            // would make two different processes answer to one pid.
+        } while (!pid_empty(&pids[last_allocated_pid]) ||
+                 pid_is_kthread(last_allocated_pid, NULL));
+    }
     struct pid *pid = &pids[last_allocated_pid];
+    // (Numbers the slot's last holder had in a pid namespace, if nothing
+    // took them back when it emptied.)
+    pid_ns_unnumber((dword_t) last_allocated_pid);
     pid->id = last_allocated_pid;
     list_init(&pid->alive);
     list_init(&pid->session);
@@ -665,10 +1688,30 @@ struct task *task_create_(struct task *parent) {
     list_add(&alive_pids_list, &pid->alive);
     if (parent != NULL) {
         task->parent = parent;
-        list_add(&parent->children, &task->siblings);
+        // At the end: a children list is oldest first, as Linux's
+        // copy_process keeps it (list_add_tail), and wait walks it from the
+        // front, so of several zombies wait(-1) reaps the oldest. At the head
+        // it reaped the youngest (tests/manual/wait_child_order.c). A
+        // checkpoint restore builds each parent's children in list order
+        // through here too (ckpt_order_tasks).
+        list_add_tail(&parent->children, &task->siblings);
     }
     unlock(&pids_lock);
+    // The parent's seccomp filters are the child's too; the struct copy above
+    // shares the pointer, and task_free_final drops this reference.
+    seccomp_filter_retain(task->seccomp_filter);
+    // The machine now exists, so its load average starts being sampled.
+    if (parent == NULL)
+        guest_loadavg_start();
     return task;
+}
+
+struct task *task_create_(struct task *parent) {
+    return task_create_pid_(parent, 0);
+}
+
+struct task *task_create_with_pid(struct task *parent, pid_t_ want) {
+    return task_create_pid_(parent, want);
 }
 
 // We consolidate the check for whether the task is in a critical section,
@@ -684,19 +1727,48 @@ void task_unlink_locked(struct task *task) {
     task->exiting = true;
     list_remove(&task->siblings);
     list_remove_safe(&task->ptrace_siblings);
-    struct pid *pid = pid_get(task->pid);
+    struct pid *pid = pid_get_global(task->pid);
+    // pid_get returns NULL for a pid it considers empty, and pid_empty is
+    // satisfied by `task == NULL` alone once session and pgroup are gone -- so
+    // a second unlink of the same task arrives here with nothing to unlink.
+    if (pid == NULL)
+        return;
     pid->task = NULL;
+    // Re-init rather than leave it NULL. list_remove sets next and prev to
+    // NULL (util/list.h), list_init leaves a node pointing at itself, and
+    // list_for_each_entry stops only on `&item->member != (list)` -- it has no
+    // NULL check, and SEVEN sites walk alive_pids_list with it. A node left
+    // NULL is therefore a live hazard for every one of those walks: the walk
+    // follows `next` into 0 and the container_of subtraction faults at
+    // 0xfffffffffffffff8, which is the shape of the device checkpoint crash in
+    // docs/TODO.md. Self-pointing is the state list_init already gives a fresh
+    // pid (task_create_pid_), and nothing reads this node's emptiness --
+    // pid_empty tests task/session/pgroup and never `alive`.
     list_remove(&pid->alive);
+    list_init(&pid->alive);
+    // The number names nothing more, unless a process group or session
+    // still goes by it: its numbers in a pid namespace are free again.
+    pid_ns_unnumber_if_empty((dword_t) task->pid);
 }
 
 static void task_free_final(struct task *task) {
+    if (unlikely(guestprof_on))
+        guestprof_slot_release(task);
     // A native program recorded by execve but never reached -- the task died
     // between the exec and its first execution (task_start failing, say).
     native_exec_discard_pending(task);
     native_env_discard(task);
     native_cmdline_discard(task);
     native_sigtable_discard(task);
-    if (task != NULL && task_is_leader(task) && task->group != NULL) {
+    // The group goes with its leader. Whether this IS the leader is asked
+    // without reading a thread's group pointer first: a thread's struct can
+    // outlive its process's group -- one left on the deferred queue below
+    // while its process is reaped, or the last thread of a process whose exit
+    // freed the leader before this thread had finished freeing itself -- and
+    // task_is_leader would read the freed group. A leader's pid is its tgid;
+    // a thread's never is, nor that of a leader execve retired (pid 0).
+    if (task != NULL && task->group != NULL && task->pid == task->tgid &&
+            task->group->leader == task) {
         // Before the group struct goes: an AIO context is keyed by a guest
         // address, and this address space is on its way out.
         aio_discard_tgroup(task->group);
@@ -707,6 +1779,24 @@ static void task_free_final(struct task *task) {
     }
     free(task->groups);
     task->groups = NULL;
+    // Kept to here and not let go in do_exit: a zombie is still in its pid
+    // namespace, where the parent that will reap it has to be able to see it.
+    pid_ns_release(task->pid_ns);
+    task->pid_ns = NULL;
+    seccomp_filter_release(task->seccomp_filter);
+    task->seccomp_filter = NULL;
+    sockrestart_task_gone(task);
+    // A native program that ended with threads of its own still running --
+    // it aborted, or exited from one of them -- has left host threads whose
+    // `current` is this struct, and all that stands between them and the rest
+    // of the kernel is native_have_task() reading it (files is NULL from
+    // do_exit on). They are not stopped and cannot be; so the struct they
+    // read is not handed back to malloc. A few kilobytes per program that
+    // ends that way, against a use-after-free in every one of its threads.
+    // (A thread that returned was counted out in nlibc_thread_trampoline; a
+    // program whose threads were all joined frees as before.)
+    if (task != NULL && __atomic_load_n(&task->native_helper_threads, __ATOMIC_ACQUIRE) > 0)
+        return;
     free(task);
 }
 
@@ -723,7 +1813,15 @@ void task_destroy_unlinked(struct task *task, int caller) {
         count++;
     }
 
-    if (task_ref_cnt_get(task, 1)) { // Check to see if another thread is accessing this process.  If yes, note that and defer freeing it
+    // A zombie can be reaped the moment do_exit marks it, while its own thread
+    // is still finishing do_exit on the struct -- freeing the queued signals,
+    // sending its parent's SIGCHLD, publishing exit_finished. A reap used to
+    // free it regardless. Now that a tracer reaps zombie threads and a
+    // process's exit can release a leader from another thread, that window is
+    // wider, so such a zombie waits on the deferred queue for exit_finished.
+    bool still_exiting = task->zombie &&
+        !atomic_load_explicit(&task->exit_finished, memory_order_acquire);
+    if (task_ref_cnt_get(task, 1) || still_exiting) { // Check to see if another thread is accessing this process.  If yes, note that and defer freeing it
         struct task_pending_deletion *pd = malloc(sizeof(struct task_pending_deletion));
         if (pd) {
             task->reference.ready_to_be_freed = true;
@@ -755,13 +1853,154 @@ void cleanup_pending_deletions(void) {
     struct task_pending_deletion *pd, *tmp;
     list_for_each_entry_safe(&tasks_pending_deletion_queue, pd, tmp, list) {
         if (difftime(time(NULL), pd->added_time) >= GRACE_PERIOD &&
-                atomic_load_explicit(&pd->task->reference.count, memory_order_acquire) == 0) { // Delete reaped tasks old and no longer referenced
+                atomic_load_explicit(&pd->task->reference.count, memory_order_acquire) == 0 &&
+                (!pd->task->zombie ||
+                 atomic_load_explicit(&pd->task->exit_finished, memory_order_acquire))) { // Delete reaped tasks old and no longer referenced
             task_free_final(pd->task);
             list_remove(&pd->list);
             free(pd);
         }
     }
     pthread_mutex_unlock(&tasks_pending_deletion_lock);
+}
+
+// ISH_TASK_DUMP_EVERY=<seconds>: every so often, print every task -- who it
+// is, what it is waiting in, and where its HOST thread actually is.
+//
+// For the hang that only happens on the device and leaves no shell to look
+// with. The case that asked for it: after a restore, every new login's shell
+// failed to start -- ssh authenticated and then hung, new terminals never
+// printed a prompt -- and every way in went through the thing that was stuck.
+// This needs no guest cooperation at all: the environment reaches the app
+// through `devicectl device process launch --environment-variables`, and the
+// output through --console. Frames come from task_host_backtrace, the
+// freezer's own instrument; see [[stuck-task-host-backtrace]] in the notes.
+static double task_dump_every;
+// The thread run_at_boot ran on: the app's main thread, and the CLI's. Where
+// the boot itself is, when the hang is before there is any task to dump -- a
+// launch that sat for minutes before init existed is what made this worth it.
+static pthread_t task_dump_boot_thread;
+
+static void task_dump_frames(uintptr_t *frames, unsigned n) {
+    for (unsigned i = 0; i < n; i++) {
+        Dl_info info;
+        if (dladdr((void *) frames[i], &info) && info.dli_sname != NULL)
+            fprintf(stderr, "taskdump:     %2u %s\n", i, info.dli_sname);
+        else
+            fprintf(stderr, "taskdump:     %2u %#lx\n", i, (unsigned long) frames[i]);
+    }
+}
+
+// ISH_TASK_DUMP_ALL_THREADS=1: every host thread in the process too, named.
+// For a stall on a thread that is neither a task's nor the boot thread -- a
+// launch sat for minutes while the main thread idled in its run loop, so the
+// work was somewhere else. Each thread is suspended through its Mach port
+// BEFORE its pthread is looked at: a thread that exited between the listing
+// and the walk would otherwise leave a dangling pthread_t, and a suspended
+// thread cannot exit.
+static bool task_dump_all_threads;
+
+static void task_dump_every_host_thread(void) {
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    thread_act_array_t threads;
+    mach_msg_type_number_t count;
+    if (task_threads(mach_task_self(), &threads, &count) != KERN_SUCCESS)
+        return;
+    mach_port_t self = mach_thread_self();
+    for (mach_msg_type_number_t i = 0; i < count; i++) {
+        if (threads[i] != self && thread_suspend(threads[i]) == KERN_SUCCESS) {
+            pthread_t pt = pthread_from_mach_thread_np(threads[i]);
+            char name[64] = {0};
+            uintptr_t frames[16];
+            unsigned n = 0;
+            if (pt != NULL) {
+                pthread_getname_np(pt, name, sizeof(name));
+                uintptr_t top = (uintptr_t) pthread_get_stackaddr_np(pt);
+                uintptr_t bottom = top - pthread_get_stacksize_np(pt);
+                arm_thread_state64_t st;
+                mach_msg_type_number_t sc = ARM_THREAD_STATE64_COUNT;
+                if (thread_get_state(threads[i], ARM_THREAD_STATE64,
+                                     (thread_state_t) &st, &sc) == KERN_SUCCESS) {
+                    frames[n++] = (uintptr_t) arm_thread_state64_get_pc(st) & 0x0000ffffffffffffULL;
+                    frames[n++] = (uintptr_t) arm_thread_state64_get_lr(st) & 0x0000ffffffffffffULL;
+                    uintptr_t fp = (uintptr_t) arm_thread_state64_get_fp(st);
+                    while (n < 16 && fp >= bottom && fp + 16 <= top && (fp & 7) == 0) {
+                        const uintptr_t *rec = (const uintptr_t *) fp;
+                        uintptr_t next = rec[0];
+                        uintptr_t ret = rec[1] & 0x0000ffffffffffffULL;
+                        if (ret == 0)
+                            break;
+                        frames[n++] = ret;
+                        if (next <= fp)
+                            break;
+                        fp = next;
+                    }
+                }
+            }
+            thread_resume(threads[i]);
+            fprintf(stderr, "taskdump: host thread %u \"%s\":\n", i, name);
+            task_dump_frames(frames, n);
+        }
+        mach_port_deallocate(mach_task_self(), threads[i]);
+    }
+    mach_port_deallocate(mach_task_self(), self);
+    vm_deallocate(mach_task_self(), (vm_address_t) threads,
+                  count * sizeof(thread_act_t));
+#endif
+}
+
+static void task_dump_one(struct task *t) {
+    const struct native_program *native = t->native_running;
+    fprintf(stderr, "taskdump: pid %d tgid %d ppid %d uid %u euid %u %s%s%s%s%s\n",
+            t->pid, t->tgid, t->parent != NULL ? t->parent->pid : 0,
+            (unsigned) t->uid, (unsigned) t->euid, t->comm,
+            t->zombie ? " ZOMBIE" : "", t->exiting ? " EXITING" : "",
+            t->io_block ? " io_block" : "",
+            native != NULL ? " native" : "");
+    if (t->zombie || !atomic_load_explicit(&t->host_thread_started,
+                                           memory_order_acquire))
+        return;
+    if (pthread_equal(t->thread, pthread_self()))
+        return;
+    uintptr_t frames[24];
+    task_dump_frames(frames, task_host_backtrace(t, frames, 24));
+}
+
+static void *task_dump_thread(void *unused) {
+    (void) unused;
+    for (;;) {
+        usleep((useconds_t) (task_dump_every * 1000000));
+        struct task_snapshot snap = {0};
+        if (task_snapshot_collect(&snap, false) < 0)
+            continue;
+        fprintf(stderr, "taskdump: ---- %u tasks ----\n", snap.count);
+        uintptr_t boot_frames[40];
+        fprintf(stderr, "taskdump: boot thread (main):\n");
+        task_dump_frames(boot_frames,
+                         host_thread_backtrace(task_dump_boot_thread, boot_frames, 40));
+        if (task_dump_all_threads)
+            task_dump_every_host_thread();
+        for (unsigned i = 0; i < snap.count; i++)
+            task_dump_one(snap.tasks[i]);
+        fprintf(stderr, "taskdump: ---- end ----\n");
+        task_snapshot_release(&snap);
+    }
+    return NULL;
+}
+
+static void task_dump_start_if_asked(void) {
+    const char *e = getenv("ISH_TASK_DUMP_EVERY");
+    if (e == NULL || e[0] == '\0')
+        return;
+    task_dump_every = atof(e);
+    task_dump_boot_thread = pthread_self();
+    const char *all = getenv("ISH_TASK_DUMP_ALL_THREADS");
+    task_dump_all_threads = all != NULL && all[0] != '\0' && all[0] != '0';
+    if (task_dump_every < 1)
+        task_dump_every = 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, task_dump_thread, NULL) == 0)
+        pthread_detach(th);
 }
 
 void run_at_boot(void) {  // Stuff we run only once, at boot time.
@@ -771,10 +2010,33 @@ void run_at_boot(void) {  // Stuff we run only once, at boot time.
     unsigned short ncpu = get_cpu_count();
     lock_init(&pids_lock, "pids");
     lock_init(&atomic_l_lock, "run_at_boot");
+    task_dump_start_if_asked();
     // No guest arch named here: this runs once at boot, and one session
     // can run i386, x86_64, and arm64 guests (per-task ABI).
-    printk("iSH-AOK %s built %s %s booted on %d emulated CPU(s)\n",
-            uts.release, __DATE__, __TIME__, ncpu);
+    //
+    // The executable's timestamp, NOT __DATE__/__TIME__.
+    //
+    // This line is what everyone reads to answer "is the thing I am testing
+    // the thing I just built?", and __DATE__/__TIME__ cannot answer it: they
+    // are THIS FILE's compile time, and an incremental build that changes only
+    // app/ code relinks without recompiling task.c. Measured on two bundles
+    // here: one linked at 18:36 reported 18:21, another linked at 18:04
+    // reported 12:06. I read one of those lags as "you tested a stale build"
+    // and was wrong about it. buildTimestamp() is the same source of truth
+    // hostinfo.m already uses, and it has an implementation in both the app
+    // (kernel/hostinfo.m) and the CLI (platform/standalone.c).
+    char built[64];
+    time_t built_at = buildTimestamp();
+    if (built_at != 0) {
+        struct tm built_tm;
+        localtime_r(&built_at, &built_tm);
+        strftime(built, sizeof(built), "%b %d %Y %H:%M:%S", &built_tm);
+    } else {
+        // Nothing to stat -- better a compile time than no answer at all.
+        snprintf(built, sizeof(built), "%s %s", __DATE__, __TIME__);
+    }
+    printk("iSH-AOK %s built %s booted on %d emulated CPU(s)\n",
+            uts.release, built, ncpu);
     // Get boot time
     extern time_t boot_time;
          
@@ -788,7 +2050,33 @@ extern _Atomic long quiesce_pokes_sent;
 extern _Atomic long quiesce_pokes_skipped;
 extern _Atomic long quiesce_reader_naps;
 
+// ISH_TEST_POKE_BLOCKED_TASKS=<comm prefix>: poke a task whose comm starts with
+// this even while it is io_block, as though the barrier had read the flag a
+// moment before the task set it. That race is real -- an inotify read, which is
+// io_block, came back EINTR with no signal sent once in some hundreds of tries
+// -- and too rare to test, so without this the other half of the defence
+// (wait_for_blocked in util/sync.c reporting a bare poke as a spurious wakeup)
+// could only ever be reasoned about. tests/manual/blocked_wait_state.c is the
+// reader. Deliberately narrow, like ISH_TEST_LOSE_WAKE_POKES in kernel/signal.c:
+// a comm prefix, never every task.
+static bool poke_blocked_task_for_test(const struct task *task) {
+    static const char *prefix = NULL;
+    static int looked_up = 0;
+    if (!looked_up) {
+        prefix = getenv("ISH_TEST_POKE_BLOCKED_TASKS");
+        looked_up = 1;
+    }
+    if (prefix == NULL || *prefix == '\0' || task == NULL)
+        return false;
+    return strncmp(task->comm, prefix, strlen(prefix)) == 0;
+}
+
 void task_poke_shared_mem(struct task *task, struct mem *mem) {
+    task_poke_shared_mem_counting(task, mem, 0);
+}
+
+unsigned task_poke_shared_mem_counting(struct task *task, struct mem *mem, uint64_t splitters_since) {
+    unsigned others = 0;
     // A NULL `task` is a caller with no `current` -- kswapd, and anything else
     // that takes the address-space barrier from a host thread rather than a
     // guest one. It is NOT a reason to do nothing, and returning here made the
@@ -803,12 +2091,12 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
     // above it excludes -- so a NULL caller correctly means "poke every thread
     // of this mem, there is no self to skip".
     if (mem == NULL)
-        return;
+        return 0;
 
     atomic_fetch_add_explicit(&quiesce_poke_calls, 1, memory_order_relaxed);
     if (trylock(&pids_lock) != 0) {
         atomic_fetch_add_explicit(&quiesce_poke_noop, 1, memory_order_relaxed);
-        return;
+        return 0;
     }
     struct pid *pid_entry;
     list_for_each_entry(&alive_pids_list, pid_entry, alive) {
@@ -827,7 +2115,7 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
         // enters JIT right after this check is covered by mem_write_lock_with_
         // pokes re-poking every 64 attempts: by then io_block is clear and the
         // trylockw it now blocks forces another poke round that catches it.
-        if (other->io_block) {
+        if (other->io_block && !poke_blocked_task_for_test(other)) {
             atomic_fetch_add_explicit(&quiesce_pokes_skipped, 1, memory_order_relaxed);
             continue;
         }
@@ -841,6 +2129,10 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
             atomic_fetch_add_explicit(&quiesce_pokes_skipped, 1, memory_order_relaxed);
             continue;
         }
+        // (In or near guest code, then: one the caller is taking the address
+        // space from. Not counted when it is at the same thing itself.)
+        if (atomic_load_explicit(&other->split_lock_stamp, memory_order_relaxed) < splitters_since)
+            others++;
         // Already poked and hasn't consumed it: the sticky flag is still up,
         // so the sibling either hasn't reached a block boundary yet (the
         // flag, not the signal, is what evicts a JIT runner) or has already
@@ -863,6 +2155,7 @@ void task_poke_shared_mem(struct task *task, struct mem *mem) {
         cpu_poke(&other->cpu);
     }
     unlock(&pids_lock);
+    return others;
 }
 
 static void task_wait_for_mem_quiesce(struct task *task) {
@@ -905,6 +2198,14 @@ void task_run_current(void) {
     task_pthread_canary_note_tlb(&tlb, sizeof(tlb));
     
     while (true) {
+        // The one place in the guest where a task is at a clean boundary: no
+        // address-space lock held, not inside a syscall, and struct cpu_state
+        // naming the NEXT instruction rather than the one being executed. A
+        // checkpoint asked for from a syscall is taken here, one pass later,
+        // which is what makes a restore continue instead of re-running the
+        // request. See kernel/checkpoint.c.
+        checkpoint_park_if_frozen();
+        checkpoint_run_pending();
         task_wait_for_mem_quiesce(save);
         read_lock(&save->mem->lock);
 
@@ -914,12 +2215,27 @@ void task_run_current(void) {
         task_pthread_canary_check_self_at(
                 "at the top of task_run_current's loop, where the cleanup list must be empty",
                 true);
+        if (unlikely(guestprof_on))
+            guestprof_state(GUESTPROF_GUEST);
         int interrupt = cpu_run_to_interrupt(cpu, &tlb);
+        if (unlikely(guestprof_on))
+            guestprof_state(GUESTPROF_KERNEL);
         task_pthread_canary_check_self("after guest execution");
 
         read_unlock(&save->mem->lock);
         jit_cleanup_jetsam_after_interrupt(cpu);
- 
+        // A thread that has just done a split LOCK operation at a sibling's
+        // expense stands aside for a moment (emu/tlb.c, x86_lock_split_begin,
+        // which poked it out to here): now, where it holds nothing.
+        if (save->split_lock_wait) {
+            save->split_lock_wait = false;
+            static const struct timespec quantum = {0, 100000};
+            nanosleep(&quantum, NULL);
+            struct timespec stood;
+            clock_gettime(CLOCK_MONOTONIC, &stood);
+            save->split_lock_stood_aside = (uint64_t) stood.tv_sec * 1000000000ull + (uint64_t) stood.tv_nsec;
+        }
+
         handle_interrupt(interrupt);
         task_pthread_canary_check_self("after handle_interrupt");
     }
@@ -949,6 +2265,28 @@ static void *task_thread(void *task) {
 
     update_thread_name();
     task_pthread_canary_register();
+
+    // A child its parent's tracer attached to at clone time owes that tracer
+    // its first stop (sys_clone_common_): a PTRACE_EVENT_STOP if the tracer
+    // seized, taken first and whatever the mask, and otherwise a queued
+    // SIGSTOP. Linux takes it on the child's way out of ret_from_fork, before
+    // the child runs an instruction of its own; the loop in task_run_current
+    // looks for signals only after the first interrupt, by which time a child
+    // that exits at once has already exited.
+    if (current->ptrace.traced) {
+        ptrace_trap_stop_if_pending();
+        lock(&current->sighand->lock, 0);
+        bool pending = ((current->pending | task_group_pending(current)) &
+                ~current->blocked) != 0;
+        unlock(&current->sighand->lock);
+        if (pending)
+            receive_signals();
+        // Whether or not a signal stopped it: a process already job-control
+        // stopped reports that as its first stop, and the trap looked for above
+        // is left to it (ptrace_trap_stop_if_pending).
+        group_stop_wait();
+        ptrace_trap_stop_if_pending();
+    }
 
     task_run_current();
     die("task_thread returned"); // above function call should never return
@@ -2163,4 +3501,75 @@ bool current_is_valid(void) {
         return true;
     
     return false;
+}
+
+// Raw return addresses from another task's host thread.
+//
+// The freeze blame can name the syscall a stuck task is in by reading x8 -- but
+// only if it IS in a syscall. A task spinning in guest code, or blocked on a
+// lock inside the kernel, leaves x8 holding whatever its LAST syscall was, and
+// the blame then points at an innocent path: chronyd on an M4 iPad read
+// "blocked in arm64 syscall 72" while every pselect6 shape reproducible on the
+// CLI parked correctly. These frames settle that kind of disagreement.
+//
+// Here rather than in kernel/checkpoint.c because this file can already see the
+// Mach headers: including them there makes PAGE_SIZE a runtime variable, which
+// silently turns a later `static const char zero[PAGE_SIZE]` into a VLA.
+//
+// Collected while the thread is suspended, which is only memory reads, and every
+// read is bounded to that thread's own stack so a garbage frame pointer ends the
+// walk instead of faulting the app. The caller symbolizes AFTER this returns and
+// the thread is running again: a suspended thread may hold the malloc or dyld
+// lock that dladdr needs, and waiting on it here would hang the caller.
+// The frame walk itself, for any host thread that is known to be alive. The
+// caller answers that; see task_host_backtrace for a task's.
+unsigned host_thread_backtrace(pthread_t thread, uintptr_t *frames, unsigned max) {
+#if defined(__APPLE__) && (defined(__arm64__) || defined(__aarch64__))
+    if (frames == NULL || max == 0 || pthread_equal(thread, pthread_self()))
+        return 0;
+    uintptr_t stack_top = (uintptr_t) pthread_get_stackaddr_np(thread);
+    uintptr_t stack_bottom = stack_top - pthread_get_stacksize_np(thread);
+    mach_port_t th = pthread_mach_thread_np(thread);
+    if (th == MACH_PORT_NULL || thread_suspend(th) != KERN_SUCCESS)
+        return 0;
+    unsigned n = 0;
+    arm_thread_state64_t st;
+    mach_msg_type_number_t count = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(th, ARM_THREAD_STATE64,
+                         (thread_state_t) &st, &count) == KERN_SUCCESS) {
+        // The same pointer-authentication strip the canary report uses.
+        frames[n++] = (uintptr_t) arm_thread_state64_get_pc(st) & 0x0000ffffffffffffULL;
+        if (n < max)
+            frames[n++] = (uintptr_t) arm_thread_state64_get_lr(st) & 0x0000ffffffffffffULL;
+        uintptr_t fp = (uintptr_t) arm_thread_state64_get_fp(st);
+        while (n < max && fp >= stack_bottom && fp + 16 <= stack_top && (fp & 7) == 0) {
+            const uintptr_t *rec = (const uintptr_t *) fp;
+            uintptr_t next = rec[0];
+            uintptr_t ret = rec[1] & 0x0000ffffffffffffULL;
+            if (ret == 0)
+                break;
+            frames[n++] = ret;
+            if (next <= fp)
+                break;
+            fp = next;
+        }
+    }
+    thread_resume(th);
+    return n;
+#else
+    (void) thread; (void) frames; (void) max;
+    return 0;
+#endif
+}
+
+unsigned task_host_backtrace(struct task *task, uintptr_t *frames, unsigned max) {
+    if (task == NULL)
+        return 0;
+    // The liveness test task_wake_for_freeze makes, for its reason: a pthread_t
+    // whose thread has exited is undefined to touch, not a no-op.
+    if (!atomic_load_explicit(&task->host_thread_started, memory_order_acquire) ||
+            task->zombie || task->exiting ||
+            atomic_load_explicit(&task->exit_finished, memory_order_acquire))
+        return 0;
+    return host_thread_backtrace(task->thread, frames, max);
 }

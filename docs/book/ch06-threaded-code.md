@@ -288,15 +288,23 @@ host registers around the call:
     gret
 ```
 
-The comment `# regrettable` is doing honest work there. `cpuid` is rare, its
-semantics are a large table, and nobody wants that table in assembly — so it
-bridges to C, at the cost of a save/restore around every execution.
+The comment `# regrettable` was doing honest work there. `cpuid` is rare, its
+semantics are a large table, and nobody wanted that table in assembly — so it
+bridged to C, at the cost of a save/restore around every execution. Build 558
+retired it along with the rest of the run-time C (the project's rule became
+100% gadgets): the table is now filled once at start-up, in C, as
+`cpuid_tables` in `jit/helpers.c`, and the gadget only looks the answer up, in
+assembly (`cpuid_lookup`, `jit/gadgets-aarch64/misc.S`). C still computes the
+answer; it just no longer runs while the guest waits for it. The macros remain
+for what is genuinely the kernel's work, such as a TLB miss that has to walk
+the page table (`tlb_handle_miss`).
 
-The amd64 engine takes that trade much further, and the consequences show up in
-Chapter 7's benchmark table. Its translator emits real assembly gadgets for the
-shapes that run hot, and for the long tail it emits a bridge to a C helper that
-re-decodes the instruction at run time. The tree is clear-eyed about what that
-costs. Here is the note attached to the gadget that replaced one such bridge —
+The amd64 engine took that trade much further, and the consequences show up in
+Chapter 7's benchmark table. Its translator emitted real assembly gadgets for the
+shapes that ran hot, and for the long tail a bridge to a C helper that
+re-decoded the instruction at run time — until 558, which replaced the last
+bridges with real semantics by gadgets or #UD (`fa6fc40b`). The tree is
+clear-eyed about what a bridge costs. Here is the note attached to the gadget that replaced one such bridge —
 register-operand `INC`/`DEC`, which in long mode is *every* `incq`, because the
 one-byte `0x40+r` encodings that used to be `INC` are the REX prefixes:
 
@@ -316,9 +324,9 @@ Every gadget ends by invoking one macro, `gret`:
 
 ```asm
 .macro gret pop=0
-    ldr x8, [_ip, \pop*8]!
+    ldr x8, [_ip, \pop*8]
     dmb ishld
-    add _ip, _ip, 8
+    add _ip, _ip, \pop*8 + 8
     cbnz x8, 0f      /* null gadget safety: if non-null, execute normally */
     b jit_ret        /* null gadget: bail safely */
 0:  br x8
@@ -326,7 +334,12 @@ Every gadget ends by invoking one macro, `gret`:
 ```
 
 That is `NEXT`. Load the next gadget address, step the gadget program counter,
-and branch to it.
+and branch to it. The load and the step both start from the old `_ip` rather
+than one writing it back for the other to add to (559): every gadget reads its
+operands through `_ip`, so it is the one dependency chain that runs the length
+of the stream, and each update of it is a cycle no out-of-order core can
+overlap. Two updates a gadget became one in every engine, and the arm64
+guest's 7-Zip ran 5.7% faster on an M4.
 
 The guest's registers live in host registers for the duration of a block: on
 aarch64, `eax` is `w20`, `ecx` is `w22`, `esp` is `w27`, `_ip` is `x28`, with
@@ -362,11 +375,14 @@ instruction instead of two.
 > numbers live in the header so the next person to notice the "obvious"
 > simplification gets the answer without buying an iPad.
 >
-> The honest footnote, also in the tree: the fully-translated guests
-> (`jit/guest-arm64/`) still dispatch via `ldar`, so the arm64 guest may be
-> paying that same penalty on ARMv8.0 hardware. Nobody has A/B'd it on an
-> ARMv8.0 device. It is written down as an open question rather than assumed
-> either way.
+> The footnote this box used to carry — that the fully-translated guests
+> (`jit/guest-arm64/`) still dispatched via `ldar`, unmeasured on ARMv8.0 — was
+> measured in August 2026: 1.73x in `dmb`'s favour on the A9, so they default
+> to it too. Then the barrier moved. Its only job is ordering the load of a
+> chain link, the one word in a code stream another thread patches, so the
+> arm64 and riscv64 guests' `gret` carries none, and `arm64_chain` issues the
+> one `dmb ishld` when execution crosses into another block: 10–25% less per
+> instruction on an M5.
 
 ## 6.8 Entering and leaving
 
@@ -399,10 +415,33 @@ hashed from the ip, held in per-thread scratch. A hit is a load and two
 compares, with no locks at all. It is per-*entry* rather than global on purpose:
 the hot path must not touch shared state.
 
-**The block hash table.** On a miss, take `jit->lock` and look the address up in
-the jit's chained hash table, which resizes as the working set grows. There is
-one jit per address space, so a `fork` shares translations until the address
-spaces diverge and an `execve` starts over with a fresh one.
+**The block hash table.** On a miss, look the address up in the jit's chained
+hash table, which resizes as the working set grows, under the lock of its
+bucket's stripe — one of 64 — and take `jit->lock` only when the block is not
+there and has to be translated. (Until 559 the lookup itself took `jit->lock`,
+and under eight sysbench clients 77% of MariaDB's lock waiting was at that one
+line.) There is one jit per address space. A `fork` gives the child a fresh,
+empty one, and an
+`execve` starts over too; but before translating, a forked child's miss looks
+for its parent's block at the same address and copies it, provided every page
+the block covers is still the same memory in both (the same `struct data` at
+the same offset -- a store by either side breaks the copy-on-write sharing and
+with it the match). On arm64 and riscv64 guests a block the child translates
+goes back to the parent too, so its later children find the fork-return and
+exit paths it never runs itself. A subshell (`( : )`, `$(...)`) then translates
+almost nothing: 14-20% less time on the M4 and A10X. `jit_fork` in `jit/jit.c`
+has the rules; `/proc/ish/jit_inherit` switches it off.
+
+An `execve` gets the same help since 559, from a cache that outlives the
+process: translated blocks are kept by guest address and confirmed by
+comparing the guest bytes, and a hit is cloned as a forked child's is. It is
+the "Cache Translated Code (arm64)" setting, off by default, because a block
+is found by the address its code was at and the guest's ASLR moves every
+address on every exec — so turning it on turns ASLR off, and says so
+(Chapter 15). With it on, on the Mac, a hundred `/bin/true`s take 111 ms
+instead of 144 and a hundred `dash -c :` 129 instead of 175; one long-running
+program gains little. The cache holds up to 96 MB, and `/proc/ish/jit_cache`
+is the same switch, with counters.
 
 **Compilation.** On a miss there too, translate. Decoding runs forward from the
 current ip until the block ends, which happens at a branch, at a page boundary —
@@ -602,6 +641,19 @@ so a genuine repeat cannot spin. A transient race heals invisibly, and a
 genuinely bad guest address refaults through the normal translation path as a
 clean guest `SIGSEGV` with a real address.
 
+The same two handlers also catch faults the kernel takes, not the guest. A
+syscall that copies to or from guest memory does it from C, and for a file
+mapping that memory is a host mapping of the file, which is only as long as
+the file: a host page wholly past the end cannot be paged in. musl's loader
+leaves such pages in every arm64 library, and `write(2)` from one used to end
+the app. So a copy from a page that is not anonymous runs under a guard
+(`emu/host_fault.h`): a `sigsetjmp`, savemask 0 again, named by a thread-local
+pointer while the copy runs. Both handlers look at that pointer first, and a
+fault inside the range the guard covers resumes at the guard, so the syscall
+fails with `EFAULT` as Linux's `copy_from_user` would. It is Linux's exception
+table, with `sigsetjmp` standing in for the table. Anonymous pages cannot fault
+this way and are nearly every copy, so they keep a plain `memcpy`.
+
 ## 6.15 Fusion, and why the switches are readable at run time
 
 Dispatch costs about 6.8 nanoseconds, and it costs that whether the gadget
@@ -613,15 +665,29 @@ That is instruction fusion, and each guest has its own families:
 
 | guest | families |
 |---|---|
-| i386 | `ADDR`, `MOVMR`, `LEA`, `ALU`, `PUSHPOP` |
-| arm64 | `BCOND` (compare + branch), `LDST` (load/store RMW), `LDCMP` (load + compare), `RETCACHE` |
-| riscv64 | `FOLD` (`lui`/`auipc` + `addi`/load), `JAL` (link write + branch in one), `RETCACHE` |
-| amd64 | `INCDEC_REG` |
+| i386 | `ADDR`, `MOVMR`, `LEA`, `ALU`, `PUSHPOP`, `JCC8` (8-bit `cmp`/`test` + `jcc`), and one-gadget register-register, shift, `inc`/`dec`, immediate-move, `movzx`, `imul`, scaled-address and `cmp`/`test` + `jcc` forms |
+| arm64 | `BCOND` (compare + branch), `LDST` (load/store RMW), `LDCMP` (load + compare), `RETCACHE`, `VSPEC`/`OSPEC`/`LSPEC` (SIMD, scalar ALU and writeback or register-offset load/store gadgets fed precomputed register offsets), `BTFN`, `PAIR` and `FWD` (below) |
+| riscv64 | `FOLD` (`lui`/`auipc` + `addi`/load), `JAL` (link write + branch in one), `RETCACHE`, `PAIR` (`ld`/`sd` pairs), `ALU` (`slli` + shift/`add`, `add` + load), `BR` (`li`/`andi` + branch), `BTFN` (backward branches keep the taken path straight-line), `RCACHE` (register-cached runs; off by default), `FUSE2` and `FWD` (below) |
+| amd64 | `INCDEC_REG`, and native-versus-bridge switches for whole families |
 
-The amd64 entry is the gadget from Section 6.6 — the one that replaced a bridge
-costing three dispatches and a re-decode. Fusion and de-bridging are the same
-move seen from two angles: both remove run-time work that translation time had
-already done.
+The first amd64 entry is the gadget from Section 6.6 — the one that replaced a
+bridge costing three dispatches and a re-decode — and the rest of its bits
+choose between a family's gadgets and the C helper it used to reach. Fusion
+and de-bridging are the same move seen from two angles: both remove run-time
+work that translation time had already done.
+
+The arm64 and riscv64 guests' newest entries (559) are not hand-written
+fusions at all. Their gadget bodies are macros (`frag.h`), a pair gadget is
+one body, the next, and a single dispatch, and the list of pairs (`pairs.h`)
+is *measured*: every adjacent pair of gadgets that is at least 0.03% of those
+run in the gadget-level profiles of Python, sqlite, gcc and 7-Zip — 405 pairs
+on arm64, removing 29–33% of those workloads' dispatches. Each half still
+commits its result before the next begins, so a fault in the second finds the
+first done, exactly as between two gadgets. `FWD` then hands the first half's
+result to the second in a host register rather than through the guest
+register file, which is where a dependent pair spent its time. On the M4,
+pairing made the arm64 guest's 7-Zip 8.8% faster and forwarding another
+3.8%.
 
 Both sides of every fusion live in the same binary: clearing a bit makes `gen`
 emit the unfused multi-dispatch expansion instead. And the bits are readable and

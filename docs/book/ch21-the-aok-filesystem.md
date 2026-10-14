@@ -42,9 +42,9 @@ extracted on first boot. They are compiled into the application.
 Four manifest files list what ships:
 
 ```
-fs/aok-docs.manifest     27 lines
-fs/aok-tools.manifest    32 lines
-fs/aok-tests.manifest   ~235 lines  (it grows every cycle)
+fs/aok-docs.manifest     33 lines
+fs/aok-tools.manifest    41 lines
+fs/aok-tests.manifest   436 lines   (it grows every cycle)
 fs/aok-libs.manifest    334 lines   (grammars and support files for helix)
 ```
 
@@ -83,8 +83,11 @@ quietest of the three lives.
 
 `/AOK/fixes` is a small directory with a specific philosophy behind it. When a
 distribution ships something that does not work under AOK — Devuan's
-`pkcsslotd` init script, an Arch packaging assumption, a Debian symlink — the
-fix has to live somewhere.
+`pkcsslotd` init script, an Arch packaging assumption, a Debian symlink, and
+for two builds Codex CLI, which runs every command inside a bubblewrap sandbox
+that needed namespaces AOK did not have until 559 (Chapter 41) — the fix has
+to live somewhere. (That one is also the example of a fix retiring: the
+script that used to turn Codex's sandbox off now removes what it added.)
 
 The obvious place is the root filesystem image, patched before it ships. That
 means the fix is frozen at image-build time, applies only to roots created
@@ -155,16 +158,18 @@ misconfigured something or whether the feature was never compiled in.
 
 ## 21.6 The advantage hiding inside a limitation
 
-Chapter 10 established that AOK has no PID or mount namespaces, and treated it
-as a limitation — nothing container-shaped works, and that is architectural.
+Chapter 10 established that AOK is one machine: a mount table or a pid
+namespace of one's own is something a process has to ask for, and nothing
+else has one. It treated that as a limitation — nothing container-shaped
+works, and that is architectural.
 
 `/AOK` is where the same fact reads as an advantage, and the in-app overview
 states it directly:
 
-> iSH-AOK has no mount or PID namespaces — there's exactly one emulated Linux kernel
+> iSH-AOK is one machine — there's exactly one Linux kernel
 > underneath everything, so `/proc`, `/sys`, and `/dev` always reflect the
-> single true system state no matter which root or chroot you're looking at them
-> from.
+> single true system state no matter which root or chroot you're looking at
+> them from.
 
 So a process viewer running inside a chroot sees *every* process on the system,
 across every mounted root, labelled by guest architecture. `ktop` — the tool in
@@ -176,9 +181,9 @@ one trust domain, and one kernel, and the property that would be a container
 escape elsewhere is simply visibility.
 
 It is worth being precise that this is not a second design decision. It is the
-same absence of namespaces, seen from the other side, and the honest summary is
-that the project traded isolation it could not implement for a global view it
-did not have to build.
+same one machine, seen from the other side, and the honest summary is that the
+project traded isolation it could not implement — and since 559 implements
+only for a sandbox that asks — for a global view it did not have to build.
 
 ## 21.7 The pattern: making the app addressable
 

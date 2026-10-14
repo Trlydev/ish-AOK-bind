@@ -26,6 +26,22 @@ need_file() {
 }
 
 # need_in <file> <pattern> [description]
+# need_count FILE PATTERN MIN REASON: PATTERN (fixed string) occurs at least
+# MIN times. For masks that have to be in several places of one file, where
+# need_in would be satisfied by any one survivor.
+need_count() {
+    if [ ! -f "$1" ]; then
+        echo "MISSING FILE: $1 (wanted: $2)"
+        fail=1
+        return
+    fi
+    n=$(grep -c -F -- "$2" "$1")
+    if [ "$n" -lt "$3" ]; then
+        echo "MISSING in $1: $2 -- found $n, want >= $3  ($4)"
+        fail=1
+    fi
+}
+
 need_in() {
     if [ ! -f "$1" ]; then
         echo "MISSING FILE: $1 (wanted: $2)"
@@ -125,6 +141,40 @@ need_in kernel/calls.c SAME_FAULT_LIMIT \
 # bisecting: they name the calling helper in the log the first time it happens.
 need_in emu/tlb.c    tlb_note_tagged_miss \
     "the TBI tripwire that names whoever hands the TLB a tagged address"
+
+# The arm64 gadgets themselves. Upstream has no TBI handling at all, so every
+# memory path it adds or rewrites arrives without a mask and has to get one
+# here -- the 2026-10 sync brought inline atomics, a64_vldst, MOPS and a
+# one-compare TLB probe, none of which knew about tags. Each check below is a
+# place a tagged pointer would otherwise index the TLB or reach the host.
+need_count jit/guest-arm64/gadgets.h  "and x7, x7, #0x00ffffffffffffff" 1 \
+    "read_prep/write_prep strip the tag before the TLB probe"
+need_count jit/guest-arm64/atomics.S  "and x7, x7, #0x00ffffffffffffff" 2 \
+    "a64_atomic_wptr and a64_atomic_rptr strip it for every atomic gadget"
+need_count jit/guest-arm64/atomics.S  "and x21, x21, #0x00ffffffffffffff" 5 \
+    "the exclusive monitor compares untagged addresses (ldxr/stxr/cas/casp/ldxp/stxp)"
+need_count jit/guest-arm64/simd.S     "and x7, x7, #0x00ffffffffffffff" 4 \
+    "a64_xlate_r, a64_xlate_w, a64_vldst and ld1st1_multi's inline probe"
+need_count jit/guest-arm64/control.S  "#0x00fffffffffff000" 3 \
+    "the MOPS gadget's own TLB probe and dirty-page stores use the untagged page"
+need_in jit/jit.c "addr &= 0x00ffffffffffffffULL" \
+    "IC IVAU invalidates the untagged page"
+# A store-trace record names its instruction only if the atomics stash it.
+need_count jit/guest-arm64/atomics.S  "TLB_watch_ip" 5 \
+    "stxr, cas, lse_rmw, casp and stxp stash watch_ip for the store trace"
+
+# --- fs/mount.c: room in the filesystem table -------------------------------
+# binderfs and selinuxfs are two more static entries than upstream sizes for.
+# At 16 the 2026-10 sync left 16 of 16 used, and the next fs_register asserts
+# at boot -- on the phone, not in any build.
+need_in fs/mount.c "#define MAX_FILESYSTEMS 24" \
+    "the table has room for this fork's filesystems and upstream's next one"
+
+# --- Kept in blocks of their own so upstream edits merge around them --------
+need_in README.md "<!-- ish-AOK-bind: this fork's block" \
+    "the fork's README block, under the title"
+need_in tests/manual/setup-regressions.sh "# ish-AOK-bind: this fork's tests" \
+    "the fork's test list block"
 
 # --- arm64 guest: testable without a device ---------------------------------
 # The arm64 engine is aarch64-host-only, so on an x86_64 dev box every gadget
@@ -424,10 +474,12 @@ need_in tests/manual/setup-regressions.sh kmsg
 need_in tests/manual/setup-regressions.sh property_area
 
 # --- CI -------------------------------------------------------------------
-# Upstream guards these on repository *name*, which this fork's name does not
-# match; if a sync reverts our owner/name pin, no IPA is ever built again.
-need_in .github/workflows/build-dev-ipa.yml     "DogeKingC/ish-AOK-bind"
-need_in .github/workflows/build-release-ipa.yml "DogeKingC/ish-AOK-bind"
+# Upstream guards these on repository *name* (endsWith '/ish-AOK'), which this
+# fork's name does not match; if a sync reverts our guard, no IPA is ever built
+# again. Matched on the name, not owner/name: the owner was renamed once
+# (DogeKingC -> Trlydev) and a pinned owner skipped every run for five weeks.
+need_in .github/workflows/build-dev-ipa.yml     "endsWith(github.repository, '/ish-AOK-bind')"
+need_in .github/workflows/build-release-ipa.yml "endsWith(github.repository, '/ish-AOK-bind')"
 
 # Upstream's arm64-guest dispatch default (dmb) is tuned for the ARMv8.0 iPad
 # the engine is benchmarked on. This fork targets modern Apple cores, where
@@ -450,8 +502,8 @@ need_in .github/workflows/sync-upstream.yml run-guest-tests.sh \
     "the sync runs the i386 guest regression tests"
 need_in .github/workflows/sync-upstream.yml run-arm64-guest-tests.sh \
     "the sync runs the arm64 guest tests under qemu-user"
-need_in .github/workflows/sync-upstream.yml "github.repository == 'DogeKingC/ish-AOK-bind'" \
-    "pinned, so a fork of this fork does not push to a repo it should not"
+need_in .github/workflows/sync-upstream.yml "endsWith(github.repository, '/ish-AOK-bind')" \
+    "guarded, so a fork of this fork does not push to a repo it should not"
 
 if [ "$fail" -eq 0 ]; then
     echo "fork additions: all present"

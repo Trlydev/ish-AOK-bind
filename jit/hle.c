@@ -1,6 +1,7 @@
 // High-level emulation (HLE) of hot, well-specified guest libc functions.
 //
-// When enabled (default OFF; CLI: ISH_HLE=1, app: the HLE toggle), block
+// When enabled (default ON; CLI: ISH_HLE=0 turns it off, app: the HLE
+// toggle, live: /proc/ish/hle), block
 // translation for the arm64 and riscv64 guests checks whether the block's
 // start address is the entry point of a known libc function build --
 // identified by an exact 64-byte prologue fingerprint, hashed against a
@@ -47,7 +48,7 @@
 #include "misc.h"
 
 // Set from ISH_HLE (main.c) or the app preference observer (AppDelegate.m).
-bool doEnableHLE = false;
+bool doEnableHLE = true;
 
 enum hle_fn {
     HLE_MEMCPY,   // dst, src, n -> dst
@@ -572,7 +573,11 @@ static bool hle_module_and_bias(guest_addr_t ip, enum guest_abi abi,
     if (pt == NULL || pt->data == NULL)
         return false;
     struct data *data = pt->data;
-    if (data->fd == NULL)
+    // Not a page copied off the file (struct data::copied): a debugger's
+    // breakpoint at a libc function's entry lives in exactly such a copy, and
+    // attaching by the file's symbol table would run the function straight
+    // past it.
+    if (data->fd == NULL || data->copied)
         return false;
     struct hle_module *m = hle_mapping_module(data, abi);
     if (m == NULL)
@@ -580,9 +585,9 @@ static bool hle_module_and_bias(guest_addr_t ip, enum guest_abi abi,
     // Bias from the live mapping: this page's guest address minus the vaddr
     // its file offset corresponds to.
     uint64_t page_guest = (uint64_t) PAGE(ip) << PAGE_BITS;
-    // pt->offset is the byte offset of this page within data's allocation;
-    // data->file_offset is the file offset the allocation starts at.
-    uint64_t page_file_off = (uint64_t) data->file_offset + pt->offset;
+    // pt->offset is the byte offset of this page within data's allocation,
+    // which starts map_offset bytes before the mapping's first page.
+    uint64_t page_file_off = (uint64_t) data_file_offset(data, pt->offset);
     uint64_t page_vaddr = ~0ull;
     for (unsigned i = 0; i < m->nloads; i++) {
         const struct hle_load *l = &m->loads[i];
@@ -789,7 +794,7 @@ static bool hle_try_loop_arm64(struct gen_state *state, struct tlb *tlb,
     if (!hle_loops_enabled())
         return false;
     uint32_t insn[4];
-    if (!tlb_read(tlb, ip, insn, sizeof(insn)))
+    if (!tlb_fetch(tlb, ip, insn, sizeof(insn)))
         return false;
 
     struct hle_a64_ldst ld, st;
@@ -880,7 +885,7 @@ bool hle_try_emit(struct gen_state *state, struct tlb *tlb, guest_addr_t ip,
     if (ip & (riscv64 ? 1 : 3))
         return false;
     uint8_t code[HLE_PROLOGUE_LEN];
-    if (!tlb_read(tlb, ip, code, sizeof(code)))
+    if (!tlb_fetch(tlb, ip, code, sizeof(code)))
         return false;
     enum guest_abi abi = riscv64 ? GUEST_ABI_RISCV64 : GUEST_ABI_ARM64;
     for (size_t i = hle_fingerprints_enabled() ? 0

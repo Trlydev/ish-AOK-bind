@@ -2,6 +2,7 @@
 #define KERNEL_INIT_H
 
 #include "fs/tty.h"
+#include "kernel/resource.h"
 
 // Incredibly sloppy. Please do not reference as an example of good API design.
 // / reports /dev/<GUEST_DISK_NAME> as its source in /proc/mounts, matching
@@ -14,10 +15,28 @@ void ensure_root_fstab_entry(void);
 void ensure_dev_fd_links(void);
 void set_console_device(int major, int minor);
 void get_console_device(int *major, int *minor);
+// The rlimits a brand-new process starts with. See kernel/init.c.
+extern struct rlimit_ init_rlimits[16];
 intptr_t become_first_process(void);
 intptr_t become_new_init_child(void);
 int create_stdio(const char *file, int major, int minor);
 int create_piped_stdio(void);
+// The host's standard stream `stream` (0, 1 or 2) as create_piped_stdio wraps
+// it, but around a COPY of the host descriptor, above 2, so closing it closes
+// only the copy. Not installed anywhere. NULL if it could not be made. For a
+// checkpoint restore; see the definition.
+struct fd *open_host_stdio_copy(int stream);
+
+// Called by xX_main_Xx once the root is mounted and `current` exists, and
+// BEFORE the initial command is exec'd. NULL by default; main.c points it at
+// its /dev, /proc, /sys and /AOK setup.
+//
+// The CLI used to do that setup after xX_main_Xx returned, which meant the very
+// first exec ran against a root where none of it existed yet -- so `ish -f <root>
+// /AOK/native/bash` answered ENOENT for a program that works from any shell the
+// same run starts. Nothing in the setup needs the exec to have happened, and
+// everything the guest's first program looks for is better there before it runs.
+extern void (*ish_boot_setup_hook)(void);
 
 // Result of run_guest_command_capture(). output is malloc'd and must be freed
 // by the caller (NULL only on allocation failure).
@@ -65,5 +84,27 @@ int run_guest_command_capture_user(const char *user, const char *command,
                                    const char *env, int timeout_ms,
                                    size_t max_output,
                                    struct guest_command_result *result);
+
+// A guest process that keeps running, with the host ends of its stdio: for a
+// host component that talks to a guest program over stdin/stdout (the LLM
+// Chat's MCP servers run inside the guest). `command` runs under /bin/sh -c,
+// or as `user` through su exactly as run_guest_command_capture_user does.
+// Write requests to stdin_fd, read replies from stdout_fd, and read (or
+// drain) stderr_fd -- a pipe nobody drains stalls the program once it fills.
+// All three are blocking host descriptors; stdin_fd never raises SIGPIPE.
+// Returns 0 or a negative errno. MUST be called on a dedicated host thread,
+// not a guest task thread: it temporarily repoints `current`.
+struct guest_process {
+    int pid;
+    int stdin_fd;
+    int stdout_fd;
+    int stderr_fd;
+    int own_pgroup;
+};
+int guest_process_spawn_user(const char *user, const char *command, const char *env,
+                             struct guest_process *process);
+// SIGKILLs the process and everything it started, closes the host ends and
+// reaps it (bounded to about three seconds). Same threading rule as spawn.
+void guest_process_stop(struct guest_process *process);
 
 #endif

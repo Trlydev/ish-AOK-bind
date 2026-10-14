@@ -1,16 +1,20 @@
 # 25. The catalogue
 
-Nine entries live in the registry, and everything else under `/AOK/native` is a
-symlink to one of them:
+Sixteen entries can live in the registry as of 557, and everything else under
+`/AOK/native` is a symlink to one of them:
 
 | entry | what it is |
 |---|---|
 | `smallclue` | a busybox-style MIT toolbox; applet chosen by `argv[0]` |
+| `sudo`, `su`, `passwd` | the three setuid-root programs, separate so no applet can be talked into root |
 | `motepad` | a modeless terminal text editor |
+| `ktop` | the `/AOK/tools` process viewer (Chapter 31), compiled as host code |
+| `wl-present` | carries the Wayland desktop's frames and input to the app (Chapter 32) |
 | `hx` | [helix](https://helix-editor.com), a modal editor with syntax highlighting |
-| `bash` | GNU bash, behind a build option (Chapter 26) |
+| `bash` | GNU bash, behind a build option that is off since 556 (Chapter 26) |
 | `zsh` | zsh, on by default |
 | `zsh-multio` | the byte pump behind zsh's MULTIOS redirections |
+| `dash`, `sh` | dash, on by default; `sh` is the same program by its POSIX name |
 | `rust-probe` | exercises the Rust-on-the-shim path |
 | `bmm`, `bmt` | the `/AOK/tools` benchmarks, as native programs |
 
@@ -52,6 +56,28 @@ That is Chapter 22's rule wearing different clothes. An ordinary program owns
 everything it was handed, because the kernel that handed it over is gone. A
 native program shares its arguments with a caller that is still running and will
 clean up afterwards.
+
+557 changed what SmallCLUE's applets are for. Once `native-links.sh` put them
+ahead of the distribution's commands on every `PATH` (Chapter 22), a busybox
+subset stopped being good enough: its `sed` knew four commands, and
+`setup-gpu.sh`'s checks died on `sed: unsupported flag 'p'` on a device whose GPU
+was working. So the applets that shadow a distribution's tools were brought up
+to GNU compatibility one at a time — `sed`, `grep`, `find`, `ls`, `cp`, `mv`,
+`rm`, `sort`, `xargs`, `date`, `diff`, `tar`, `gzip`, `stty` and others, with
+`awk` matching mawk 1.3.4 — each with golden cases whose expected output and
+exit status were recorded from the original program (`tests/manual/native_sed.c`,
+`native_coreutils.c`). `native_sed` has 134 of them, and its positive control is
+the point: the old `sed` failed 101.
+
+558 asked more of it again. Native mode (Chapter 30) is a root with no
+distribution at all, so SmallCLUE had to be the system as well as its tools:
+`init` as pid 1 with runit-style supervision, `sv` and `shutdown`, `login` at
+`/bin/login`, `mount` and `umount`, `tput`, `free` and `printenv`, curl's
+`-I`/`-i`/`-f`/`-w`, and login records — `login` and `init` write the guest's
+own `utmp` and `wtmp` layout, which is two layouts (glibc's `struct utmp` is 384
+bytes on x86 and 400 on aarch64 and riscv64), and `who` and `users` read them.
+And `git` stopped refusing: libgit2 is built in, with SecureTransport as its
+HTTPS transport (Chapter 41).
 
 ## 25.2 OpenSSH: re-enabling, not porting
 
@@ -147,6 +173,15 @@ The per-process globals are the invocation-token problem of Chapter 22, which is
 why the project maintains forks of `tokio` and `signal-hook-registry` keyed on
 `nlibc_invocation_token()`.
 
+The front end met that problem itself in 559. Its queues were found by
+descriptor number, and every tokio program's queue has the same small number,
+so two at once waited on and woke each other's; a queue now belongs to the
+program run that made it. And a registration that had been reported stayed
+out of the wait until a later `kevent` saw it not ready, so a reactor that went
+back to sleep before its consumer had read never saw the next data: the
+shim's `read`, `write`, `send`, `recv` and `accept` now say when a descriptor
+has been drained, and the sleeper is woken to watch it again.
+
 Real Rust runs, async Rust included. `rust-probe` exists to exercise that path
 deliberately — it is not a tool anybody has a use for, and the registry entry
 says so.
@@ -229,7 +264,7 @@ invisible until they break.
 [tools/build-rust-native.sh](../../tools/build-rust-native.sh),
 [tools/gen-nlibc-renames.py](../../tools/gen-nlibc-renames.py),
 [tools/native-applet-audit.py](../../tools/native-applet-audit.py),
-[docs/native_workspace_design.md](../../docs/native_workspace_design.md).
+[docs/historical/native_workspace_design.md](../../docs/historical/native_workspace_design.md).
 
 *Story:* `fs::canonicalize` resolving against the Mac — because Darwin exports
 `_realpath$DARWIN_EXTSN` and the symbol-rename list was keyed on bare names, so

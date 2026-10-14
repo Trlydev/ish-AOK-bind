@@ -18,6 +18,8 @@
 #include "fs/real.h"
 #include "fs/tty.h"
 #include "fs/fifo.h"
+#include "kernel/fs.h"
+#include "kernel/xattr.h"
 #define ISH_INTERNAL
 #include "fs/fake.h"
 #include "fs/fake-path.h"
@@ -190,6 +192,10 @@ static void fakefs_trace_symlink_result(struct mount *mount, struct fakefs_db *f
             ishstat.mode, ishstat.uid, ishstat.gid, ishstat.rdev);
 }
 
+struct fifo_file *fakefs_fd_fifo(struct fd *fd) {
+    return fd != NULL && fd->ops == &initctl_fdops ? fakefs_initctl_fifo : NULL;
+}
+
 static ssize_t initctl_read(struct fd *fd, void *buf, size_t bufsize) {
     return fifo_file_read(fakefs_initctl_fifo, fd, buf, bufsize);
 }
@@ -222,6 +228,8 @@ static int fakefs_close(struct fd *fd) {
         fd->fs_data = NULL;
         return 0;
     }
+    free(fd->fake_open_path);
+    fd->fake_open_path = NULL;
     return realfs_close(fd);
 }
 
@@ -233,6 +241,15 @@ static int fakefs_getpath(struct fd *fd, char *buf) {
     if (fd->mount != NULL && fd->fake_inode != 0) {
         struct fakefs_db *fs = fakefs_db_thread(&fd->mount->fakefs);
         FAKEFS_LOCK_READ(fs);
+        // The path it was opened by, while that still names this inode (not
+        // after a rename or unlink of it): of a file's hard links, that is
+        // the one Linux reports.
+        if (fd->fake_open_path != NULL && strlen(fd->fake_open_path) <= MAX_PATH &&
+                path_get_inode(fs, fd->fake_open_path) == (inode_t) fd->fake_inode) {
+            strcpy(buf, fd->fake_open_path);
+            FAKEFS_UNLOCK_READ(fs);
+            return 0;
+        }
         sqlite3_stmt *stmt = fs->stmt.path_from_inode;
         sqlite3_bind_int64(stmt, 1, fd->fake_inode);
         bool found = db_exec(fs, stmt);
@@ -340,6 +357,14 @@ static void fakefs_inherit_group(struct fakefs_db *fs, const char *path,
     *gid = parent_stat.gid;
     if (S_ISDIR(*mode))
         *mode |= S_ISGID;
+    // Linux's mode_strip_sgid(): a new non-directory asking for S_ISGID with
+    // group-execute keeps it only if its creator is in the group it inherits,
+    // or holds CAP_FSETID. Otherwise anyone who can write in a setgid
+    // directory could create a program that runs as the directory's group.
+    else if ((*mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP) &&
+             current != NULL && !current_in_group(parent_stat.gid) &&
+             !current_capable(CAP_FSETID_))
+        *mode &= ~S_ISGID;
 }
 
 static struct fd *fakefs_open(struct mount *mount, const char *path, int flags, int mode) {
@@ -423,6 +448,7 @@ retry:
         return ERR_PTR(_ENOENT);
     }
     fakefs_snapshot_fd_stat(fd);
+    fd->fake_open_path = strdup(path);
     fd->ops = &fakefs_fdops;
     return fd;
 }
@@ -833,6 +859,28 @@ static void fake_stat_setattr(struct ish_stat *ishstat, struct attr attr) {
     }
 }
 
+// A file's ctime is its HOST file's (fakefs_stat takes the times from the host
+// stat), but a chmod or chown here changes only the database, so the host file
+// never learned of it and ctime stayed put -- the one timestamp nothing can set
+// and backup tools trust for exactly that reason. Re-applying the host file's
+// own mode is a change the host counts, moving its ctime on APFS and on Linux
+// alike, that alters nothing else about it. (A chown to -1, -1 or a utimensat
+// of UTIME_OMIT twice would be as harmless, and APFS moves no ctime for either.)
+// Best effort: the change has already been made, and a host that refuses this
+// costs only the timestamp.
+static void fakefs_touch_ctime(struct mount *mount, const char *host_path) {
+    struct stat st;
+    const char *p = fix_path(host_path);
+    if (fstatat(mount->root_fd, p, &st, AT_SYMLINK_NOFOLLOW) == 0)
+        (void) fchmodat(mount->root_fd, p, st.st_mode & 07777, AT_SYMLINK_NOFOLLOW);
+}
+
+static void fakefs_touch_ctime_fd(struct fd *fd) {
+    struct stat st;
+    if (fd->real_fd >= 0 && fstat(fd->real_fd, &st) == 0)
+        (void) fchmod(fd->real_fd, st.st_mode & 07777);
+}
+
 static int fakefs_setattr(struct mount *mount, const char *path, struct attr attr) {
     struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
     if (attr.type == attr_size) {
@@ -852,6 +900,9 @@ static int fakefs_setattr(struct mount *mount, const char *path, struct attr att
     fake_stat_setattr(&ishstat, attr);
     inode_write_stat(fs, inode, &ishstat);
     db_commit(fs);
+    host_path_t host_path;
+    if (fakefs_host_path(path, host_path) == 0)
+        fakefs_touch_ctime(mount, host_path);
     return 0;
 }
 
@@ -881,6 +932,7 @@ static int fakefs_fsetattr(struct fd *fd, struct attr attr) {
     fake_stat_setattr(&ishstat, attr);
     inode_write_stat(fs, fd->fake_inode, &ishstat);
     db_commit(fs);
+    fakefs_touch_ctime_fd(fd);
     return 0;
 }
 
@@ -1030,10 +1082,7 @@ static int fakefs_utime(struct mount *mount, const char *path, struct timespec a
 }
 
 static int fakefs_mount(struct mount *mount) {
-    char db_path[PATH_MAX];
-    strncpy(db_path, mount->source, PATH_MAX - 1);
-    db_path[PATH_MAX - 1] = '\0';
-    char *slash = strrchr(db_path, '/');
+    const char *slash = strrchr(mount->source, '/');
     // The metadata DB lives next to the source dir as "meta.db", found by
     // swapping the final "data" path component -- an internal convention of
     // how this project's own root-installation code names its fakefs source
@@ -1046,7 +1095,18 @@ static int fakefs_mount(struct mount *mount) {
     // the entire app instead of just failing the mount).
     if (slash == NULL || strcmp(slash + 1, "data") != 0)
         return _EINVAL;
-    strncpy(slash + 1, "meta.db", 8);
+    // "meta.db" is three bytes longer than the "data" it replaces, so a source
+    // that fits PATH_MAX can still make a db path that does not -- and the
+    // guest chooses the source. This used to strncpy the name in unchecked: a
+    // guest `mount -t fake` of a 1023-byte ".../data" wrote past db_path and
+    // aborted the host process. Refuse rather than truncate, because a
+    // truncated path names a different database.
+    char db_path[PATH_MAX];
+    size_t dir_len = (size_t) (slash + 1 - mount->source);
+    if (dir_len + sizeof("meta.db") > sizeof(db_path))
+        return _ENAMETOOLONG;
+    memcpy(db_path, mount->source, dir_len);
+    memcpy(db_path + dir_len, "meta.db", sizeof("meta.db"));
 
     // do this now so rebuilding can use root_fd
     int err = realfs.mount(mount);
@@ -1074,11 +1134,128 @@ static void fakefs_inode_orphaned(struct mount *mount, ino_t inode) {
     db_begin_write(fs);
     sqlite3_bind_int64(fs->stmt.try_cleanup_inode, 1, inode);
     db_exec_reset(fs, fs->stmt.try_cleanup_inode);
+    // The attributes go with the stat: this is the last reference to a file
+    // with no name left, so nothing can reach them again.
+    sqlite3_bind_int64(fs->stmt.try_cleanup_xattrs, 1, inode);
+    db_exec_reset(fs, fs->stmt.try_cleanup_xattrs);
     db_commit(fs);
 }
 
+// ---------------------------------------------------- extended attributes
+//
+// Kept in the metadata database beside the stat, keyed by inode
+// (fs/fake-db.h's xattrs table): hard links share them, a rename keeps them,
+// and an unlinked file keeps them until its last descriptor goes and
+// fakefs_inode_orphaned sweeps both. kernel/xattr.c has made every permission
+// and name check before any of these runs.
+
+// The inode an xattr call is about. A descriptor carries its own -- which is
+// what makes the f* calls work on an unlinked file -- and a path is looked up
+// inside the caller's transaction.
+static inode_t fakefs_xattr_inode(struct fakefs_db *fs, const char *path, struct fd *fd) {
+    if (fd != NULL)
+        return fd->fake_inode;
+    return path_get_inode(fs, path);
+}
+
+// Setting or removing an attribute is a change to the inode, and moves its
+// ctime as on Linux (measured on 6.12, ext4 and tmpfs alike). The attributes
+// live in the database, so the host file is told the way a chmod tells it.
+static void fakefs_xattr_touch_ctime(struct mount *mount, const char *path, struct fd *fd) {
+    if (fd != NULL) {
+        fakefs_touch_ctime_fd(fd);
+        return;
+    }
+    host_path_t host_path;
+    if (fakefs_host_path(path, host_path) == 0)
+        fakefs_touch_ctime(mount, host_path);
+}
+
+static ssize_t fakefs_getxattr(struct mount *mount, const char *path, struct fd *fd,
+        const char *name, void *value, size_t size) {
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
+    // Asked of every file's first write (the capability kill), so the answer
+    // for a mount that has never held one is given without a lookup.
+    if (strcmp(name, "security.capability") == 0 &&
+            !atomic_load(&fakefs_db_shared(fs)->xattr_caps_seen))
+        return _ENODATA;
+    db_begin_read(fs);
+    inode_t inode = fakefs_xattr_inode(fs, path, fd);
+    ssize_t res = inode == 0 ? _ENOENT : inode_xattr_get(fs, inode, name, value, size);
+    db_commit(fs);
+    return res;
+}
+
+static int fakefs_setxattr(struct mount *mount, const char *path, struct fd *fd,
+        const char *name, const void *value, size_t size, int flags) {
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
+    db_begin_write(fs);
+    inode_t inode = fakefs_xattr_inode(fs, path, fd);
+    int err = 0;
+    if (inode == 0)
+        err = _ENOENT;
+    if (err == 0 && (flags & (XATTR_CREATE_ | XATTR_REPLACE_))) {
+        // In the same transaction as the write, so CREATE really is
+        // exclusive and REPLACE really replaces.
+        bool exists = inode_xattr_get(fs, inode, name, NULL, 0) >= 0;
+        if ((flags & XATTR_CREATE_) && exists)
+            err = _EEXIST;
+        else if ((flags & XATTR_REPLACE_) && !exists)
+            err = _ENODATA;
+    }
+    if (err == 0)
+        err = inode_xattr_put(fs, inode, name, value, size);
+    if (err < 0)
+        db_rollback(fs);
+    else
+        db_commit(fs);
+    if (err == 0)
+        fakefs_xattr_touch_ctime(mount, path, fd);
+    return err;
+}
+
+static ssize_t fakefs_listxattr(struct mount *mount, const char *path, struct fd *fd,
+        char *list, size_t size) {
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
+    db_begin_read(fs);
+    inode_t inode = fakefs_xattr_inode(fs, path, fd);
+    ssize_t res = inode == 0 ? _ENOENT : inode_xattr_list(fs, inode, list, size);
+    db_commit(fs);
+    return res;
+}
+
+static int fakefs_removexattr(struct mount *mount, const char *path, struct fd *fd,
+        const char *name) {
+    struct fakefs_db *fs = fakefs_db_thread(&mount->fakefs);
+    db_begin_write(fs);
+    inode_t inode = fakefs_xattr_inode(fs, path, fd);
+    int err = inode == 0 ? _ENOENT : inode_xattr_remove(fs, inode, name);
+    if (err < 0)
+        db_rollback(fs);
+    else
+        db_commit(fs);
+    if (err == 0)
+        fakefs_xattr_touch_ctime(mount, path, fd);
+    return err;
+}
+
+const struct xattr_ops fakefs_xattr_ops = {
+    .get = fakefs_getxattr,
+    .set = fakefs_setxattr,
+    .list = fakefs_listxattr,
+    .remove = fakefs_removexattr,
+};
+
+// statfs reports ext4's magic (EXT4_SUPER_MAGIC): fakefs is a persistent local
+// disk filesystem, and a type no Linux reports is one nothing has been tested
+// against. The old 'fake' (0x66616b65) was unknown to every table of local
+// filesystem types, so GNU tail treated each root as remote and polled once a
+// second instead of using inotify, and any program that special-cases unknown
+// types took its least-tested path. The name in /proc/mounts stays "fake".
+// realfs keeps its own type on purpose: a host directory changes underneath
+// the guest without inotify events, so polling is right there.
 const struct fs_ops fakefs = {
-    .name = "fake", .magic = 0x66616b65,
+    .name = "fake", .magic = 0xEF53,
     .mount = fakefs_mount,
     .umount = fakefs_umount,
     .statfs = realfs_statfs,

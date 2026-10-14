@@ -35,7 +35,19 @@ struct mmu {
 
 #define MEM_READ 0
 #define MEM_WRITE 1
+// Whether `page` may be executed: mapped (or reserved) with PROT_EXEC. A page
+// neither mapped nor reserved answers true -- a fetch from it is an unmapped
+// access, reported as one by the read that follows. Defined in emu/memory.c.
+struct mmu;
+bool mmu_page_executable(struct mmu *mmu, page_t page);
+// The same answer as a P_EXEC bit, with the page's P_SHARED bit beside it:
+// what tlb_handle_miss needs to decide whether a store is a code write.
+unsigned mmu_page_code_flags(struct mmu *mmu, page_t page);
+// A debugger's forced access -- PTRACE_PEEK/POKE*, /proc/<pid>/mem -- which
+// the protection check lets through for that one access (Linux's FOLL_FORCE):
+// see mem_write_way in emu/memory.c. Only ever passed to mem_ptr.
 #define MEM_WRITE_PTRACE 2
+#define MEM_READ_PTRACE 3
 
 struct mmu_ops {
     // type is MEM_READ or MEM_WRITE

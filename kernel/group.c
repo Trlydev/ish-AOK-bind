@@ -1,6 +1,7 @@
 #include <string.h>
 #include "util/list.h"
 #include "util/sync.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "kernel/task.h"
 #include "fs/tty.h"
@@ -8,8 +9,10 @@
 dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
     STRACE("setpgid(%d, %d)", id, pgid);
     int err;
+    // Both numbers are the caller's pid namespace's (kernel/pid_ns.h), its
+    // own included; what is stored below is the machine's.
     if (id == 0)
-        id = current->pid;
+        id = current_pid_shown(current->pid);
     if (pgid == 0)
         pgid = id;
     // a negative process-group id is invalid (checked before any task lookup,
@@ -30,10 +33,11 @@ dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
     group_locked = true;
 
     // you can only join a process group in the same session
+    struct pid *group_pid = pid;
     if (id != pgid) {
         // there has to be a process in pgrp that's in the same session as id
         err = _EPERM;
-        struct pid *group_pid = pid_get(pgid);
+        group_pid = pid_get(pgid);
         if (group_pid == NULL || list_empty(&group_pid->pgroup))
             goto out;
         struct tgroup *group_first_tgroup = list_first_entry(&group_pid->pgroup, struct tgroup, pgroup);
@@ -65,10 +69,21 @@ dword_t sys_setpgid(pid_t_ id, pid_t_ pgid) {
     if (tgroup_is_session_leader(tgroup))
         goto out;
 
-    if (tgroup->pgid != pgid) {
+    // Filed under the GROUP's pid: its pgroup list is what a group signal
+    // walks (send_group_signal, kill(-pgid)), and what keeps the group -- and
+    // its number -- alive once the leader is gone. This used the caller's own
+    // pid, the same thing when a process makes a group of its own and wrong
+    // whenever it joins another one: the joiner had the right pgid and nothing
+    // sent to the group reached it, so the second process of every
+    // job-controlled pipeline missed its ^C, ^Z and hangup, and once the
+    // leader was reaped the group looked gone -- kill(-pgid) said ESRCH and
+    // joining it said EPERM.
+    pid_t_ machine_pgid = current_pid_global(pgid);
+    if (tgroup->pgid != machine_pgid) {
         list_remove(&tgroup->pgroup);
-        tgroup->pgid = pgid;
-        list_add(&pid->pgroup, &tgroup->pgroup);
+        pid_ns_unnumber_if_empty((dword_t) tgroup->pgid);
+        tgroup->pgid = machine_pgid;
+        list_add(&group_pid->pgroup, &tgroup->pgroup);
     }
 
     err = 0;
@@ -98,7 +113,7 @@ pid_t_ sys_getpgid(pid_t_ pid) {
     unlock(&task->group->lock);
     if (release_task)
         task_ref_cnt_mod(task, -1);
-    return pgid;
+    return current_pid_shown(pgid);
 }
 pid_t_ sys_getpgrp(void) {
     return sys_getpgid(0);
@@ -107,9 +122,12 @@ pid_t_ sys_getpgrp(void) {
 // Must lock pids_lock and task->group->lock.
 void task_leave_session(struct task *task) {
     struct tgroup *group = task->group;
-    struct pid *sid_pid = pid_get(group->sid);
+    struct pid *sid_pid = pid_get_global(group->sid);
     bool last_session_group = sid_pid == NULL || list_size(&sid_pid->session) <= 1;
     list_remove_safe(&group->session);
+    // (The last of a session whose leader is long reaped: the number was
+    // kept for the session, and now names nothing.)
+    pid_ns_unnumber_if_empty((dword_t) group->sid);
     if (group->tty) {
         lock(&ttys_lock, 0);
         if (last_session_group) {
@@ -134,7 +152,7 @@ void task_leave_session(struct task *task) {
 //
 // Caller holds pids_lock, which is what keeps the membership lists still.
 bool pgroup_is_orphaned(pid_t_ pgid, pid_t_ sid) {
-    struct pid *pid = pid_get(pgid);
+    struct pid *pid = pid_get_global(pgid);
     if (pid == NULL)
         return true;
     struct tgroup *tgroup;
@@ -164,11 +182,28 @@ pid_t_ task_setsid(struct task *task) {
     }
 
     task_leave_session(task);
-    struct pid *pid = pid_get(task->pid);
+    // The leader's pid, matching new_sid, NOT pid_get(task->pid).
+    //
+    // group->sid and group->pgid are both set to new_sid, which comes from
+    // group->leader. Membership has to hang off the same pid, because that is
+    // what a group signal is delivered through: send_group_signal(pgid) does
+    // pid_get(pgid) and walks that pid's pgroup list. Linked under a different
+    // pid, the lookup SUCCEEDS and the list simply does not contain this group,
+    // so the signal reaches nobody and reports no error -- see the comment on
+    // tgroup_restore_ids below, which documents the same hazard.
+    //
+    // For the usual caller the two are identical: a process calling setsid() is
+    // its own group leader, so task->pid == group->leader->pid. They diverge
+    // only when a NON-LEADER thread calls setsid(), where this used to name the
+    // leader in group->sid while filing the membership under the thread's pid.
+    // Linux uses task_pid(group_leader) for both (ksys_setsid ->
+    // set_special_pids).
+    struct pid *pid = pid_get_global(new_sid);
     list_add(&pid->session, &group->session);
     group->sid = new_sid;
 
     list_remove_safe(&group->pgroup);
+    pid_ns_unnumber_if_empty((dword_t) group->pgid);
     list_add(&pid->pgroup, &group->pgroup);
     group->pgid = new_sid;
 
@@ -177,9 +212,50 @@ pid_t_ task_setsid(struct task *task) {
     return new_sid;
 }
 
+// Put a restored process back into the session and process group the image
+// says it was in.
+//
+// setsid/setpgid cannot express this. They are the rules a LIVE process must
+// obey when it ASKS -- a session leader may not create a process group, a
+// child that has exec'd may not be moved, a session may not be joined at all
+// -- and a restore is not a request. It is the state being put back, and the
+// state was legal when it was taken.
+//
+// Assigning group->sid and group->pgid alone is not enough either: membership
+// lives in the per-pid session and pgroup LISTS, which is what tcsetpgrp's
+// "does this group belong to my session" check walks, and what a group signal
+// is delivered through. A restored shell whose lists said one thing and whose
+// fields said another got ENOTTY from tcsetpgrp and came up with job control
+// disabled.
+void tgroup_restore_ids(struct task *task, pid_t_ sid, pid_t_ pgid) {
+    complex_lockt(&pids_lock, 0);
+    struct tgroup *group = task->group;
+    lock(&group->lock, 0);
+    // A session or group whose leader is not in the image (it exited before
+    // the checkpoint and the members were left behind) has no pid struct to
+    // hang off. Keeping the task's own is what a live orphan would look like
+    // and is better than a dangling id.
+    struct pid *spid = pid_get_global((dword_t) sid);
+    struct pid *gpid = pid_get_global((dword_t) pgid);
+    if (spid == NULL) { spid = pid_get_global((dword_t) task->pid); sid = task->pid; }
+    if (gpid == NULL) { gpid = pid_get_global((dword_t) task->pid); pgid = task->pid; }
+    if (spid != NULL) {
+        list_remove_safe(&group->session);
+        list_add(&spid->session, &group->session);
+        group->sid = sid;
+    }
+    if (gpid != NULL) {
+        list_remove_safe(&group->pgroup);
+        list_add(&gpid->pgroup, &group->pgroup);
+        group->pgid = pgid;
+    }
+    unlock(&group->lock);
+    unlock(&pids_lock);
+}
+
 dword_t sys_setsid(void) {
     STRACE("setsid()");
-    return task_setsid(current);
+    return current_pid_shown(task_setsid(current));
 }
 
 dword_t sys_getsid(pid_t_ pid) {
@@ -197,5 +273,5 @@ dword_t sys_getsid(pid_t_ pid) {
     unlock(&task->group->lock);
     if (release_task)
         task_ref_cnt_mod(task, -1);
-    return sid;
+    return current_pid_shown(sid);
 }

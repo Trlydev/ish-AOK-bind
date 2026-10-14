@@ -10,7 +10,12 @@
 #import "NSObject+SaneKVO.h"
 #import "Theme.h"
 #import "ThemeViewController.h"
+#import "UIViewController+Extras.h"
 #import "UserPreferences.h"
+#import "WorkspaceViewController.h"
+
+@interface ThemesViewController () <WorkspaceTextScaledPage>
+@end
 
 @implementation ThemesViewController {
     BOOL _singleRowEditing;
@@ -24,7 +29,8 @@
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
+
     [UserPreferences.shared observe:@[@"theme"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -118,9 +124,9 @@ enum {
     }
     switch (section) {
         case DefaultSection:
-            return @"Default Themes";
+            return NSLocalizedString(@"Default Themes", @"Themes list section header");
         case UserSection:
-            return @"User Themes";
+            return NSLocalizedString(@"User Themes", @"Themes list section header");
         case ImportSection:
             return nil;
         default:
@@ -134,9 +140,9 @@ enum {
     }
     switch (section) {
         case DefaultSection:
-            return self->_preferUserTheme ? [NSString stringWithFormat:@"The default theme \"%@\" is currently being overridden by a user theme.", self->_theme.name] : nil;
+            return self->_preferUserTheme ? [NSString stringWithFormat:NSLocalizedString(@"The default theme \"%@\" is currently being overridden by a user theme.", @"Themes list footer; %@ is a theme name"), self->_theme.name] : nil;
         case ImportSection:
-            return @"User themes are stored in the iSH documents directory, under the \"themes\" folder. You can access them within iSH by running\n\n# mount -t real \"$(cat /proc/ish/documents)/themes\" [folder]\n\nand manipulating them from there.";
+            return NSLocalizedString(@"User themes are stored in the iSH-AOK documents directory, under the \"themes\" folder. You can access them within iSH-AOK by running\n\n# mount -t real \"$(cat /proc/ish/documents)/themes\" [folder]\n\nand manipulating them from there.", @"Themes list footer under Import Theme; keep the mount command unchanged");
         default:
             return nil;
     }
@@ -150,7 +156,19 @@ enum {
     return [self shouldHideSection:section] ? CGFLOAT_MIN : UITableViewAutomaticDimension;
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [self unscaledTableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (UITableViewCell *)unscaledTableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Theme" forIndexPath:indexPath];
     
     cell.textLabel.textColor = indexPath.section == ImportSection ? cell.tintColor : nil;
@@ -166,7 +184,7 @@ enum {
             theme = self->_userThemes[indexPath.row];
             break;
         case ImportSection:
-            cell.textLabel.text = @"Import Theme";
+            cell.textLabel.text = NSLocalizedString(@"Import Theme", @"Themes list row that imports a theme file");
             cell.editingAccessoryType = UITableViewCellAccessoryNone;
             return cell;
     }
@@ -255,7 +273,7 @@ enum {
     if (self.isEditing) {
         return nil;
     } else {
-        NSMutableArray<UIContextualAction *> *actions = [NSMutableArray arrayWithObject:[UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:@"Duplicate" handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
+        NSMutableArray<UIContextualAction *> *actions = [NSMutableArray arrayWithObject:[UIContextualAction contextualActionWithStyle:UIContextualActionStyleNormal title:NSLocalizedString(@"Duplicate", @"Swipe action that copies a theme") handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
             [(indexPath.section == DefaultSection ? self->_defaultThemes : self->_userThemes)[indexPath.row] duplicateAsUserTheme];
             [tableView performBatchUpdates:^{
                 [tableView reloadSections:[NSIndexSet indexSetWithIndex:UserSection] withRowAnimation:UITableViewRowAnimationAutomatic];
@@ -263,7 +281,7 @@ enum {
             completionHandler(YES);
         }]];
         if (indexPath.section == UserSection) {
-            [actions addObject:[UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:@"Delete" handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
+            [actions addObject:[UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive title:NSLocalizedString(@"Delete", @"Swipe action that deletes a user theme") handler:^(UIContextualAction *action, UIView *sourceView, void (^completionHandler)(BOOL)) {
                 [self deleteUserThemeAtIndexPath:indexPath];
                 completionHandler(YES);
             }]];

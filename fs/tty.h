@@ -86,21 +86,79 @@ struct termios2_ {
 #define ONOCR_ (1 << 4)
 #define ONLRET_ (1 << 5)
 
-// c_cflag bits, from Linux's asm-generic/termbits.h. iSH's ttys have no real
+// The rest of asm-generic/termbits.h's flags. The tty itself acts on none of
+// them, but a guest reads them back and stty prints and restores every one,
+// so the native shim (kernel/native_libc.c) carries them across to Darwin's
+// struct termios wherever Darwin has the same idea.
+#define XCASE_ (1 << 2)
+#define ECHONL_ (1 << 6)
+#define ECHOPRT_ (1 << 10)
+#define FLUSHO_ (1 << 12)
+#define PENDIN_ (1 << 14)
+#define EXTPROC_ (1 << 16)
+
+#define IGNBRK_ (1 << 0)
+#define BRKINT_ (1 << 1)
+#define IGNPAR_ (1 << 2)
+#define PARMRK_ (1 << 3)
+#define INPCK_ (1 << 4)
+#define ISTRIP_ (1 << 5)
+#define IUCLC_ (1 << 9)
+#define IMAXBEL_ (1 << 13)
+#define IUTF8_ (1 << 14)
+
+#define OLCUC_ (1 << 1)
+#define OFILL_ (1 << 6)
+#define OFDEL_ (1 << 7)
+#define NLDLY_ 0x100
+#define NL1_ 0x100
+#define CRDLY_ 0x600
+#define CR1_ 0x200
+#define CR2_ 0x400
+#define CR3_ 0x600
+#define TABDLY_ 0x1800
+#define TAB1_ 0x800
+#define TAB2_ 0x1000
+#define TAB3_ 0x1800
+#define BSDLY_ 0x2000
+#define BS1_ 0x2000
+#define VTDLY_ 0x4000
+#define VT1_ 0x4000
+#define FFDLY_ 0x8000
+#define FF1_ 0x8000
+
+// c_cflag bits, from Linux's asm-generic/termbits.h. AOK's ttys have no real
 // line discipline hardware, so nothing here changes how a tty behaves -- but
 // guests do read these bits back, and the baud rate in particular is not
 // cosmetic: musl's and glibc's cfgetospeed() return c_cflag & CBAUD, and B0
 // means "hang up the line". A tty reporting B0 makes ssh(1) send ospeed 0 in
 // its pty-req, and a BSD sshd honours that by SIGHUPing the session leader --
 // so the remote shell died the instant it started (exit status 129).
-#define CBAUD_ 0010017
-#define B0_ 0000000
-#define B38400_ 0000017
-#define CSIZE_ 0000060
-#define CS8_ 0000060
-#define CREAD_ 0000200
-#define PARENB_ 0000400
-#define HUPCL_ 0002000
+#define CBAUD_ 0x100f
+#define B0_ 0x0
+#define B38400_ 0xf
+#define CSIZE_ 0x30
+#define CS5_ 0x0
+#define CS6_ 0x10
+#define CS7_ 0x20
+#define CS8_ 0x30
+#define CSTOPB_ 0x40
+#define CREAD_ 0x80
+#define PARENB_ 0x100
+#define PARODD_ 0x200
+#define HUPCL_ 0x400
+#define CLOCAL_ 0x800
+#define CBAUDEX_ 0x1000
+#define CMSPAR_ 0x40000000
+#define CRTSCTS_ 0x80000000
+
+// Index of a CBAUD code in a table laid out like the kernel's baud_table
+// (drivers/tty/tty_baudrate.c): codes with CBAUDEX set carry on after B38400,
+// so B57600 (CBAUDEX | 1) is index 16.
+static inline dword_t tty_baud_index(dword_t cflags) {
+    dword_t code = cflags & CBAUD_;
+    return code & CBAUDEX_ ? (code & ~CBAUDEX_) + 15 : code;
+}
 
 #define TCGETS_ 0x5401
 #define TCSETS_ 0x5402
@@ -165,6 +223,16 @@ struct tty_driver_ops {
 extern struct tty_driver *tty_drivers[256];
 extern struct tty_driver real_tty_driver;
 
+// A factory for a PSEUDO-terminal whose master side is not a guest process --
+// the shape the iOS app has, where the master is a Terminal object. NULL
+// unless an entry point installs one; main.c does when ISH_CLI_PTY is set, so
+// the CLI can run a session on a pts and exercise the checkpoint's
+// CKPT_TTY_PTS restore path, which is otherwise unreachable from here (see
+// kernel/checkpoint.c's ckpt_stdio_set_for: it downgrades a pts to the console
+// when checkpoint_open_session_tty is NULL). Debug only; it changes nothing
+// about a normal launch.
+extern struct tty *(*cli_session_tty_open)(void);
+
 struct tty {
     unsigned refcount;
     struct tty_driver *driver;
@@ -197,9 +265,9 @@ struct tty {
     struct termios_ termios;
     int type;
     int num;
-    dword_t atime;
-    dword_t mtime;
-    dword_t ctime;
+    sqword_t atime;
+    sqword_t mtime;
+    sqword_t ctime;
 
     // XON/XOFF output flow control. `stopped` is what actually gates writes;
     // `tco_stopped` records that tcflow(TCOOFF) was what stopped them, because
@@ -237,17 +305,22 @@ struct tty {
 // if blocking, may return _EINTR, otherwise, may return _EAGAIN
 ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking);
 void tty_set_winsize(struct tty *tty, struct winsize_ winsize);
+// Put a terminal back to the state a freshly created one is in. A checkpoint
+// restore does this before re-launching a native program.
+void tty_reset_termios_to_default(struct tty *tty);
 // Who to signal for a hangup. Captured while tty->lock is held (tty_hangup),
 // then handed to tty_hangup_notify once every tty lock has been dropped --
 // sending a signal takes pids_lock, and fs/tty.c's input path already
 // establishes that signals go out only after tty->lock is released.
 struct tty_hangup_targets {
-    pid_t_ fg_group;
-    pid_t_ session;
+    pid_t_ fg_group;    // SIGHUP, then SIGCONT, to this process group
+    pid_t_ session;     // SIGHUP, then SIGCONT, to this session's leader alone
+    bool exit_cont;     // a leader's exit (do_exit sends): SIGCONT after its SIGHUP
 };
 struct tty_hangup_targets tty_hangup(struct tty *tty);
-// SIGHUP (then SIGCONT, as Linux does) to the foreground group and session
-// leader of a terminal that has gone away. Call with no tty lock held.
+// SIGHUP (then SIGCONT, as Linux does) to the targets tty_hangup or TIOCNOTTY
+// named: the session leader of a terminal that has gone away, or the
+// foreground group of one its leader let go of. Call with no tty lock held.
 void tty_hangup_notify(struct tty_hangup_targets targets);
 bool tty_stat_rdev(dev_t_ rdev, struct statbuf *stat);
 
@@ -278,10 +351,39 @@ struct tty *tty_lookup_ref(int type, int num, struct tty *expected);
 void tty_put(struct tty *tty);
 
 extern struct dev_ops tty_dev;
+
+// The tty behind a descriptor, or NULL if this descriptor is not one.
+//
+// `fd->tty` lives in a UNION with the other per-driver arms (epoll's poll, the
+// socket, the fifo links), so reading it on a descriptor that is not a tty
+// does not give NULL -- it gives whichever pointer that arm happens to hold.
+// A daemon with its standard streams on /dev/null or a socket therefore looked
+// like it had a terminal, and the checkpoint locked the address it found:
+// EXC_BAD_ACCESS in ckpt_save_task, reported from a device 2026-09-11.
+//
+// Every descriptor with a valid ->tty is opened through dev_open, which sets
+// ops from the driver, so the ops ARE the discriminator. kernel/poll.c already
+// tested it this way; this is that test, named, so the next caller does not
+// have to know.
+static inline struct tty *fd_tty(struct fd *fd) {
+    if (fd == NULL || fd->ops != &tty_dev.fd)
+        return NULL;
+    return fd->tty;
+}
 extern struct dev_ops ptmx_dev;
 
 int ptmx_open(struct fd *fd);
 // Should call with a driver declared *without* DEFINE_TTY_DRIVER, as it overwrites the ttys field.
 struct tty *pty_open_fake(struct tty_driver *driver);
+// True when a guest process holds this pty's master; see fs/pty.c.
+bool pty_master_is_open(int num);
+// Replay the guest's unlockpt() on a master rebuilt by the checkpoint.
+void pty_unlock_slave_of(struct tty *master);
+// The slave's owner and mode, through its master (fs/pty.c). false when the
+// master has no slave.
+bool pty_slave_owner_of(struct tty *master, uid_t_ *uid, uid_t_ *gid,
+                        mode_t_ *perms);
+void pty_set_slave_owner_of(struct tty *master, uid_t_ uid, uid_t_ gid,
+                            mode_t_ perms);
 
 #endif

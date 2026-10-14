@@ -8,7 +8,7 @@
 #   * generous "ultimate terminal" CLI tool set
 #   * daemons started directly in the background (sshd, syslog-ng, chronyd,
 #     crond) -- see the "Services" section below for why, and its limits
-#   * US/Pacific timezone (configurable)
+#   * the device's timezone, kept following the device (configurable)
 #   * chrony in iSH-aware monitoring mode (the guest clock is the host clock)
 #   * shell niceties: bash login shells, colour prompt, MOTD, login summary,
 #     fzf/dircolors integration, machine-id, periodic maintenance via cron
@@ -21,10 +21,11 @@
 # When run on a terminal it PROMPTS for the timezone and the primary login
 # (creating that user if it does not exist). Pre-set any tunable via the
 # environment to skip its prompt / run non-interactively:
-#       TZ_NAME=America/Los_Angeles    # timezone (else prompted)
+#       TZ_NAME=America/Los_Angeles    # timezone (else prompted, offering the device's)
 #       TARGET_USER=mke                # primary login to set up (else prompted)
 #       NEW_HOSTNAME=                  # hostname to set (else prompted)
-#       SUDO_NOPASSWD=0                # 1 = passwordless %wheel sudo
+#       NATIVE_LINKS=1                 # 0 = skip linking /AOK/native (native-links.sh)
+#       SUDO_NOPASSWD=1                # 0 = %wheel sudo asks for a password (else prompted)
 #
 # EXPERIMENTAL / not officially supported (see kBundledRootDisplayNameKey in
 # app/Roots.m): Arch ships real util-linux login + PAM (unlike Alpine/
@@ -45,10 +46,13 @@ note() { printf '    %s\n' "$*"; }
 
 # ---- config (env overrides; prompts interactively when run on a TTY) ------
 NEW_HOSTNAME="${NEW_HOSTNAME:-}"
-SUDO_NOPASSWD="${SUDO_NOPASSWD:-0}"
+SUDO_NOPASSWD="${SUDO_NOPASSWD:-}"
 
-# Defaults offered at the prompts.
-DEF_TZ="${TZ_NAME:-America/Los_Angeles}"
+# Defaults offered at the prompts. The timezone offered is the device's own, as
+# the app reports it; a build too old to report one offers the old default.
+HOST_TZ="$(cat /proc/ish/timezone 2>/dev/null)"
+TZ_PRESET="${TZ_NAME:+1}"
+DEF_TZ="${TZ_NAME:-${HOST_TZ:-America/Los_Angeles}}"
 DEF_USER="${TARGET_USER:-${SUDO_USER:-}}"
 if [ -z "$DEF_USER" ] || [ "$DEF_USER" = root ]; then
     # Skip 'alarm': it's ArchLinuxARM's generic stock account (see the rename
@@ -76,6 +80,10 @@ ask() {
 ask TZ_NAME     "Timezone (e.g. America/New_York, UTC)" "$DEF_TZ"
 ask TARGET_USER "Primary login username to set up"      "$DEF_USER"
 ask NEW_HOSTNAME "Hostname"                              "$DEF_HOSTNAME"
+# Passwordless unless you say otherwise: the login above is created with no
+# password, so a rule that asks for one would leave it unable to use sudo.
+ask SUDO_NOPASSWD "Passwordless sudo for ${TARGET_USER:-the admin group}? (y/n)" "y"
+case "$SUDO_NOPASSWD" in [Yy]*|1) SUDO_NOPASSWD=1 ;; *) SUDO_NOPASSWD=0 ;; esac
 
 # ArchLinuxARM's official aarch64 minirootfs (unlike the plain x86_64
 # archlinux.org tarball) ships a pre-created 'alarm' user out of the box: uid
@@ -301,6 +309,19 @@ log "Timezone -> $TZ_NAME"
 if [ -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
     ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
     echo "$TZ_NAME" > /etc/timezone
+    # Taking the device's own zone leaves the choice with iSH-AOK, which moves
+    # /etc/localtime along with the device at each boot for as long as
+    # /etc/aok-localtime names the zone it holds (see /AOK/docs/roots.md). A
+    # zone set in TZ_NAME, or a different one typed at the prompt, stays put.
+    if [ -z "$TZ_PRESET" ] && [ "$TZ_NAME" = "$HOST_TZ" ]; then
+        printf '%s\n' \
+            "# /etc/localtime names this zone because it is the device's. iSH-AOK" \
+            "# moves it along with the device, at boot, for as long as it still names" \
+            "# this zone; choose any other and it is left alone from then on. Keep this" \
+            "# file: without it a UTC /etc/localtime looks like the distribution's own." \
+            "$TZ_NAME" > /etc/aok-localtime
+        note "following the device's zone from boot to boot (/etc/aok-localtime)"
+    fi
     note "$(date)"
 else
     note "zoneinfo for '$TZ_NAME' not found; leaving clock as-is"
@@ -355,16 +376,25 @@ log "sudo for the wheel group"
 # ===========================================================================
 grep -q '^@includedir /etc/sudoers.d\|^#includedir /etc/sudoers.d' /etc/sudoers 2>/dev/null || \
     echo '@includedir /etc/sudoers.d' >> /etc/sudoers
+# Named to sort FIRST: sudo reads /etc/sudoers.d in name order and the LAST
+# matching rule wins, so a fragment the user adds (zz-me-nopasswd, 90-me, ...)
+# must come after this one to be able to override it. AOK's earlier name,
+# aok-wheel, sorted after the common ones -- a user's NOPASSWD file was silently
+# beaten by its password rule -- so that file goes, if it is still ours.
+_old=/etc/sudoers.d/aok-wheel
+if [ -f "$_old" ] && { [ "$(cat "$_old")" = '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' ] || [ "$(cat "$_old")" = '%wheel ALL=(ALL:ALL) ALL' ]; }; then
+    rm -f "$_old"
+fi
 if [ "$SUDO_NOPASSWD" = 1 ]; then
-    echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/aok-wheel
+    echo '%wheel ALL=(ALL:ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-aok-wheel
     note "passwordless sudo for %wheel"
 else
-    echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/aok-wheel
-    note "%wheel sudo (password required; set SUDO_NOPASSWD=1 for passwordless)"
+    echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/00-aok-wheel
+    note "%wheel sudo (password required -- the login needs one: passwd ${TARGET_USER:-<user>})"
 fi
-chmod 0440 /etc/sudoers.d/aok-wheel
-if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/aok-wheel >/dev/null 2>&1; then
-    rm -f /etc/sudoers.d/aok-wheel
+chmod 0440 /etc/sudoers.d/00-aok-wheel
+if command -v visudo >/dev/null 2>&1 && ! visudo -cf /etc/sudoers.d/00-aok-wheel >/dev/null 2>&1; then
+    rm -f /etc/sudoers.d/00-aok-wheel
     note "WARNING: generated sudoers fragment failed validation; removed it"
 fi
 if [ -n "$TARGET_USER" ] && id "$TARGET_USER" >/dev/null 2>&1; then
@@ -717,6 +747,29 @@ TMUXCONF
 }
 write_tmux /root root
 [ -n "$TARGET_HOME" ] && write_tmux "$TARGET_HOME" "$TARGET_USER"
+
+# ===========================================================================
+log "iSH-AOK native programs"
+# ===========================================================================
+# native-links.sh links the app's native programs -- SmallCLUE's applets, zsh,
+# dash as `sh`, motepad and the rest of /AOK/native -- into
+# /usr/local/native-bin, put first on PATH for login shells, and into
+# /usr/local/bin, which every default PATH has ahead of /bin. --no-shell,
+# because this script chose the login shells above. persist-links.sh links your
+# own /AOK/persist/bin into /usr/local/bin, for the sessions that never read
+# /etc/profile.d (`ssh host cmd`, cron, services). NATIVE_LINKS=0 skips both.
+if [ "${NATIVE_LINKS:-1}" = 1 ]; then
+    if [ -f /AOK/tools/native-links.sh ] && [ -x /AOK/native/smallclue ]; then
+        sh /AOK/tools/native-links.sh --no-shell 2>&1 | sed 's/^/    /'
+    else
+        note "this iSH-AOK has no /AOK/native; native links skipped"
+    fi
+    if [ -f /AOK/tools/persist-links.sh ] && [ -d /AOK/persist/bin ]; then
+        sh /AOK/tools/persist-links.sh 2>&1 | sed 's/^/    /'
+    fi
+else
+    note "NATIVE_LINKS=0: native links skipped"
+fi
 
 # ===========================================================================
 log "Services"

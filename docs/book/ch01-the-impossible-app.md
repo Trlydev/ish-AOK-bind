@@ -7,7 +7,7 @@ Here is an ordinary thing happening in an unusual place:
 ```
 $ ./build/ish -f build/alpine-arm64-test /bin/sh
 / # uname -a
-Linux Mac.lan 5.20.66-ish_aok iSH-AOK built 2026-08-31 10:24Z unoptimized aarch64 Linux
+Linux Mac.lan 5.10.0-ish_aok iSH-AOK built 2026-08-31 10:24Z unoptimized aarch64 Linux
 / # head -4 /proc/cpuinfo
 processor       : 0
 model name      : iSH Virtual aarch64-compatible CPU @ 1.066GHz
@@ -30,10 +30,12 @@ the same code is an iOS app: one App Store download, no jailbreak, no developer
 mode, no sideloading, running on a device whose operating system will not let
 an application do most of what a Linux userland assumes an application can do.
 
-Every line of that output is manufactured. There is no Linux 5.20.66; the
-version string is assembled in `kernel/uname.c`, and the word `unoptimized` in
-it is a deliberate confession that this particular build was compiled at `-O0`
-and its timings should not be believed. There is no processor 0: `/proc/cpuinfo`
+Every line of that output is manufactured. This machine never ran Linux
+5.10.0; the version string is assembled in `kernel/uname.c`, chosen to be the
+oldest real release whose mandatory syscalls this build actually has rather
+than a later one that would promise more, and the word `unoptimized` in it is
+a deliberate confession that this particular build was compiled at `-O0` and
+its timings should not be believed. There is no processor 0: `/proc/cpuinfo`
 is a string generated on demand, and the feature list in it is a promise about
 which instructions the translator implements. `busybox` is owned by `root:root`
 with mode 755 because a row in a SQLite database says so — the host file
@@ -69,8 +71,8 @@ groups and thread groups have to be rebuilt by hand (Chapter 10); a signal is a
 bitmask plus a `pthread_kill` to nudge the target out of a blocking host call
 (Chapter 12); and, most sharply, a native program compiled into the app cannot
 fork at all, because a C function running on a guest task's thread has no
-address space to copy — which is why the native bash serializes its own state
-into a script and re-launches itself (Chapter 24).
+address space to copy — which is why a native shell such as bash serializes
+its own state into a script and re-launches itself (Chapter 24).
 
 **You cannot write instructions and then execute them.** The entitlement that
 permits mapping a page both writable and executable is not available to ordinary
@@ -312,16 +314,15 @@ is the most reliable way to introduce a bug.
 A book about a system should say early where the system is weak, so the reader
 can calibrate.
 
-**There are no namespaces.** No PID namespaces, no mount namespaces. There is
-exactly one Linux underneath everything, so `/proc`, `/sys` and `/dev` show the
-same true state no matter which root you booted or which chroot you are standing
-in. Nothing container-shaped works. This is architectural, not a missing
-feature; Chapter 21 shows the one place it is an advantage, and Chapter 41 is
-honest about the rest.
-
-**`PROT_EXEC` is never enforced.** Guest pages have no NX. A guest program that
-jumps into its own data will run it. Chapter 13 explains why fixing that is a
-project rather than a patch.
+**There is one machine.** There is exactly one Linux underneath everything, so
+`/proc`, `/sys` and `/dev` show the same true state no matter which root you
+booted or which chroot you are standing in. A process can ask for a mount table,
+a user namespace, a pid namespace and a network of its own (all four arrived in
+559, and a sandbox like bubblewrap is built from them), but that network reaches
+no further than loopback and a veth pair to another sandbox, there are no cgroup
+namespaces, and nothing container-shaped works. This is architectural, not a
+missing feature; Chapter 21 shows the one place it is an advantage, and Chapter
+41 is honest about the rest.
 
 **Everything is one process, so everything is one blast radius.** An assertion
 failure in a routine `/proc/meminfo` read aborts the whole application, terminal
@@ -332,7 +333,7 @@ versions, and a guest running `free` would otherwise have killed the app.
 **It is dispatch-bound.** See Chapter 38 for what that means in practice, and
 for the measurements that say when it stops mattering.
 
-**And the fidelity tail never ends.** There are more than 170 C
+**And the fidelity tail never ends.** There are more than 400 C
 programs in `tests/manual/`, plus a handful of shell-script suites, and each one
 exists because something behaved differently from Linux and somebody had to find
 out why. Appendix F annotates them.
@@ -384,7 +385,7 @@ measurement, the method is given with it. Where a claim is a guess, it says so.
 > ```sh
 > meson setup build --buildtype=debugoptimized
 > ninja -C build
-> ./build/tools/fakefsify alpine-minirootfs-3.23.3-aarch64.tar.xz alpine
+> ./build/tools/fakefsify alpine-minirootfs-3.24.2-aarch64.tar.xz alpine
 > ./build/ish -f alpine /bin/sh
 > ```
 >

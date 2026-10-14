@@ -9,13 +9,28 @@
 
 extern struct tty_driver pty_slave;
 
+// See fs/tty.h. Installed by main.c under ISH_CLI_PTY; NULL everywhere else.
+struct tty *(*cli_session_tty_open)(void);
+
 // the master holds a reference to the slave, so the slave will always be cleaned up second
 // when the master cleans up it hangs up the slave, making any operation that references the master unreachable
 
 static void pty_slave_init_inode(struct tty *tty) {
-    tty->pty.uid = current->euid;
+    // `current` is not guaranteed here. A pty is usually opened by a guest
+    // process through /dev/ptmx, and then the node belongs to whoever opened
+    // it -- but the APP also makes them, on its UI thread, which is not a task:
+    // the appearance preview, the Wayland display session, and the terminal a
+    // restored session is re-attached to. Owned by root in that case, which is
+    // what a device node the system created IS.
+    //
+    // This read used to be unconditional and survived only because the UI
+    // thread happened to be carrying a stale task pointer from the last
+    // session start. Clearing that pointer -- correctly, see
+    // TerminalViewController's startSession -- turned it into an immediate
+    // EXC_BAD_ACCESS on opening Settings -> Appearance.
+    tty->pty.uid = current != NULL ? current->euid : 0;
     // TODO make these mount options
-    tty->pty.gid = current->egid;
+    tty->pty.gid = current != NULL ? current->egid : 0;
     tty->pty.perms = 0620;
 }
 
@@ -136,6 +151,63 @@ int ptmx_open(struct fd *fd) {
     if (IS_ERR(master))
         return PTR_ERR(master);
     return tty_open(master, fd);
+}
+
+// Unlock the slave of a freshly re-opened master.
+//
+// A pty starts LOCKED -- Linux's rule, and pty_slave_open refuses a locked
+// slave with EIO -- and it is the guest's unlockpt() that clears it. A master
+// restored from a checkpoint never gets that call again: the guest issued it
+// before the image was taken. So a restored pane could not open its own
+// terminal, which came back as "could not attach restored pid 7 to
+// /dev/pts/1: -5". Unlocking here is what the guest's earlier unlockpt() meant,
+// replayed; a guest that had NOT unlocked yet simply does it again, which
+// costs nothing.
+void pty_unlock_slave_of(struct tty *master) {
+    if (master == NULL || master->pty.other == NULL)
+        return;
+    master->pty.other->pty.locked = false;
+}
+
+// Who owns a pty's slave node, and its mode -- what login and sshd set with
+// fchown/fchmod once they know which user the terminal is for. A checkpoint
+// has to carry it: the pair is rebuilt by opening /dev/ptmx again, which makes
+// a slave owned by whoever did the opening, and a user's shell could then no
+// longer open its own terminal.
+bool pty_slave_owner_of(struct tty *master, uid_t_ *uid, uid_t_ *gid,
+                        mode_t_ *perms) {
+    if (master == NULL || master->pty.other == NULL)
+        return false;
+    struct tty *slave = master->pty.other;
+    *uid = slave->pty.uid;
+    *gid = slave->pty.gid;
+    *perms = slave->pty.perms;
+    return true;
+}
+
+void pty_set_slave_owner_of(struct tty *master, uid_t_ uid, uid_t_ gid,
+                            mode_t_ perms) {
+    if (master == NULL || master->pty.other == NULL)
+        return;
+    struct tty *slave = master->pty.other;
+    slave->pty.uid = uid;
+    slave->pty.gid = gid;
+    slave->pty.perms = perms & 07777;
+}
+
+// Is a guest process holding the MASTER of this pty?
+//
+// The checkpoint asks so it can tell a terminal the image owns from one the UI
+// owns. A session pty made by pty_open_fake has a slave and no master -- the
+// app or the CLI holds the other side -- so it answers false, which is what
+// makes it a window to be re-created rather than a pair to be rebuilt.
+bool pty_master_is_open(int num) {
+    if (num < 0 || num >= MAX_PTYS)
+        return false;
+    lock(&ttys_lock, 0);
+    bool open = pty_master.ttys[num] != NULL;
+    unlock(&ttys_lock);
+    return open;
 }
 
 struct tty *pty_open_fake(struct tty_driver *driver) {
@@ -318,5 +390,6 @@ const struct fs_ops devptsfs = {
 };
 
 static const struct fd_ops devpts_fdops = {
+    .name = "devpts",
     .readdir = devpts_readdir,
 };

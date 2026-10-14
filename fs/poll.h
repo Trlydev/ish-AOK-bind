@@ -28,6 +28,10 @@ struct poll {
     // instead move them to a freelist where they can be reused.
     struct list pollfd_freelist;
 
+    // poll_host_resume_gen (fs/poll.c) as of this poll's last look at its
+    // host-edge registrations after a suspension.
+    unsigned host_resume_seen;
+
     // When this poll belongs to an epoll FD (kernel/epoll.c), the owning
     // struct fd -- so a wakeup on a member can cascade to whoever is
     // polling the epoll fd itself (epoll-inside-epoll, e.g. systemd's
@@ -57,10 +61,24 @@ struct poll_fd {
         int fd;
         uint64_t num;
     } info;
-    // Used to implement edge-triggered notifications. When an event is
-    // returned its bits are set here, and those bits are ignored on the next
-    // call to poll_wait. The bits are cleared by poll_wakeup.
+    // Used to implement edge-triggered notifications: what this registration
+    // has reported since the file's last event. A wait reports it again only
+    // once something not in here is ready, which after an event is anything
+    // (see poll_fd_note_event_locked, which empties it).
     int triggered_types;
+    // Host events collected for this registration and not yet reported
+    // (poll_note_host_event_locked). The scan adds them to what it finds and
+    // clears them once they are reported.
+    int host_events;
+    // The host reports this file's events edge-triggered (EV_CLEAR, which
+    // every registration of it here being EPOLLET arms) and reliably -- a
+    // socket, a pipe or a FIFO. Such a registration reports only an event
+    // collected from the host, never a readiness a scan happens to see:
+    // see poll_drain_host_locked. Kept by poll_sync_host_locked.
+    bool host_edges;
+    // An EPOLLONESHOT registration that has reported, waiting for
+    // EPOLL_CTL_MOD. It reports nothing until then, a hangup included.
+    bool disarmed;
 
     // locked by containing struct fd
     struct poll *poll;
@@ -112,6 +130,12 @@ int poll_del_fd(struct poll *poll, struct fd *fd, fd_t guest_fd);
 // generate a new edge-triggered notification.
 // please do not call this while holding any locks you would acquire in your poll operation
 void poll_wakeup(struct fd *fd, int events);
+// The host object behind fd changed under it (fs/sockrestart.c): re-program
+// every poll's host watch of it, and wake their waiters.
+void poll_rearm_host_fd(struct fd *fd);
+// Back from a suspension (fs/sockrestart.c): every poll takes one fresh look
+// at its edge-triggered host registrations.
+void poll_note_host_resume(void);
 // Same, but never blocks: skips fds/polls it can't immediately lock instead
 // of waiting. Use this instead of poll_wakeup() when the lock-ordering rule
 // above can't be honored (see the comment on the definition in poll.c).
@@ -120,11 +144,36 @@ void poll_wakeup_trylock(struct fd *fd, int events);
 // Returns the number of times the callback returned 1, or negative for error.
 typedef int (*poll_callback_t)(void *context, int types, union poll_fd_info info);
 int poll_wait(struct poll *poll, poll_callback_t callback, void *context, struct timespec *timeout);
+// Collects what the host has queued for this poll's edge-triggered host
+// watches, noting each event against its registrations (fs/poll.c). Caller
+// holds poll->lock.
+void poll_drain_host_locked(struct poll *poll);
 // does not lock the poll because lock ordering, you must ensure no other
 // thread will add or remove fds from this poll
 void poll_destroy(struct poll *poll);
 
 // for fd_close
 void poll_cleanup_fd(struct fd *fd);
+
+// The longest this file will block on the host in one go. Every host wait here
+// is capped at it, so a wake that never arrives costs a second of latency
+// instead of the rest of the process's life; see the long comment at the cap
+// itself for why a wake can fail to arrive at all.
+//
+// A second rather than kernel/time.c's 50 ms slice, because the populations are
+// different: that one bounds how late a SLEEPING task notices a signal, and a
+// sleeping task is a task that asked to be slow. This one bounds how late a
+// LOST wake is recovered from, which should never happen, and it is paid by
+// every idle daemon in the guest at once -- a booted rootfs has a dozen threads
+// parked in poll doing nothing. 50 ms there would be 240 pointless wakeups a
+// second on a phone; one second is 12, and a hang that clears within a second
+// is not a hang anyone reports.
+#define POLL_WAKE_RECHECK_NS 1000000000L
+
+// How many consecutive expiries of that cap make a wait worth reporting, when
+// -- and only when -- a signal is raised that the waiter reads as blocked. Long
+// enough that no ordinary handoff trips it; short enough that a user who says
+// "it is hung" still has it in the log.
+#define POLL_STUCK_ROUNDS 30
 
 #endif

@@ -599,22 +599,43 @@ dp3_store:
     str w9, [_cpu, #CPU_nzcv]
     gret
 
-// MRS Xt, CNTVCT_EL0: virtual counter read at runtime from the host
-// monotonic clock (nanoseconds; CNTFRQ_EL0 reports 1 GHz to match).
-// [gadget][rt]
+// MRS Xt, CNTVCT_EL0: the host's counter in nanoseconds (CNTFRQ_EL0 reports
+// 1 GHz to match; gadgets-generic.h host_counter_ns). [gadget][rt]
 .gadget mrs_cntvct
+    ldr x12, [_ip]
+    add _ip, _ip, #8
+    and x12, x12, #0x1f
+    host_counter_ns x8, x9, x10, x11
+    cmp x12, #31
+    b.eq 1f
+    add x10, _cpu, #CPU_x0
+    str x8, [x10, x12, lsl #3]
+1:  gret
+
+// MRS Xt, S3_3_C15_C0_0: AOK_VCLOCK, which only the vDSO reads (vdso/arm64/
+// vdso.S). Wt names a clock -- XZR names clock 0 and discards the result --
+// and Xt is replaced by kernel/time.c's vdso_clock_ns of it: the reading
+// clock_gettime(2) would give, in ns, or -1 for "make the system call".
+// [gadget][rt]
+.gadget mrs_vclock
     ldr x8, [_ip]
     add _ip, _ip, #8
     and x19, x8, #0x1f         // rt, callee-saved across the C call
-    save_c
-    bl NAME(arm64_cntvct)
-    mov x20, x0                // result; x0 itself is restored by restore_c
-    restore_c
+    mov w0, #0
     cmp x19, #31
     b.eq 1f
     add x10, _cpu, #CPU_x0
+    add x10, x10, x19, lsl #3
+    ldr w0, [x10]              // the clock: Wt, the slot's low half
+1:  save_c                     // stores x0, and leaves it as the argument
+    bl NAME(vdso_clock_ns)
+    mov x20, x0                // result; x0 itself is restored by restore_c
+    restore_c
+    cmp x19, #31
+    b.eq 2f
+    add x10, _cpu, #CPU_x0
     str x20, [x10, x19, lsl #3]
-1:  gret
+2:  gret
 
 // CRC32{B,H,W,X} / CRC32C{B,H,W,X}: Wd = crc(Wn, Rm<sz>). FEAT_CRC32 is
 // optional in v8.0 and Apple only added it with A10 — gen.c hands this
@@ -676,72 +697,121 @@ crc32_st:
     str x15, [x14, x9, lsl #3] // Wd zero-extends
 9:  gret
 
-// Soft CRC32 fallback for hosts without FEAT_CRC32 (pre-A10): computes
-// in C (arm64_crc32_soft, emu/tlb.c). Same code stream as crc32 above:
-// [gadget][rd | rn<<8 | rm<<16 | sz<<24 | c<<26]
+// CRC32 for hosts without FEAT_CRC32 (pre-A10), a bit at a time: the
+// reflected polynomial (CRC32 0xEDB88320, CRC32C 0x82F63B78) folded in for
+// each of the 8 << size bits of Rm, lowest first. Same code stream as crc32
+// above: [gadget][rd | rn<<8 | rm<<16 | sz<<24 | c<<26]
 .gadget crc32_soft
     ldr x8, [_ip]
     add _ip, _ip, #8
-    save_c
-    and x19, x8, #0x1f          // rd, callee-saved across the C call
-    ubfx x9, x8, #8, #5         // rn
-    ubfx x10, x8, #16, #5       // rm
-    add x11, _cpu, #CPU_x0
-    mov x0, #0
-    cmp x9, #31
-    b.eq 1f
-    // w-sized load can't use `lsl #3` addressing (see memory.S header,
-    // bug #2): compute the 8-byte-strided slot address separately.
-    add x12, x11, x9, lsl #3
-    ldr w0, [x12]               // Wn (acc)
-1:  mov x1, #0
+    and x9, x8, #0x1f
+    ubfx x10, x8, #8, #5
+    ubfx x11, x8, #16, #5
+    ubfx x12, x8, #24, #2      // size: 0=b 1=h 2=w 3=x
+    add x14, _cpu, #CPU_x0
+    mov x15, #0
     cmp x10, #31
+    b.eq 1f
+    add x17, x14, x10, lsl #3
+    ldr w15, [x17]             // Wn (acc)
+1:  mov x16, #0
+    cmp x11, #31
     b.eq 2f
-    ldr x1, [x11, x10, lsl #3]  // Rm (value)
-2:  ubfx x2, x8, #24, #2        // size: 0=b 1=h 2=w 3=x
-    ubfx x3, x8, #26, #1        // 1 = CRC32C
-    bl NAME(arm64_crc32_soft)
-    mov w20, w0                 // zero-extend: Wd write clears the top
-    restore_c
-    cmp x19, #31
-    b.eq 3f
-    add x10, _cpu, #CPU_x0
-    str x20, [x10, x19, lsl #3]
-3:  gret
+    ldr x16, [x14, x11, lsl #3] // Rm
+2:  mov w17, #0x8320
+    movk w17, #0xedb8, lsl #16
+    tbz x8, #26, 3f
+    mov w17, #0x3b78
+    movk w17, #0x82f6, lsl #16
+3:  mov x13, #8
+    lsl x13, x13, x12          // bits
+4:  eor w10, w15, w16
+    and w10, w10, #1
+    neg w10, w10
+    and w10, w10, w17
+    eor w15, w10, w15, lsr #1
+    lsr x16, x16, #1
+    subs x13, x13, #1
+    b.ne 4b
+    cmp x9, #31
+    b.eq 5f
+    str x15, [x14, x9, lsl #3] // Wd zero-extends
+5:  gret
 
 # vim: ft=gas
 
-// MRS/MSR FPCR and FPSR: stored in cpu_state (arm64_fpcr/arm64_fpsr) but
-// NOT installed on the host — see fp.S's header on rounding modes. The
-// guest reads back exactly what it wrote, which satisfies musl's
-// save/restore-around-conversion pattern.
+// MRS/MSR FPCR and FPSR, emu/fpenv.c's model: a written FPCR goes onto the
+// host FPU at once (its guest-controlled bits: RMode, FZ16, FZ, DN, AHP --
+// the rest reads back zero), so the guest's rounding mode, FZ and DN govern
+// the very next instruction; a read of FPSR gathers the flags the host FPU
+// has raised since (IOC..IXC, IDC, QC) into cpu->arm64_fpsr; a write of FPSR
+// drops the host's and keeps the written flags. fpenv's FPCR cache compares
+// the live register, so writing it here keeps it coherent.
 // Code stream: [gadget][rt]
-.macro fpsysreg_gadgets name, field
-.gadget mrs_\name
-    ldr x8, [_ip]
+#define ARM64_FPCR_GUEST_HI 0x07c8      /* (0x07c80000) */
+.macro fp_rt_read rd                    /* \rd = Xt (XZR reads 0); x12 = rt */
+    ldr x12, [_ip]
     add _ip, _ip, #8
-    and x8, x8, #0x1f
-    cmp x8, #31
+    and x12, x12, #0x1f
+    mov \rd, #0
+    cmp x12, #31
     b.eq 1f
-    ldr w9, [_cpu, #\field]
-    add x10, _cpu, #CPU_x0
-    add x10, x10, x8, lsl #3
-    str x9, [x10]
-1:  gret
-
-.gadget msr_\name
-    ldr x8, [_ip]
-    add _ip, _ip, #8
-    and x8, x8, #0x1f
-    mov x9, #0
-    cmp x8, #31
-    b.eq 1f
-    add x10, _cpu, #CPU_x0
-    add x10, x10, x8, lsl #3
-    ldr x9, [x10]
-1:  str w9, [_cpu, #\field]
-    gret
+    add x9, _cpu, #CPU_x0
+    ldr \rd, [x9, x12, lsl #3]
+1:
 .endm
-
-fpsysreg_gadgets fpcr, CPU_fpcr
-fpsysreg_gadgets fpsr, CPU_fpsr
+.macro fp_rt_write rs                   /* Xt = \rs, x12 = rt */
+    cmp x12, #31
+    b.eq 2f
+    add x9, _cpu, #CPU_x0
+    str \rs, [x9, x12, lsl #3]
+2:
+.endm
+.macro fp_take_flags rd                 /* \rd = the host's sticky flags, now cleared */
+    mrs x10, fpsr
+    movz w11, #0x9f
+    movk w11, #0x0800, lsl #16
+    and \rd, x10, x11
+    cbz \rd, 3f
+    bic x10, x10, x11
+    msr fpsr, x10
+3:
+.endm
+.gadget mrs_fpcr
+    ldr x12, [_ip]
+    add _ip, _ip, #8
+    and x12, x12, #0x1f
+    ldr w13, [_cpu, #CPU_arm64_fpcr]
+    fp_rt_write x13
+    gret
+.gadget msr_fpcr
+    fp_rt_read x13
+    movz w11, #ARM64_FPCR_GUEST_HI, lsl #16
+    and w13, w13, w11
+    str w13, [_cpu, #CPU_arm64_fpcr]
+    mrs x10, fpcr
+    and x14, x10, x11
+    cmp x14, x13
+    b.eq 4f
+    bic x10, x10, x11
+    orr x10, x10, x13
+    msr fpcr, x10
+4:  gret
+.gadget mrs_fpsr
+    ldr x12, [_ip]
+    add _ip, _ip, #8
+    and x12, x12, #0x1f
+    fp_take_flags x13
+    ldr w14, [_cpu, #CPU_arm64_fpsr]
+    orr w14, w14, w13
+    str w14, [_cpu, #CPU_arm64_fpsr]
+    fp_rt_write x14
+    gret
+.gadget msr_fpsr
+    fp_rt_read x14
+    fp_take_flags x13
+    movz w11, #0x9f
+    movk w11, #0x0800, lsl #16
+    and w14, w14, w11
+    str w14, [_cpu, #CPU_arm64_fpsr]
+    gret

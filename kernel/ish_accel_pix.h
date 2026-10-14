@@ -26,6 +26,12 @@ void ish_pix_fill_row(void *dst, uint32_t pixels, uint32_t value);
 // so this never needs memmove-style direction handling.
 void ish_pix_copy_row(const void *src, void *dst, uint32_t pixels);
 
+// PIXMAN_OP_SRC from an x8r8g8b8 source into an a8r8g8b8 destination: pixman
+// does NOT copy the source's padding byte, it writes 0xff alpha (its
+// src_x888_8888 fast path; checked against real pixman, which copies the
+// byte unchanged for every other a8r8g8b8/x8r8g8b8 pairing).
+void ish_pix_copy_row_set_alpha(const void *src, void *dst, uint32_t pixels);
+
 // Premultiplied-alpha OVER of `pixels` consecutive a8r8g8b8 src pixels onto
 // a8r8g8b8 dst pixels: out_c = src_c + mul_un8(dst_c, 255 - src_a), applied
 // uniformly to all 4 byte lanes (A,R,G,B, each saturating). If
@@ -55,5 +61,29 @@ void ish_pix_over_row(const void *src, void *dst, uint32_t pixels, bool src_is_o
 // meaning as ish_pix_over_row's (x8r8g8b8 src forces alpha=255 before mask
 // scaling is applied).
 void ish_pix_over_mask_row(const void *src, const uint8_t *mask, void *dst, uint32_t pixels, bool src_is_opaque);
+
+// The same two blends with a SOLID source: every source pixel is `src`, a
+// premultiplied a8r8g8b8 value (pixman's color_32 for a solid-fill image,
+// alpha real). pixman turns an OVER of an opaque solid into SRC and skips a
+// fully transparent one; both land on the same bytes as this formula, on
+// an a8r8g8b8 or an x8r8g8b8 destination alike. Validated against real
+// pixman before being written here (see pixman_accel_plan.md).
+void ish_pix_over_solid_row(uint32_t src, void *dst, uint32_t pixels);
+void ish_pix_over_solid_mask_row(uint32_t src, const uint8_t *mask, void *dst, uint32_t pixels);
+
+// One destination row of pixman's bilinear stretch (PIXMAN_FILTER_BILINEAR,
+// REPEAT_NONE, a scale+translate transform): out[i] for the sample point
+// x + i*ux (16.16 fixed, already less half a pixel, as pixman's fetchers hold
+// it), between source rows `row1` (y1) and `row2` (y1 + 1) at vertical weight
+// `disty` (0..127). Each row holds source columns [col0, col0 + cols); a NULL
+// row is outside the image. Taps outside the image read 0; taps inside are
+// OR'd with `tap_or` (0xff000000 for an x8r8g8b8 source, where pixman forces
+// alpha, or 0 where it interpolates the raw byte -- its NEON SRC x8->x8 path).
+// Interpolation is pixman's bilinear_interpolation: 7-bit weights widened to
+// 8 bits, per channel floor(sum(c * w) / 65536). Validated against real
+// pixman on riscv64 (its C code) and arm64 (its NEON code), every byte.
+void ish_pix_bilinear_row(const uint32_t *row1, const uint32_t *row2, int32_t col0, int32_t cols,
+        int32_t src_width, int32_t x, int32_t ux, int disty, uint32_t tap_or,
+        uint32_t *out, uint32_t pixels);
 
 #endif

@@ -9,6 +9,7 @@
 
 #import "FontPickerViewController.h"
 #import "UserPreferences.h"
+#import "WorkspaceViewController.h"
 
 // UIFontPickerViewController can only filter on UIFontDescriptorTraitMonoSpace, and a
 // font that skips that trait is simply absent from it with no way to override. That
@@ -69,7 +70,7 @@ enum {
     NumberOfSections,
 };
 
-@interface FontPickerViewController () <UISearchResultsUpdating>
+@interface FontPickerViewController () <UISearchResultsUpdating, WorkspaceTextScaledPage>
 @end
 
 @implementation FontPickerViewController {
@@ -112,8 +113,9 @@ enum {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.title = @"Font";
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"Reset" style:UIBarButtonItemStylePlain target:self action:@selector(resetFont:)];
+    self.title = NSLocalizedString(@"Font", @"Font picker navigation title");
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:NSLocalizedString(@"Reset", @"Font picker button that restores the default font") style:UIBarButtonItemStylePlain target:self action:@selector(resetFont:)];
+    self.navigationItem.rightBarButtonItem.accessibilityHint = NSLocalizedString(@"Restores the default application font.", @"Accessibility hint for the font reset button");
     [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"Font"];
     [self.tableView registerClass:UITableViewCell.class forCellReuseIdentifier:@"Filter"];
 
@@ -122,7 +124,7 @@ enum {
     _search = [[UISearchController alloc] initWithSearchResultsController:nil];
     _search.searchResultsUpdater = self;
     _search.obscuresBackgroundDuringPresentation = NO;
-    _search.searchBar.placeholder = @"Search";
+    _search.searchBar.placeholder = NSLocalizedString(@"Search", @"Font picker search field placeholder");
     self.navigationItem.searchController = _search;
     self.navigationItem.hidesSearchBarWhenScrolling = NO;
     self.definesPresentationContext = YES;
@@ -183,25 +185,33 @@ enum {
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == FilterSection && !self.isSearching)
-        return @"Some installed fonts, several Nerd Fonts among them, never report themselves as monospaced. Turn this on to choose from every font on the device.";
+        return NSLocalizedString(@"Some installed fonts, several Nerd Fonts among them, never report themselves as monospaced. Turn this on to choose from every font on the device.", @"Font picker footer under the Show All Fonts switch");
     return nil;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     if (indexPath.section == FilterSection) {
         UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Filter" forIndexPath:indexPath];
-        cell.textLabel.text = @"Show All Fonts";
+        cell.textLabel.text = NSLocalizedString(@"Show All Fonts", @"Font picker switch label");
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         UISwitch *toggle = [UISwitch new];
         toggle.on = _showsAllFonts;
         [toggle addTarget:self action:@selector(showAllFontsChanged:) forControlEvents:UIControlEventValueChanged];
         cell.accessoryView = toggle;
+        // At the text size of the Workspace window Settings is in; see
+        // WorkspaceTextScaledPage. Anywhere else the row is left as it is.
+        ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
         return cell;
     }
 
     UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:@"Font" forIndexPath:indexPath];
     NSString *family = _visibleFamilies[indexPath.row];
-    UIFont *font = [UIFont fontWithName:_previewNames[family] size:18];
+    // Scaled here, before Dynamic Type scales it, rather than by
+    // ISHWorkspaceScaleTableViewCell: this label follows Dynamic Type, and the
+    // Workspace window's text size (1.0 anywhere else) multiplies with that
+    // rather than switching it off.
+    UIFont *font = [UIFont fontWithName:_previewNames[family]
+                                   size:ISHWorkspaceScaledPointSize(18, ISHWorkspaceTextScaleForViewController(self))];
     cell.textLabel.font = [[UIFontMetrics metricsForTextStyle:UIFontTextStyleBody] scaledFontForFont:font];
     cell.textLabel.adjustsFontForContentSizeCategory = YES;
     cell.textLabel.text = family;
@@ -221,6 +231,10 @@ enum {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     UserPreferences.shared.fontFamily = _visibleFamilies[indexPath.row];
     [self dismissSearchAndPop];
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
 }
 
 #pragma mark - Actions

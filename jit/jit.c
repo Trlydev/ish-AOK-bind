@@ -1,12 +1,15 @@
 #define DEFAULT_CHANNEL instr
 #include "debug.h"
 #include "jit/jit.h"
+#include "kernel/guestprof.h"
 #include "jit/gen.h"
 #include "jit/frame.h"
 #include "emu/cpu.h"
 #include "emu/memory.h"
 #include "emu/interrupt.h"
+#include "emu/fpenv.h"
 #include "kernel/task.h"
+#include "kernel/personality.h"
 #include "util/list.h"
 #include "util/sync.h"
 #include <stdatomic.h>
@@ -17,6 +20,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if __APPLE__
+#include <dlfcn.h>
+#include <sys/ucontext.h>
+// Leaf header: kern_return_t's value names and nothing else. Deliberately not
+// <mach/mach.h>, which drags in the headers that turn PAGE_SIZE into a runtime
+// variable (see kernel/checkpoint.c's note about what that does to a later
+// static array).
+#include <mach/kern_return.h>
+#endif
+#include "emu/host_fault.h"
 
 extern int current_pid(struct task *task);
 
@@ -36,18 +49,28 @@ static atomic_ulong jit_timing_count_total;
 static atomic_ullong jit_timing_bytes_total; // sum of compiled code[] sizes, in bytes -- estimates what an on-disk cache would need to store
 static atomic_ullong jit_timing_ns_by_arch[4];
 static atomic_ulong jit_timing_count_by_arch[4];
+static atomic_ulong jit_timing_inherited_by_arch[4]; // of those, copied from the parent (jit_fork)
 static const char *const jit_timing_arch_names[4] = {"i386", "amd64", "arm64", "riscv64"};
 
+// -1 until the first compile reads ISH_JIT_TIMING; /proc/ish/jit_timing can
+// turn it on and off at run time (the app has no environment to set).
+static atomic_int jit_timing_state = -1;
+
 static bool jit_timing_enabled(void) {
-    static int enabled = -1;
-    if (enabled == -1)
-        enabled = getenv("ISH_JIT_TIMING") != NULL ? 1 : 0;
-    return enabled == 1;
+    int state = atomic_load_explicit(&jit_timing_state, memory_order_relaxed);
+    if (state == -1) {
+        int env = getenv("ISH_JIT_TIMING") != NULL ? 1 : 0;
+        atomic_compare_exchange_strong(&jit_timing_state, &state, env);
+        state = atomic_load_explicit(&jit_timing_state, memory_order_relaxed);
+    }
+    return state == 1;
 }
 
 static unsigned long long jit_timing_now_ns(void) {
+    // RAW: Darwin's CLOCK_MONOTONIC ticks in microseconds, coarser than one
+    // block's translation.
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (unsigned long long) ts.tv_sec * 1000000000ULL + (unsigned long long) ts.tv_nsec;
 }
 
@@ -57,6 +80,33 @@ static void jit_timing_note(unsigned arch_idx, unsigned long long elapsed_ns, si
     atomic_fetch_add_explicit(&jit_timing_bytes_total, bytes, memory_order_relaxed);
     atomic_fetch_add_explicit(&jit_timing_ns_by_arch[arch_idx], elapsed_ns, memory_order_relaxed);
     atomic_fetch_add_explicit(&jit_timing_count_by_arch[arch_idx], 1, memory_order_relaxed);
+}
+
+// /proc/ish/jit_timing: writing 1 zeroes the counters and starts counting,
+// so a workload can be measured on its own inside the app; 0 stops.
+void jit_timing_set(bool on) {
+    if (on) {
+        atomic_store_explicit(&jit_timing_ns_total, 0, memory_order_relaxed);
+        atomic_store_explicit(&jit_timing_count_total, 0, memory_order_relaxed);
+        atomic_store_explicit(&jit_timing_bytes_total, 0, memory_order_relaxed);
+        for (unsigned i = 0; i < 4; i++) {
+            atomic_store_explicit(&jit_timing_ns_by_arch[i], 0, memory_order_relaxed);
+            atomic_store_explicit(&jit_timing_count_by_arch[i], 0, memory_order_relaxed);
+            atomic_store_explicit(&jit_timing_inherited_by_arch[i], 0, memory_order_relaxed);
+        }
+    }
+    atomic_store_explicit(&jit_timing_state, on ? 1 : 0, memory_order_relaxed);
+}
+
+void jit_timing_get(struct jit_timing_stats *stats) {
+    stats->enabled = jit_timing_enabled();
+    stats->bytes = atomic_load_explicit(&jit_timing_bytes_total, memory_order_relaxed);
+    for (unsigned i = 0; i < 4; i++) {
+        stats->arch[i] = jit_timing_arch_names[i];
+        stats->ns[i] = atomic_load_explicit(&jit_timing_ns_by_arch[i], memory_order_relaxed);
+        stats->blocks[i] = atomic_load_explicit(&jit_timing_count_by_arch[i], memory_order_relaxed);
+        stats->inherited[i] = atomic_load_explicit(&jit_timing_inherited_by_arch[i], memory_order_relaxed);
+    }
 }
 
 // dup'd from stderr by main.c before guest teardown closes the (possibly
@@ -78,9 +128,15 @@ void jit_timing_dump(void) {
         if (count == 0)
             continue;
         unsigned long long ns = atomic_load_explicit(&jit_timing_ns_by_arch[i], memory_order_relaxed);
-        dprintf(jit_timing_stats_fd, "jit-timing:   %-8s blocks=%lu ns_total=%llu ns_avg=%llu\n",
-                jit_timing_arch_names[i], count, ns, ns / count);
+        dprintf(jit_timing_stats_fd, "jit-timing:   %-8s blocks=%lu ns_total=%llu ns_avg=%llu inherited=%lu\n",
+                jit_timing_arch_names[i], count, ns, ns / count,
+                atomic_load_explicit(&jit_timing_inherited_by_arch[i], memory_order_relaxed));
     }
+    struct jit_xcache_stats xc;
+    jit_xcache_get(&xc);
+    if (xc.enabled)
+        dprintf(jit_timing_stats_fd, "jit-timing:   exec cache hits=%lu misses=%lu stored=%lu refused=%lu bytes=%llu\n",
+                xc.hits, xc.misses, xc.stored, xc.refused, xc.bytes);
 }
 static atomic_bool amd64_jit_enabled = true;
 static atomic_ulong amd64_jit_compile_attempts;
@@ -478,8 +534,24 @@ static void amd64_jit_note_compile_fallback(const struct gen_state *state, guest
 
     // Periodic sorted dump (powers of two >= 256) so a single run prints the
     // frequency ranking as it converges, without needing an exit hook.
-    if (amd64_jit_stats_enabled() && total >= 8 && (total & (total - 1)) == 0)
+    // The FIRST fallback is dumped as well as the powers of two from eight up.
+    // The whole point of this counter is to answer "is it zero", and a
+    // threshold of eight cannot distinguish one fallback from none -- which
+    // mattered exactly when the count reached one and there was no way to learn
+    // which opcode it was without rebuilding.
+    if (amd64_jit_stats_enabled() &&
+            (total == 1 || (total >= 8 && (total & (total - 1)) == 0)))
         amd64_jit_dump_fallback_histogram(total);
+}
+
+void amd64_jit_compile_stats(unsigned long *attempts, unsigned long *successes,
+        unsigned long *fallbacks) {
+    if (attempts != NULL)
+        *attempts = atomic_load_explicit(&amd64_jit_compile_attempts, memory_order_relaxed);
+    if (successes != NULL)
+        *successes = atomic_load_explicit(&amd64_jit_compile_successes, memory_order_relaxed);
+    if (fallbacks != NULL)
+        *fallbacks = atomic_load_explicit(&amd64_jit_compile_fallbacks, memory_order_relaxed);
 }
 
 bool amd64_jit_is_enabled(void) {
@@ -621,8 +693,11 @@ static inline void jit_crash_track_mutex_unlock(lock_t *mutex) {
 
 static void jit_block_disconnect(struct jit *jit, struct jit_block *block);
 static void jit_block_free(struct jit *jit, struct jit_block *block);
+static void jit_insert(struct jit *jit, struct jit_block *block);
 static void jit_free_jetsam(struct jit *jit);
 static void jit_resize_hash(struct jit *jit, size_t new_size);
+static void jit_shared_forget_page(struct jit *jit, page_t page);
+static void jit_shared_free(struct jit *jit);
 
 // Called by hook.c's Mach exception handler when a JIT thread faults while
 // executing translated code. The handler redirects the faulting thread's PC
@@ -714,19 +789,99 @@ static void jit_unmapped_guest_fault(void *host_addr) {
     jit_crash_fn(); // noreturn: releases locks and unwinds
 }
 
+// A host address as something that can be looked up in a binary: the image it
+// belongs to and the offset into it, which is what `atos -o <image> -l 0` and
+// `nm`/`objdump` want. Raw runtime addresses are useless in a log, because ASLR
+// means they name nothing once the process is gone -- reconstructing the slide
+// afterwards needs a matching build and nine known frames to triangulate from,
+// which is exactly the archaeology this exists to prevent.
+static void jit_describe_host_addr(char *buf, size_t len, const void *addr) {
+#if __APPLE__
+    Dl_info info;
+    if (addr != NULL && dladdr(addr, &info) != 0 && info.dli_fname != NULL &&
+            info.dli_fbase != NULL) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        snprintf(buf, len, "%s+0x%llx", slash != NULL ? slash + 1 : info.dli_fname,
+                 (unsigned long long) ((uintptr_t) addr - (uintptr_t) info.dli_fbase));
+        return;
+    }
+#else
+    (void) addr;
+#endif
+    snprintf(buf, len, "no image");
+}
+
+// What the access was DOING, which is the difference between a wild pointer and
+// a legal pointer used illegally. A write to read-only memory (a string literal,
+// a const table) reports protection failure; an unmapped address reports invalid
+// address; a page that could not be read in reports a memory error. These say
+// completely different things about the bug, and the old log said none of them.
+static const char *jit_fault_kind(long kind) {
+#if __APPLE__
+    switch (kind) {
+        case KERN_INVALID_ADDRESS:    return "unmapped";
+        case KERN_PROTECTION_FAILURE: return "protection failure (write to read-only?)";
+        case KERN_MEMORY_ERROR:       return "memory error (page-in failed)";
+        default: break;
+    }
+#endif
+    (void) kind;
+    return "unknown";
+}
+
+// The one line a real bad access gets to leave behind, from either platform's
+// handler. Both call it with the same three facts so the CLI and the app are
+// diagnosable the same way -- until now the CLI printed nothing at all here,
+// and re-faulted into a bare crash.
+static void jit_report_untranslatable(void *host_addr, const char *what,
+                                      void *fault_pc) {
+    // The raw facts FIRST, in one printk, before anything that can block.
+    // jit_describe_host_addr calls dladdr, which takes dyld's lock -- on a
+    // thread that has just faulted while holding who knows what. That is a
+    // small risk worth taking for a symbolisable address, but not at the price
+    // of losing the report altogether, so the line that matters is already out
+    // if the lookup below ever wedges.
+    printk("JIT: untranslatable bad access at host %p from pc %p: %s "
+           "(pid %d, comm %s) - crashing\n",
+           host_addr, fault_pc, what,
+           current ? current->pid : -1,
+           current ? current->comm : "none");
+    char where[256], who[256];
+    jit_describe_host_addr(where, sizeof(where), host_addr);
+    jit_describe_host_addr(who, sizeof(who), fault_pc);
+    printk("JIT:   host %p is %s, pc %p is %s\n",
+           host_addr, where, fault_pc, who);
+}
+
 // Faulting-thread entry point for the device (Mach) path. The Mach exception
 // handler (app/hook.c) runs on a dedicated server pthread where `current` is
 // NULL, so it cannot reverse-map the fault itself. Instead it redirects the
-// FAULTING thread's PC here (fault address in the first argument register), so
-// this runs with the guest thread's `current` intact. If the address backs a
-// guest page, unwind with a guest SIGBUS; if it doesn't but the fault
-// happened during guest execution, unwind with a guest SIGSEGV (see
-// jit_unmapped_guest_fault); otherwise it is a real bad access (wild
-// pointer in a helper, corrupted state) and we crash, logging the address.
-// A re-entrancy guard covers only the page-table walk: if the walk itself
-// faults it re-enters here, and we abort rather than loop.
+// FAULTING thread's PC here, so this runs with the guest thread's `current`
+// intact. If the address backs a guest page, unwind with a guest SIGBUS; if it
+// doesn't but the fault happened during guest execution, unwind with a guest
+// SIGSEGV (see jit_unmapped_guest_fault); otherwise it is a real bad access
+// (wild pointer in a helper, corrupted state) and we crash. A re-entrancy guard
+// covers only the page-table walk: if the walk itself faults it re-enters here,
+// and we abort rather than loop.
+//
+// host_addr is WHERE the access touched, kind is WHAT it was doing, and
+// fault_pc is WHICH INSTRUCTION did it: the Mach exception's code[1], code[0]
+// and the faulting thread's PC.
+//
+// The PC has to be handed over rather than read here, because reporting
+// destroys it -- the handler redirects the faulting thread's PC to this
+// function, so by the time this runs the register that named the culprit holds
+// this function's address instead. Only the fault address used to survive, and
+// one line saying "untranslatable bad access at host 0x109519661" cannot name a
+// bug: that address turned out to be a string literal in __cstring, which
+// narrows it to "a write to read-only memory or a wild read" and says nothing
+// at all about who did it.
 __attribute__((__noreturn__))
-void jit_crash_bus_fn(void *host_addr) {
+void jit_crash_bus_fn(void *host_addr, long kind, void *fault_pc) {
+    // The kernel's own guarded access to guest memory, a syscall copying a
+    // file page past EOF (emu/host_fault.h): it resumes at its guard and the
+    // syscall fails. First, because it is not the guest that faulted.
+    host_fault_guard_recover(host_addr);
     static __thread bool bus_dispatch_active = false;
     if (bus_dispatch_active)
         abort(); // the reverse-map walk faulted -> genuine memory corruption
@@ -737,15 +892,72 @@ void jit_crash_bus_fn(void *host_addr) {
         jit_crash_fn(); // noreturn: releases locks and unwinds with INT_BUS
     if (jit_crash_unwind_active && current != NULL)
         jit_unmapped_guest_fault(host_addr); // noreturn: guest SIGSEGV
-    printk("JIT: untranslatable bad access at host %p (pid %d) - crashing\n",
-           host_addr, current ? current->pid : -1);
+    jit_report_untranslatable(host_addr, jit_fault_kind(kind), fault_pc);
     abort();
 }
 
 // POSIX SIGBUS handler (standalone CLI only — the device app catches these via
 // Mach before POSIX delivery). Runs on a per-thread altstack (SA_ONSTACK).
+static void *jit_uctx_pc(void *uctx) {
+    if (uctx == NULL)
+        return NULL;
+#if __APPLE__
+    ucontext_t *uc = uctx;
+    if (uc->uc_mcontext == NULL)
+        return NULL;
+#if defined(__aarch64__)
+    return (void *) (uintptr_t) uc->uc_mcontext->__ss.__pc;
+#elif defined(__x86_64__)
+    return (void *) (uintptr_t) uc->uc_mcontext->__ss.__rip;
+#endif
+#endif
+    return NULL;
+}
+
+// A host fault inside one of the amd64 register-cache memory gadgets (math.S,
+// between amd64_specmem_start and amd64_specmem_end): there the cache in
+// x20-x27 is authoritative for rax..rdi and CPU_amd64_regs may be behind it,
+// and the crash unwind restores x20-x27 from its jmpbuf -- so before it, put
+// the faulting thread's values where the unwind's cpu copy will find them.
+// x1 is the gadgets' _cpu. x is the faulting thread's x0..x28. Called from the
+// POSIX handler below and from the Mach handler (app/hook.c) -- the latter on
+// the exception-server thread while the faulting thread is suspended.
+void jit_amd64_fault_spill(uint64_t pc, const uint64_t *x) {
+#if defined(__aarch64__)
+    extern char amd64_specmem_start[], amd64_specmem_end[];
+    if (pc < (uint64_t) (uintptr_t) amd64_specmem_start || pc >= (uint64_t) (uintptr_t) amd64_specmem_end)
+        return;
+    struct cpu_state *cpu = (struct cpu_state *) (uintptr_t) x[1];
+    if (cpu == NULL)
+        return;
+    cpu->amd64_regs[0] = x[20];
+    cpu->amd64_regs[1] = x[22];
+    cpu->amd64_regs[2] = x[23];
+    cpu->amd64_regs[3] = x[21];
+    cpu->amd64_regs[4] = x[27];
+    cpu->amd64_regs[5] = x[26];
+    cpu->amd64_regs[6] = x[24];
+    cpu->amd64_regs[7] = x[25];
+#else
+    (void) pc; (void) x;
+#endif
+}
+
 static void jit_host_sigbus_handler(int sig, siginfo_t *info, void *uctx) {
-    (void) uctx;
+#if defined(__aarch64__) && defined(__APPLE__)
+    if (uctx != NULL && ((ucontext_t *) uctx)->uc_mcontext != NULL)
+        jit_amd64_fault_spill(((ucontext_t *) uctx)->uc_mcontext->__ss.__pc,
+                              ((ucontext_t *) uctx)->uc_mcontext->__ss.__x);
+#elif defined(__aarch64__) && defined(__linux__)
+    if (uctx != NULL)
+        jit_amd64_fault_spill(((ucontext_t *) uctx)->uc_mcontext.pc,
+                              (const uint64_t *) ((ucontext_t *) uctx)->uc_mcontext.regs);
+#endif
+    // A guarded kernel access (emu/host_fault.h), as in jit_crash_bus_fn: out
+    // of the handler to the guard, which, like the unwind below, was armed
+    // with savemask 0 -- SA_NODEFER is what leaves SIGBUS unblocked after it.
+    if (info != NULL)
+        host_fault_guard_recover(info->si_addr);
     if (info != NULL && jit_translate_host_fault(info->si_addr)) {
         // Unwind out of the faulting gadget back to cpu_step_to_interrupt's
         // sigsetjmp, which returns INT_BUS. jit_crash_fn releases the jetsam
@@ -762,19 +974,39 @@ static void jit_host_sigbus_handler(int sig, siginfo_t *info, void *uctx) {
         // emulator crash. See jit_unmapped_guest_fault.
         jit_unmapped_guest_fault(info != NULL ? info->si_addr : NULL); // noreturn
     }
-    // Not a translatable guest fault: real bug. Restore the default disposition
-    // and return so the instruction re-faults into a normal crash/core dump,
-    // preserving debuggability.
+    // Not a translatable guest fault: real bug. Say so FIRST -- this used to
+    // return in silence, so the CLI's only account of a genuine host fault was
+    // whatever the re-fault left in a crash report. Then restore the default
+    // disposition and return, so the instruction re-faults into a normal
+    // crash/core dump and debuggability is preserved.
+    char what[64];
+    snprintf(what, sizeof(what), "signal %d, si_code %d", sig,
+             info != NULL ? info->si_code : 0);
+    jit_report_untranslatable(info != NULL ? info->si_addr : NULL, what,
+                              jit_uctx_pc(uctx));
     signal(sig, SIG_DFL);
 }
 
-// Process-wide SIGBUS disposition, installed once.
+// Process-wide SIGBUS and SIGSEGV disposition, installed once.
+//
+// SIGSEGV too, because an access to host memory that is not mapped at all
+// raises SIGSEGV (KERN_INVALID_ADDRESS), not SIGBUS: that is the stale-TLB
+// race, a guest access through an entry whose page a munmap or an exec has
+// already released, which the handler's jit_unmapped_guest_fault branch heals
+// by flushing and re-executing (55afb69d1). With only SIGBUS routed here that
+// branch was unreachable on the CLI -- the device's Mach handler sees every
+// EXC_BAD_ACCESS -- and the race killed the whole emulator instead:
+// concurrent_exec_tlb took the CLI down about one run in ten, in fpu_ldm80
+// under fhelper_read80 (an x87 load in cc1's startup). A fault outside guest
+// execution is still reported, the default restored, and re-raised, so a real
+// emulator bug crashes as loudly as before.
 static void jit_install_host_fault_sigaction(void) {
     struct sigaction sa = {0};
     sa.sa_sigaction = jit_host_sigbus_handler;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGSEGV, &sa, NULL);
 }
 
 // Per-thread setup for the CLI POSIX host-fault handler: a dedicated altstack
@@ -791,6 +1023,22 @@ static void jit_install_host_fault_signal_handler(void) {
 
     static pthread_once_t once = PTHREAD_ONCE_INIT;
     pthread_once(&once, jit_install_host_fault_sigaction);
+}
+
+// Both handlers for the calling thread, once: every engine's entry calls this,
+// and so does a guarded kernel access (emu/host_fault.h), which can run on a
+// thread that has never entered the JIT. The Mach port is per thread (the
+// device); when it is not active (the standalone CLI), a host SIGBUS on a
+// truncated file-backed guest mmap would otherwise kill the process, so the
+// POSIX handler translates it into a guest SIGBUS instead.
+void jit_host_fault_thread_init(void) {
+    static __thread bool installed = false;
+    if (installed)
+        return;
+    jit_install_thread_exception_handler();
+    if (!jit_host_fault_mach_active())
+        jit_install_host_fault_signal_handler();
+    installed = true;
 }
 
 // Acquire jetsam write lock with a short timeout. Uses non-blocking
@@ -941,10 +1189,13 @@ struct jit *jit_new(struct mmu *mmu) {
         printk("ERROR: Failed to allocate memory for JIT\n");
         return NULL;
     }
+    for (int i = 0; i < JIT_LOOKUP_STRIPES; i++)
+        pthread_mutex_init(&jit->lookup_lock[i], NULL);
     lock(&jit->lock, 0);
     jit->mmu = mmu;
     jit_resize_hash(jit, JIT_INITIAL_HASH_SIZE);
-    jit->page_hash = calloc(JIT_PAGE_HASH_SIZE, sizeof(*jit->page_hash));
+    jit->page_hash = calloc(JIT_INITIAL_PAGE_HASH_SIZE, sizeof(*jit->page_hash));
+    jit->page_hash_size = JIT_INITIAL_PAGE_HASH_SIZE;
     list_init(&jit->jetsam);
     lock_init(&jit->lock, "jit_new\0");
     wrlock_init(&jit->jetsam_lock);
@@ -1038,6 +1289,7 @@ void jit_invalidate_unlock(struct jit *jit) {
 // never released; the struct is freed while it is held.
 void jit_free(struct jit *jit) {
     if (!jit) return;
+    jit_lineage_detach(jit);
     lock(&jit->lock, 0);
     for (size_t i = 0; i < jit->hash_size; i++) {
         struct jit_block *block, *tmp;
@@ -1050,13 +1302,17 @@ void jit_free(struct jit *jit) {
     jit_free_jetsam(jit);
     free(jit->page_hash);
     free(jit->hash);
+    free(jit->code_writes);
+    jit_shared_free(jit);
     unlock(&jit->lock);
+    for (int i = 0; i < JIT_LOOKUP_STRIPES; i++)
+        pthread_mutex_destroy(&jit->lookup_lock[i]);
     free(jit);
 }
 
 static inline struct list *blocks_list(struct jit *jit, page_t page, int i) {
     // Page numbers are dense small integers, so plain modulo distributes fine here.
-    return &jit->page_hash[page % JIT_PAGE_HASH_SIZE].blocks[i];
+    return &jit->page_hash[page & (jit->page_hash_size - 1)].blocks[i];
 }
 
 // Block addresses are clustered (aligned entry points, dense code pages), and
@@ -1067,38 +1323,54 @@ static inline size_t jit_hash_bucket(guest_addr_t addr, size_t size) {
     return (size_t) ((addr * 0x9E3779B97F4A7C15ull) >> 32) % size;
 }
 
-void jit_invalidate_range(struct jit *jit, page_t start, page_t end) {
-    lock(&jit->lock, 0);
+// Drop this page's translations. Caller holds jit->lock; returns whether
+// any block was dropped, which obliges the caller to bump cleanup_seq.
+static bool jit_invalidate_page_locked(struct jit *jit, page_t page) {
     bool invalidated = false;
     struct jit_block *block, *tmp;
-    for (page_t page = start; page < end; page++) {
-        for (int i = 0; i <= 1; i++) {
-            struct list *blocks = blocks_list(jit, page, i);
-            if (list_null(blocks))
-                continue;
-            // A single page bucket can hold at most every block on this jit, so
-            // more iterations than num_blocks means the page[i] linkage has a
-            // cycle -- observed as an unkillable 100%-CPU hang here (a store
-            // fault's SMC invalidation walking a corrupted list) after heavy
-            // guest JIT churn (node/V8 under npm). Cap the walk at that exact
-            // bound: on overrun, log loudly and stop rather than spin forever.
-            // The remaining blocks stay compiled (a bounded SMC-staleness risk,
-            // vs. an infinite hang) and the surrounding fault path proceeds.
-            size_t guard = jit->num_blocks + 1;
-            list_for_each_entry_safe(blocks, block, tmp, page[i]) {
-                if (guard-- == 0) {
-                    printk("BUG: jit_invalidate_range cyclic page list "
-                           "jit=%p page=%u i=%d num_blocks=%zu; breaking\n",
-                           (void *) jit, page, i, jit->num_blocks);
-                    break;
-                }
-                jit_block_disconnect(jit, block);
-                block->is_jetsam = true;
-                list_add(&jit->jetsam, &block->jetsam);
-                invalidated = true;
+    for (int i = 0; i <= 1; i++) {
+        struct list *blocks = blocks_list(jit, page, i);
+        if (list_null(blocks))
+            continue;
+        // A single page bucket can hold at most every block on this jit, so
+        // more iterations than num_blocks means the page[i] linkage has a
+        // cycle -- observed as an unkillable 100%-CPU hang here (a store
+        // fault's SMC invalidation walking a corrupted list) after heavy
+        // guest JIT churn (node/V8 under npm). Cap the walk at that exact
+        // bound: on overrun, log loudly and stop rather than spin forever.
+        // The remaining blocks stay compiled (a bounded SMC-staleness risk,
+        // vs. an infinite hang) and the surrounding fault path proceeds.
+        size_t guard = jit->num_blocks + 1;
+        list_for_each_entry_safe(blocks, block, tmp, page[i]) {
+            if (guard-- == 0) {
+                printk("BUG: jit_invalidate_range cyclic page list "
+                       "jit=%p page=%u i=%d num_blocks=%zu; breaking\n",
+                       (void *) jit, page, i, jit->num_blocks);
+                break;
             }
+            // The bucket is shared by every page congruent to this one
+            // mod page_hash_size, so it holds other pages' blocks too.
+            // Only this page's are stale: jit_insert links a block under
+            // exactly PAGE(addr) and PAGE(end_addr). Dropping the others
+            // made a write to any data page throw away every block whose
+            // code page shares its bucket -- and a write spanning 1024
+            // pages, the whole process's translations, with every thread
+            // then stalling in the jetsam cleanup. Keeping them is what
+            // makes the table's size matter: see jit_resize_page_hash.
+            if (PAGE(i == 0 ? block->addr : block->end_addr) != page)
+                continue;
+            jit_block_disconnect(jit, block);
+            block->is_jetsam = true;
+            list_add(&jit->jetsam, &block->jetsam);
+            invalidated = true;
         }
     }
+    // No block touches the page now; a store to shared memory need not find it.
+    jit_shared_forget_page(jit, page);
+    return invalidated;
+}
+
+static void jit_invalidated(struct jit *jit) {
     // Invalidated blocks stay allocated (jetsam) until a write-locked
     // cleanup, so per-thread dispatch caches, frame->last_block, and the
     // assembly ret_cache still hold pointers to their now-STALE
@@ -1111,13 +1383,515 @@ void jit_invalidate_range(struct jit *jit, page_t start, page_t end) {
     // translation then ran the OLD function's code against the NEW
     // function's frames -> npm/node crashed ~50% of runs (LoadIC probing
     // a feedback slot of the wrong IC kind, V8 CHECK failures, SIGSEGV).
+    atomic_fetch_add_explicit(&jit->cleanup_seq, 1, memory_order_relaxed);
+}
+
+void jit_invalidate_range(struct jit *jit, page_t start, page_t end) {
+    lock(&jit->lock, 0);
+    bool invalidated = false;
+    for (page_t page = start; page < end; page++)
+        invalidated |= jit_invalidate_page_locked(jit, page);
     if (invalidated)
-        atomic_fetch_add_explicit(&jit->cleanup_seq, 1, memory_order_relaxed);
+        jit_invalidated(jit);
+    unlock(&jit->lock);
+}
+
+// Every page a rectangle of `rows` rows of `row_bytes` bytes, `stride` apart
+// from `start`, covers, under ONE jit->lock -- see mem_write_prepare_rect,
+// the reason this exists. Rows advance, so a page shared by consecutive
+// rows (stride under a page) is visited once.
+void jit_invalidate_rect(struct jit *jit, guest_addr_t start, uint64_t stride,
+        uint64_t row_bytes, uint32_t rows) {
+    if (rows == 0 || row_bytes == 0)
+        return;
+    lock(&jit->lock, 0);
+    bool invalidated = false;
+    page_t next = PAGE(start);
+    for (uint32_t r = 0; r < rows; r++) {
+        guest_addr_t row = (guest_addr_t) (start + (uint64_t) r * stride);
+        page_t first = PAGE(row), last = PAGE(row + row_bytes - 1);
+        for (page_t page = first > next ? first : next; page <= last; page++)
+            invalidated |= jit_invalidate_page_locked(jit, page);
+        if (last + 1 > next)
+            next = last + 1;
+    }
+    if (invalidated)
+        jit_invalidated(jit);
     unlock(&jit->lock);
 }
 
 void jit_invalidate_page(struct jit *jit, page_t page) {
     jit_invalidate_range(jit, page, page + 1);
+}
+
+// ---- x86 self-modifying code ----------------------------------------------
+//
+// x86 has no instruction-cache maintenance: a store to code is seen by the
+// next fetch, and programs rely on it (tests/manual/modify.c). arm64 and
+// riscv64 guests have to say so (arm64_ic_ivau, riscv64_fence_i below).
+//
+// A store drops a page's blocks only on the TLB write MISS path (mmu_translate
+// -> mem_ptr -> jit_invalidate_page). Once a TLB entry is writable, later
+// stores hit it and reach nothing. So when a block is compiled from a page,
+// no TLB may keep that page writable: its next store has to miss again.
+//
+// Taking a page's writability away from every thread's TLB is a bump of
+// mmu->changes, which each thread's write fast path compares before every
+// store. That flushes whole TLBs, so it is done only when some TLB may hold
+// the page writable -- which is what the notes below record. A page nobody
+// has stored to since the last bump (all ordinary .text) costs nothing, and a
+// page only the compiling thread has stored to (code patching itself, the
+// common case) costs one entry of that thread's own TLB.
+//
+// The protocol, all of it under jit->lock:
+//  - jit_note_code_write, from tlb_handle_miss AFTER the writable entry is
+//    installed: drop the page's blocks, and record the store in the page's
+//    slot (seq, the mmu->changes the entry is valid under, which TLB, and
+//    which page that TLB's entry is for).
+//  - jit_code_write_prepare, BEFORE a compile reads any bytes: if a slot for
+//    either page the block can span records a writable entry that is still
+//    valid, take it away -- from the compiling thread's own TLB if that is the
+//    only one the slot names, else by bumping mmu->changes. Every store after
+//    this misses and is noted.
+//  - jit_code_write_raced, at insert: a note for the block's pages since
+//    prepare means a store may have landed after the compile read the bytes.
+//    The block then runs once and is dropped, never cached -- the one outcome
+//    that cannot leave stale code behind, and it cannot livelock against a
+//    thread that keeps storing.
+//
+// Noting after the install is what closes the race with a compile on another
+// thread: noted before it, a prepare could slip between the note and the
+// install and leave a writable entry behind that no slot records.
+//
+// Left open, as in every emulator that translates: a store whose TLB check
+// passed on one thread just before another thread's bump, and which lands
+// just after that thread's compile read the bytes. That is unsynchronized
+// cross-modifying code, which the SDM (8.1.3) leaves undefined. Stores within
+// the block being executed are not seen until it exits, either.
+//
+// Slots are a small direct-mapped table keyed by page -- or, for a MAP_SHARED
+// page, by what it maps (below): two keys sharing a slot cost at worst a
+// needless bump or a needless run-once, never a miss.
+#define JIT_CODE_WRITE_SLOT_BITS 9
+#define JIT_CODE_WRITE_SLOTS (1 << JIT_CODE_WRITE_SLOT_BITS)
+struct jit_code_write {
+    uint64_t seq;
+    uint64_t changes;
+    // The one TLB that made a page here writable while mmu->changes ==
+    // changes, or NULL once a second one has -- or the same one, for a second
+    // page. Only ever compared with the compiling thread's own TLB, so a dead
+    // thread's stale pointer is safe.
+    const struct tlb *writer;
+    // The page writer's entry is for: the page itself, or for a shared page,
+    // the mapping of it that was stored through.
+    page_t page;
+};
+
+static inline size_t jit_code_write_slot(uint64_t key) {
+    return (size_t) ((key * 0x9E3779B97F4A7C15ull) >> (64 - JIT_CODE_WRITE_SLOT_BITS));
+}
+
+// ---- code reached through a second mapping --------------------------------
+//
+// Blocks are keyed by guest virtual page. A W^X "dual mapping" JIT -- .NET 7
+// and later by default, libffi when RWX mmap is refused -- maps one memfd or
+// file twice, MAP_SHARED: read-write, where it writes code, and read-execute,
+// where it runs it. The store reaches only the RW page, which has no blocks;
+// the RX page's run on. Each guest mmap of a shared file is its own host
+// mapping and its own struct data, so nothing short of the host file says the
+// two pages are one.
+//
+// So a page holding blocks compiled from shared memory is also recorded under
+// what it maps (mem_shared_page_id: host file and page, SysV segment, or the
+// struct data of anonymous shared memory), and the protocol above runs on that
+// id in place of the page, for every shared page: a note drops the blocks of
+// every page recorded under the id and fills the id's slot, naming the page
+// actually stored through; prepare revokes that page's entry; insert records
+// the block's pages under their ids before the raced check, so a note either
+// comes after and finds them, or before and makes the block run once.
+//
+// Nothing is noted for shared pages until the first block is compiled from
+// one (jit->track_shared_code), and that compile bumps mmu->changes, since
+// stores made before it left writable entries no slot records. A process that
+// never executes shared memory pays nothing for any of this.
+//
+// Within one address space only. A store from ANOTHER address space -- a
+// forked child writing its inherited RW mapping, an unrelated process
+// mapping the same file, write(2) to the file -- reaches neither this table
+// nor this mm's TLBs, and the RX alias runs stale code, as it always has.
+// Nor is a MAP_PRIVATE mapping of the file tracked, which Linux keeps in step
+// with the file until the page is first written; no JIT maps code that way.
+struct jit_shared_page {
+    struct list by_page;
+    struct list by_id;
+    page_t page;
+    struct mem_shared_id id;
+};
+
+struct jit_shared_code {
+    // Two views of the same nodes, one node per guest page: by page, to
+    // forget a page whose blocks are gone; by id, to find every page a store
+    // has to reach. `size` buckets each, a power of two, grown with count.
+    struct list *by_page;
+    struct list *by_id;
+    size_t size;
+    size_t count;
+};
+
+static uint64_t jit_shared_id_key(const struct mem_shared_id *id) {
+    uint64_t h = id->kind;
+    h = (h ^ id->object[0]) * 0x9E3779B97F4A7C15ull;
+    h = (h ^ id->object[1]) * 0x9E3779B97F4A7C15ull;
+    h = (h ^ id->index) * 0x9E3779B97F4A7C15ull;
+    return h ^ (h >> 31);
+}
+
+static inline size_t jit_shared_bucket(uint64_t key, size_t size) {
+    return (size_t) ((key * 0x9E3779B97F4A7C15ull) >> 32) & (size - 1);
+}
+
+static bool jit_shared_resize(struct jit_shared_code *sc, size_t new_size) {
+    struct list *by_page = calloc(new_size, sizeof(struct list));
+    struct list *by_id = calloc(new_size, sizeof(struct list));
+    if (by_page == NULL || by_id == NULL) {
+        free(by_page);
+        free(by_id);
+        return false;
+    }
+    for (size_t i = 0; i < sc->size; i++) {
+        if (list_null(&sc->by_page[i]))
+            continue;
+        struct jit_shared_page *sp, *tmp;
+        list_for_each_entry_safe(&sc->by_page[i], sp, tmp, by_page) {
+            list_remove(&sp->by_page);
+            list_remove(&sp->by_id);
+            list_init_add(&by_page[jit_shared_bucket(sp->page, new_size)], &sp->by_page);
+            list_init_add(&by_id[jit_shared_bucket(jit_shared_id_key(&sp->id), new_size)], &sp->by_id);
+        }
+    }
+    free(sc->by_page);
+    free(sc->by_id);
+    sc->by_page = by_page;
+    sc->by_id = by_id;
+    sc->size = new_size;
+    return true;
+}
+
+static struct jit_shared_page *jit_shared_find_page(struct jit_shared_code *sc, page_t page) {
+    struct list *bucket = &sc->by_page[jit_shared_bucket(page, sc->size)];
+    if (list_null(bucket))
+        return NULL;
+    struct jit_shared_page *sp;
+    list_for_each_entry(bucket, sp, by_page) {
+        if (sp->page == page)
+            return sp;
+    }
+    return NULL;
+}
+
+// `page` holds blocks compiled from the shared memory `id`. Caller holds
+// jit->lock. False if that could not be recorded, and then the block must
+// not be cached: a store through another mapping would never find it.
+static bool jit_shared_add(struct jit *jit, page_t page, const struct mem_shared_id *id) {
+    struct jit_shared_code *sc = jit->shared_code;
+    if (sc == NULL) {
+        sc = calloc(1, sizeof(*sc));
+        if (sc == NULL || !jit_shared_resize(sc, 64)) {
+            free(sc);
+            return false;
+        }
+        jit->shared_code = sc;
+    }
+    struct jit_shared_page *sp = jit_shared_find_page(sc, page);
+    if (sp != NULL) {
+        if (mem_shared_id_equal(&sp->id, id))
+            return true;
+        list_remove(&sp->by_id);
+    } else {
+        if (sc->count >= sc->size * 2)
+            jit_shared_resize(sc, sc->size * 2); // kept smaller on failure: slower, never wrong
+        sp = malloc(sizeof(*sp));
+        if (sp == NULL)
+            return false;
+        sp->page = page;
+        list_init_add(&sc->by_page[jit_shared_bucket(page, sc->size)], &sp->by_page);
+        sc->count++;
+    }
+    sp->id = *id;
+    list_init_add(&sc->by_id[jit_shared_bucket(jit_shared_id_key(id), sc->size)], &sp->by_id);
+    return true;
+}
+
+// jit_invalidate_page_locked has dropped every block touching `page`.
+static void jit_shared_forget_page(struct jit *jit, page_t page) {
+    struct jit_shared_code *sc = jit->shared_code;
+    if (sc == NULL || sc->count == 0)
+        return;
+    struct jit_shared_page *sp = jit_shared_find_page(sc, page);
+    if (sp == NULL)
+        return;
+    list_remove(&sp->by_page);
+    list_remove(&sp->by_id);
+    free(sp);
+    sc->count--;
+}
+
+static void jit_shared_free(struct jit *jit) {
+    struct jit_shared_code *sc = jit->shared_code;
+    if (sc == NULL)
+        return;
+    for (size_t i = 0; i < sc->size; i++) {
+        if (list_null(&sc->by_page[i]))
+            continue;
+        struct jit_shared_page *sp, *tmp;
+        list_for_each_entry_safe(&sc->by_page[i], sp, tmp, by_page)
+            free(sp);
+    }
+    free(sc->by_page);
+    free(sc->by_id);
+    free(sc);
+    jit->shared_code = NULL;
+}
+
+// Drop the blocks of every page recorded under `id`. Caller holds jit->lock;
+// returns whether any block was dropped, which obliges the caller to bump
+// cleanup_seq.
+static bool jit_shared_invalidate(struct jit *jit, const struct mem_shared_id *id) {
+    struct jit_shared_code *sc = jit->shared_code;
+    if (sc == NULL || sc->count == 0)
+        return false;
+    struct list *bucket = &sc->by_id[jit_shared_bucket(jit_shared_id_key(id), sc->size)];
+    if (list_null(bucket))
+        return false;
+    bool invalidated = false;
+    struct jit_shared_page *sp, *tmp;
+    list_for_each_entry_safe(bucket, sp, tmp, by_id) {
+        // Forgets sp, and only sp: one node per page.
+        if (mem_shared_id_equal(&sp->id, id))
+            invalidated |= jit_invalidate_page_locked(jit, sp->page);
+    }
+    return invalidated;
+}
+
+// What the code-write protocol needs to know about a page: its P_EXEC and
+// P_SHARED bits (P_EXEC where mmu_page_executable would say so without an
+// entry), and whether *id was filled -- a shared page with an entry. A shared
+// page still only reserved has no id, and needs none: until it is touched no
+// mapping of it exists but that reservation, and no TLB holds it.
+static unsigned jit_code_page(struct jit *jit, page_t page, struct mem_shared_id *id, bool *have_id) {
+    struct mem *mem = container_of(jit->mmu, struct mem, mmu);
+    *have_id = false;
+    if (page >= mem->page_limit)
+        return P_EXEC;
+    struct pt_entry *entry = mem_pt(mem, page);
+    if (entry != NULL) {
+        *have_id = mem_shared_page_id(entry, id);
+        return entry->flags & (P_EXEC | P_SHARED);
+    }
+    struct mem_lazy_map *lazy = mem_lazy_find(mem, page);
+    if (lazy != NULL)
+        return lazy->flags & (P_EXEC | P_SHARED);
+    return P_EXEC;
+}
+
+// Takes writability away from every TLB of this address space: each one's
+// next store sees mmu->changes move and goes back through tlb_handle_miss.
+static void jit_revoke_writable(struct jit *jit) {
+    atomic_fetch_add_explicit(&jit->mmu->changes, 1, memory_order_seq_cst);
+}
+
+bool jit_note_code_write(struct jit *jit, page_t page, const struct tlb *tlb) {
+    struct mem_shared_id id;
+    bool shared;
+    unsigned flags = jit_code_page(jit, page, &id, &shared);
+    shared = shared && atomic_load_explicit(&jit->track_shared_code, memory_order_relaxed);
+    if (!(flags & P_EXEC) && !shared)
+        return true;
+    lock(&jit->lock, 0);
+    if (jit->code_writes == NULL)
+        jit->code_writes = calloc(JIT_CODE_WRITE_SLOTS, sizeof(*jit->code_writes));
+    // Again, although mem_ptr did it before installing: a compile may have
+    // inserted a block from this page in between. For a shared page, also
+    // every other mapping's blocks, which nothing has dropped yet.
+    bool invalidated = jit_invalidate_page_locked(jit, page);
+    if (shared)
+        invalidated |= jit_shared_invalidate(jit, &id);
+    if (invalidated)
+        jit_invalidated(jit);
+    bool noted = jit->code_writes != NULL;
+    if (noted) {
+        struct jit_code_write *slot = &jit->code_writes[
+                jit_code_write_slot(shared ? jit_shared_id_key(&id) : page)];
+        slot->seq = ++jit->code_write_seq;
+        // A TLB behind mmu->changes is already doomed, and must not overwrite
+        // a slot that still describes a live entry.
+        uint64_t changes = atomic_load_explicit(&jit->mmu->changes, memory_order_seq_cst);
+        if (tlb->mem_changes == changes) {
+            if (slot->changes != changes) {
+                slot->writer = tlb;
+                slot->page = page;
+            } else if (slot->writer != tlb || slot->page != page) {
+                slot->writer = NULL;
+            }
+            slot->changes = changes;
+        }
+    }
+    unlock(&jit->lock);
+    return noted;
+}
+
+void jit_note_shared_write(struct jit *jit, const struct pt_entry *entry) {
+    struct mem_shared_id id;
+    if (jit == NULL || !atomic_load_explicit(&jit->track_shared_code, memory_order_relaxed) ||
+            !mem_shared_page_id(entry, &id))
+        return;
+    lock(&jit->lock, 0);
+    if (jit_shared_invalidate(jit, &id))
+        jit_invalidated(jit);
+    // No TLB entry to record, but a compile in flight may already have read
+    // the bytes: make it run once (jit_code_write_raced).
+    if (jit->code_writes != NULL)
+        jit->code_writes[jit_code_write_slot(jit_shared_id_key(&id))].seq = ++jit->code_write_seq;
+    unlock(&jit->lock);
+}
+
+// Before compiling a block at ip on the thread that owns tlb. Returns the seq
+// jit_code_write_raced checks.
+static uint64_t jit_code_write_prepare(struct jit *jit, guest_addr_t ip, struct tlb *tlb) {
+    // A block holds at most a page of code, so it ends on this page or the
+    // next.
+    struct {
+        page_t page;
+        unsigned flags;
+        bool have_id;
+        struct mem_shared_id id;
+    } pages[2];
+    bool shared = false;
+    for (int i = 0; i < 2; i++) {
+        pages[i].page = PAGE(ip) + i;
+        pages[i].flags = jit_code_page(jit, pages[i].page, &pages[i].id, &pages[i].have_id);
+        shared |= (pages[i].flags & P_SHARED) != 0;
+    }
+    // Stores made before this, by an engine that noted nothing -- or to
+    // shared pages, which were not noted before code came from one -- may
+    // have left writable entries behind. Both flags are set before the bump,
+    // so a store whose entry is valid after it sees them (tlb_handle_miss).
+    bool first = false;
+    if (!atomic_load_explicit(&jit->track_code_writes, memory_order_relaxed)) {
+        atomic_store_explicit(&jit->track_code_writes, true, memory_order_relaxed);
+        first = true;
+    }
+    if (shared && !atomic_load_explicit(&jit->track_shared_code, memory_order_relaxed)) {
+        atomic_store_explicit(&jit->track_shared_code, true, memory_order_relaxed);
+        first = true;
+    }
+    if (first) {
+        jit_revoke_writable(jit);
+    } else if (jit->code_writes != NULL) {
+        uint64_t changes = atomic_load_explicit(&jit->mmu->changes, memory_order_seq_cst);
+        for (int i = 0; i < 2; i++) {
+            if ((pages[i].flags & P_SHARED) && !pages[i].have_id)
+                continue;
+            const struct jit_code_write *slot = &jit->code_writes[jit_code_write_slot(
+                    pages[i].have_id ? jit_shared_id_key(&pages[i].id) : pages[i].page)];
+            if (slot->changes != changes)
+                continue;
+            if (slot->writer != tlb) {
+                jit_revoke_writable(jit);
+                break;
+            }
+            tlb_revoke_writable(tlb, (guest_addr_t) slot->page << PAGE_BITS);
+        }
+    }
+    return jit->code_write_seq;
+}
+
+// Has a note for any of the block's pages, by their slot keys, come since
+// prepare returned seq?
+static bool jit_code_write_raced(struct jit *jit, const uint64_t *keys, int n, uint64_t seq) {
+    if (jit->code_write_seq == seq || jit->code_writes == NULL)
+        return false;
+    for (int i = 0; i < n; i++) {
+        if (jit->code_writes[jit_code_write_slot(keys[i])].seq > seq)
+            return true;
+    }
+    return false;
+}
+
+// Whether ip's page has a store on record, under the key its notes use: the
+// page, or for shared memory the id every alias of it shares (see
+// jit_code_write_prepare). Only those pages pay for jit_compile_consistent's
+// snapshot; ordinary .text never does. A slot shared with another key only
+// costs a needless copy, and a shared page with no id is copied to be safe.
+static bool jit_code_written(struct jit *jit, guest_addr_t ip) {
+    if (jit->code_writes == NULL)
+        return false;
+    struct mem_shared_id id;
+    bool have_id;
+    unsigned flags = jit_code_page(jit, PAGE(ip), &id, &have_id);
+    if ((flags & P_SHARED) && !have_id)
+        return true;
+    uint64_t key = have_id ? jit_shared_id_key(&id) : PAGE(ip);
+    return jit->code_writes[jit_code_write_slot(key)].seq != 0;
+}
+
+static struct jit_block *jit_block_compile(addr_t ip, struct tlb *tlb);
+static struct jit_block *jit_block_compile_amd64(guest_addr_t ip, struct tlb *tlb,
+        bool *fallback_to_interp);
+
+// Compile with the first page's code snapshotted when it has been written to,
+// so the decoder sees one version of it: see tlb_fetch_snapshot_begin in
+// emu/tlb.c for the torn decode this prevents. Called after
+// jit_code_write_prepare, so a store after the copy is noted as usual.
+static struct jit_block *jit_compile_consistent(guest_addr_t ip, struct tlb *tlb, bool check) {
+    if (check)
+        tlb_fetch_snapshot_begin(tlb, ip);
+    struct jit_block *block = jit_block_compile((addr_t) ip, tlb);
+    if (check)
+        tlb_fetch_snapshot_end();
+    return block;
+}
+
+static struct jit_block *jit_compile_consistent_amd64(guest_addr_t ip, struct tlb *tlb,
+        bool check, bool *fallback_to_interp) {
+    if (check)
+        tlb_fetch_snapshot_begin(tlb, ip);
+    struct jit_block *block = jit_block_compile_amd64(ip, tlb, fallback_to_interp);
+    if (check)
+        tlb_fetch_snapshot_end();
+    return block;
+}
+
+// Insert a freshly compiled block, unless a store raced its compile: then it
+// goes straight to jetsam, so the caller runs it this once and the next
+// lookup compiles the page again. A block from shared memory is recorded
+// under what it maps first, so a store through any mapping finds it; if that
+// cannot be recorded, it is not cached either.
+static void jit_insert_checked(struct jit *jit, struct jit_block *block, uint64_t seq) {
+    jit_insert(jit, block);
+    bool keep = true;
+    page_t pages[2] = {PAGE(block->addr), PAGE(block->end_addr)};
+    uint64_t keys[2];
+    int n = pages[1] == pages[0] ? 1 : 2;
+    for (int i = 0; i < n; i++) {
+        struct mem_shared_id id;
+        bool have_id;
+        unsigned flags = jit_code_page(jit, pages[i], &id, &have_id);
+        if (have_id) {
+            keep &= jit_shared_add(jit, pages[i], &id);
+            keys[i] = jit_shared_id_key(&id);
+        } else {
+            // A shared page the compile read has an entry by now.
+            keep &= !(flags & P_SHARED);
+            keys[i] = pages[i];
+        }
+    }
+    if (!keep || jit_code_write_raced(jit, keys, n, seq)) {
+        jit_block_disconnect(jit, block);
+        block->is_jetsam = true;
+        list_add(&jit->jetsam, &block->jetsam);
+        jit_invalidated(jit);
+    }
 }
 
 // IC IVAU from the arm64 guest (memory.S's ic_ivau gadget): drop translated
@@ -1131,6 +1905,9 @@ void jit_invalidate_page(struct jit *jit, page_t page) {
 // (npm install on an arm64 guest died ~50% of runs; see
 // tests/manual/arm64/smc_stale_block.c for the distilled A/B).
 void arm64_ic_ivau(struct tlb *tlb, uint64_t addr) {
+    // ish-AOK-bind -- TBI: a tagged VA names the same page as its untagged
+    // self; PAGE() of the tagged one is a page nothing was compiled from.
+    addr &= 0x00ffffffffffffffULL;
     struct jit *jit = tlb->mmu->jit;
     if (jit != NULL)
         jit_invalidate_page(jit, PAGE(addr));
@@ -1151,9 +1928,16 @@ void jit_invalidate_all(struct jit *jit) {
     jit_invalidate_range(jit, 0, mem->page_limit);
 }
 
+static inline pthread_mutex_t *jit_lookup_stripe(struct jit *jit, guest_addr_t addr) {
+    return &jit->lookup_lock[jit_hash_bucket(addr, JIT_LOOKUP_STRIPES)];
+}
+
 static void jit_resize_hash(struct jit *jit, size_t new_size) {
     TRACE_(verbose, "%d resizing hash to %lu, using %lu bytes for gadgets\n", current_pid(current), new_size, jit->mem_used);
+    _Static_assert(JIT_INITIAL_HASH_SIZE % JIT_LOOKUP_STRIPES == 0, "a bucket's stripe must survive a resize");
     struct list *new_hash = calloc(new_size, sizeof(struct list));
+    for (int i = 0; i < JIT_LOOKUP_STRIPES; i++)
+        pthread_mutex_lock(&jit->lookup_lock[i]);
     for (size_t i = 0; i < jit->hash_size; i++) {
         if (list_null(&jit->hash[i]))
             continue;
@@ -1166,6 +1950,43 @@ static void jit_resize_hash(struct jit *jit, size_t new_size) {
     free(jit->hash);
     jit->hash = new_hash;
     jit->hash_size = new_size;
+    for (int i = JIT_LOOKUP_STRIPES - 1; i >= 0; i--)
+        pthread_mutex_unlock(&jit->lookup_lock[i]);
+}
+
+// Every write to guest memory from the kernel (mem_ptr with MEM_WRITE) and
+// every munmap walks the page_hash bucket of each page it touches, and a
+// bucket keeps the blocks of every page congruent to that one. At a fixed
+// 1024 buckets a process with tens of thousands of blocks has all of them
+// occupied, dozens deep, so a syscall writing a 1280x720 frame (~1800 page
+// visits) spent ~4 ms walking lists that never held a block of the pages it
+// wrote -- 13x the copy itself. Growing the table with num_blocks keeps most
+// buckets empty, so a data page's walk is usually a single empty-list check.
+// Caller holds jit->lock, which every blocks_list() user does.
+static void jit_resize_page_hash(struct jit *jit, size_t new_size) {
+    __typeof__(jit->page_hash) new_hash = calloc(new_size, sizeof(*new_hash));
+    if (new_hash == NULL)
+        return; // keep the smaller table: slower, never wrong
+    __typeof__(jit->page_hash) old_hash = jit->page_hash;
+    jit->page_hash = new_hash;
+    jit->page_hash_size = new_size;
+    // Every block linked into a page list is also in the address hash, so
+    // walking the address hash finds them all; relink each exactly as
+    // jit_insert did.
+    for (size_t i = 0; i < jit->hash_size; i++) {
+        if (list_null(&jit->hash[i]))
+            continue;
+        struct jit_block *block;
+        list_for_each_entry(&jit->hash[i], block, chain) {
+            list_remove(&block->page[0]);
+            list_init_add(blocks_list(jit, PAGE(block->addr), 0), &block->page[0]);
+            if (PAGE(block->addr) != PAGE(block->end_addr)) {
+                list_remove(&block->page[1]);
+                list_init_add(blocks_list(jit, PAGE(block->end_addr), 1), &block->page[1]);
+            }
+        }
+    }
+    free(old_hash);
 }
 
 static void jit_insert(struct jit *jit, struct jit_block *block) {
@@ -1174,8 +1995,15 @@ static void jit_insert(struct jit *jit, struct jit_block *block) {
     // target an average hash chain length of 1-2
     if (jit->num_blocks >= jit->hash_size * 2)
         jit_resize_hash(jit, jit->hash_size * 2);
+    // One page bucket per two blocks: a process's code pages then occupy
+    // a small fraction of the buckets (a code page holds many blocks), and
+    // a write to a data page usually finds its bucket empty.
+    if (jit->num_blocks >= jit->page_hash_size * 2)
+        jit_resize_page_hash(jit, jit->page_hash_size * 2);
 
+    pthread_mutex_lock(jit_lookup_stripe(jit, block->addr));
     list_init_add(&jit->hash[jit_hash_bucket(block->addr, jit->hash_size)], &block->chain);
+    pthread_mutex_unlock(jit_lookup_stripe(jit, block->addr));
     list_init_add(blocks_list(jit, PAGE(block->addr), 0), &block->page[0]);
     if (PAGE(block->addr) != PAGE(block->end_addr))
         list_init_add(blocks_list(jit, PAGE(block->end_addr), 1), &block->page[1]);
@@ -1191,6 +2019,16 @@ static struct jit_block *jit_lookup(struct jit *jit, guest_addr_t addr) {
             return block;
     }
     return NULL;
+}
+
+// The same for a thread that holds only the jetsam read lock, which is what
+// keeps the block it finds from being freed: see jit.lookup_lock.
+static struct jit_block *jit_lookup_shared(struct jit *jit, guest_addr_t addr) {
+    pthread_mutex_t *stripe = jit_lookup_stripe(jit, addr);
+    pthread_mutex_lock(stripe);
+    struct jit_block *block = jit_lookup(jit, addr);
+    pthread_mutex_unlock(stripe);
+    return block;
 }
 
 static struct jit_block *jit_block_compile_common(guest_addr_t ip, struct tlb *tlb,
@@ -1210,9 +2048,15 @@ static struct jit_block *jit_block_compile_common(guest_addr_t ip, struct tlb *t
     bool started = arm64 ? gen_start_arm64(ip, &state)
                  : riscv64 ? gen_start_riscv64(ip, &state)
                  : amd64 ? gen_start_amd64(ip, &state)
-                 : gen_start(ip, &state);
+                 : (gen_start(ip, &state) && (gen_start_x86_profile(ip, &state), true));
     if (!started)
         return NULL;
+    // the vtype in force now is the best guess for the block's vector
+    // instructions (gen.c, gen_riscv64_vector)
+    if (riscv64 && current != NULL && !(current->cpu.riscv64_vtype >> 63))
+        state.riscv64_vtype = current->cpu.riscv64_vtype;
+    if (riscv64 && current != NULL && !riscv64_v_enabled(current))
+        state.riscv64_v_off = true;
     state.oom_active = true;
     // _setjmp, not setjmp: on Darwin (BSD semantics, unlike glibc) plain
     // setjmp/longjmp save and restore the signal mask, which is a real
@@ -1277,7 +2121,381 @@ static struct jit_block *jit_block_compile_common(guest_addr_t ip, struct tlb *t
     else
         assert(state.ip - ip <= PAGE_SIZE);
     state.block->used = state.capacity;
+    state.block->no_share = hle_block || state.jitprof != NULL;
     return state.block;
+}
+
+// ---- Fork inheritance -------------------------------------------------------
+// A forked child starts with an empty jit, and used to translate again every
+// block its parent already had: a `( : )` subshell spent ~20% of its CPU on
+// that (2026-10-01, docs/TODO.md). Instead, a miss in the child first looks
+// for the parent's block at the same address and copies it.
+//
+// The copy is right only if the child's code is the bytes the parent's block
+// was made from. A parent block in the parent's hash matches the parent's
+// current memory (the parent's own invalidation keeps it so), so it is enough
+// that each page the block covers is still the SAME memory in both: the same
+// struct data at the same offset, with the same flags. A store to a
+// copy-on-write page by either side gives the writer a private copy, so after
+// one the entries differ and the child translates for itself. MAP_SHARED
+// pages are left out: both sides can store to them in place.
+//
+// The parent may exec or exit while a child is copying. struct jit_lineage
+// is the link: the child takes its lock and finds the parent's jit there, or
+// NULL once jit_lineage_detach ran; detach runs before the parent's page
+// tables are torn down and waits for a copy in progress. While holding it the
+// child only TRIES the parent's locks, so it can never wait on a parent that
+// waits on it -- a failed try just means translating, as before.
+struct jit_lineage {
+    pthread_mutex_t lock;
+    struct jit *jit;
+    atomic_int refs;
+};
+
+static atomic_bool jit_inherit_on = true;
+
+void jit_inherit_set(bool on) {
+    atomic_store_explicit(&jit_inherit_on, on, memory_order_relaxed);
+}
+
+bool jit_inherit_enabled(void) {
+    static atomic_int env = -1;
+    int e = atomic_load_explicit(&env, memory_order_relaxed);
+    if (e == -1) {
+        const char *v = getenv("ISH_JIT_INHERIT");
+        e = v != NULL && strcmp(v, "0") == 0 ? 0 : 1;
+        if (e == 0)
+            jit_inherit_set(false);
+        atomic_store_explicit(&env, e, memory_order_relaxed);
+    }
+    return atomic_load_explicit(&jit_inherit_on, memory_order_relaxed);
+}
+
+static void jit_lineage_put(struct jit_lineage *lineage) {
+    if (lineage != NULL && atomic_fetch_sub_explicit(&lineage->refs, 1, memory_order_acq_rel) == 1) {
+        pthread_mutex_destroy(&lineage->lock);
+        free(lineage);
+    }
+}
+
+void jit_fork(struct jit *parent, struct jit *child) {
+    if (parent == NULL || child == NULL)
+        return;
+    lock(&parent->lock, 0);
+    struct jit_lineage *lineage = parent->lineage;
+    if (lineage == NULL) {
+        lineage = calloc(1, sizeof(*lineage));
+        if (lineage != NULL) {
+            pthread_mutex_init(&lineage->lock, NULL);
+            lineage->jit = parent;
+            atomic_init(&lineage->refs, 1); // the parent's
+            parent->lineage = lineage;
+        }
+    }
+    if (lineage != NULL)
+        atomic_fetch_add_explicit(&lineage->refs, 1, memory_order_relaxed);
+    unlock(&parent->lock);
+    child->origin = lineage;
+}
+
+void jit_lineage_detach(struct jit *jit) {
+    if (jit == NULL)
+        return;
+    struct jit_lineage *lineage = jit->lineage;
+    if (lineage != NULL) {
+        pthread_mutex_lock(&lineage->lock);
+        lineage->jit = NULL;
+        pthread_mutex_unlock(&lineage->lock);
+        jit->lineage = NULL;
+        jit_lineage_put(lineage);
+    }
+    jit_lineage_put(jit->origin);
+    jit->origin = NULL;
+}
+
+// Are the pages under `block` the same memory in both address spaces? Both
+// read locks are held: the child's by its run loop, the parent's tried.
+static bool jit_same_code(struct mem *mem, struct mem *pmem, const struct jit_block *block) {
+    for (page_t page = PAGE(block->addr); page <= PAGE(block->end_addr); page++) {
+        if (page >= mem->page_limit || page >= pmem->page_limit)
+            return false;
+        struct pt_entry *entry = mem_pt(mem, page);
+        struct pt_entry *pentry = mem_pt(pmem, page);
+        if (entry == NULL || pentry == NULL || entry->data != pentry->data ||
+                entry->offset != pentry->offset || entry->flags != pentry->flags ||
+                (entry->flags & P_SHARED))
+            return false;
+    }
+    return true;
+}
+
+// The block as gen_end leaves it: unchained, on no list.
+static struct jit_block *jit_block_clone(const struct jit_block *from) {
+    size_t size = sizeof(struct jit_block) + from->used * sizeof(unsigned long);
+    struct jit_block *block = malloc(size);
+    if (block == NULL)
+        return NULL;
+    memcpy(block, from, size);
+    for (int i = 0; i <= 1; i++) {
+        if (from->jump_ip[i] != NULL) {
+            block->jump_ip[i] = block->code + (from->jump_ip[i] - from->code);
+            *block->jump_ip[i] = from->old_jump_ip[i];
+        }
+        list_init(&block->jumps_from[i]);
+        list_init(&block->jumps_from_links[i]);
+        list_init(&block->page[i]);
+    }
+    list_init(&block->chain);
+    list_init(&block->jetsam);
+    block->is_jetsam = false;
+    if (block->patch_ip != 0)
+        block->code[block->patch_ip] = (unsigned long) block;
+    return block;
+}
+
+static struct jit_block *jit_inherit(struct jit *jit, guest_addr_t ip) {
+    struct jit_lineage *origin = jit->origin;
+    if (origin == NULL || !jit_inherit_enabled())
+        return NULL;
+    struct jit_block *copy = NULL;
+    pthread_mutex_lock(&origin->lock);
+    struct jit *pjit = origin->jit;
+    if (pjit != NULL) {
+        struct mem *mem = container_of(jit->mmu, struct mem, mmu);
+        struct mem *pmem = container_of(pjit->mmu, struct mem, mmu);
+        if (trylockr(&pmem->lock) == 0) {
+            if (trylock(&pjit->lock) == 0) {
+                struct jit_block *block = jit_lookup(pjit, ip);
+                if (block != NULL && !block->is_jetsam && jit_same_code(mem, pmem, block))
+                    copy = jit_block_clone(block);
+                unlock(&pjit->lock);
+            }
+            read_unlock(&pmem->lock);
+        }
+    }
+    pthread_mutex_unlock(&origin->lock);
+    return copy;
+}
+
+// A block this child translated goes to the parent as well, when its code is
+// still the same memory in both: the parent never runs a child's fork-return
+// and exit paths, so without this every sibling translated them again (half
+// of a `( : )` child's blocks). The parent drops it like one of its own: any
+// store of its to that page faults first (copy-on-write), and the fault
+// invalidates the page's blocks (mem_ptr's write path). arm64 and riscv64
+// only: their guests must also run IC IVAU / FENCE.I before executing changed
+// code, which drops it again. x86 has no such barrier and relies on
+// jit_code_write_prepare/jit_insert_checked around each compile, which a block
+// arriving from another address space did not go through.
+static void jit_donate(struct jit *jit, const struct jit_block *block) {
+    struct jit_lineage *origin = jit->origin;
+    if (origin == NULL || !jit_inherit_enabled())
+        return;
+    pthread_mutex_lock(&origin->lock);
+    struct jit *pjit = origin->jit;
+    if (pjit != NULL) {
+        struct mem *mem = container_of(jit->mmu, struct mem, mmu);
+        struct mem *pmem = container_of(pjit->mmu, struct mem, mmu);
+        if (trylockr(&pmem->lock) == 0) {
+            if (jit_same_code(mem, pmem, block) && trylock(&pjit->lock) == 0) {
+                if (jit_lookup(pjit, block->addr) == NULL) {
+                    struct jit_block *copy = jit_block_clone(block);
+                    if (copy != NULL)
+                        jit_insert(pjit, copy);
+                }
+                unlock(&pjit->lock);
+            }
+            read_unlock(&pmem->lock);
+        }
+    }
+    pthread_mutex_unlock(&origin->lock);
+}
+
+// ---- The exec cache (off by default; jit_xcache_set_enabled) ---------------
+// Fork inheritance reaches a child that goes on running its parent's code. An
+// exec starts with nothing, so `sh -c true`, a configure script or a build
+// translates ld.so, libc and each program again for every process: 19-23% of
+// the CPU of a fork+exec loop, 8-10% of a configure script (docs/TODO.md,
+// 2026-10-01). This keeps translated blocks beyond the process that made
+// them, for the next one that maps the same code at the same address.
+//
+// A block is a function of the guest bytes it was translated from and the
+// address they sit at: the stream holds absolute guest addresses (branch
+// targets, adrp results, return addresses) and gadget pointers, and nothing of
+// the process. So the key is the address, and a hit is confirmed by comparing
+// the bytes: the block's own, plus XC_TAIL beyond it, because the translator
+// may have looked that far to decide a fusion it did not take. Blocks that are
+// not such a function are left out (jit_block.no_share).
+//
+// ITS LIMITS, which are why it is off by default: the same address means the
+// guest's ASLR must put the file where it was before, so turning it on turns
+// ASLR off (jit_xcache_set_enabled) -- until blocks can be rebased or images
+// get one base per boot, that is the price, and it is the user's to choose;
+// it is the arm64 guest only; and a run-time change to what the translator
+// emits (/proc/ish/arm64_jit_fuse, hle) does not flush it.
+#define XC_TAIL 8
+#define XC_BUCKETS (1u << 16)
+#define XC_MAX_BYTES (96u << 20)
+
+struct xc_entry {
+    struct xc_entry *next;
+    guest_addr_t addr;
+    unsigned len;               // guest bytes compared, tail included
+    struct jit_block *block;    // unchained, on no list: a template
+    unsigned char bytes[];
+};
+
+static pthread_mutex_t xc_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct xc_entry *xc_table[XC_BUCKETS];
+static unsigned long long xc_bytes;
+static atomic_ulong xc_hits, xc_misses, xc_stored, xc_refused;
+
+// -1: nobody has said (the CLI: ISH_JIT_XCACHE decides, and leaves the guest's
+// ASLR as it finds it). 0 or 1 once jit_xcache_set_enabled has been called.
+static atomic_int xc_enabled = -1;
+// What randomize_va_space was when the cache turned it off; -1: it did not.
+static int xc_aslr_before = -1;
+
+static bool jit_xcache_enabled(void) {
+    int e = atomic_load_explicit(&xc_enabled, memory_order_relaxed);
+    if (e == -1) {
+        const char *v = getenv("ISH_JIT_XCACHE");
+        e = v != NULL && strcmp(v, "1") == 0 ? 1 : 0;
+        int expected = -1;
+        if (!atomic_compare_exchange_strong(&xc_enabled, &expected, e))
+            e = expected;
+    }
+    return e == 1;
+}
+
+// The switch a user has: the app's "Cache Translated Code" setting, and
+// /proc/ish/jit_cache. A cached block is found by the address its code was
+// at, so the cache only pays when every process puts a file where the last
+// one did -- and turning it on turns the guest's ASLR off
+// (/proc/sys/kernel/randomize_va_space 0), for processes started from then
+// on, and holds it off: the guest cannot write another value there until the
+// cache is off again. Turning it off puts randomize_va_space back and lets
+// the cached blocks go.
+void jit_xcache_set_enabled(bool on) {
+    pthread_mutex_lock(&xc_lock);
+    bool was = atomic_load_explicit(&xc_enabled, memory_order_relaxed) == 1;
+    atomic_store_explicit(&xc_enabled, on ? 1 : 0, memory_order_relaxed);
+    if (on && !was) {
+        xc_aslr_before = aslr_randomize_va_space();
+        aslr_set_randomize_va_space(0);
+        aslr_lock_randomize_va_space(true);
+    } else if (!on && was) {
+        aslr_lock_randomize_va_space(false);
+        if (xc_aslr_before >= 0)
+            aslr_set_randomize_va_space(xc_aslr_before);
+        xc_aslr_before = -1;
+        for (unsigned b = 0; b < XC_BUCKETS; b++) {
+            struct xc_entry *e = xc_table[b];
+            xc_table[b] = NULL;
+            while (e != NULL) {
+                struct xc_entry *next = e->next;
+                free(e->block);
+                free(e);
+                e = next;
+            }
+        }
+        xc_bytes = 0;
+    }
+    pthread_mutex_unlock(&xc_lock);
+}
+
+void jit_xcache_get(struct jit_xcache_stats *stats) {
+    stats->enabled = jit_xcache_enabled();
+    stats->hits = atomic_load_explicit(&xc_hits, memory_order_relaxed);
+    stats->misses = atomic_load_explicit(&xc_misses, memory_order_relaxed);
+    stats->stored = atomic_load_explicit(&xc_stored, memory_order_relaxed);
+    stats->refused = atomic_load_explicit(&xc_refused, memory_order_relaxed);
+    stats->bytes = xc_bytes;
+}
+
+static unsigned xc_bucket(guest_addr_t addr) {
+    unsigned long long h = (unsigned long long) addr * 0x9e3779b97f4a7c15ull;
+    return (unsigned) (h >> 48) & (XC_BUCKETS - 1);
+}
+
+static struct jit_block *jit_xcache_lookup(guest_addr_t ip, struct tlb *tlb) {
+    unsigned char now[PAGE_SIZE + XC_TAIL];
+    unsigned have = 0;          // bytes of `now` read so far
+    struct jit_block *copy = NULL;
+    pthread_mutex_lock(&xc_lock);
+    for (struct xc_entry *e = xc_table[xc_bucket(ip)]; e != NULL; e = e->next) {
+        if (e->addr != ip)
+            continue;
+        if (have < e->len) {
+            if (!tlb_fetch(tlb, ip + have, now + have, e->len - have))
+                continue;
+            have = e->len;
+        }
+        if (memcmp(now, e->bytes, e->len) != 0)
+            continue;
+        copy = jit_block_clone(e->block);
+        break;
+    }
+    pthread_mutex_unlock(&xc_lock);
+    atomic_fetch_add_explicit(copy != NULL ? &xc_hits : &xc_misses, 1, memory_order_relaxed);
+    return copy;
+}
+
+static void jit_xcache_store(const struct jit_block *block, struct tlb *tlb) {
+    if (block->no_share || block->end_addr < block->addr)
+        return;
+    unsigned len = (unsigned) (block->end_addr - block->addr + 1) + XC_TAIL;
+    size_t cost = sizeof(struct xc_entry) + len
+        + sizeof(struct jit_block) + block->used * sizeof(unsigned long);
+    struct xc_entry *e = NULL;
+    if (len <= PAGE_SIZE + XC_TAIL && xc_bytes + cost <= XC_MAX_BYTES)
+        e = malloc(sizeof(*e) + len);
+    // The tail has to be readable now for the comparison to mean anything
+    // later; a block that ends at the edge of its mapping is not kept.
+    if (e == NULL || !tlb_fetch(tlb, block->addr, e->bytes, len) ||
+            (e->block = jit_block_clone(block)) == NULL) {
+        free(e);
+        atomic_fetch_add_explicit(&xc_refused, 1, memory_order_relaxed);
+        return;
+    }
+    e->addr = block->addr;
+    e->len = len;
+    pthread_mutex_lock(&xc_lock);
+    unsigned b = xc_bucket(e->addr);
+    e->next = xc_table[b];
+    xc_table[b] = e;
+    xc_bytes += cost;
+    pthread_mutex_unlock(&xc_lock);
+    atomic_fetch_add_explicit(&xc_stored, 1, memory_order_relaxed);
+}
+
+// The per-arch compile wrappers below: the parent's block if there is one,
+// else a translation.
+static struct jit_block *jit_block_inherit_or_compile(guest_addr_t ip, struct tlb *tlb,
+        unsigned arch_idx, bool amd64, bool arm64, bool riscv64, bool *fallback_to_interp) {
+    bool timing = jit_timing_enabled();
+    unsigned long long start = timing ? jit_timing_now_ns() : 0;
+    struct jit_block *block = jit_inherit(tlb->mmu->jit, ip);
+    if (block != NULL) {
+        if (fallback_to_interp != NULL)
+            *fallback_to_interp = false;
+        if (timing)
+            atomic_fetch_add_explicit(&jit_timing_inherited_by_arch[arch_idx], 1, memory_order_relaxed);
+    } else if (arm64 && jit_xcache_enabled() && (block = jit_xcache_lookup(ip, tlb)) != NULL) {
+        if (timing)
+            atomic_fetch_add_explicit(&jit_timing_inherited_by_arch[arch_idx], 1, memory_order_relaxed);
+        jit_donate(tlb->mmu->jit, block);
+    } else {
+        block = jit_block_compile_common(ip, tlb, amd64, arm64, riscv64, fallback_to_interp);
+        if (block != NULL && (arm64 || riscv64))
+            jit_donate(tlb->mmu->jit, block);
+        if (block != NULL && arm64 && jit_xcache_enabled())
+            jit_xcache_store(block, tlb);
+    }
+    if (timing)
+        jit_timing_note(arch_idx, jit_timing_now_ns() - start,
+                block != NULL ? block->used * sizeof(unsigned long) : 0);
+    return block;
 }
 
 // Each wrapper below is jit_block_compile_common's ONE call site for its arch
@@ -1289,40 +2507,20 @@ static struct jit_block *jit_block_compile_common(guest_addr_t ip, struct tlb *t
 // lazy getenv on the first call) so this couldn't itself skew the measurement
 // it's trying to take.
 static struct jit_block *jit_block_compile(addr_t ip, struct tlb *tlb) {
-    if (!jit_timing_enabled())
-        return jit_block_compile_common(ip, tlb, false, false, false, NULL);
-    unsigned long long start = jit_timing_now_ns();
-    struct jit_block *block = jit_block_compile_common(ip, tlb, false, false, false, NULL);
-    jit_timing_note(0, jit_timing_now_ns() - start, block != NULL ? block->used * sizeof(unsigned long) : 0);
-    return block;
+    return jit_block_inherit_or_compile(ip, tlb, 0, false, false, false, NULL);
 }
 
 static struct jit_block *jit_block_compile_amd64(guest_addr_t ip, struct tlb *tlb,
         bool *fallback_to_interp) {
-    if (!jit_timing_enabled())
-        return jit_block_compile_common(ip, tlb, true, false, false, fallback_to_interp);
-    unsigned long long start = jit_timing_now_ns();
-    struct jit_block *block = jit_block_compile_common(ip, tlb, true, false, false, fallback_to_interp);
-    jit_timing_note(1, jit_timing_now_ns() - start, block != NULL ? block->used * sizeof(unsigned long) : 0);
-    return block;
+    return jit_block_inherit_or_compile(ip, tlb, 1, true, false, false, fallback_to_interp);
 }
 
 static struct jit_block *jit_block_compile_arm64(guest_addr_t ip, struct tlb *tlb) {
-    if (!jit_timing_enabled())
-        return jit_block_compile_common(ip, tlb, false, true, false, NULL);
-    unsigned long long start = jit_timing_now_ns();
-    struct jit_block *block = jit_block_compile_common(ip, tlb, false, true, false, NULL);
-    jit_timing_note(2, jit_timing_now_ns() - start, block != NULL ? block->used * sizeof(unsigned long) : 0);
-    return block;
+    return jit_block_inherit_or_compile(ip, tlb, 2, false, true, false, NULL);
 }
 
 static struct jit_block *jit_block_compile_riscv64(guest_addr_t ip, struct tlb *tlb) {
-    if (!jit_timing_enabled())
-        return jit_block_compile_common(ip, tlb, false, false, true, NULL);
-    unsigned long long start = jit_timing_now_ns();
-    struct jit_block *block = jit_block_compile_common(ip, tlb, false, false, true, NULL);
-    jit_timing_note(3, jit_timing_now_ns() - start, block != NULL ? block->used * sizeof(unsigned long) : 0);
-    return block;
+    return jit_block_inherit_or_compile(ip, tlb, 3, false, false, true, NULL);
 }
 
 // Unpatch and unlink every predecessor still on block's jumps_from[i]
@@ -1366,8 +2564,13 @@ static void jit_block_disconnect(struct jit *jit, struct jit_block *block) {
     if (jit != NULL) {
         jit->mem_used -= block->used;
         jit->num_blocks--;
+        // In a hash only if it has a jit; see jit.lookup_lock.
+        pthread_mutex_lock(jit_lookup_stripe(jit, block->addr));
+        list_remove(&block->chain);
+        pthread_mutex_unlock(jit_lookup_stripe(jit, block->addr));
+    } else {
+        list_remove(&block->chain);
     }
-    list_remove(&block->chain);
     for (int i = 0; i <= 1; i++) {
         list_remove(&block->page[i]);
         list_remove_safe(&block->jumps_from_links[i]);
@@ -1560,7 +2763,19 @@ static void jit_entry_scratch_refresh(struct jit_entry_scratch *scratch,
 }
 
 int jit_enter(struct jit_block *block, struct jit_frame *frame, struct tlb *tlb);
+// The amd64 blocks' entry (gadgets-aarch64/entry.S): also loads the x20-x27
+// register cache, which every amd64 block assumes is loaded on entry. An
+// x86_64 host has no amd64 gadgets (its amd64 blocks are bridges), so there
+// it is plain jit_enter.
+#if defined(__aarch64__)
+int jit_enter_amd64(struct jit_block *block, struct jit_frame *frame, struct tlb *tlb);
+#else
+#define jit_enter_amd64 jit_enter
+#endif
 
+// i386_indir_chain (gadgets-aarch64/control.S) computes this too, as
+// mul + ubfx #32, #10: keep the constant and the 1024 in step with it.
+_Static_assert(JIT_CACHE_SIZE == 1024, "i386_indir_chain hashes into 1024 slots");
 static inline size_t jit_cache_hash(guest_addr_t ip) {
     // Same mixing rationale as jit_hash_bucket: ip ^ (ip >> 12) preserved the
     // low-bit clustering of block addresses, causing conflict evictions in
@@ -1599,16 +2814,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     // Thread-level exception ports are scoped to only this pthread; no other
     // thread in the process is affected.  Cost is one Mach call per OS thread
     // lifetime (guarded by a thread-local flag), not per jit_enter call.
-    static __thread bool exception_handler_installed = false;
-    if (!exception_handler_installed) {
-        jit_install_thread_exception_handler();
-        // When the Mach handler isn't active (standalone CLI), a host SIGBUS on
-        // a truncated file-backed guest mmap would otherwise kill the process.
-        // Install a POSIX handler that translates it into a guest SIGBUS.
-        if (!jit_host_fault_mach_active())
-            jit_install_host_fault_signal_handler();
-        exception_handler_installed = true;
-    }
+    jit_host_fault_thread_init();
 
     // Keep the hot path off malloc/free. With iOS debug malloc enabled
     // (guard pages + scribbling), even these small short-lived allocations
@@ -1636,6 +2842,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     // The old `= {}` zeroed it implicitly; now it is explicit.
     frame->last_block = NULL;
     frame->cpu = *cpu;
+    frame->i386_cache = cache;
     assert(jit->mmu == cpu->mmu);
 
     jit_crash_frame = frame;
@@ -1680,6 +2887,7 @@ static int cpu_step_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
         jit_crash_unmapped = false;
         cpu->segfault_addr = jit_crash_addr;
         cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
         jit_crash_unwind_active = false;
         jit_crash_mutex_lock = NULL;
         jit_crash_frame = NULL;
@@ -1735,12 +2943,23 @@ rearm_i386:
             break;
         }
         addr_t ip = frame->cpu.eip;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
+            // Another thread may have it: look in the shared table under the
+            // bucket's own lock first (jit.lookup_lock), and take the jit's
+            // lock only to translate.
+            block = jit_lookup_shared(jit, ip);
+            if (block != NULL) {
+                cache[cache_index] = block;
+            } else {
             lock(&jit->lock, 0);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
+                uint64_t code_write_seq = jit_code_write_prepare(jit, ip, tlb);
+                bool check_code = jit_code_written(jit, ip);
                 // Compile outside jetsam_lock: jit_block_compile allocates memory,
                 // and under debug malloc (guard pages + scribbling) this is very slow.
                 // Holding jetsam_lock during compilation starves jetsam write-lock
@@ -1756,7 +2975,7 @@ rearm_i386:
                     goto done_unlocked;
                 }
 
-                block = jit_block_compile(ip, tlb);
+                block = jit_compile_consistent(ip, tlb, check_code);
 
                 if (block == NULL) {
                     // OOM attempt 1: free already-invalidated (jetsam) blocks and retry.
@@ -1781,7 +3000,7 @@ rearm_i386:
                         jit_frame_sync_out(cpu, frame);
                         goto done_unlocked;
                     }
-                    block = jit_block_compile(ip, tlb);
+                    block = jit_compile_consistent(ip, tlb, check_code);
 
                     if (block == NULL) {
                         // OOM attempt 2: flush the entire JIT cache for this task.
@@ -1806,7 +3025,7 @@ rearm_i386:
                             jit_frame_sync_out(cpu, frame);
                             goto done_unlocked;
                         }
-                        block = jit_block_compile(ip, tlb);
+                        block = jit_compile_consistent(ip, tlb, check_code);
                         if (block == NULL) {
                             // Still OOM even after full flush: kill this guest task
                             printk("JIT OOM at %#x pid %d: even after full flush, killing task\n",
@@ -1841,13 +3060,14 @@ rearm_i386:
                     jit_block_free(NULL, block);
                     block = existing;
                 } else {
-                    jit_insert(jit, block);
+                    jit_insert_checked(jit, block, code_write_seq);
                 }
             } else {
                 TRACE("%d %08x --- missed cache\n", current_pid(current), ip);
             }
             cache[cache_index] = block;
             unlock(&jit->lock);
+            }
         }
         struct jit_block *last_block = frame->last_block;
         // If cleanup_seq changed since last_block was set, jetsam blocks were
@@ -2043,16 +3263,7 @@ done_unlocked:
 static int cpu_step_to_interrupt_arm64(struct cpu_state *cpu, struct tlb *tlb) {
     struct jit *jit = cpu->mmu->jit;
 
-    static __thread bool exception_handler_installed = false;
-    if (!exception_handler_installed) {
-        jit_install_thread_exception_handler();
-        // When the Mach handler isn't active (standalone CLI), a host SIGBUS on
-        // a truncated file-backed guest mmap would otherwise kill the process.
-        // Install a POSIX handler that translates it into a guest SIGBUS.
-        if (!jit_host_fault_mach_active())
-            jit_install_host_fault_signal_handler();
-        exception_handler_installed = true;
-    }
+    jit_host_fault_thread_init();
 
     // Per-thread persistent scratch instead of ~40 KB of stack zeroed on every
     // entry -- i.e. on every guest syscall. See jit_entry_scratch_get(). The
@@ -2124,6 +3335,7 @@ static int cpu_step_to_interrupt_arm64(struct cpu_state *cpu, struct tlb *tlb) {
         jit_crash_unmapped = false;
         cpu->segfault_addr = jit_crash_addr;
         cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
         jit_crash_unwind_active = false;
         jit_crash_mutex_lock = NULL;
         jit_crash_frame = NULL;
@@ -2161,9 +3373,18 @@ rearm_arm64:
             break;
         }
         guest_addr_t ip = frame->cpu.arm64_pc;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
+            // Another thread may have it: look in the shared table under the
+            // bucket's own lock first (jit.lookup_lock), and take the jit's
+            // lock only to translate.
+            block = jit_lookup_shared(jit, ip);
+            if (block != NULL) {
+                cache[cache_index] = block;
+            } else {
             lock(&jit->lock, 0);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
@@ -2235,6 +3456,7 @@ rearm_arm64:
             }
             cache[cache_index] = block;
             unlock(&jit->lock);
+            }
         }
         struct jit_block *last_block = frame->last_block;
         if (atomic_load_explicit(&jit->cleanup_seq, memory_order_relaxed) != last_block_cleanup_seq) {
@@ -2372,13 +3594,7 @@ done_unlocked_arm64:
 static int cpu_single_step_arm64(struct cpu_state *cpu, struct tlb *tlb) {
     struct jit *jit = cpu->mmu->jit;
 
-    static __thread bool exception_handler_installed = false;
-    if (!exception_handler_installed) {
-        jit_install_thread_exception_handler();
-        if (!jit_host_fault_mach_active())
-            jit_install_host_fault_signal_handler();
-        exception_handler_installed = true;
-    }
+    jit_host_fault_thread_init();
 
     // Same rule as cpu_step_to_interrupt_arm64: this frontend has no entry
     // refresh, so the first call after execve can still see the TLB bound to
@@ -2393,6 +3609,7 @@ static int cpu_single_step_arm64(struct cpu_state *cpu, struct tlb *tlb) {
     if (!gen_start_arm64(cpu->arm64_pc, &state))
         return INT_GPF; // OOM allocating the block
     state.oom_active = true;
+    state.single_step = true; // one instruction: no lookahead fusions
     // _setjmp, not setjmp: on Darwin (BSD semantics, unlike glibc) plain
     // setjmp/longjmp save and restore the signal mask, which is a real
     // sigprocmask SYSCALL -- and this runs once per block compilation, so a
@@ -2436,6 +3653,110 @@ static int cpu_single_step_arm64(struct cpu_state *cpu, struct tlb *tlb) {
             *jit_crash_cpu = jit_crash_frame->cpu;
         cpu->segfault_addr = jit_crash_addr;
         cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
+        jit_crash_unwind_active = false;
+        jit_crash_mutex_lock = NULL;
+        jit_crash_frame = NULL;
+        jit_crash_cpu = NULL;
+        free(state.block);
+        return jit_crash_interrupt;
+    }
+    jit_crash_unwind_active = true;
+
+    int interrupt = jit_enter(state.block, frame, tlb);
+
+    jit_crash_lock = NULL;
+    pthread_rwlock_unlock(&jit->jetsam_lock.l);
+    jit_crash_unwind_active = false;
+    jit_crash_frame = NULL;
+    jit_crash_cpu = NULL;
+
+    jit_frame_sync_out(cpu, frame);
+    free(state.block);
+
+    if (interrupt == INT_NONE)
+        interrupt = INT_DEBUG;
+    return interrupt;
+}
+
+// The riscv64 half of the same thing, and until now it did not exist: the
+// riscv64 dispatch below returned cpu_step_to_interrupt_riscv64
+// unconditionally and never looked at cpu->tf, so PTRACE_SINGLESTEP ran the
+// tracee to its next stop exactly like PTRACE_CONT -- and returned success
+// while doing it, which is the worst shape a missing feature can take. A
+// debugger on a riscv64 guest saw `stepi` run away, took `step`, `next` and
+// `finish` with it, and nothing anywhere reported a failure.
+//
+// A clone of cpu_single_step_arm64 above with the pc field and the compile
+// function swapped, which is exactly what it can be: gen_step_riscv64 has the
+// same 1/0 "not a terminator" / "already terminated" contract as
+// gen_step_arm64 (unlike amd64, where 0 is overloaded with "cannot
+// translate"), gen_exit already knows how to emit a riscv64 continuation, and
+// poked_ptr is set by the dispatch before either frontend is entered. If a
+// fourth copy of this ever appears, factor it.
+static int cpu_single_step_riscv64(struct cpu_state *cpu, struct tlb *tlb) {
+    struct jit *jit = cpu->mmu->jit;
+
+    jit_host_fault_thread_init();
+
+    // Same rule as cpu_step_to_interrupt_riscv64: this frontend has no entry
+    // refresh, so the first call after execve can still see the TLB bound to
+    // the old, freed mm. gen_step_riscv64 needs a valid TLB immediately, to
+    // fetch the instruction bytes it decodes -- skipping this crashed
+    // single-stepping the very first instruction after starti/execve
+    // (mmu_translate on a stale mmu pointer).
+    if (tlb->mmu != cpu->mmu || tlb->mem_changes != cpu->mmu->changes)
+        tlb_refresh(tlb, cpu->mmu);
+
+    struct gen_state state;
+    if (!gen_start_riscv64(cpu->riscv64_pc, &state))
+        return INT_GPF; // OOM allocating the block
+    state.oom_active = true;
+    state.single_step = true; // one instruction: no lookahead fusions
+    // _setjmp, not setjmp: on Darwin (BSD semantics, unlike glibc) plain
+    // setjmp/longjmp save and restore the signal mask, which is a real
+    // sigprocmask SYSCALL -- and this runs once per block compilation, so a
+    // translation-heavy guest pays it constantly. It showed up as
+    // cpu_step_to_interrupt -> setjmp -> sigprocmask in a gcc-compile profile.
+    // Nothing between here and gen()'s longjmp touches the signal mask (this
+    // region is pure decode plus realloc), so there is no mask to preserve.
+    // Same reasoning as the crash-unwind sigsetjmp's savemask=0 below.
+    if (_setjmp(state.oom_recovery) != 0) {
+        free(state.block);
+        return INT_GPF;
+    }
+    if (gen_step(&state, tlb))
+        gen_exit(&state); // ordinary instruction: force a terminator here
+    gen_end(&state);
+    state.block->used = state.capacity;
+
+    struct jit_frame frame_storage = {};
+    struct jit_frame *frame = &frame_storage;
+    frame->cpu = *cpu;
+    frame->chain_budget = 8192; // see jit_frame.chain_budget; unused here (this
+                                // block never chains) but jit_enter reads it
+                                // unconditionally
+
+    // jit_crash_fn (the host fault handler) only treats a fault as JIT-internal
+    // and recoverable via siglongjmp when jit_crash_lock is non-NULL -- with it
+    // NULL, it abort()s the whole process instead. This block isn't in any
+    // shared table (no jit_insert, no cache entry), so nothing else can ever
+    // look it up, jetsam it, or race a free against it -- the real lock isn't
+    // needed for THIS block's safety. Taken anyway purely to satisfy that
+    // contract; a plain read-lock, negligible cost for what's inherently a
+    // rare, deliberate, slow-path operation (a ptrace single-step in flight).
+    jetsam_read_lock_polled(jit);
+    jit_crash_lock = &jit->jetsam_lock;
+    jit_crash_frame = frame;
+    jit_crash_cpu = cpu;
+    jit_crash_interrupt = INT_GPF;
+    jit_crash_addr = frame->cpu.riscv64_pc;
+    if (sigsetjmp(jit_crash_unwind_buf, 0) != 0) {
+        if (jit_crash_cpu != NULL && jit_crash_frame != NULL)
+            *jit_crash_cpu = jit_crash_frame->cpu;
+        cpu->segfault_addr = jit_crash_addr;
+        cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
         jit_crash_unwind_active = false;
         jit_crash_mutex_lock = NULL;
         jit_crash_frame = NULL;
@@ -2469,16 +3790,7 @@ static int cpu_single_step_arm64(struct cpu_state *cpu, struct tlb *tlb) {
 static int cpu_step_to_interrupt_riscv64(struct cpu_state *cpu, struct tlb *tlb) {
     struct jit *jit = cpu->mmu->jit;
 
-    static __thread bool exception_handler_installed = false;
-    if (!exception_handler_installed) {
-        jit_install_thread_exception_handler();
-        // When the Mach handler isn't active (standalone CLI), a host SIGBUS on
-        // a truncated file-backed guest mmap would otherwise kill the process.
-        // Install a POSIX handler that translates it into a guest SIGBUS.
-        if (!jit_host_fault_mach_active())
-            jit_install_host_fault_signal_handler();
-        exception_handler_installed = true;
-    }
+    jit_host_fault_thread_init();
 
     // Per-thread persistent scratch instead of ~40 KB of stack zeroed on every
     // entry -- i.e. on every guest syscall. See jit_entry_scratch_get(). The
@@ -2544,6 +3856,7 @@ static int cpu_step_to_interrupt_riscv64(struct cpu_state *cpu, struct tlb *tlb)
         jit_crash_unmapped = false;
         cpu->segfault_addr = jit_crash_addr;
         cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
         jit_crash_unwind_active = false;
         jit_crash_mutex_lock = NULL;
         jit_crash_frame = NULL;
@@ -2582,9 +3895,18 @@ rearm_riscv64:
             break;
         }
         guest_addr_t ip = frame->cpu.riscv64_pc;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         size_t cache_index = jit_cache_hash(ip);
         struct jit_block *block = cache[cache_index];
         if (block == NULL || block->addr != ip || block->is_jetsam) {
+            // Another thread may have it: look in the shared table under the
+            // bucket's own lock first (jit.lookup_lock), and take the jit's
+            // lock only to translate.
+            block = jit_lookup_shared(jit, ip);
+            if (block != NULL) {
+                cache[cache_index] = block;
+            } else {
             lock(&jit->lock, 0);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
@@ -2655,6 +3977,7 @@ rearm_riscv64:
             }
             cache[cache_index] = block;
             unlock(&jit->lock);
+            }
         }
         struct jit_block *last_block = frame->last_block;
         if (atomic_load_explicit(&jit->cleanup_seq, memory_order_relaxed) != last_block_cleanup_seq) {
@@ -2848,16 +4171,12 @@ static int cpu_step_to_interrupt_amd64_frontend(struct cpu_state *cpu, struct tl
     if (cpu_take_poke(cpu))
         return INT_TIMER;
 
-    static __thread bool exception_handler_installed = false;
-    if (!exception_handler_installed) {
-        jit_install_thread_exception_handler();
-        // When the Mach handler isn't active (standalone CLI), a host SIGBUS on
-        // a truncated file-backed guest mmap would otherwise kill the process.
-        // Install a POSIX handler that translates it into a guest SIGBUS.
-        if (!jit_host_fault_mach_active())
-            jit_install_host_fault_signal_handler();
-        exception_handler_installed = true;
-    }
+    jit_host_fault_thread_init();
+
+    // Read once per entry, as the arm64 frontend does: the gadget half
+    // (amd64_sret) is chosen at translation time.
+    const bool publish_ret_cache =
+        (amd64_jit_fuse_mask() & JIT_FUSE_AMD64_RETCACHE) != 0;
 
     jit_crash_frame = frame;
     jit_crash_cpu = cpu;
@@ -2903,6 +4222,7 @@ static int cpu_step_to_interrupt_amd64_frontend(struct cpu_state *cpu, struct tl
         }
         cpu->segfault_addr = jit_crash_addr;
         cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
         jit_crash_unwind_active = false;
         jit_crash_frame = NULL;
         jit_crash_cpu = NULL;
@@ -2935,8 +4255,39 @@ rearm_amd64:
         if (tlb->mmu != cpu->mmu || tlb->mem_changes != cpu->mmu->changes)
             tlb_refresh(tlb, cpu->mmu);
 
+        // Stand aside for a jetsam writer before starting another block, the
+        // same guard the i386, arm64 and riscv64 frontends have at this exact
+        // point. This engine used to check only the poke flag, so a thread
+        // burning CPU in guest code held jetsam_lock for read across up to
+        // AMD64_FRONTEND_TIMER_BLOCK_QUANTUM (1024) entries of up to
+        // chain_budget (8192) chained blocks each -- millions of blocks -- with
+        // write_wanted raised the whole time. The writer polls trywrlock every
+        // 5ms for five seconds and never once found the lock free, so
+        // jit_cleanup_jetsam_if_needed burned its entire timeout having freed
+        // nothing. A host sample of the stalled run shows it exactly: the
+        // spinner in jit_enter for 3965 of 3977 samples, five siblings burning
+        // the full timeout in jit_cleanup_jetsam_if_needed, and no writer ever
+        // getting in.
+        //
+        // That is jit_writer_starvation's 18-second pthread_create on a glibc
+        // amd64 root. Why glibc: its pthread_create maps and unmaps enough per
+        // thread to keep the jetsam list non-empty, so every sibling returning
+        // from the JIT lines up behind the same spinner. Measured with a bare
+        // create/join loop and no spinner at all, 20000 of them take 19.2s on
+        // build/devuan-amd64-test against 1.7s on build/alpine-amd64-test, and
+        // the glibc run's profile is all pt_unmap_always / jit_invalidate_range
+        // / jit_free_jetsam. musl asks for a fraction of that, which is why the
+        // same build passed on every Alpine root while failing 8/8 here.
+        if (jit_should_yield(jit, cpu)) {
+            jit_frame_sync_out(cpu, frame);
+            ret = INT_TIMER;
+            break;
+        }
+
         fallback_to_interp = false;
         ip = frame->cpu.amd64_rip;
+        if (unlikely(guestprof_on))
+            guestprof_pc(ip, 0);
         if (unlikely(amd64_frontend_debug_active()) && amd64_cc1_force_interp_block(ip)) {
             frame->last_block = NULL;
             memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
@@ -2990,13 +4341,15 @@ rearm_amd64:
             jit_crash_track_mutex_lock(&jit->lock);
             block = jit_lookup(jit, ip);
             if (block == NULL) {
+                uint64_t code_write_seq = jit_code_write_prepare(jit, ip, tlb);
+                bool check_code = jit_code_written(jit, ip);
                 jit_crash_track_mutex_unlock(&jit->lock);
                 jit_crash_lock = NULL;
                 frame->last_block = NULL;
                 memset(frame->ret_cache, 0, sizeof(frame->ret_cache));
                 pthread_rwlock_unlock(&jit->jetsam_lock.l);
 
-                block = jit_block_compile_amd64(ip, tlb, &fallback_to_interp);
+                block = jit_compile_consistent_amd64(ip, tlb, check_code, &fallback_to_interp);
                 if (block == NULL) {
                     amd64_jit_debug("frontend no-block ip=%llx fallback=%d",
                             (unsigned long long) ip, fallback_to_interp);
@@ -3017,7 +4370,7 @@ rearm_amd64:
                     jit_block_free(NULL, block);
                     block = existing;
                 } else {
-                    jit_insert(jit, block);
+                    jit_insert_checked(jit, block, code_write_seq);
                 }
             }
             cache[cache_index] = block;
@@ -3090,16 +4443,22 @@ rearm_amd64:
         }
         frame->last_block = block;
         frame->chain_budget = 8192; // see jit_frame.chain_budget
+        // Publish this dispatch to the return cache, keyed by guest address
+        // as the arm64 frontend keys it: a later ret to this address enters
+        // the block directly (math.S amd64_sret), and the entry self-validates
+        // there (block->addr, is_jetsam). The cleanup_seq purge above and
+        // jit_entry_scratch_get clear the array whenever it could go stale.
+        if (publish_ret_cache)
+            frame->ret_cache[LINKREG_RET_CACHE_HASH(block->addr)] = (long) block->code;
 
         amd64_jit_debug("frontend exec block ip=%llx end=%llx",
                 (unsigned long long) ip,
                 (unsigned long long) block->end_addr);
-        amd64_jit_debug("frontend block slots 0=%lx 1=%lx 2=%lx 3=%lx helper=%lx",
+        amd64_jit_debug("frontend block slots 0=%lx 1=%lx 2=%lx 3=%lx",
                 block->used > 0 ? block->code[0] : 0,
                 block->used > 1 ? block->code[1] : 0,
                 block->used > 2 ? block->code[2] : 0,
-                block->used > 3 ? block->code[3] : 0,
-                (unsigned long) amd64_step_to_interrupt_jit);
+                block->used > 3 ? block->code[3] : 0);
         {
             // Gate on the debug master switch like the i386 frontend
             // (3558ee46): amd64_cc1_jit_trace_enabled is an out-of-line
@@ -3109,9 +4468,7 @@ rearm_amd64:
             struct cpu_state before_block_cpu;
             if (cc1_trace)
                 before_block_cpu = frame->cpu;
-        amd64_jit_bridge_set_tlb(tlb);
-        interrupt = jit_enter(block, frame, tlb);
-        amd64_jit_bridge_set_tlb(NULL);
+        interrupt = jit_enter_amd64(block, frame, tlb);
             if (cc1_trace)
                 amd64_cc1_jit_trace_record(block->addr, tlb, &before_block_cpu, &frame->cpu, interrupt);
         }
@@ -3142,7 +4499,10 @@ rearm_amd64:
             ret = interrupt;
             break;
         }
-        if (cpu_take_poke(cpu)) {
+        // write_wanted as well as the poke flag, for the reason at the top of
+        // this loop: the block quantum below is far too coarse to be the only
+        // thing that lets a jetsam writer in.
+        if (jit_should_yield(jit, cpu)) {
             jit_frame_sync_out(cpu, frame);
             ret = INT_TIMER;
             break;
@@ -3162,13 +4522,124 @@ rearm_amd64:
     return ret;
 }
 
-static int cpu_single_step_amd64_frontend(struct cpu_state *cpu, struct tlb *tlb) {
-    // Keep trap-flag semantics on the interpreter until amd64 JIT single-step
-    // has an exact one-instruction translation path.
-    return cpu_run_to_interrupt_amd64(cpu, tlb);
+// amd64 single-step, on the JIT.
+//
+// This used to be three lines routing cpu->tf straight to the interpreter, and
+// it was the last place ordinary amd64 execution reached it. Modelled on
+// cpu_single_step_arm64 above, whose own comment named this function as the
+// thing it improved on, and on i386's cpu_single_step: compile and execute
+// exactly one guest instruction as a private, ephemeral block that is never
+// inserted into the jit's table, so it needs none of the frontend's cache,
+// chaining or jetsam machinery -- nothing else can look it up or race a free
+// against it.
+//
+// Four things differ from a verbatim transcription of the arm64 version, and
+// each of them is a bug if left out:
+//
+//  - poked_ptr must be set here. cpu_run_to_interrupt assigns it only AFTER
+//    the amd64 branch has returned, and the interpreter this replaces set it
+//    itself; cpu_take_poke and jit_should_yield dereference it unconditionally.
+//    The arm64 path hit exactly this NULL once already.
+//  - eip must be re-derived from amd64_rip after the block. The exit gadget
+//    writes only eip, from a 32-bit-truncated stream word, so a rip above 4 GB
+//    would be silently truncated; the frontend does the same assignment after
+//    every block it runs.
+//  - gen_step's `false` return is overloaded for amd64: it means both "this
+//    instruction ends a block" and "this instruction could not be translated".
+//    gen_step_arm64 has no such overload, so there is no precedent to copy, and
+//    a verbatim transcription would enter a truncated block. With fallbacks now
+//    at zero across a full regression suite this is close to unreachable, but
+//    the one instruction that could reach it must still execute.
+//  - the block is freed on the crash-unwind path too. Single-stepping is
+//    precisely the workload that faults repeatedly.
+static int cpu_single_step_amd64(struct cpu_state *cpu, struct tlb *tlb) {
+    struct jit *jit = cpu->mmu->jit;
+
+    jit_host_fault_thread_init();
+
+    cpu->poked_ptr = &cpu->_poked;
+
+    // Same rule as the arm64 single-step: this path has no entry refresh, so
+    // the first call after execve can still see a TLB bound to the old, freed
+    // mm, and gen_step needs a valid one immediately to fetch the bytes it
+    // decodes.
+    if (tlb->mmu != cpu->mmu || tlb->mem_changes != cpu->mmu->changes)
+        tlb_refresh(tlb, cpu->mmu);
+
+    struct gen_state state;
+    if (!gen_start_amd64(cpu->amd64_rip, &state))
+        return INT_GPF; // OOM allocating the block
+    // One instruction: ret must not chain on (amd64_sret). The fresh frame
+    // below has an empty return cache anyway; this keeps it from mattering.
+    state.single_step = true;
+    state.oom_active = true;
+    if (_setjmp(state.oom_recovery) != 0) {
+        free(state.block);
+        return INT_GPF;
+    }
+    if (gen_step(&state, tlb))
+        gen_exit(&state); // ordinary instruction: force a terminator here
+    if (state.amd64_abort_block_to_interp || state.amd64_fallback_to_interp) {
+        // Nothing the JIT can translate. Step this one instruction on the
+        // interpreter and let the next call try again from the new rip.
+        free(state.block);
+        return cpu_run_to_interrupt_amd64(cpu, tlb);
+    }
+    gen_end(&state);
+    state.block->used = state.capacity;
+
+    struct jit_frame frame_storage = {};
+    struct jit_frame *frame = &frame_storage;
+    frame->cpu = *cpu;
+    frame->chain_budget = 8192; // jit_enter reads it unconditionally
+
+    // jit_crash_fn only treats a fault as JIT-internal and recoverable when
+    // jit_crash_lock is non-NULL; with it NULL it abort()s the process. This
+    // block is in no shared table, so the lock is not needed for its safety --
+    // taken purely to satisfy that contract, as the arm64 path does.
+    jetsam_read_lock_polled(jit);
+    jit_crash_lock = &jit->jetsam_lock;
+    jit_crash_frame = frame;
+    jit_crash_cpu = cpu;
+    jit_crash_interrupt = INT_GPF;
+    jit_crash_addr = frame->cpu.amd64_rip;
+    if (sigsetjmp(jit_crash_unwind_buf, 0) != 0) {
+        if (jit_crash_cpu != NULL && jit_crash_frame != NULL)
+            *jit_crash_cpu = jit_crash_frame->cpu;
+        cpu->segfault_addr = jit_crash_addr;
+        cpu->segfault_was_write = false;
+        cpu->segfault_reported = false;
+        jit_crash_unwind_active = false;
+        jit_crash_mutex_lock = NULL;
+        jit_crash_frame = NULL;
+        jit_crash_cpu = NULL;
+        free(state.block);
+        return jit_crash_interrupt;
+    }
+    jit_crash_unwind_active = true;
+
+    int interrupt = jit_enter_amd64(state.block, frame, tlb);
+
+    jit_crash_lock = NULL;
+    pthread_rwlock_unlock(&jit->jetsam_lock.l);
+    jit_crash_unwind_active = false;
+    jit_crash_frame = NULL;
+    jit_crash_cpu = NULL;
+
+    frame->cpu.eip = (dword_t) frame->cpu.amd64_rip;
+    jit_frame_sync_out(cpu, frame);
+    free(state.block);
+
+    // The interpreters' cpu->tf contract: a clean single-step becomes
+    // INT_DEBUG; a real interrupt raised by the stepped instruction is
+    // returned as-is so normal dispatch handles it exactly as it would
+    // outside single-step.
+    if (interrupt == INT_NONE)
+        interrupt = INT_DEBUG;
+    return interrupt;
 }
 
-int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+static int cpu_run_engine_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     // JIT gadget path (jit/guest-arm64/), per aarch64_guest_plan.md's
     // direction change — no interpreter fallback, matching i386's own
     // precedent. cpu_run_to_interrupt_arm64 (emu/arm64_interp.c) still
@@ -3204,21 +4675,32 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     if (current != NULL && current->abi == GUEST_ABI_RISCV64) {
         // Same poked_ptr rule as arm64 above.
         cpu->poked_ptr = &cpu->_poked;
-        return cpu_step_to_interrupt_riscv64(cpu, tlb);
+        return cpu->tf ? cpu_single_step_riscv64(cpu, tlb)
+                       : cpu_step_to_interrupt_riscv64(cpu, tlb);
     }
     if (current != NULL && current->abi == GUEST_ABI_AMD64) {
         if (!amd64_jit_is_enabled())
             return cpu_run_to_interrupt_amd64(cpu, tlb);
-        // GNU as stays on the amd64 interpreter: b71ce84d ("Contain amd64
-        // assembler JIT crashes") added this to contain real gas crashes
-        // under the amd64 JIT frontend that were never root-caused. Keep
-        // the bypass until someone re-runs gas under the JIT (much has
-        // changed since — see tests/manual/amd64_gas_probe.sh for the
-        // probe harness) and either reproduces and fixes the crash or
-        // shows it gone.
-        if (current->comm[0] == 'a' && strcmp(current->comm, "as") == 0)
-            return cpu_run_to_interrupt_amd64(cpu, tlb);
-        return cpu->tf ? cpu_single_step_amd64_frontend(cpu, tlb)
+        // The GNU `as` bypass is GONE. b71ce84d ("Contain amd64 assembler JIT
+        // crashes", 2026-05-03) routed anything named "as" to the interpreter
+        // to contain gas crashes that were never root-caused, and left
+        // instructions to re-run gas under the JIT and either reproduce the
+        // crash or show it gone. Shown gone, 2026-09-07:
+        //
+        //  - the full guest regression suite with the regression cache
+        //    disabled, so all 200 test programs are really compiled and gas is
+        //    really invoked 200 times: 200 pass, 0 fail, no assembler errors,
+        //    and zero JIT block fallbacks;
+        //  - a direct differential -- one nontrivial translation unit (SSE,
+        //    long double, atomics, a switch table, string builtins) assembled
+        //    by gas under the interpreter and under the JIT produces
+        //    BYTE-IDENTICAL object files.
+        //
+        // Keeping it had a cost beyond tidiness: `as` never reached
+        // jit_block_compile_amd64, so it never counted a compile attempt, and
+        // every "zero fallbacks" measurement silently excluded the most
+        // encoding-diverse phase of a compile.
+        return cpu->tf ? cpu_single_step_amd64(cpu, tlb)
                        : cpu_step_to_interrupt_amd64_frontend(cpu, tlb);
     }
 
@@ -3249,6 +4731,25 @@ int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
     return interrupt;
 }
 
+// The guest's rounding mode is on the host FPU for exactly as long as its code
+// runs, and the flags that code raised are back in cpu_state before anything
+// -- a syscall, signal delivery, fork, ptrace, a checkpoint -- looks at it.
+// Every engine and every way out of one (crash unwinds included) passes here.
+// See emu/fpenv.c.
+int cpu_run_to_interrupt(struct cpu_state *cpu, struct tlb *tlb) {
+    int abi = current != NULL ? current->abi : GUEST_ABI_I386;
+    fpenv_enter(cpu, abi);
+    int interrupt = cpu_run_engine_to_interrupt(cpu, tlb);
+    fpenv_exit(cpu, abi);
+    // REG_TRAPNO, as the i386 engine records it. On amd64 only the
+    // interpreter's loop did, so a page fault, #UD or #DE the JIT raised went
+    // out in a frame holding whatever trap came before -- 13 after a #GP, 0
+    // in a new process -- and with it no CR2 and no page-fault error code.
+    if (abi == GUEST_ABI_AMD64)
+        cpu->trapno = interrupt;
+    return interrupt;
+}
+
 void jit_cleanup_jetsam_after_interrupt(struct cpu_state *cpu) {
     if (cpu == NULL || cpu->mmu == NULL || cpu->mmu->jit == NULL)
         return;
@@ -3256,5 +4757,17 @@ void jit_cleanup_jetsam_after_interrupt(struct cpu_state *cpu) {
 }
 
 void cpu_poke(struct cpu_state *cpu) {
-    __atomic_store_n(cpu->poked_ptr, true, __ATOMIC_SEQ_CST);
+    // A task that has never entered the emulator has no poke flag: poked_ptr
+    // is set by each engine's entry, and a task whose image is a NATIVE
+    // program never reaches one. Poking it dereferenced NULL and took the
+    // whole app down with a SIGSEGV -- which read as "the guest exited",
+    // because from outside that is exactly what it looks like.
+    //
+    // task_create_ now points every task's flag at its own field, so this
+    // should not be reachable; it stays because the cost is a branch and the
+    // failure it prevents is the app disappearing.
+    bool *poked = cpu->poked_ptr;
+    if (poked == NULL)
+        return;   // nothing is executing guest code to interrupt
+    __atomic_store_n(poked, true, __ATOMIC_SEQ_CST);
 }

@@ -72,9 +72,10 @@ surfaced only because somebody on a real device was running as uid 1000.
 Permission ordering is not testable as root. It has to be tested as somebody
 else.
 
-## 15.2 Two formats
+## 15.2 Three formats
 
-Once the file may be executed, there are two things it can be.
+Once the file may be executed, there are three things it can be — two built in,
+and one the guest gets to add at run time.
 
 **A `#!` script.** `shebang_exec` reads the first 128 bytes and parses
 `#![spaces]interpreter[spaces]argument[spaces]` — one optional argument, as
@@ -85,6 +86,31 @@ so a script could run an interpreter the caller was not permitted to execute.
 The permission model has to be applied at every place a program is chosen, not
 just the one the user typed.
 
+And not only the permission model. *Every* question `execve` asks about a file
+is a question about a chosen program. Two of them were being asked only about
+the file the caller typed.
+
+Section 15.5's — is this a program compiled into iSH-AOK? — went unasked here
+for exactly as long as it took somebody to write `#!/AOK/native/bash` at the top
+of a script. See there for what that silence looked like.
+
+The other is "what if the interpreter is *itself* a `#!` script?" Linux hands
+the exec on again, and again, bounded: `exec_binprm` loops with `if (depth > 5)
+return -ELOOP`, which measures on a real kernel as five rewrites resolved and
+the sixth refused. AOK resolved exactly one and answered `ENOEXEC` past that —
+and `ENOEXEC`, as the previous section's story turns on, is the one exec errno
+no user ever sees. `exec_interpreter` is that loop, written as recursion, with
+Linux's constant and Linux's comparison. The depth is tested *after* the
+interpreter is opened, not before, because Linux opens it inside the handler
+that named it: a chain ending in an interpreter that does not exist answers
+`ENOENT` however deep it is, and a typo in a `#!` line should not be reported as
+a loop.
+
+That is not a hypothetical shape. It is exactly how the placeholder at
+`/AOK/native/<name>` — a `#!/bin/sh` script whose whole job is to say that
+native dispatch did not happen — gets to say it when a script names a copy of
+it as its interpreter.
+
 **An ELF image.** `elf_exec` maps the segments, and if the image names an
 interpreter — which every dynamically linked program does — maps that too and
 enters at *its* entry point, leaving `ld.so` to do the rest.
@@ -94,6 +120,79 @@ bias for position-independent executables, the `brk` reservation set aside for
 heap growth on the dynamic-PIE guests (Chapter 13), a guard against a later
 `mmap` landing where the heap intends to grow, and the initial stack.
 
+Through build 555 that load bias, and the stack and heap addresses beside it,
+were the same on every run — exactly the constant an exploit wants. `exec` now
+moves each of them by a random number of pages (`arch_mmap_rnd`,
+`randomize_stack_top`, `arch_randomize_brk`, mirroring what Linux does), so the
+stack, the heap, the program, the loader and every library land somewhere
+different each time, within bounds sized to each guest's address space.
+`personality(ADDR_NO_RANDOMIZE)` — `setarch -R`, and gdb's default — turns it
+off for one process and survives that process's own later `exec`s; a set-id
+`exec` clears it. `/proc/sys/kernel/randomize_va_space` is root's system-wide
+switch, and `ISH_RANDOMIZE_VA_SPACE` in the host environment sets its starting
+value, for anyone who needs a build's addresses to repeat across runs while
+bisecting a bug.
+
+Since 559 one setting turns it off for everyone. "Cache Translated Code
+(arm64)", off by default, keeps translated blocks after the process that made
+them (Chapter 6), and a cached block is found by the address its code was at,
+so it only pays when every process is laid out the same way. Turning it on
+sets `randomize_va_space` to 0, and the setting's own text says that ASLR is
+then off in the Linux system and what that makes easier for an attacker;
+while it is on, a write of any other value is `EPERM` — a distribution's boot
+that runs `sysctl kernel.randomize_va_space=2` would otherwise leave the
+cache running and hitting nothing. Turning it off puts back what was there,
+unless something else has changed it since. iOS's own protection of the app
+is not involved either way.
+
+**Anything the guest has registered.** `binfmt_misc` is the third answer, and
+unlike the other two it is written by the guest at run time: a rule matches a
+file by a magic string at some offset or by its filename extension, and names an
+interpreter to hand it to. It is how a Linux distribution runs Windows binaries
+through Wine, foreign architectures through `qemu-user`, and `.jar` files without
+anybody typing `java -jar`.
+
+The parsing has two details worth keeping, both from Linux's own
+`fs/binfmt_misc.c`. The line is `:name:type:offset:magic:mask:interpreter:flags`,
+but **the delimiter is whatever the first character is** — `update-binfmts`
+switches to `|` when a magic value contains a colon, so assuming `:` breaks the
+tool most likely to be writing here. And the `P` flag *inserts* an argument
+rather than replacing one, which is visible the moment you look at raw argv:
+
+```
+./t.np one     # no P    -> argvdump, ./t.np, one
+./t.wp one     # with P  -> argvdump, ./t.wp, ./t.wp, one
+```
+
+Without `P` the caller's argv[0] is gone, replaced by the path; with it the
+original is preserved ahead of the path, for interpreters that report or branch
+on their own invoked name.
+
+> **The bug that taught us this**
+>
+> This is the second implementation. The first was not an implementation at all:
+>
+> > `/proc/sys/fs/binfmt_misc` used to present `register` and `status` with
+> > nothing behind them — writes were accepted and discarded, `status` always
+> > read "enabled" — and it was removed because `update-binfmts` and
+> > `systemd-binfmt` believe the success they are handed, so a guest looked
+> > configured and then silently ran nothing. An empty directory replaced it as
+> > the truthful state.
+>
+> The rule the header states as a consequence is the general one: **a
+> registration that appears here must affect `execve`, or the empty directory was
+> the better answer.** Chapter 40 argues the same thing at book length — a
+> capability reported present and not delivered is a state no real system
+> produces, and it costs more than the absence would have. What makes this
+> instance sharp is that the fake surface was not merely useless: it was
+> *actively worse* than nothing, because the tools that write to it treat a
+> successful write as configuration accomplished and never look again.
+
+There is a mount to get past first, exactly as on Linux — the directory is empty
+until `mount -t binfmt_misc none /proc/sys/fs/binfmt_misc`, and `register` and
+`status` do not exist before that. `opt/AOK/docs/binfmt-misc.md` is the user's
+version of all this.
+
 ## 15.3 The stack the program wakes up on
 
 A freshly `exec`'d program does not start with an empty stack. It starts with a
@@ -102,8 +201,8 @@ above them the auxiliary vector — a list of key/value pairs the kernel uses to
 tell libc things it cannot otherwise discover.
 
 Most `AT_*` entries are bookkeeping: where the program headers are, how large a
-page is, what the entry point was, who the process is. Two are more interesting
-here.
+page is, what the entry point was, who the process is. Three are more
+interesting here.
 
 **`AT_HWCAP`** advertises the processor's features, and on aarch64 AOK
 advertises *exactly the ISA features the JIT implements*. That is not a
@@ -120,8 +219,25 @@ to be generated by running `dlsym` *inside the guest* rather than by reading the
 shared object on disk. The aux vector this chapter builds is the input to the
 fingerprints that chapter matches.
 
+`AT_HWCAP2` carries one feature past the first word: MOPS, ARMv8.8's
+memory-copy and memory-set instructions. A `CPYFP`/`CPYFM`/`CPYFE` triple is a
+whole `memcpy`, and glibc 2.41 resolves `memcpy`, `memmove` and `memset` to
+such triples when the bit is set. No Apple chip AOK runs on has MOPS, and it
+does not need to: to a gadget JIT the instruction is one dispatch to a gadget
+that copies page span by page span, where the NEON loop it replaces is a
+dispatch for every instruction of every 64 bytes (`jit/guest-arm64/control.S`;
+until 558 everything past 64 bytes went to C, and `jit/arm64_mops.c` now keeps
+only the model the gadget follows and the switch). So AOK advertises a feature the
+host lacks, because emulating it is cheaper than emulating what software does
+without it. `ISH_MOPS=0`, or `echo 0 > /proc/ish/arm64_mops` for programs
+started afterwards, hides it again.
+
 The riscv64 equivalent packs one bit per ISA letter, which is a pleasantly
-direct encoding for a pleasantly regular architecture.
+direct encoding for a pleasantly regular architecture — and since 558 it has a
+`v`: the vector unit is all gadgets and advertised, in `AT_HWCAP`, the
+`/proc/cpuinfo` isa line and `riscv_hwprobe`, and
+`PR_RISCV_V_SET_CONTROL` can withhold it from the next exec, which then sees no
+`v` and finds every vector instruction illegal.
 
 **`AT_SECURE`** is the security-relevant one. It tells libc that this execution
 crossed a privilege boundary — a setuid or setgid binary, or a uid/euid mismatch
@@ -161,6 +277,46 @@ every setuid binary in the guest died with `SIGSEGV` before `main`. Two
 independent pieces of correctness, each defensible alone, intersecting in a
 crash that named neither.
 
+**`AT_SYSINFO_EHDR`** is the address of the vDSO, a small shared object the
+kernel maps into every process so that the C library can read the clock without
+making a system call. Under AOK the system call is the expensive part of reading
+the clock: leaving the JIT, dispatching, checking seccomp, ptrace and pending
+signals, and coming back cost about 700 ns on an arm64 guest — the price of
+`getppid` — where the host reads its own clock in 30. Every guest has one: i386
+always did, and amd64, arm64 and riscv64 (`vdso/<arch>/vdso.S`) now do, under
+the names and versions their C libraries look up.
+
+Linux's vDSO computes the time itself, from a hardware counter and numbers the
+kernel publishes on a `[vvar]` page. AOK's cannot, because the numbers under a
+guest clock are not the kernel's to publish once: a checkpoint restore moves the
+guest clocks' origins, and the host stepping its wall clock moves the gap
+between realtime and monotonic without telling anyone. A copy on a page would
+be stale until something noticed, and in that window the guest could read a time
+earlier than a file the kernel had just stamped. So the vDSO asks the JIT
+instead, through one private instruction per architecture — an `mrs` of an
+implementation-defined system register on arm64, a custom CSR on riscv64,
+`vmcall` on x86_64 — which runs `vdso_clock_ns` in `kernel/time.c`, the same
+computation `clock_gettime` runs. The two cannot drift apart because they are
+one computation, and `tests/manual/vdso_clock.c` holds them to it by bracketing
+every vDSO read between two system calls. What changes for the guest is what a
+vDSO changes on Linux: these reads are no longer system calls, so neither
+seccomp nor `strace` sees them. (musl's riscv64 port never looks the vDSO up, so
+there only glibc and Go use it.)
+
+That promise, a read never earlier than a file just stamped, needed one more
+step on Apple hosts. Darwin's wall clock only has whole microseconds, while APFS
+stamps files to the nanosecond, so a file written in the same microsecond as a
+later read came out dated after it. The M4 iPad's JIT is fast enough to land in
+one microsecond; the vDSO test's "an mtime is never in the future" check failed
+there 17 times in 300. So `clock_gettime_host_backed` reports each REALTIME
+read at the *end* of its microsecond. That is never behind the host's clock and
+never more than 999 ns ahead of it, so a deadline computed from it still cannot
+come due early.
+
+Each process gets its own copy, as it does of the `[sigpage]`. The i386 vDSO
+used to be one array mapped into every process, which any of them could
+`mprotect` writable and rewrite for all the others, root's included.
+
 ## 15.4 Exec against the thread group
 
 If a *non-leader* thread calls `execve`, Linux requires that exactly one thread
@@ -182,20 +338,33 @@ that a process be able to shed its threads and keep its pid.
 
 ## 15.5 The fork in the road
 
-The last thing `__do_execve` does before any of the above is ask whether the
-resolved path is a natively-implemented program:
+The last thing done before any of the above is ask whether the resolved file is
+a natively-implemented program:
 
 ```c
 // Natively-implemented programs (/AOK/native/*, kernel/native.h) are ...
 ```
 
-If it is, the function sets `native_exec` on the task and returns before
-reaching any of the ELF machinery. No segments are mapped, no interpreter is
-loaded, no entry point is set. When the task would otherwise begin executing the
-loaded image, it calls a C function inside iSH-AOK instead. Part V is about what
-that means; here it is enough to note where the branch is, and that it is a
+If it is, `native_dispatch_exec` records the program on the task and returns
+before reaching any of the ELF machinery. No segments are mapped, no interpreter
+is loaded, no entry point is set. When the task would otherwise begin executing
+the loaded image, it calls a C function inside iSH-AOK instead. Part V is about
+what that means; here it is enough to note where the branch is, and that it is a
 branch in `execve` rather than a special case bolted on elsewhere — which is
 exactly why the caller cannot tell.
+
+For a while the branch was in `__do_execve` and nowhere else, which meant it was
+taken when a native program was named directly and not when it was reached as a
+`#!` interpreter. The result was the quietest possible failure. What the guest
+finds at `/AOK/native/<name>` is a `#!/bin/sh` placeholder — the real program is
+compiled in, and the file is only there so the path exists — so a script saying
+`#!/AOK/native/bash` was handed a shell script as its interpreter, found no
+loader that would take one, and came back `ENOEXEC`. `ENOEXEC` is precisely the
+errno every shell answers by re-running the file under `/bin/sh`. So the script
+ran, under dash, and said nothing: not the program asked for, not the
+placeholder's own diagnostic, no error anywhere. The question now lives in
+`native_dispatch_exec` and is asked wherever a program is chosen — the direct
+exec, the `#!` interpreter, and the `binfmt_misc` interpreter alike.
 
 Even so, exec's ordinary obligations do not go away, and forgetting them was a
 source of bugs. `exec_apply_native_process_state` resets the signal
@@ -227,8 +396,10 @@ catches people out), pending alternate signal stacks, memory mappings including
 shared ones, and the JIT's translations, since a new address space gets a fresh
 `struct jit` (Chapter 6).
 
-**Changes:** the credentials, if the binary is setuid or setgid; `AT_SECURE`
-accordingly; and the capability sets, which are now actually recomputed rather
+**Changes:** the effective credentials, if the binary is setuid or setgid, and
+on every exec the saved and filesystem ids, which take the effective ones;
+`AT_SECURE`, whenever the effective ids end up other than the real ones, set-id
+bit or not; and the capability sets, which are now actually recomputed rather
 than inherited wholesale.
 
 That list is the security boundary. Before the work described in this chapter,

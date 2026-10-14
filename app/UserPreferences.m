@@ -6,6 +6,7 @@
 //
 
 #import "UserPreferences.h"
+#import "LLMKeychain.h"
 #import "fs/proc/ish.h"
 #include "jit/jit.h"
 #include "task.h"
@@ -20,26 +21,38 @@ static NSString *const kPreferenceHideExtraKeysWithExternalKeyboardKey = @"Hide 
 static NSString *const kPreferenceMaximizeScreenSpaceKey = @"Maximize Screen Space";
 static NSString *const kPreferenceShowTerminalQuickButtonsKey = @"Show Terminal Quick Buttons";
 static NSString *const kPreferenceAutoShowKeyboardKey = @"Auto Show Keyboard";
+static NSString *const kPreferenceDisplayTouchpadModeKey = @"Display Touchpad Mode";
 static NSString *const kPreferenceWorkspaceLaunchCountKey = @"Workspaces At Launch";
 static NSString *const kPreferenceOverrideControlSpaceKey = @"Override Control Space";
 static NSString *const kPreferenceFontFamilyKey = @"Font Family";
 static NSString *const kPreferenceFontSizeKey = @"Font Size";
 static NSString *const kPreferenceLineHeightKey = @"Line Height";
+static NSString *const kPreferenceTerminalBottomPaddingKey = @"Terminal Bottom Padding";
 static NSString *const kPreferenceThemeKey = @"ModernTheme";
 static NSString *const kPreferenceDisableDimmingKey = @"Disable Dimming";
 static NSString *const kPreferenceEnableMulticoreKey = @"Enable Multicore";
 static NSString *const kPreferenceEnableHLEKey = @"Enable HLE Accel";
+static NSString *const kPreferenceEnableJITCacheKey = @"Enable JIT Cache";
 static NSString *const kPreferenceEnableCryptoAccelKey = @"Enable Crypto Accel";
 static NSString *const kPreferenceEnablePixAccelKey = @"Enable Pixman Accel";
 static NSString *const kPreferenceEnableExtraLockingKey = @"Enable Additional Locking";
 static NSString *const kPreferenceEnableSwapKey = @"Enable Swap";
+static NSString *const kPreferenceSuspendToDiskKey = @"Suspend To Disk";
 static NSString *const kPreferenceSwapSizeMBKey = @"Swap Size MB";
+static NSString *const kPreferenceEnableSwapOnExternalKey = @"Enable Swap On External";
+static NSString *const kPreferenceSwapExternalBookmarkKey = @"Swap External Bookmark";
+static NSString *const kPreferenceSwapExternalPathKey = @"Swap External Path";
+static NSString *const kPreferenceEnableCompressedMemoryKey = @"Enable Compressed Memory";
+static NSString *const kPreferenceCompressedMemorySizeMBKey = @"Compressed Memory Size MB";
 static NSString *const kPreferenceEnableLLMClientKey = @"Enable LLM Client";
 static NSString *const kPreferenceLLMProviderKey = @"LLM Provider";
 static NSString *const kPreferenceLLMServerURLKey = @"LLM Server URL";
 static NSString *const kPreferenceLLMModelKey = @"LLM Model";
 static NSString *const kPreferenceLLMAPIKeyKey = @"LLM API Key";
 static NSString *const kPreferenceLLMDestinationsKey = @"LLM Destinations";
+static NSString *const kPreferenceSnippetsKey = @"Snippets";
+static NSString *const kPreferenceSnippetsSyncedDigestKey = @"Snippets Synced Digest";
+static NSString *const kPreferenceToolbarKeysKey = @"Toolbar Keys";
 static NSString *const kPreferenceLLMActiveDestinationKey = @"LLM Active Destination";
 static NSString *const kPreferenceLLMToolsEnabledKey = @"LLM Tools Enabled";
 static NSString *const kPreferenceLLMToolTimeoutSecondsKey = @"LLM Tool Timeout Seconds";
@@ -48,6 +61,9 @@ static NSString *const kPreferenceLLMToolMaxRoundsKey = @"LLM Tool Max Rounds";
 static NSString *const kPreferenceLLMHideThinkingKey = @"LLM Hide Thinking";
 static NSString *const kPreferenceShortcutsRunCommandsEnabledKey = @"Shortcuts Run Commands Enabled";
 static NSString *const kPreferenceCustomDnsServersKey = @"Custom DNS Servers";
+static NSString *const kPreferenceDisplayDesktopScaleKey = @"Display Desktop Scale";
+static NSString *const kPreferenceDisplayUIScaleKey = @"Display UI Scale";
+static NSString *const kPreferenceDisableResolvConfRewriteKey = @"Disable Resolv Conf Rewrite";
 
 NSString *const kPreferenceLaunchCommandKey = @"Init Command";
 NSString *const kPreferenceBootCommandKey = @"Boot Command";
@@ -58,9 +74,46 @@ NSString *const kPreferenceInitialWindowKey = @"Initial Window";
 static NSArray<NSString *> *ISHDefaultLaunchCommand(void);
 static NSArray<NSString *> *ISHDefaultBootCommand(void);
 static NSString *const kPreferenceLoginAsDefaultUserKey = @"Login As Default User";
+static NSString *const kPreferenceForeignExecModeKey = @"Programs From Other Roots";
 
 const int ISHDefaultUserAccountUID = 1000;
 const NSInteger ISHSwapMaxSizeMB = 16384;
+// The pool is RESIDENT memory, unlike the swap area which is disk, so its
+// ceiling is much lower: a pool larger than the device's RAM is not a
+// configuration, it is a jetsam kill waiting for a workload.
+// CLAMPED AGAINST THE DEVICE, not a fixed number.
+//
+// The first version was a flat 4096, chosen against swap's 16384 on the
+// reasoning that the pool is resident memory where the swap area is disk. That
+// is the right reasoning and the wrong number: on the 1.45 GB iPad this was
+// tested on, a 4 GB pool is not a configuration, it is a jetsam kill waiting
+// for a workload -- and the pool competes for the very memory it is saving,
+// since its own bytes are charged to phys_footprint exactly like the frames
+// they replaced.
+//
+// A quarter of physical RAM, floored so a small device still gets a usable
+// choice and capped so a large one does not get an absurd one. A quarter
+// because at the measured 2.2-2.8x that holds roughly 60-70% of RAM's worth of
+// guest memory, which is a large win while leaving three quarters of the
+// machine for everything else.
+static NSInteger ISHComputeCompressedMemoryMax(void) {
+    uint64_t ram = NSProcessInfo.processInfo.physicalMemory;
+    NSInteger quarter = (NSInteger) (ram / (4 * 1024 * 1024));
+    if (quarter < 64)
+        quarter = 64;
+    if (quarter > 4096)
+        quarter = 4096;
+    return quarter;
+}
+
+const NSInteger ISHCompressedMemoryMaxSizeMB = 4096;   // the absolute ceiling
+
+NSInteger ISHCompressedMemoryMaxForDevice(void) {
+    static NSInteger cached;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ cached = ISHComputeCompressedMemoryMax(); });
+    return cached;
+}
 static NSString *const kPreferenceCursorStyleKey = @"Cursor Style";
 static NSString *const kPreferenceBlinkCursorKey = @"Blink Cursor";
 NSString *const kPreferenceHideStatusBarKey = @"Status Bar";
@@ -193,7 +246,8 @@ void amd64_jit_preference_set(bool enabled) {
         _defaults = [NSUserDefaults standardUserDefaults];
         [_defaults registerDefaults:@{
             kPreferenceEnableMulticoreKey: @(YES),
-            kPreferenceEnableHLEKey: @(NO),
+            kPreferenceEnableHLEKey: @(YES),
+            kPreferenceEnableJITCacheKey: @(NO),
             kPreferenceEnableCryptoAccelKey: @(NO),
             kPreferenceEnablePixAccelKey: @(NO),
             kPreferenceEnableExtraLockingKey: @(YES),
@@ -204,13 +258,26 @@ void amd64_jit_preference_set(bool enabled) {
             // /proc/ish/defaults and in the iOS Settings pane with an honest
             // value instead of an empty one.
             kPreferenceEnableSwapKey: @(NO),
+            kPreferenceSuspendToDiskKey: @(NO),
             kPreferenceSwapSizeMBKey: @(0),
+            kPreferenceEnableSwapOnExternalKey: @(NO),
+            kPreferenceSwapExternalPathKey: @"",
+            kPreferenceEnableCompressedMemoryKey: @(NO),
+            // 128 MB, not 0. Swap's size registers as 0 ("no size chosen")
+            // because picking one would be AOK deciding how much of the user's
+            // FLASH to write to. This is RAM, it is bounded by the cap, and it
+            // writes nothing -- so a switch that does nothing until you also
+            // pick a number is just a foot-gun. The switch still defaults OFF;
+            // this only decides what you get when you turn it on.
+            kPreferenceCompressedMemorySizeMBKey: @(128),
             kPreferenceEnableLLMClientKey: @(NO),
             kPreferenceLLMProviderKey: @"OpenRouter Free",
             kPreferenceLLMServerURLKey: @"https://openrouter.ai/api/v1",
             kPreferenceLLMModelKey: @"openrouter/free",
             kPreferenceLLMAPIKeyKey: @"",
             kPreferenceLLMDestinationsKey: @[],
+            kPreferenceSnippetsKey: @[],
+            kPreferenceSnippetsSyncedDigestKey: @"",
             kPreferenceLLMActiveDestinationKey: @"",
             kPreferenceLLMToolsEnabledKey: @(NO),
             kPreferenceLLMToolTimeoutSecondsKey: @(30),
@@ -222,10 +289,15 @@ void amd64_jit_preference_set(bool enabled) {
             // 1 = the height hterm measures, i.e. exactly what every build
             // before this one did. Nobody's terminal moves until they ask.
             kPreferenceLineHeightKey: @(1),
+            kPreferenceTerminalBottomPaddingKey: @(0),
             kPreferenceCapsLockMappingKey: @(CapsLockMapControl),
             kPreferenceOptionMappingKey: @(OptionMapNone),
             kPreferenceBacktickEscapeKey: @(NO),
             kPreferenceDisableDimmingKey: @(NO),
+            kPreferenceDisableResolvConfRewriteKey: @(NO),
+            // 1 = one desktop pixel per point, 0 = match the resolution.
+            kPreferenceDisplayDesktopScaleKey: @(1),
+            kPreferenceDisplayUIScaleKey: @(0),
             kPreferenceLaunchCommandKey: ISHDefaultLaunchCommand(),
             kPreferenceBootCommandKey: ISHDefaultBootCommand(),
             // The SESSION SHELL, not the console, and that is what makes a
@@ -257,9 +329,11 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceWorkspaceStyleKey: @(WorkspaceStyleModern),
             kPreferenceShowTerminalQuickButtonsKey: @(YES),
             kPreferenceAutoShowKeyboardKey: @(YES),
+            kPreferenceDisplayTouchpadModeKey: @(NO),
             kPreferenceWorkspaceLaunchCountKey: @(1),
             kPreferenceThemeKey: @"Solarized",
             kPreferenceLoginAsDefaultUserKey: @(NO),
+            kPreferenceForeignExecModeKey: @"root",
         }];
         // https://webkit.org/blog/10247/new-webkit-features-in-safari-13-1/
         if (@available(iOS 13.4, *)) {
@@ -285,11 +359,13 @@ void amd64_jit_preference_set(bool enabled) {
         friendlyPreferenceMapping = @{
             @"enable_multicore": kPreferenceEnableMulticoreKey,
             @"enable_hle": kPreferenceEnableHLEKey,
+            @"enable_jit_cache": kPreferenceEnableJITCacheKey,
             @"enable_crypto_accel": kPreferenceEnableCryptoAccelKey,
             @"enable_pix_accel": kPreferenceEnablePixAccelKey,
             @"enable_extralocking": kPreferenceEnableExtraLockingKey,
             @"enable_swap": kPreferenceEnableSwapKey,
             @"swap_size_mb": kPreferenceSwapSizeMBKey,
+            @"enable_swap_external": kPreferenceEnableSwapOnExternalKey,
             @"caps_lock_mapping": kPreferenceCapsLockMappingKey,
             @"option_mapping": kPreferenceOptionMappingKey,
             @"backtick_mapping_escape": kPreferenceBacktickEscapeKey,
@@ -297,12 +373,18 @@ void amd64_jit_preference_set(bool enabled) {
             @"maximize_screen_space": kPreferenceMaximizeScreenSpaceKey,
             @"show_terminal_quick_buttons": kPreferenceShowTerminalQuickButtonsKey,
             @"auto_show_keyboard": kPreferenceAutoShowKeyboardKey,
+            @"display_touchpad_mode": kPreferenceDisplayTouchpadModeKey,
             @"workspace_launch_count": kPreferenceWorkspaceLaunchCountKey,
             @"override_control_space": kPreferenceOverrideControlSpaceKey,
             @"font_family": kPreferenceFontFamilyKey,
             @"font_size": kPreferenceFontSizeKey,
             @"line_height": kPreferenceLineHeightKey,
+            @"terminal_bottom_padding": kPreferenceTerminalBottomPaddingKey,
             @"disable_dimming": kPreferenceDisableDimmingKey,
+            @"custom_dns_servers": kPreferenceCustomDnsServersKey,
+            @"disable_resolv_conf_rewrite": kPreferenceDisableResolvConfRewriteKey,
+            @"display_desktop_scale": kPreferenceDisplayDesktopScaleKey,
+            @"display_ui_scale": kPreferenceDisplayUIScaleKey,
             @"enable_llm_client": kPreferenceEnableLLMClientKey,
             @"llm_provider": kPreferenceLLMProviderKey,
             @"llm_server_url": kPreferenceLLMServerURLKey,
@@ -317,6 +399,7 @@ void amd64_jit_preference_set(bool enabled) {
             @"launch_command": kPreferenceLaunchCommandKey,
             @"boot_command": kPreferenceBootCommandKey,
             @"login_as_default_user": kPreferenceLoginAsDefaultUserKey,
+            @"foreign_exec": kPreferenceForeignExecModeKey,
             @"cursor_style": kPreferenceCursorStyleKey,
             @"blink_cursor": kPreferenceBlinkCursorKey,
             @"hide_status_bar": kPreferenceHideStatusBarKey,
@@ -334,11 +417,19 @@ void amd64_jit_preference_set(bool enabled) {
         kvoProperties = @{
             kPreferenceEnableMulticoreKey: property(shouldEnableMulticore),
             kPreferenceEnableHLEKey: property(shouldEnableHLE),
+            kPreferenceEnableJITCacheKey: property(shouldEnableJITCache),
+            kPreferenceForeignExecModeKey: property(foreignExecMode),
             kPreferenceEnableCryptoAccelKey: property(shouldEnableCryptoAccel),
             kPreferenceEnablePixAccelKey: property(shouldEnablePixAccel),
 	        kPreferenceEnableExtraLockingKey: property(shouldEnableExtraLocking),
             kPreferenceEnableSwapKey: property(shouldEnableSwap),
+            kPreferenceSuspendToDiskKey: property(shouldSuspendToDisk),
             kPreferenceSwapSizeMBKey: property(swapSizeMB),
+            kPreferenceEnableSwapOnExternalKey: property(shouldEnableSwapOnExternal),
+            kPreferenceSwapExternalBookmarkKey: property(swapExternalBookmark),
+            kPreferenceSwapExternalPathKey: property(swapExternalPath),
+            kPreferenceEnableCompressedMemoryKey: property(shouldEnableCompressedMemory),
+            kPreferenceCompressedMemorySizeMBKey: property(compressedMemorySizeMB),
             kPreferenceCapsLockMappingKey: property(capsLockMapping),
             kPreferenceOptionMappingKey: property(optionMapping),
             kPreferenceBacktickEscapeKey: property(backtickMapEscape),
@@ -346,11 +437,13 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceMaximizeScreenSpaceKey: property(maximizeScreenSpace),
             kPreferenceShowTerminalQuickButtonsKey: property(showTerminalQuickButtons),
             kPreferenceAutoShowKeyboardKey: property(autoShowKeyboard),
+            kPreferenceDisplayTouchpadModeKey: property(displayTouchpadMode),
             kPreferenceWorkspaceLaunchCountKey: property(workspaceLaunchCount),
             kPreferenceOverrideControlSpaceKey: property(overrideControlSpace),
             kPreferenceFontFamilyKey: property(fontFamily),
             kPreferenceFontSizeKey: property(fontSize),
             kPreferenceLineHeightKey: property(lineHeight),
+            kPreferenceTerminalBottomPaddingKey: property(terminalBottomPadding),
             kPreferenceDisableDimmingKey: property(shouldDisableDimming),
             kPreferenceEnableLLMClientKey: property(shouldEnableLLMClient),
             kPreferenceLLMProviderKey: property(llmProvider),
@@ -358,6 +451,9 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceLLMModelKey: property(llmModel),
             kPreferenceLLMAPIKeyKey: property(llmAPIKey),
             kPreferenceLLMDestinationsKey: property(llmDestinations),
+            kPreferenceSnippetsKey: property(snippets),
+            kPreferenceToolbarKeysKey: property(toolbarKeys),
+            kPreferenceSnippetsSyncedDigestKey: property(snippetsSyncedDigest),
             kPreferenceLLMActiveDestinationKey: property(llmActiveDestinationID),
             kPreferenceLLMToolsEnabledKey: property(llmToolsEnabled),
             kPreferenceLLMToolTimeoutSecondsKey: property(llmToolTimeoutSeconds),
@@ -366,6 +462,9 @@ void amd64_jit_preference_set(bool enabled) {
             kPreferenceLLMHideThinkingKey: property(llmHideThinking),
             kPreferenceShortcutsRunCommandsEnabledKey: property(shortcutsRunCommandsEnabled),
             kPreferenceCustomDnsServersKey: property(customDnsServers),
+            kPreferenceDisableResolvConfRewriteKey: property(shouldDisableResolvConfRewrite),
+            kPreferenceDisplayDesktopScaleKey: property(displayDesktopScale),
+            kPreferenceDisplayUIScaleKey: property(displayUIScale),
             kPreferenceLaunchCommandKey: property(launchCommand),
             kPreferenceBootCommandKey: property(bootCommand),
             kPreferenceCursorStyleKey: property(cursorStyle),
@@ -476,6 +575,15 @@ void amd64_jit_preference_set(bool enabled) {
     [_defaults setBool:autoShowKeyboard forKey:kPreferenceAutoShowKeyboardKey];
 }
 
+// MARK: displayTouchpadMode
+- (BOOL)displayTouchpadMode {
+    return [_defaults boolForKey:kPreferenceDisplayTouchpadModeKey];
+}
+
+- (void)setDisplayTouchpadMode:(BOOL)displayTouchpadMode {
+    [_defaults setBool:displayTouchpadMode forKey:kPreferenceDisplayTouchpadModeKey];
+}
+
 // MARK: workspaceLaunchCount
 - (NSInteger)workspaceLaunchCount {
     NSInteger value = [_defaults integerForKey:kPreferenceWorkspaceLaunchCountKey];
@@ -535,6 +643,25 @@ void amd64_jit_preference_set(bool enabled) {
     return scale > 0.5 && scale <= 2;
 }
 
+// MARK: terminalBottomPadding
+- (NSNumber *)terminalBottomPadding {
+    NSNumber *value = [_defaults objectForKey:kPreferenceTerminalBottomPaddingKey];
+    return value != nil ? value : @(0);
+}
+
+- (void)setTerminalBottomPadding:(NSNumber *)terminalBottomPadding {
+    [_defaults setObject:terminalBottomPadding forKey:kPreferenceTerminalBottomPaddingKey];
+}
+
+// Up to a quarter of the shortest screen iSH-AOK runs on: more than that is a
+// terminal somebody cannot find, not a margin.
+- (BOOL)validateTerminalBottomPadding:(id *)value error:(NSError **)error {
+    if (![*value isKindOfClass:NSNumber.class])
+        return NO;
+    double points = [*value doubleValue];
+    return points >= 0 && points <= 120;
+}
+
 - (NSNumber *)defaultFontSize {
     NSNumber *defaultFontSize = [[[NSUserDefaults alloc] initWithSuiteName:NSRegistrationDomain] objectForKey:kPreferenceFontSizeKey];
     return defaultFontSize ?: @12;
@@ -562,7 +689,7 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 - (NSString *)fontFamilyUserFacingName {
-    return [self.fontFamily isEqualToString:kSystemMonospacedFontName] ? @"System" : self.fontFamily;
+    return [self.fontFamily isEqualToString:kSystemMonospacedFontName] ? NSLocalizedString(@"System", @"Font name shown for the system monospaced font") : self.fontFamily;
 }
 
 - (UIFont *)approximateFont {
@@ -689,12 +816,25 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 // MARK: llmAPIKey
+// In the Keychain, not the defaults: every defaults key is readable by any
+// guest process as /proc/ish/defaults/<name>, which handed the user's keys to
+// anything the model ran. The guest can still set it (llm_api_key) but reads
+// back only the registered empty string. See LLMKeychain.h.
 - (NSString *)llmAPIKey {
-    return [_defaults stringForKey:kPreferenceLLMAPIKeyKey] ?: @"";
+    NSString *legacy = [_defaults stringForKey:kPreferenceLLMAPIKeyKey];
+    if (legacy.length > 0) {
+        if (!ISHLLMKeychainWrite(kISHLLMKeychainActiveAccount, legacy))
+            return legacy;
+        [_defaults removeObjectForKey:kPreferenceLLMAPIKeyKey];
+    }
+    return ISHLLMKeychainRead(kISHLLMKeychainActiveAccount) ?: @"";
 }
 
 - (void)setLlmAPIKey:(NSString *)llmAPIKey {
-    [_defaults setObject:llmAPIKey ?: @"" forKey:kPreferenceLLMAPIKeyKey];
+    if (ISHLLMKeychainWrite(kISHLLMKeychainActiveAccount, llmAPIKey))
+        [_defaults removeObjectForKey:kPreferenceLLMAPIKeyKey];
+    else
+        [_defaults setObject:llmAPIKey ?: @"" forKey:kPreferenceLLMAPIKeyKey];
 }
 
 // MARK: llmDestinations
@@ -702,13 +842,101 @@ void amd64_jit_preference_set(bool enabled) {
 // dictionaries has no sensible string form for the guest-side `defaults`
 // tool, and a destination id set there without the matching four scalars
 // would make the next settings edit write into the wrong saved entry.
+//
+// Each entry's "apiKey" lives in the Keychain under the entry's "id" (see
+// llmAPIKey for why). Callers still see and pass "apiKey" in the
+// dictionaries; only the stored copy goes without it. A stored key from an
+// older build is moved on first read.
 - (NSArray<NSDictionary<NSString *, NSString *> *> *)llmDestinations {
     NSArray *stored = [_defaults arrayForKey:kPreferenceLLMDestinationsKey];
-    return [stored isKindOfClass:NSArray.class] ? stored : @[];
+    if (![stored isKindOfClass:NSArray.class])
+        return @[];
+    NSMutableArray *result = [NSMutableArray array];
+    BOOL migrated = NO;
+    for (id entry in stored) {
+        if (![entry isKindOfClass:NSDictionary.class]) {
+            [result addObject:entry];
+            continue;
+        }
+        NSString *identifier = [entry[@"id"] isKindOfClass:NSString.class] ? entry[@"id"] : nil;
+        NSString *legacy = [entry[@"apiKey"] isKindOfClass:NSString.class] ? entry[@"apiKey"] : nil;
+        if (identifier.length > 0 && legacy.length > 0 && ISHLLMKeychainWrite(ISHLLMKeychainDestinationAccount(identifier), legacy))
+            migrated = YES;
+        NSMutableDictionary *filled = [entry mutableCopy];
+        if (identifier.length > 0)
+            filled[@"apiKey"] = ISHLLMKeychainRead(ISHLLMKeychainDestinationAccount(identifier)) ?: (legacy ?: @"");
+        [result addObject:filled];
+    }
+    if (migrated)
+        self.llmDestinations = result;
+    return result;
 }
 
 - (void)setLlmDestinations:(NSArray<NSDictionary<NSString *, NSString *> *> *)llmDestinations {
-    [_defaults setObject:llmDestinations ?: @[] forKey:kPreferenceLLMDestinationsKey];
+    NSMutableSet<NSString *> *previousIDs = [NSMutableSet set];
+    for (id entry in [_defaults arrayForKey:kPreferenceLLMDestinationsKey]) {
+        if ([entry isKindOfClass:NSDictionary.class] && [entry[@"id"] isKindOfClass:NSString.class])
+            [previousIDs addObject:entry[@"id"]];
+    }
+    NSMutableArray *stored = [NSMutableArray array];
+    for (id entry in llmDestinations ?: @[]) {
+        if (![entry isKindOfClass:NSDictionary.class]) {
+            [stored addObject:entry];
+            continue;
+        }
+        NSString *identifier = [entry[@"id"] isKindOfClass:NSString.class] ? entry[@"id"] : nil;
+        NSMutableDictionary *stripped = [entry mutableCopy];
+        id key = entry[@"apiKey"];
+        // Kept in the stored copy only if the Keychain refused it, so a key
+        // is never lost; the next read retries the move.
+        if (identifier.length > 0 && key != nil &&
+            ISHLLMKeychainWrite(ISHLLMKeychainDestinationAccount(identifier), [key isKindOfClass:NSString.class] ? key : nil))
+            [stripped removeObjectForKey:@"apiKey"];
+        if (identifier.length > 0)
+            [previousIDs removeObject:identifier];
+        [stored addObject:stripped];
+    }
+    // A deleted destination takes its key with it.
+    for (NSString *identifier in previousIDs)
+        ISHLLMKeychainWrite(ISHLLMKeychainDestinationAccount(identifier), nil);
+    [_defaults setObject:stored forKey:kPreferenceLLMDestinationsKey];
+}
+
+// MARK: snippets
+// Same shape as llmDestinations and the same reason for staying out of
+// friendlyPreferenceMapping: an array of dictionaries has no sensible string
+// form for the guest-side `defaults` tool. Snippets do not need one -- the
+// guest edits them through the JSON mirror instead, which is a better fit for
+// multi-line text than a preference string could ever be.
+- (NSArray<NSDictionary<NSString *, id> *> *)snippets {
+    NSArray *stored = [_defaults arrayForKey:kPreferenceSnippetsKey];
+    return [stored isKindOfClass:NSArray.class] ? stored : @[];
+}
+
+- (void)setSnippets:(NSArray<NSDictionary<NSString *, id> *> *)snippets {
+    [_defaults setObject:snippets ?: @[] forKey:kPreferenceSnippetsKey];
+}
+
+// MARK: toolbarKeys
+- (NSDictionary<NSString *, NSArray *> *)toolbarKeys {
+    NSDictionary *stored = [_defaults dictionaryForKey:kPreferenceToolbarKeysKey];
+    return [stored isKindOfClass:NSDictionary.class] ? stored : nil;
+}
+
+- (void)setToolbarKeys:(NSDictionary<NSString *, NSArray *> *)toolbarKeys {
+    if (toolbarKeys == nil)
+        [_defaults removeObjectForKey:kPreferenceToolbarKeysKey];
+    else
+        [_defaults setObject:toolbarKeys forKey:kPreferenceToolbarKeysKey];
+}
+
+// MARK: snippetsSyncedDigest
+- (NSString *)snippetsSyncedDigest {
+    return [_defaults stringForKey:kPreferenceSnippetsSyncedDigestKey] ?: @"";
+}
+
+- (void)setSnippetsSyncedDigest:(NSString *)snippetsSyncedDigest {
+    [_defaults setObject:snippetsSyncedDigest ?: @"" forKey:kPreferenceSnippetsSyncedDigestKey];
 }
 
 // MARK: llmActiveDestinationID
@@ -815,6 +1043,48 @@ void amd64_jit_preference_set(bool enabled) {
     return [*value isKindOfClass:NSString.class];
 }
 
+// MARK: shouldDisableResolvConfRewrite
+- (BOOL)shouldDisableResolvConfRewrite {
+    return [_defaults boolForKey:kPreferenceDisableResolvConfRewriteKey];
+}
+
+- (void)setShouldDisableResolvConfRewrite:(BOOL)disable {
+    [_defaults setBool:disable forKey:kPreferenceDisableResolvConfRewriteKey];
+}
+
+- (BOOL)validateShouldDisableResolvConfRewrite:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: displayDesktopScale / displayUIScale
+// Clamped to 0..3: 0 carries a meaning (native, and match-the-resolution), and
+// anything past 3 is more pixels than any device here has points to justify.
+- (NSInteger)displayDesktopScale {
+    return MIN(MAX([_defaults integerForKey:kPreferenceDisplayDesktopScaleKey], (NSInteger) 0), (NSInteger) 3);
+}
+
+- (void)setDisplayDesktopScale:(NSInteger)scale {
+    [_defaults setInteger:MIN(MAX(scale, (NSInteger) 0), (NSInteger) 3)
+                   forKey:kPreferenceDisplayDesktopScaleKey];
+}
+
+- (BOOL)validateDisplayDesktopScale:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+- (NSInteger)displayUIScale {
+    return MIN(MAX([_defaults integerForKey:kPreferenceDisplayUIScaleKey], (NSInteger) 0), (NSInteger) 3);
+}
+
+- (void)setDisplayUIScale:(NSInteger)scale {
+    [_defaults setInteger:MIN(MAX(scale, (NSInteger) 0), (NSInteger) 3)
+                   forKey:kPreferenceDisplayUIScaleKey];
+}
+
+- (BOOL)validateDisplayUIScale:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
 // MARK: ShouldEnablemulticore
 - (BOOL)shouldEnableMulticore {
     return [_defaults boolForKey:kPreferenceEnableMulticoreKey];
@@ -828,6 +1098,26 @@ void amd64_jit_preference_set(bool enabled) {
     return [*value isKindOfClass:NSNumber.class];
 }
 
+// MARK: foreignExecMode
+- (NSString *)foreignExecMode {
+    NSString *mode = [_defaults stringForKey:kPreferenceForeignExecModeKey];
+    if ([mode isEqualToString:@"libs"] || [mode isEqualToString:@"off"])
+        return mode;
+    return @"root";
+}
+
+- (void)setForeignExecMode:(NSString *)mode {
+    if (![mode isEqualToString:@"libs"] && ![mode isEqualToString:@"off"])
+        mode = @"root";
+    [_defaults setObject:mode forKey:kPreferenceForeignExecModeKey];
+}
+
+- (BOOL)validateForeignExecMode:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSString.class] &&
+        ([*value isEqualToString:@"root"] || [*value isEqualToString:@"libs"] ||
+         [*value isEqualToString:@"off"]);
+}
+
 // MARK: ShouldEnableHLE
 - (BOOL)shouldEnableHLE {
     return [_defaults boolForKey:kPreferenceEnableHLEKey];
@@ -838,6 +1128,19 @@ void amd64_jit_preference_set(bool enabled) {
 }
 
 - (BOOL)validateShouldEnableHLE:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+// MARK: ShouldEnableJITCache
+- (BOOL)shouldEnableJITCache {
+    return [_defaults boolForKey:kPreferenceEnableJITCacheKey];
+}
+
+- (void)setShouldEnableJITCache:(BOOL)enable {
+    [_defaults setBool:enable forKey:kPreferenceEnableJITCacheKey];
+}
+
+- (BOOL)validateShouldEnableJITCache:(id *)value error:(NSError **)error {
     return [*value isKindOfClass:NSNumber.class];
 }
 
@@ -902,6 +1205,23 @@ void amd64_jit_preference_set(bool enabled) {
     return [*value isKindOfClass:NSNumber.class];
 }
 
+// MARK: shouldSuspendToDisk
+//
+// Suspend to disk, kernel/checkpoint.c. OFF is the shipping state and the
+// registered default, for the same reason swap's is: a feature that spends the
+// user's storage and can lose their session is one they opt into.
+- (BOOL)shouldSuspendToDisk {
+    return [_defaults boolForKey:kPreferenceSuspendToDiskKey];
+}
+
+- (void)setShouldSuspendToDisk:(BOOL)shouldSuspendToDisk {
+    [_defaults setBool:shouldSuspendToDisk forKey:kPreferenceSuspendToDiskKey];
+}
+
+- (BOOL)validateShouldSuspendToDisk:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
 // MARK: swapSizeMB
 //
 // Clamped on the way OUT as well as in, for the same reason the launch command
@@ -927,6 +1247,74 @@ void amd64_jit_preference_set(bool enabled) {
 - (void)setSwapSizeMB:(NSInteger)swapSizeMB {
     [_defaults setInteger:MIN(MAX(swapSizeMB, (NSInteger)0), ISHSwapMaxSizeMB)
                    forKey:kPreferenceSwapSizeMBKey];
+}
+
+// MARK: shouldEnableSwapOnExternal / swapExternalBookmark / swapExternalPath
+
+- (BOOL)shouldEnableSwapOnExternal {
+    return [_defaults boolForKey:kPreferenceEnableSwapOnExternalKey];
+}
+
+- (void)setShouldEnableSwapOnExternal:(BOOL)shouldEnableSwapOnExternal {
+    [_defaults setBool:shouldEnableSwapOnExternal forKey:kPreferenceEnableSwapOnExternalKey];
+}
+
+- (BOOL)validateShouldEnableSwapOnExternal:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+- (nullable NSData *)swapExternalBookmark {
+    return [_defaults dataForKey:kPreferenceSwapExternalBookmarkKey];
+}
+
+- (void)setSwapExternalBookmark:(nullable NSData *)swapExternalBookmark {
+    if (swapExternalBookmark == nil)
+        [_defaults removeObjectForKey:kPreferenceSwapExternalBookmarkKey];
+    else
+        [_defaults setObject:swapExternalBookmark forKey:kPreferenceSwapExternalBookmarkKey];
+}
+
+- (NSString *)swapExternalPath {
+    return [_defaults stringForKey:kPreferenceSwapExternalPathKey] ?: @"";
+}
+
+- (void)setSwapExternalPath:(NSString *)swapExternalPath {
+    [_defaults setObject:swapExternalPath ?: @"" forKey:kPreferenceSwapExternalPathKey];
+}
+
+// MARK: shouldEnableCompressedMemory / compressedMemorySizeMB
+//
+// Same shape as the two above, and clamped on the way OUT for the same reason:
+// the iOS Settings pane and anything else editing the domain directly write
+// these keys with none of our code running, so a stored 2^40 would otherwise
+// reach the pool as a real request.
+- (BOOL)shouldEnableCompressedMemory {
+    return [_defaults boolForKey:kPreferenceEnableCompressedMemoryKey];
+}
+
+- (void)setShouldEnableCompressedMemory:(BOOL)value {
+    [_defaults setBool:value forKey:kPreferenceEnableCompressedMemoryKey];
+}
+
+- (BOOL)validateShouldEnableCompressedMemory:(id *)value error:(NSError **)error {
+    return [*value isKindOfClass:NSNumber.class];
+}
+
+- (NSInteger)compressedMemorySizeMB {
+    NSInteger value = [_defaults integerForKey:kPreferenceCompressedMemorySizeMBKey];
+    return MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxForDevice());
+}
+
+- (void)setCompressedMemorySizeMB:(NSInteger)value {
+    [_defaults setInteger:MIN(MAX(value, (NSInteger)0), ISHCompressedMemoryMaxForDevice())
+                   forKey:kPreferenceCompressedMemorySizeMBKey];
+}
+
+- (BOOL)validateCompressedMemorySizeMB:(id *)value error:(NSError **)error {
+    if (![*value isKindOfClass:NSNumber.class])
+        return NO;
+    NSInteger v = [*value integerValue];
+    return v >= 0 && v <= ISHCompressedMemoryMaxForDevice();
 }
 
 - (BOOL)validateSwapSizeMB:(id *)value error:(NSError **)error {
@@ -1168,3 +1556,152 @@ static NSArray<NSString *> *ISHDefaultBootCommand(void) {
 }
 
 @end
+
+// ---- The extra-keys toolbar's keys (#609) -------------------------------
+
+NSString *const ISHToolbarKeyGroupLeft = @"left";
+NSString *const ISHToolbarKeyGroupCenter = @"center";
+NSString *const ISHToolbarKeyBuiltin = @"key";
+NSString *const ISHToolbarKeyTitle = @"title";
+NSString *const ISHToolbarKeySends = @"sends";
+NSString *const ISHToolbarKeyNarrow = @"narrow";
+
+// id, symbol, name -- in the order the Add Key menu offers them.
+static NSArray<NSArray<NSString *> *> *ISHToolbarBuiltinCatalog(void) {
+    static NSArray *catalog;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        catalog = @[
+            @[@"tab", @"\u21E5", NSLocalizedString(@"Tab", @"Keyboard toolbar key name in Settings")],
+            @[@"ctrl", @"\u2303", NSLocalizedString(@"Control", @"Keyboard toolbar key name in Settings")],
+            @[@"esc", @"\u238B", NSLocalizedString(@"Escape", @"Keyboard toolbar key name in Settings")],
+            @[@"arrows", @"\u271C", NSLocalizedString(@"Arrow keys", @"Keyboard toolbar key name in Settings")],
+            @[@"dash", @"-", NSLocalizedString(@"Hyphen", @"Keyboard toolbar key name in Settings")],
+            @[@"dot", @".", NSLocalizedString(@"Period", @"Keyboard toolbar key name in Settings")],
+            @[@"slash", @"/", NSLocalizedString(@"Slash", @"Keyboard toolbar key name in Settings")],
+            @[@"colon", @":", NSLocalizedString(@"Colon", @"Keyboard toolbar key name in Settings")],
+            @[@"bang", @"!", NSLocalizedString(@"Exclamation mark", @"Keyboard toolbar key name in Settings")],
+            @[@"pipe", @"|", NSLocalizedString(@"Vertical bar", @"Keyboard toolbar key name in Settings")],
+        ];
+    });
+    return catalog;
+}
+
+NSArray<NSString *> *ISHToolbarBuiltinKeyIDs(void) {
+    NSMutableArray *ids = [NSMutableArray array];
+    for (NSArray *entry in ISHToolbarBuiltinCatalog())
+        [ids addObject:entry[0]];
+    return ids;
+}
+
+static NSArray<NSString *> *ISHToolbarBuiltinEntry(NSString *key) {
+    for (NSArray *entry in ISHToolbarBuiltinCatalog())
+        if ([entry[0] isEqualToString:key])
+            return entry;
+    return nil;
+}
+
+NSString *ISHToolbarBuiltinKeySymbol(NSString *key) {
+    return ISHToolbarBuiltinEntry(key)[1] ?: key;
+}
+
+NSString *ISHToolbarBuiltinKeyName(NSString *key) {
+    return ISHToolbarBuiltinEntry(key)[2] ?: key;
+}
+
+NSDictionary<NSString *, NSArray *> *ISHToolbarKeysDefaultLayout(void) {
+    NSDictionary *(^builtin)(NSString *, BOOL) = ^(NSString *key, BOOL narrow) {
+        return @{ISHToolbarKeyBuiltin: key, ISHToolbarKeyNarrow: @(narrow)};
+    };
+    return @{
+        ISHToolbarKeyGroupLeft: @[builtin(@"tab", YES), builtin(@"ctrl", YES),
+                                  builtin(@"esc", YES), builtin(@"arrows", YES)],
+        ISHToolbarKeyGroupCenter: @[builtin(@"dash", NO), builtin(@"dot", YES),
+                                    builtin(@"slash", YES), builtin(@"colon", NO),
+                                    builtin(@"bang", NO), builtin(@"pipe", NO)],
+    };
+}
+
+NSDictionary<NSString *, NSArray *> *ISHToolbarKeysValidatedLayout(NSDictionary *layout) {
+    if (![layout isKindOfClass:NSDictionary.class])
+        return ISHToolbarKeysDefaultLayout();
+    NSMutableSet<NSString *> *seen = [NSMutableSet set];
+    NSMutableDictionary *result = [NSMutableDictionary dictionary];
+    for (NSString *group in @[ISHToolbarKeyGroupLeft, ISHToolbarKeyGroupCenter]) {
+        NSArray *items = layout[group];
+        NSMutableArray *kept = [NSMutableArray array];
+        for (NSDictionary *item in [items isKindOfClass:NSArray.class] ? items : @[]) {
+            if (![item isKindOfClass:NSDictionary.class])
+                continue;
+            id narrow = item[ISHToolbarKeyNarrow];
+            BOOL shown = [narrow isKindOfClass:NSNumber.class] ? [narrow boolValue] : YES;
+            NSString *key = item[ISHToolbarKeyBuiltin];
+            if (key != nil) {
+                if (![key isKindOfClass:NSString.class] || ISHToolbarBuiltinEntry(key) == nil ||
+                        [seen containsObject:key])
+                    continue;
+                [seen addObject:key];
+                [kept addObject:@{ISHToolbarKeyBuiltin: key, ISHToolbarKeyNarrow: @(shown)}];
+                continue;
+            }
+            NSString *title = item[ISHToolbarKeyTitle], *sends = item[ISHToolbarKeySends];
+            if (![title isKindOfClass:NSString.class] || ![sends isKindOfClass:NSString.class] ||
+                    title.length == 0 || sends.length == 0)
+                continue;
+            [kept addObject:@{ISHToolbarKeyTitle: title, ISHToolbarKeySends: sends,
+                              ISHToolbarKeyNarrow: @(shown)}];
+        }
+        result[group] = kept;
+    }
+    return result;
+}
+
+NSDictionary<NSString *, NSArray *> *ISHToolbarKeysCurrentLayout(void) {
+    NSDictionary *saved = UserPreferences.shared.toolbarKeys;
+    return saved != nil ? ISHToolbarKeysValidatedLayout(saved) : ISHToolbarKeysDefaultLayout();
+}
+
+static int ISHHexDigit(unichar c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+NSString *ISHToolbarKeyDecodeSends(NSString *sends) {
+    NSMutableString *out = [NSMutableString string];
+    NSUInteger n = sends.length;
+    for (NSUInteger i = 0; i < n; i++) {
+        unichar c = [sends characterAtIndex:i];
+        if (c != '\\' || i + 1 >= n) {
+            [out appendFormat:@"%C", c];
+            continue;
+        }
+        unichar e = [sends characterAtIndex:i + 1];
+        unichar decoded = 0;
+        NSUInteger used = 2;
+        switch (e) {
+            case 'e': decoded = 0x1b; break;
+            case 't': decoded = '\t'; break;
+            case 'n': decoded = '\n'; break;
+            case 'r': decoded = '\r'; break;
+            case '\\': decoded = '\\'; break;
+            case 'x': {
+                int hi = i + 2 < n ? ISHHexDigit([sends characterAtIndex:i + 2]) : -1;
+                int lo = i + 3 < n ? ISHHexDigit([sends characterAtIndex:i + 3]) : -1;
+                if (hi >= 0 && lo >= 0 && hi * 16 + lo <= 0x7f) {
+                    decoded = (unichar) (hi * 16 + lo);
+                    used = 4;
+                }
+                break;
+            }
+        }
+        if (decoded == 0 && !(e == 'x' && used == 4)) {
+            [out appendFormat:@"%C", c];   // not an escape: the backslash stands
+            continue;
+        }
+        [out appendFormat:@"%C", decoded];
+        i += used - 1;
+    }
+    return out;
+}

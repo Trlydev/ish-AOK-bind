@@ -110,6 +110,10 @@ void native_arena_release(void) {
     native_syscall(NATIVE_SYS_munmap, base, size);
 }
 
+bool native_frames_live(void) {
+    return frame_top != NULL;
+}
+
 void native_frame_push(struct native_frame *frame) {
     frame->prev = frame_top;
     frame->mark = arena.used;
@@ -214,7 +218,7 @@ int native_scratch_get(void *dst, guest_addr_t src, size_t size) {
 // guest gets. Everything specific to a native caller is here: the signal
 // checkpoint, and restarting.
 
-sqword_t native_syscall_args(unsigned num, const qword_t args[6]) {
+static sqword_t native_syscall_issue(unsigned num, const qword_t args[6], bool wait) {
     if (!native_have_task())
         return _EFAULT;
 
@@ -229,8 +233,24 @@ sqword_t native_syscall_args(unsigned num, const qword_t args[6]) {
         // a shim call which has already checkpointed, and receive_signals may
         // not return -- exiting from inside the allocator would leave the
         // frame it was called from unreleased.
+        unsigned long handlers_run = nlibc_handlers_run();
         if (num != NATIVE_SYS_mmap && num != NATIVE_SYS_munmap)
             native_checkpoint();
+        // A wait the caller has armed (native_syscall_wait) does not start
+        // once that checkpoint has run a handler: the handler was the event
+        // being waited for. This is the only place that can say so. The
+        // caller checks for a pending signal before it gets here, and the
+        // kernel checks again as the wait begins, but a signal landing
+        // between the two is taken by the checkpoint above -- which is neither
+        // -- and the kernel then finds nothing pending and sleeps on a
+        // condition the handler has already consumed. That covers the
+        // re-issue of a restarted call as well: it comes back round to this
+        // same checkpoint.
+        if (wait && nlibc_handlers_run() != handlers_run) {
+            current->sleep_restart_valid = false;
+            current->poll_restart_valid = false;
+            return _EINTR;
+        }
 
         sqword_t result = syscall_dispatch_native(num, args);
         // A syscall cut short by a signal: run the handler BEFORE the program
@@ -245,7 +265,7 @@ sqword_t native_syscall_args(unsigned num, const qword_t args[6]) {
         // issues the call again, which is the same thing one level up.
         // Both restart flavours mean "issue it again"; a native caller has no
         // PC to rewind, so the NOHAND cancellation has nothing to undo.
-        if (result != _ERESTART && result != _ERESTART_NOHAND)
+        if (result != _ERESTART && result != _ERESTART_NOHAND && result != _ERESTART_NOINTR)
             return result;
         // ...unless the handler that justifies the restart cannot run yet.
         // Inside a host stdio callback the checkpoint above deliberately
@@ -253,8 +273,21 @@ sqword_t native_syscall_args(unsigned num, const qword_t args[6]) {
         // the very same pending signal and be cut short again -- a spin, not a
         // restart. The deferral's own contract is that the callback FAILS, so
         // stdio unwinds through its unlock and the signal is taken at the next
-        // checkpoint outside it; hand the caller the EINTR that says so.
-        if (nlibc_delivery_deferred())
+        // checkpoint outside it; hand the caller the EINTR that says so --
+        // and drop the deadline the call left for its re-issue, which is not
+        // coming: the next sleep or poll would wait it out instead of its own.
+        if (nlibc_delivery_deferred()) {
+            current->sleep_restart_valid = false;
+            current->poll_restart_valid = false;
             return _EINTR;
+        }
     }
+}
+
+sqword_t native_syscall_args(unsigned num, const qword_t args[6]) {
+    return native_syscall_issue(num, args, false);
+}
+
+sqword_t native_syscall_wait_args(unsigned num, const qword_t args[6]) {
+    return native_syscall_issue(num, args, true);
 }

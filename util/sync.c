@@ -8,11 +8,18 @@
 #include <signal.h>
 #include <stdlib.h>
 #include "kernel/task.h"
+#include "kernel/checkpoint.h"
 #include <stdio.h>
 #include "util/sync.h"
+#include "util/timer.h"
 #include "debug.h"
 #include "kernel/errno.h"
 #include <string.h>
+#if __APPLE__
+#include <stdint.h>
+#include <sys/event.h>
+#include <unistd.h>
+#endif
 
 int noprintk = 0; // Used to suppress calls to printk.
 
@@ -31,7 +38,8 @@ bool wait_trace_enabled(void) {
     }
     return cached == 1;
 }
-static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeout, bool interruptible);
+static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeout,
+        bool interruptible, bool precise);
 #if __linux__
 static struct timespec timespec_add_local(struct timespec x, struct timespec y) {
     x.tv_sec += y.tv_sec;
@@ -44,19 +52,178 @@ static struct timespec timespec_add_local(struct timespec x, struct timespec y) 
 }
 #endif
 
-static int cond_wait_with_optional_timeout(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+#if __APPLE__
+// A timed wait's deadline, kept on time.
+//
+// Darwin coalesces a condition variable's timeout like every other sleep: a
+// wait can end a quarter of its length late, up to 5ms, and twice that while
+// the user is idle (see host_nanosleep_precise in util/timer.c). So every
+// guest wait with a deadline that parks here -- FUTEX_WAIT, and with it every
+// pthread_cond_timedwait and sem_timedwait in the guest, sigtimedwait,
+// semtimedop, mq_timedreceive -- ran that late: a 40ms futex wait took up to
+// 50ms on the Mac and on an M4 iPad, where Linux takes 40.06ms.
+//
+// A condition variable cannot be told to be punctual, and a thread cannot
+// wait on one and on a kqueue at once. So the deadline is kept by a kqueue
+// timer marked NOTE_CRITICAL, on one service thread, which wakes the waiter
+// by broadcasting its condition at the deadline. The waiter's own timed wait
+// stays as it was, as the backstop: if the wake is lost -- the kqueue is
+// unavailable, or it fires before the waiter is in the wait -- the wait ends
+// as late as it always did, never later. Everyone else waiting on the same
+// condition sees one spurious wakeup, which condition variables allow and
+// every caller of wait_for already re-checks for.
+//
+// A deadline_wake is shared by the waiter and the service thread. `cond` is
+// cleared by the waiter under `lock` before it leaves the wait, so the
+// broadcast, made under the same lock, can never reach a condition whose wait
+// is over. `refs` counts the waiter and, until the timer is gone for good, the
+// kqueue.
+struct deadline_wake {
+    pthread_mutex_t lock;
+    pthread_cond_t *cond;
+    int refs;
+};
+
+// Below this a wait is late by no more than Linux's own slack would allow.
+#define DEADLINE_WAKE_MIN_NS 200000L
+
+static int deadline_kq = -1;
+static pthread_once_t deadline_once = PTHREAD_ONCE_INIT;
+
+static void deadline_wake_put(struct deadline_wake *w, int refs) {
+    pthread_mutex_lock(&w->lock);
+    w->refs -= refs;
+    bool last = w->refs == 0;
+    pthread_mutex_unlock(&w->lock);
+    if (last) {
+        pthread_mutex_destroy(&w->lock);
+        free(w);
+    }
+}
+
+static void *deadline_wake_thread(void *arg) {
+    int kq = (int) (intptr_t) arg;
+    for (;;) {
+        struct kevent64_s fired[16];
+        int n = kevent64(kq, NULL, 0, fired, 16, 0, NULL);
+        for (int i = 0; i < n; i++) {
+            if (fired[i].filter != EVFILT_TIMER)
+                continue;
+            struct deadline_wake *w = (struct deadline_wake *) (uintptr_t) fired[i].udata;
+            pthread_mutex_lock(&w->lock);
+            if (w->cond != NULL)
+                pthread_cond_broadcast(w->cond);
+            pthread_mutex_unlock(&w->lock);
+            deadline_wake_put(w, 1);
+        }
+    }
+    return NULL;
+}
+
+static void deadline_wake_init(void) {
+    int kq = kqueue();
+    if (kq < 0)
+        return;
+    // It takes no guest signals and must not be picked for a host one.
+    sigset_t all, old;
+    sigfillset(&all);
+    pthread_sigmask(SIG_BLOCK, &all, &old);
+    // Above the guest's own threads (USER_INITIATED, kernel/task.c): a
+    // thread made without attributes gets DEFAULT, below them, and a device
+    // they keep busy would hold its wakes back to the backstop's lateness.
+    // It does a broadcast per wake and nothing else.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_set_qos_class_np(&attr, QOS_CLASS_USER_INTERACTIVE, 0);
+    pthread_t thread;
+    int err = pthread_create(&thread, &attr, deadline_wake_thread, (void *) (intptr_t) kq);
+    pthread_attr_destroy(&attr);
+    pthread_sigmask(SIG_SETMASK, &old, NULL);
+    if (err != 0) {
+        close(kq);
+        return;
+    }
+    pthread_detach(thread);
+    deadline_kq = kq;
+}
+
+static struct deadline_wake *deadline_wake_arm(pthread_cond_t *cond, const struct timespec *timeout) {
+    if (timeout->tv_sec == 0 && timeout->tv_nsec < DEADLINE_WAKE_MIN_NS)
+        return NULL;
+    pthread_once(&deadline_once, deadline_wake_init);
+    if (deadline_kq < 0)
+        return NULL;
+    struct deadline_wake *w = malloc(sizeof(*w));
+    if (w == NULL)
+        return NULL;
+    pthread_mutex_init(&w->lock, NULL);
+    w->cond = cond;
+    w->refs = 2;
+    // wait_for hands over a slice of a second at most; bound it anyway.
+    int64_t ns = timeout->tv_sec > 86400 ? (int64_t) 86400 * 1000000000
+        : (int64_t) timeout->tv_sec * 1000000000 + timeout->tv_nsec;
+    struct kevent64_s timer;
+    EV_SET64(&timer, (uint64_t) (uintptr_t) w, EVFILT_TIMER, EV_ADD | EV_ONESHOT,
+             NOTE_NSECONDS | NOTE_CRITICAL | NOTE_LEEWAY, ns, (uint64_t) (uintptr_t) w,
+             0, HOST_TIMER_SLACK_NS);
+    if (kevent64(deadline_kq, &timer, 1, NULL, 0, 0, NULL) < 0) {
+        pthread_mutex_destroy(&w->lock);
+        free(w);
+        return NULL;
+    }
+    return w;
+}
+
+// Called by the waiter, holding the wait's mutex again, once it is out of the
+// wait for whatever reason.
+static void deadline_wake_disarm(struct deadline_wake *w) {
+    pthread_mutex_lock(&w->lock);
+    w->cond = NULL;
+    pthread_mutex_unlock(&w->lock);
+    // Deleted before it fired, the service thread will never hear of it, and
+    // its reference is the waiter's to drop too. Once it has fired, the delete
+    // fails and the service thread drops it after its (now empty) broadcast --
+    // which is also what keeps the address, the timer's name in the kqueue,
+    // from being reused while an event for it is outstanding.
+    struct kevent64_s timer;
+    EV_SET64(&timer, (uint64_t) (uintptr_t) w, EVFILT_TIMER, EV_DELETE, 0, 0, 0, 0, 0);
+    bool deleted = kevent64(deadline_kq, &timer, 1, NULL, 0, 0, NULL) == 0;
+    deadline_wake_put(w, deleted ? 2 : 1);
+}
+#endif
+
+// `precise`: the timeout is the caller's own deadline, not one of wait_for's
+// slices, so it is worth keeping on time.
+static int cond_wait_with_optional_timeout(cond_t *cond, lock_t *lock, struct timespec *timeout,
+        bool precise) {
     if (timeout == NULL) {
         lock->wait4 = true;
         return pthread_cond_wait(&cond->cond, &lock->m);
     }
 
 #if __linux__
+    (void) precise;
     struct timespec abs_timeout;
     clock_gettime(CLOCK_MONOTONIC, &abs_timeout);
     abs_timeout = timespec_add_local(abs_timeout, *timeout);
     return pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
 #elif __APPLE__
-    return pthread_cond_timedwait_relative_np(&cond->cond, &lock->m, timeout);
+    struct deadline_wake *w = NULL;
+    struct timespec deadline;
+    if (precise) {
+        deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), *timeout);
+        w = deadline_wake_arm(&cond->cond, timeout);
+    }
+    int rc = pthread_cond_timedwait_relative_np(&cond->cond, &lock->m, timeout);
+    if (w != NULL) {
+        deadline_wake_disarm(w);
+        // Woken by the deadline's own broadcast, most likely: say so, as the
+        // timed wait would have. A notify that raced it is found by the
+        // caller, which looks at its condition whatever this returns.
+        if (rc == 0 && !timespec_positive(timespec_subtract(deadline, timespec_now(CLOCK_MONOTONIC))))
+            rc = ETIMEDOUT;
+    }
+    return rc;
 #else
 #error Unimplemented pthread_cond_wait relative timeout.
 #endif
@@ -84,6 +251,12 @@ void cond_destroy(cond_t *cond) {
 static bool is_signal_pending(lock_t *lock) {
     if (!current)
         return false;
+    // A PTRACE_EVENT_STOP the task owes its tracer ends a wait as a deliverable
+    // signal does, whatever the mask: the task has to reach the checkpoint
+    // where it stops. It is a flag, not a signal (ptrace.trap_stop in
+    // kernel/task.h), and task_wake_signal_pending answers for it too.
+    if (task_trap_stop_pending(current))
+        return true;
     // A process-directed signal (e.g. SIGCHLD delivered via
     // send_signal_to_group, see kernel/exit.c/kernel/signal.c) only ever sets
     // current->sighand->pending, never current->pending -- deliver_signal_to_
@@ -99,8 +272,12 @@ static bool is_signal_pending(lock_t *lock) {
     // even though a zombie was sitting there the whole time. Matches
     // kernel/exit.c's wait_interrupted_by_signal(), which already ORs in
     // sighand->pending for the same reason on the do_wait() path.
+    //
+    // But only once this thread has been told to take it (task_group_pending):
+    // a signal sent to the process ends the wait of the one thread told, not
+    // every thread's.
     sigset_t_ pending = __atomic_load_n(&current->pending, __ATOMIC_ACQUIRE);
-    sigset_t_ shand_pending = __atomic_load_n(&current->sighand->pending, __ATOMIC_ACQUIRE);
+    sigset_t_ shand_pending = task_group_pending(current);
     // task_wake_blocked, not ->blocked: a native program's handlers are held
     // by the shim with the signal blocked, and such a wait must still end so
     // the handler can run at the next syscall checkpoint (kernel/signal.h).
@@ -110,7 +287,7 @@ static bool is_signal_pending(lock_t *lock) {
         return false;
     if (lock != &current->sighand->lock)
         lock(&current->sighand->lock, 0);
-    bool has_pending = !!((current->pending | current->sighand->pending) &
+    bool has_pending = !!((current->pending | task_group_pending(current)) &
             ~task_wake_blocked(current));
     if (lock != &current->sighand->lock)
         unlock(&current->sighand->lock);
@@ -149,7 +326,10 @@ static bool wait_flag_leak_enabled(void) {
     return enabled == 1;
 }
 
-int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+// `guest_deadline`: the timeout is a deadline the guest asked for, and worth
+// ending on time. A caller that caps its own waits passes false for the caps.
+static int wait_for_common(cond_t *cond, lock_t *lock, struct timespec *timeout,
+        bool guest_deadline) {
     if (consume_wait_interrupted() || is_signal_pending(lock)) {
         // The caller published the address of one of its own STACK locals in
         // current->waiting_interrupt_flag just before calling (kernel/futex.c
@@ -192,15 +372,81 @@ int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
         }
         return _EINTR;
     }
-    int err = wait_for_internal(cond, lock, timeout, true);
+    // In slices, so a checkpoint freeze cannot be missed.
+    //
+    // The ways out of a wait are a notify, a signal, and the freezer's wake --
+    // and the freezer's wake is host pokes that a device can lose (fs/poll.c
+    // and fs/sock.c cap their host waits for the same reason). A wait with no
+    // deadline, or a long one, then outlives the freeze: a shell in `wait`
+    // (rt_sigsuspend) refused a suspend on an iPad with "did not reach a
+    // syscall boundary within 5000ms (blocked in arm64 syscall 133)", while
+    // the same shell froze on macOS, where the wake lands.
+    //
+    // ONE slice per call, then back to the caller. A slice that ends with
+    // nothing to report returns 0, a spurious wakeup, and the caller re-checks
+    // what it is waiting for -- every caller loops on its own condition, as a
+    // condition variable requires. Looping here instead, inside the wait,
+    // meant a notify that was missed was missed for good: a native zsh in the
+    // app sat in tty_read's wait with 23 bytes of typed input in the buffer,
+    // slicing once a second and never looking at the buffer again, and the
+    // terminal took no input.
+    //
+    // A caller's own deadline is kept across its calls: *timeout comes back
+    // holding the time left, so a caller that waits again with the same
+    // pointer waits only for the remainder, and _ETIMEDOUT is only reported
+    // once the real deadline has passed. A freeze reports _EINTR, which is what
+    // a wake that lands produces too, and the dispatcher turns it into a
+    // restart.
+    //
+    // Only a wait the freeze is actually holding up reports it. A wait that
+    // was notified, or reached its own deadline, answers as it always did --
+    // a ZERO timeout included. Asking about the freeze first turned native
+    // zsh's describe-yourself-for-the-checkpoint into an endless loop: its
+    // signal poll (rt_sigtimedwait with a zero timeout) came back EINTR, the
+    // shim re-issued it, and the shell never reached the point where it parks.
+    struct timespec slice = {.tv_sec = 1, .tv_nsec = 0};
+    bool last_slice = false;
+    struct timespec deadline = {0};
+    if (timeout != NULL) {
+        struct timespec left = timespec_positive(*timeout) ? *timeout : (struct timespec) {0};
+        deadline = timespec_add(timespec_now(CLOCK_MONOTONIC), left);
+        // Up to a tenth over the slice is waited in one: a slice that is not
+        // the last is not kept precise, and may end 10ms late, so it has to
+        // leave more than that before the deadline.
+        if (left.tv_sec < slice.tv_sec ||
+                (left.tv_sec == slice.tv_sec && left.tv_nsec <= 100000000)) {
+            slice = left;
+            last_slice = true;
+        }
+    }
+    // Only the last slice ends at the caller's deadline; the others are this
+    // function's own caps, and nobody minds when they end.
+    int err = wait_for_internal(cond, lock, &slice, true, guest_deadline && last_slice);
+    if (timeout != NULL) {
+        struct timespec left = timespec_subtract(deadline, timespec_now(CLOCK_MONOTONIC));
+        *timeout = timespec_positive(left) ? left : (struct timespec) {0};
+    }
     if (consume_wait_interrupted() || is_signal_pending(lock))
         return _EINTR;
-    if (err < 0)
+    if (err == 0)
+        return 0;
+    if (last_slice)
         return _ETIMEDOUT;
+    if (checkpoint_freeze_pending())
+        return _EINTR;
     return 0;
 }
 
-static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeout, bool interruptible) {
+int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+    return wait_for_common(cond, lock, timeout, true);
+}
+
+int wait_for_capped(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+    return wait_for_common(cond, lock, timeout, false);
+}
+
+static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeout,
+        bool interruptible, bool precise) {
     if (current) {
         // A voluntary context switch, in the sense getrusage means: the task
         // gave up the CPU to wait for something rather than being preempted.
@@ -211,6 +457,7 @@ static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeou
         lock(&current->waiting_cond_lock, 0);
         current->waiting_cond = cond;
         current->waiting_lock = lock;
+        current->waiting_interruptible = interruptible;
         unlock(&current->waiting_cond_lock);
     }
     int rc = 0;
@@ -226,7 +473,7 @@ static int wait_for_internal(cond_t *cond, lock_t *lock, struct timespec *timeou
     bool old_should_mark_wait_interrupted = should_mark_wait_interrupted;
     if (interruptible)
         should_mark_wait_interrupted = true;
-    rc = cond_wait_with_optional_timeout(cond, lock, timeout);
+    rc = cond_wait_with_optional_timeout(cond, lock, timeout, precise);
     should_mark_wait_interrupted = old_should_mark_wait_interrupted;
 #if LOCK_DEBUG
 out:
@@ -239,6 +486,7 @@ out:
         lock(&current->waiting_cond_lock, 0);
         current->waiting_cond = NULL;
         current->waiting_lock = NULL;
+        current->waiting_interruptible = false;
         current->waiting_interrupt_flag = NULL;
         unlock(&current->waiting_cond_lock);
     }
@@ -249,7 +497,46 @@ out:
 }
 
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout) {
-    return wait_for_internal(cond, lock, timeout, false);
+    return wait_for_internal(cond, lock, timeout, false, timeout != NULL);
+}
+
+// wait_for, for a wait a guest syscall is blocked in. A bare wait_for gets two
+// things wrong there, and both were measured on an arm64 guest.
+//
+// The task reads as running. /proc/<pid>/stat says 'S' only for a task with
+// io_block set (fs/proc/pid.c), and the guest load average counts every task
+// without it (guest_count_runnable in kernel/task.c). A child parked in msgrcv,
+// msgsnd, semop, semtimedop or io_getevents showed 'R' for as long as it
+// waited, where Linux shows 'S'. read, poll, futex and the rest set io_block
+// with TASK_MAY_BLOCK; these waits never did.
+//
+// A poke ends the wait. The address-space barrier (task_poke_shared_mem)
+// SIGUSR1s every sibling that is not io_block when a thread maps or unmaps
+// memory, and wait_for reports the poke as _EINTR without asking whether any
+// signal is pending. So a thread in msgrcv, msgsnd, semop or io_getevents
+// failed with EINTR 0-10ms into the wait, with no signal sent, while its
+// siblings ran and called mmap. io_block keeps the barrier away, but it can
+// read the flag just before this sets it, so the answer is checked as well:
+// only a pending signal or a checkpoint freeze is an interruption. Anything
+// else is a spurious wakeup and returns 0. The caller re-checks its condition,
+// as it must after any wakeup, and waits again -- and that wait does not come
+// straight back, because wait_for has already consumed the poke's mark. Same
+// two halves as the netlink receive wait in fs/sock.c.
+//
+// io_block is put back as it was rather than cleared: a FUSE request can be
+// made from inside read(2) or write(2), which have already set it.
+int wait_for_blocked(cond_t *cond, lock_t *lock, struct timespec *timeout) {
+    bool was_blocked = false;
+    if (current != NULL) {
+        was_blocked = current->io_block;
+        current->io_block = true;
+    }
+    int err = wait_for(cond, lock, timeout);
+    if (current != NULL)
+        current->io_block = was_blocked;
+    if (err == _EINTR && !task_wake_signal_pending() && !checkpoint_freeze_pending())
+        return 0;
+    return err;
 }
 
 void notify(cond_t *cond) {
@@ -319,6 +606,9 @@ void sigusr1_handler(int UNUSED(sig)) {
 // EINTR, which every blocking site in the tree already handles by re-checking
 // the guest's pending set -- they have to, since a spurious SIGUSR1 can already
 // produce the same EINTR today.
+//
+// (What blocked SIGUSR1 turned out to be another thread's siglongjmp, which on
+// Darwin rewrites every thread's mask: see signal_thread_unwedge_wake_sigs.)
 void sigusr2_handler(int UNUSED(sig)) {
     if (!thread_locals_ready())
         return;
@@ -349,7 +639,10 @@ void sigusr2_handler(int UNUSED(sig)) {
 // measured entering task_thread with SIGUSR2 already unblocked in about 2% of
 // creations, and others lost it from the mask later with no handler of ours
 // having run on them -- the same Darwin wake-mask weirdness that
-// signal_thread_unwedge_wake_sigs() below exists to repair. So the handlers
+// signal_thread_unwedge_wake_sigs() below exists to repair, and since explained
+// there: another thread's siglongjmp set every thread's mask, the new one's
+// included. That source is gone, but any host sigprocmask does the same, and
+// this guard does not depend on there being none. So the handlers
 // cannot assume the mask protected them; they check thread_locals_ready()
 // instead, which is true only once the instantiation below has finished.
 //
@@ -382,6 +675,17 @@ void signal_thread_locals_init(void) {
 // observed while the thread sat in nanosleep(), across host thread churn from
 // concurrent guest fork/exec. It is permanent: the signal is masked, so it is
 // never redelivered, and every later poke to that thread is equally deaf.
+//
+// The cause, found 2026-09-24: nothing swallowed the poke. ANOTHER thread set
+// this one's mask. On Darwin sigprocmask sets the mask of every thread in the
+// process, and siglongjmp from a buffer saved with its mask calls it -- which
+// sigunwind_start's buffer was, saved with SIGUSR1 blocked, so each poke that
+// unwound a poll, socket or pipe wait blocked SIGUSR1 in every thread of the
+// app. More guest activity meant more unwinds, hence "grows with churn". Those
+// buffers no longer save a mask (util/sync.h), native programs' jumps no
+// longer restore one (kernel/native_libc.h), and
+// tests/manual/wake_mask_isolation.c watches for it coming back. This repair
+// and its counters stay, as the instrument that says whether it has.
 //
 // A thread that finds a wake signal masked when it expected it unblocked can
 // repair itself: unblocking delivers the queued signal immediately (the handler
@@ -431,17 +735,17 @@ bool signal_thread_wake_sigs_unblocked(void) {
     sigaddset(&sigusr1, SIGUSR1);
 
     if (current) {
-        if (sigsetjmp(unwind_buf, 1)) {
+        if (sigsetjmp(unwind_buf, 0)) {   // never 1: see util/sync.h
             return _EINTR;
         }
         should_unwind = true;
-        sigprocmask(SIG_BLOCK, &sigusr1, NULL);
+        pthread_sigmask(SIG_BLOCK, &sigusr1, NULL);
         if (lock != &current->sighand->lock)
             lock(&current->sighand->lock, 0);
         bool pending = !!(current->pending & ~task_wake_blocked(current));
         if (lock != &current->sighand->lock)
             unlock(&current->sighand->lock);
-        sigprocmask(SIG_UNBLOCK, &sigusr1, NULL);
+        pthread_sigmask(SIG_UNBLOCK, &sigusr1, NULL);
         if (pending) {
             should_unwind = false;
             return _EINTR;

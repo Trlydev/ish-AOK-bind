@@ -5,11 +5,13 @@
 // fmv.x.d) don't even come here: gen emits the integer addi gadget with
 // an f-slot offset. Only genuinely-FP semantics live in this file.
 //
-// Rounding: host runs in its default RNE. Static rounding modes on
-// arithmetic are honored as RNE (deviation, logged in the plan); the one
-// case where static rm is load-bearing in real code -- float->int
-// conversion, where C casts encode RTZ -- is dispatched by gen to the
-// explicit fcvtzs/fcvtns/etc. variants, so conversions are exact.
+// Rounding: while guest code runs the host FPCR's rounding mode is frm (and
+// DN is set, which gives RISC-V's canonical NaN), and the flags the host
+// raises are gathered into fflags -- emu/fpenv.c. A dynamic rm (7) needs
+// nothing more. A static rm on float->int picks the aarch64 convert that
+// rounds that way; on arithmetic, gen brackets the op with rm_set and
+// rm_restore, a pair of FPCR writes (~45 ns on an M5), which compilers never
+// make it pay: they emit dynamic rm for arithmetic.
 //
 // S-format values are NaN-boxed: inputs read the low 32 bits (hardware
 // treats improperly-boxed inputs as canonical NaN; we skip the check),
@@ -44,12 +46,36 @@
 .macro fpop_div o, a, b
     fdiv \o, \a, \b
 .endm
-// RISC-V fmin/fmax return the non-NaN operand = AArch64 fminnm/fmaxnm
-.macro fpop_min o, a, b
-    fminnm \o, \a, \b
+// RISC-V fmin/fmax (minimumNumber) return the non-NaN operand -- which is
+// AArch64 fminnm/fmaxnm, except against a signalling NaN, where those give
+// the default NaN: put the other operand back then (NV is raised either
+// way). Operands in \r16/\r17, the result in \r16, \r18 scratch.
+.macro fp_minmax insn, r
+    \insn \r\()18, \r\()16, \r\()17
+    fcmp \r\()16, \r\()16
+    b.vc 1f
+    fcmp \r\()17, \r\()17
+    b.vs 2f
+    fmov \r\()18, \r\()17
+    b 2f
+1:  fcmp \r\()17, \r\()17
+    b.vc 2f
+    fmov \r\()18, \r\()16
+2:  fmov \r\()16, \r\()18
+.endm
+.macro fpop_min o, a, b             // (o, a, b) = (d16|s16, \o, 17)
+.ifc \o, d16
+    fp_minmax fminnm, d
+.else
+    fp_minmax fminnm, s
+.endif
 .endm
 .macro fpop_max o, a, b
-    fmaxnm \o, \a, \b
+.ifc \o, d16
+    fp_minmax fmaxnm, d
+.else
+    fp_minmax fmaxnm, s
+.endif
 .endm
 
 .macro fp_d_gadget op
@@ -152,23 +178,24 @@
     gret 3
 
 // ---- compares: rd (integer) = 0/1. Quiet NaN handling comes out right:
-// fcmp with a NaN sets no eq/lt/le-satisfying flags.
-.macro fcmp_gadget name, width, cond
+// fcmp with a NaN sets no eq/lt/le-satisfying flags. feq is a quiet compare
+// (NV only for a signalling NaN); flt and fle signal on any NaN, so fcmpe.
+.macro fcmp_gadget name, width, cond, cmp
 .gadget \name
     fp_head
     ldr \width\()16, [x10]
     ldr \width\()17, [x11]
-    fcmp \width\()16, \width\()17
+    \cmp \width\()16, \width\()17
     cset x12, \cond
     str x12, [_cpu, x9]
     gret 3
 .endm
-fcmp_gadget feq_d, d, eq
-fcmp_gadget flt_d, d, mi
-fcmp_gadget fle_d, d, ls
-fcmp_gadget feq_s, s, eq
-fcmp_gadget flt_s, s, mi
-fcmp_gadget fle_s, s, ls
+fcmp_gadget feq_d, d, eq, fcmp
+fcmp_gadget flt_d, d, mi, fcmpe
+fcmp_gadget fle_d, d, ls, fcmpe
+fcmp_gadget feq_s, s, eq, fcmp
+fcmp_gadget flt_s, s, mi, fcmpe
+fcmp_gadget fle_s, s, ls, fcmpe
 
 // ---- conversions ----
 // int -> fp (rounding irrelevant for exact cases; RNE otherwise, fine)
@@ -195,29 +222,213 @@ cvt_i2f_gadget fcvt_s_wu, ucvtf, w12, s16, 1
 cvt_i2f_gadget fcvt_s_l,  scvtf, x12, s16, 1
 cvt_i2f_gadget fcvt_s_lu, ucvtf, x12, s16, 1
 
-// fp -> int: gen picks the variant by static rm (RTZ = C casts = fcvtz*,
-// RNE/dynamic = fcvtn*). W results sign-extend into rd per RV64.
-.macro cvt_f2i_gadget name, insn, src, dst, sext
+// fp -> int: gen picks the variant by rm -- n/z/m/p/a for RNE, RTZ, RDN,
+// RUP and RMM (fcvta is ties-away, exactly RMM), and x for DYN: frinti
+// rounds by the host FPCR, which is frm, and the fcvtz after it is exact
+// (see the gadget for the flags). A NaN converts to the largest value of the
+// destination on RISC-V (aarch64 gives 0), and the invalid flag either way.
+// W results sign-extend into rd per RV64, which also makes .wu's all-ones.
+.macro cvt_f2i_gadget name, round, insn, src, dst, sext, nanval
 .gadget \name
     fp_head
     ldr \src, [x10]
+.ifc \round, frintx
+    // DYN: frinti rounds by the FPCR (frm) and raises nothing; the convert's
+    // IOC then says whether the value was in range. RISC-V raises NV alone
+    // out of range, and NX only for an inexact result in range.
+    mrs x13, fpsr
+    bic x14, x13, #1
+    msr fpsr, x14
+.ifc \src, d16
+    frinti d18, d16
+    \insn \dst, d18
+.else
+    frinti s18, s16
+    \insn \dst, s18
+.endif
+    mrs x14, fpsr
+    tbnz x14, #0, 3f
+.ifc \src, d16
+    fcmp d18, d16
+.else
+    fcmp s18, s16
+.endif
+    b.eq 3f
+    orr x14, x14, #16
+3:  orr x14, x14, x13
+    msr fpsr, x14
+.else
+.ifnb \round
+    \round \src, \src
+.endif
     \insn \dst, \src
+.endif
+    fcmp \src, \src
+    b.vc 1f
+    mov x12, #\nanval
+1:
 .if \sext
     sxtw x12, w12
 .endif
     str x12, [_cpu, x9]
     gret 3
 .endm
-.irp rmode, n,z
-cvt_f2i_gadget fcvt\rmode\()_w_d,  fcvt\rmode\()s, d16, w12, 1
-cvt_f2i_gadget fcvt\rmode\()_wu_d, fcvt\rmode\()u, d16, w12, 1
-cvt_f2i_gadget fcvt\rmode\()_l_d,  fcvt\rmode\()s, d16, x12, 0
-cvt_f2i_gadget fcvt\rmode\()_lu_d, fcvt\rmode\()u, d16, x12, 0
-cvt_f2i_gadget fcvt\rmode\()_w_s,  fcvt\rmode\()s, s16, w12, 1
-cvt_f2i_gadget fcvt\rmode\()_wu_s, fcvt\rmode\()u, s16, w12, 1
-cvt_f2i_gadget fcvt\rmode\()_l_s,  fcvt\rmode\()s, s16, x12, 0
-cvt_f2i_gadget fcvt\rmode\()_lu_s, fcvt\rmode\()u, s16, x12, 0
-.endr
+.macro cvt_f2i_family rmode, round, cvt
+cvt_f2i_gadget fcvt\rmode\()_w_d,  \round, \cvt\()s, d16, w12, 1, 0x7fffffff
+cvt_f2i_gadget fcvt\rmode\()_wu_d, \round, \cvt\()u, d16, w12, 1, 0xffffffff
+cvt_f2i_gadget fcvt\rmode\()_l_d,  \round, \cvt\()s, d16, x12, 0, 0x7fffffffffffffff
+cvt_f2i_gadget fcvt\rmode\()_lu_d, \round, \cvt\()u, d16, x12, 0, 0xffffffffffffffff
+cvt_f2i_gadget fcvt\rmode\()_w_s,  \round, \cvt\()s, s16, w12, 1, 0x7fffffff
+cvt_f2i_gadget fcvt\rmode\()_wu_s, \round, \cvt\()u, s16, w12, 1, 0xffffffff
+cvt_f2i_gadget fcvt\rmode\()_l_s,  \round, \cvt\()s, s16, x12, 0, 0x7fffffffffffffff
+cvt_f2i_gadget fcvt\rmode\()_lu_s, \round, \cvt\()u, s16, x12, 0, 0xffffffffffffffff
+.endm
+cvt_f2i_family n, , fcvtn
+cvt_f2i_family z, , fcvtz
+cvt_f2i_family m, , fcvtm
+cvt_f2i_family p, , fcvtp
+cvt_f2i_family a, , fcvta
+cvt_f2i_family x, frintx, fcvtz
+
+// fclass.{s,d}: rd = 1 << class -- 0 -inf, 1 -normal, 2 -subnormal, 3 -0,
+// 4 +0, 5 +subnormal, 6 +normal, 7 +inf, 8 signalling NaN, 9 quiet NaN. An
+// S value that is not NaN-boxed is the canonical NaN, as the spec reads it.
+// [gadget][rd_off][rs1_off][unused]
+.macro fclass_gadget name, is_d
+.gadget \name
+    fp_head
+    ldr x12, [x10]
+.if \is_d
+    lsr x13, x12, #63              // sign
+    ubfx x14, x12, #52, #11        // exponent
+    and x15, x12, #0xfffffffffffff // fraction
+    mov x16, #0x7ff
+    lsr x11, x15, #51              // the quiet bit
+.else
+    mov x17, #9
+    lsr x13, x12, #32
+    cmn w13, #1
+    b.ne 9f                        // not boxed: the canonical NaN
+    ubfx x13, x12, #31, #1
+    ubfx x14, x12, #23, #8
+    and x15, x12, #0x7fffff
+    mov x16, #0xff
+    lsr x11, x15, #22
+.endif
+    cmp x14, x16
+    b.eq 3f
+    cbz x14, 2f
+    mov x17, #6                    // normal
+    mov x16, #1
+    b 8f
+2:  mov x17, #4                    // zero
+    mov x16, #3
+    cbz x15, 8f
+    mov x17, #5                    // subnormal
+    mov x16, #2
+    b 8f
+3:  cbnz x15, 4f
+    mov x17, #7                    // infinity
+    mov x16, #0
+    b 8f
+4:  mov x17, #8                    // NaN, 9 if quiet
+    add x17, x17, x11
+    b 9f
+8:  cmp x13, #0
+    csel x17, x16, x17, ne         // the negative class
+9:  mov x12, #1
+    lsl x12, x12, x17
+    str x12, [_cpu, x9]
+    gret 3
+.endm
+fclass_gadget fclass_s, 0
+fclass_gadget fclass_d, 1
+
+// Zfa fcvtmod.w.d rd, rs1, rtz: the double truncated toward zero, modulo
+// 2^32, sign-extended -- JavaScript's ToInt32. NaN and infinity give 0. NV
+// if the value is not a 32-bit integer's (NaN, infinity, out of range),
+// else NX if it had a fraction. The flags go straight into fcsr (a read of
+// it folds the host's in on top).
+// [gadget][rd_off][rs1_off][unused]
+.gadget fcvtmod_w_d
+    fp_head
+    ldr x12, [x10]
+    lsr x13, x12, #63              // sign
+    ubfx x14, x12, #52, #11        // exponent
+    and x15, x12, #0xfffffffffffff
+    mov x16, #0x7ff
+    cmp x14, x16
+    b.ne 1f
+    mov x12, #0                    // NaN, infinity
+    mov w17, #0x10                 // NV
+    b 8f
+1:  cbz x14, 2f
+    orr x15, x15, #(1 << 52)       // the implicit bit: |value| = x15 * 2^shift
+2:  mov w17, #0                    // NX: a fraction was dropped
+    mov x16, #1075
+    subs x16, x14, x16             // shift
+    b.lt 3f
+    mov x12, #0
+    cmp x16, #32
+    b.hs 5f
+    lsl x12, x15, x16
+    b 5f
+3:  neg x16, x16                   // shift right by n
+    cmp x16, #64
+    b.lo 4f
+    mov x12, #0
+    cmp x15, #0
+    cset w17, ne
+    b 5f
+4:  lsr x12, x15, x16
+    mov x10, #64
+    sub x10, x10, x16
+    lsl x10, x15, x10              // the bits shifted out
+    cmp x10, #0
+    cset w17, ne
+5:  // in range: exponent < 1023 + 31, or the value truncates to -2^31
+    // (-2^31 - 0.5 does: x15 below 2^52 + 2^21, the integer part 2^31)
+    mov x10, #1054
+    cmp x14, x10
+    b.lo 6f
+    b.ne 7f
+    cbz x13, 7f
+    mov x10, #(1 << 52)
+    add x10, x10, #0x200, lsl #12
+    cmp x15, x10
+    b.lo 6f
+7:  mov w17, #0x10                 // out of range: NV, not NX
+6:  cmp x13, #0
+    cneg x12, x12, ne
+    sxtw x12, w12
+8:  add x10, _cpu, #CPU_riscv64_fcsr
+    ldr w11, [x10]
+    orr w11, w11, w17
+    str w11, [x10]
+    str x12, [_cpu, x9]
+    gret 3
+
+
+// A static rounding mode on an arithmetic instruction: [rm_set][rmode],
+// the op, then [rm_restore], which puts frm's mode back (RNE 0, RTZ 3,
+// RDN 2, RUP 1 in FPCR.RMode; RMM has none and runs as RNE).
+.gadget rm_set
+    ldr x8, [_ip]
+    mrs x9, fpcr
+    bfi x9, x8, #22, #2
+    msr fpcr, x9
+    gret 1
+.gadget rm_restore
+    ldr w8, [_cpu, #CPU_riscv64_fcsr]
+    ubfx w8, w8, #5, #3
+    lsl w8, w8, #2
+    mov w9, #0x1230
+    lsr w9, w9, w8
+    and w9, w9, #3
+    mrs x10, fpcr
+    bfi x10, x9, #22, #2
+    msr fpcr, x10
+    gret
 
 // fp <-> fp width
 .gadget fcvt_d_s
@@ -263,6 +474,106 @@ cvt_f2i_gadget fcvt\rmode\()_lu_s, fcvt\rmode\()u, s16, x12, 0
     restore_c
     gret 2
 
+// ---- the FP CSRs and the counters --------------------------------------
+// fflags (0x001) = fcsr[4:0], frm (0x002) = fcsr[7:5], fcsr (0x003) =
+// fcsr[7:0], under csrrw/s/c and their immediate forms, emu/fpenv.c's model:
+// a read of fflags or fcsr first gathers the flags the host FPU raised
+// (IOC DZC OFC UFC IXC -> NV DZ OF UF NX, the bit order reversed); a write
+// goes onto the host FPU at once (frm's rounding mode -- RMM and the
+// reserved values run as RNE -- and DN, RISC-V's canonical NaN), a write of
+// the flags discarding the host's. fpenv's FPCR cache compares the live
+// register, so writing it here keeps it coherent.
+// [rd | rs1 << 5 | funct3 << 10 | csr << 13], gret 1.
+.macro rv_take_flags                     /* w13 = the host's flags as fflags; cleared */
+    mrs  x10, fpsr
+    movz w11, #0x9f
+    movk w11, #0x0800, lsl #16
+    ands w12, w10, w11
+    mov  w13, 0
+    b.eq 1f
+    bic  x10, x10, x11
+    msr  fpsr, x10
+    and  w12, w12, #0x1f
+    rbit w13, w12
+    lsr  w13, w13, #27
+1:
+.endm
+.gadget csr_fp
+    ldr  x8, [_ip]
+    and  x14, x8, #31                    /* rd */
+    ubfx x15, x8, #5, #5                 /* rs1 */
+    ubfx x16, x8, #10, #3                /* funct3 */
+    lsr  x17, x8, #13                    /* csr */
+    ldr  w9, [_cpu, #CPU_riscv64_fcsr]
+    cmp  x17, #2
+    b.eq 2f
+    rv_take_flags
+    orr  w9, w9, w13
+    str  w9, [_cpu, #CPU_riscv64_fcsr]
+2:  and  w4, w9, #0x1f                   /* old: fflags */
+    cmp  x17, #2
+    b.ne 3f
+    ubfx w4, w9, #5, #3                  /* frm */
+3:  cmp  x17, #3
+    b.ne 4f
+    and  w4, w9, #0xff                   /* fcsr */
+4:  mov  x5, x15                         /* src: the immediate */
+    tbnz x16, #2, 5f
+    add  x10, _cpu, #CPU_riscv64_regs
+    ldr  x5, [x10, x15, lsl #3]          /* or rs1 */
+5:  and  x6, x16, #3
+    cmp  x6, #1
+    b.eq 6f                              /* csrrw: always writes */
+    cbz  x15, 9f                         /* csrrs/c with rs1/uimm 0: a read */
+    orr  x10, x4, x5
+    bic  x11, x4, x5
+    cmp  x6, #2
+    csel x5, x10, x11, eq
+6:  cmp  x17, #1
+    b.ne 7f
+    bfi  w9, w5, #0, #5
+    b    8f
+7:  cmp  x17, #2
+    b.ne 71f
+    bfi  w9, w5, #5, #3
+    b    8f
+71: and  w9, w5, #0xff
+8:  str  w9, [_cpu, #CPU_riscv64_fcsr]
+    cmp  x17, #2
+    b.eq 81f
+    rv_take_flags                        /* the flags were written: the host's go */
+81: ubfx w10, w9, #5, #3
+    lsl  w10, w10, #1
+    mov  w11, #0x6c                      /* frm -> RMode: 0 3 2 1, the rest 0 */
+    lsr  w11, w11, w10
+    and  w11, w11, #3
+    lsl  w11, w11, #22
+    orr  w11, w11, #(1 << 25)            /* DN */
+    mrs  x10, fpcr
+    movz w12, #0x07c8, lsl #16           /* FPCR's guest bits */
+    and  w13, w10, w12
+    cmp  w13, w11
+    b.eq 9f
+    bic  x10, x10, x12
+    orr  x10, x10, x11
+    msr  fpcr, x10
+9:  cbz  x14, 10f
+    add  x10, _cpu, #CPU_riscv64_regs
+    str  x4, [x10, x14, lsl #3]
+10: gret 1
+
+// cycle, time, instret (0xc00-2, read only): all three the host counter in
+// nanoseconds (gadgets-generic.h host_counter_ns) -- there is no cycle or
+// instruction count to give, and Go's nanotime (`csrrs rd, time, x0`) only
+// needs a steady clock. [rd], gret 1.
+.gadget csr_counter
+    ldr  x12, [_ip]
+    host_counter_ns x8, x9, x10, x11
+    cbz  x12, 1f
+    add  x10, _cpu, #CPU_riscv64_regs
+    str  x8, [x10, x12, lsl #3]
+1:  gret 1
+
 // ---- fused multiply-add family (4 register operands) ----------------------
 // riscv->aarch64 mnemonic mapping is a crosswise trap, verified per-op:
 //   riscv fmadd  (a*b)+c  -> aarch64 fmadd
@@ -301,3 +612,89 @@ fma_gadget fmadd_s,  fmadd,  s, 1
 fma_gadget fmsub_s,  fnmsub, s, 1
 fma_gadget fnmsub_s, fmsub,  s, 1
 fma_gadget fnmadd_s, fnmadd, s, 1
+
+// ---- Zfa (RVA23) -----------------------------------------------------------
+// fminm/fmaxm: min/max that return the canonical NaN when either input is a
+// NaN = AArch64 fmin/fmax under FPCR.DN. fround/froundnx: round to an
+// integer in the current rounding mode (gen brackets a static rm), without
+// and with the inexact flag = frinti/frintx. fleq/fltq: fle/flt that are
+// quiet (NV only for a signalling NaN) = fcmp rather than fcmpe.
+.macro fpop_minm o, a, b
+    fmin \o, \a, \b
+.endm
+.macro fpop_maxm o, a, b
+    fmax \o, \a, \b
+.endm
+.irp op, minm,maxm
+    fp_d_gadget \op
+    fp_s_gadget \op
+.endr
+.irp op, i,x
+.gadget fround\op\()_d
+    fp_head
+    ldr d16, [x10]
+    frint\op d16, d16
+    str d16, [_cpu, x9]
+    gret 3
+.gadget fround\op\()_s
+    fp_head
+    ldr s16, [x10]
+    frint\op s16, s16
+    fmov w10, s16
+    orr x10, x10, #0xffffffff00000000
+    str x10, [_cpu, x9]
+    gret 3
+.endr
+fcmp_gadget fltq_d, d, mi, fcmp
+fcmp_gadget fleq_d, d, ls, fcmp
+fcmp_gadget fltq_s, s, mi, fcmp
+fcmp_gadget fleq_s, s, ls, fcmp
+
+// ---- Zfhmin (RVA23): half-precision moves and conversions ------------------
+// H values are NaN-boxed in the 64-bit f-register (high 48 bits all ones);
+// FPCR.AHP is 0, so the host's half format is IEEE binary16.
+.macro box_h reg
+    orr \reg, \reg, #0xffffffffffff0000
+.endm
+.gadget fcvt_s_h
+    fp_head
+    ldr h16, [x10]
+    fcvt s16, h16
+    fmov w10, s16
+    orr x10, x10, #0xffffffff00000000
+    str x10, [_cpu, x9]
+    gret 3
+.gadget fcvt_d_h
+    fp_head
+    ldr h16, [x10]
+    fcvt d16, h16
+    str d16, [_cpu, x9]
+    gret 3
+.gadget fcvt_h_s
+    fp_head
+    ldr s16, [x10]
+    fcvt h16, s16
+    umov w10, v16.h[0]
+    box_h x10
+    str x10, [_cpu, x9]
+    gret 3
+.gadget fcvt_h_d
+    fp_head
+    ldr d16, [x10]
+    fcvt h16, d16
+    umov w10, v16.h[0]
+    box_h x10
+    str x10, [_cpu, x9]
+    gret 3
+// fmv.x.h: the low 16 bits, sign-extended; fmv.h.x boxes.
+.gadget fmv_x_h
+    fp_head
+    ldrsh x12, [x10]
+    str x12, [_cpu, x9]
+    gret 3
+.gadget fmv_h_x
+    fp_head
+    ldrh w12, [x10]
+    box_h x12
+    str x12, [_cpu, x9]
+    gret 3

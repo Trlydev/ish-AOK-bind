@@ -1,5 +1,7 @@
 #include <sys/utsname.h>
 #include <string.h>
+#include "kernel/user_ns.h"
+#include "kernel/ipc_ns.h"
 #include "kernel/calls.h"
 #include "kernel/uts.h"
 #include "kernel/hostinfo.h"
@@ -15,9 +17,40 @@ static_assert(UTS_NAME_LENGTH == UNAME_LENGTH, "UTS name length must match struc
 
 const char *uname_version = "iSH-AOK";
 
+// The kernel release AOK reports: uname -r, /proc/sys/kernel/osrelease and
+// /proc/version.
+//
+// It said 5.20.66, a release that never existed -- 5.19 was followed by 6.0 --
+// and one past features AOK did not have, so software that decides by version
+// was promised rseq, io_uring and the rest. A real release now, and the one
+// whose feature set AOK's matches: everything 5.10 always has is here,
+//
+//   pidfd_open, pidfd_send_signal, pidfd_getfd, clone3 (5.1-5.6)
+//   openat2, faccessat2, close_range (5.6-5.9), process_madvise (5.10)
+//   rseq (4.18), POSIX message queues, extended attributes
+//
+// and CAP_CHECKPOINT_RESTORE (5.9) makes cap_last_cap 40 (kernel/task.h).
+// What 5.10 can be built without answers as such a build does: io_uring is
+// ENOSYS (CONFIG_IO_URING=n), and so are the namespaces AOK does not model. A
+// few later calls exist as well -- epoll_pwait2 (5.11), fchmodat2 (6.6) -- which
+// no program is harmed to find, since callers probe for them. Two later x86
+// signal behaviours too, both 5.14's (kernel/signal.c): AT_MINSIGSTKSZ in the
+// auxv, which readers take from getauxval with a fallback for 0, and SIGSEGV
+// for a frame that overruns its altstack -- where 5.10 writes the frame past
+// the altstack's bottom over whatever lies below, which no program can rely
+// on and an AVX-512 frame (~3.5 KB, over MINSIGSTKSZ) makes reachable. The
+// next release up would promise mount_setattr (5.12) and futex_waitv (5.16),
+// which are not.
+//
+// 5.10.0 rather than a later 5.10.y, as Debian's 5.10 kernels spell it; libuv
+// turns io_uring on from 5.10.186, and should not go probing for it here.
+#define ISH_KERNEL_RELEASE "5.10.0-ish_aok"
+
 struct uts_namespace init_uts_ns = {
     .lock = LOCK_INITIALIZER,
     .refcount = 1,
+    // Linux's PROC_UTS_INIT_INO.
+    .inode = 4026531838ul,
 };
 
 struct uts_namespace *uts_ns_retain(struct uts_namespace *ns) {
@@ -37,8 +70,10 @@ void uts_ns_release(struct uts_namespace *ns) {
     // can never reach zero here -- provided every task that points at it took a
     // reference. construct_task() used to inherit the pointer without one; see
     // the comment there.
-    if (dead)
+    if (dead) {
+        user_ns_release(ns->user_ns);
         free(ns);
+    }
 }
 
 struct uts_namespace *uts_ns_copy(struct uts_namespace *ns) {
@@ -48,6 +83,7 @@ struct uts_namespace *uts_ns_copy(struct uts_namespace *ns) {
     *new_ns = (struct uts_namespace) {};
     lock_init(&new_ns->lock, "uts_ns\0");
     new_ns->refcount = 1;
+    new_ns->inode = ns_alloc_inum();
     lock(&ns->lock, 0);
     memcpy(new_ns->hostname, ns->hostname, sizeof(new_ns->hostname));
     memcpy(new_ns->domainname, ns->domainname, sizeof(new_ns->domainname));
@@ -125,7 +161,7 @@ void do_uname(struct uname *uts) {
     else
         strncpy(uts->domain, "(none)", sizeof(uts->domain));
     unlock(&ns->lock);
-    strncpy(uts->release, "5.20.66-ish_aok", sizeof(uts->release));
+    strncpy(uts->release, ISH_KERNEL_RELEASE, sizeof(uts->release));
     strncpy(uts->system, "Linux", sizeof(uts->system));
     snprintf(uts->hostname, sizeof(uts->hostname), "%s", hostname);
     snprintf(uts->version, sizeof(uts->version), "%s %s%s%s", uname_version, build_version,
@@ -152,7 +188,7 @@ dword_t sys_sethostname(addr_t hostname_addr, dword_t hostname_len) {
 dword_t sys_sethostname_guest(guest_addr_t hostname_addr, dword_t hostname_len) {
     struct uname uts;
 
-    if (!superuser()) {
+    if (!ns_capable(uts_ns_current()->user_ns, CAP_SYS_ADMIN_)) {
         return _EPERM;
     }
 
@@ -178,7 +214,8 @@ dword_t sys_setdomainname(addr_t domainname_addr, dword_t domainname_len) {
 }
 
 dword_t sys_setdomainname_guest(guest_addr_t domainname_addr, dword_t domainname_len) {
-    if (!superuser())
+    // CAP_SYS_ADMIN in the user namespace this UTS namespace belongs to.
+    if (!ns_capable(uts_ns_current()->user_ns, CAP_SYS_ADMIN_))
         return _EPERM;
     if (domainname_len >= UNAME_LENGTH)
         return _EINVAL;
@@ -310,7 +347,14 @@ static void sysinfo_specific_amd64(struct amd64_sys_info *info) {
 static_assert(sizeof(struct amd64_sys_info) == 112, "amd64 sysinfo layout mismatch");
 
 dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
-    struct uptime_info uptime = get_uptime();
+    // sysinfo(2)'s uptime is in SECONDS. It was uptime_ticks / 100 -- and
+    // before that the undivided ticks, which had busybox uptime read a
+    // 12-second-old guest as "up 20 min". Linux rounds UP: do_sysinfo reports
+    // tv_sec plus one for any fraction, so sysinfo never reads below
+    // /proc/uptime. Measured on Linux 6.12: boottime 1647044.474,
+    // sysinfo.uptime 1647045. From the nanosecond clock rather than
+    // uptime_ticks, because rounding up needs the fraction the ticks drop.
+    uint64_t uptime_s = (guest_uptime_ns() + 999999999ull) / 1000000000ull;
     uint64_t loads[3];
     get_guest_loadavg(loads);
 
@@ -318,10 +362,7 @@ dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
     // that ABI fill and write the wider layout with raw (un-truncated) values.
     if (guest_abi_is_64bit(current->abi)) { // arm64 shares the 64-bit layout
         struct amd64_sys_info info = {0};
-        // sysinfo(2)'s uptime is in SECONDS; uptime_ticks is 100 Hz. Without
-        // the divide, busybox uptime read a 12-second-old guest as "up 20
-        // min" -- and top, htop and anything else on sysinfo(2) with it.
-        info.uptime = (sqword_t)(uptime.uptime_ticks / 100);
+        info.uptime = (sqword_t) uptime_s;
         info.loads[0] = loads[0];
         info.loads[1] = loads[1];
         info.loads[2] = loads[2];
@@ -332,7 +373,7 @@ dword_t sys_sysinfo_guest(guest_addr_t info_addr) {
     }
 
     struct sys_info info = {0};
-    info.uptime = (dword_t)(uptime.uptime_ticks / 100);   // seconds, as above
+    info.uptime = (dword_t) uptime_s;   // seconds, rounded up, as above
     info.loads[0] = (dword_t)loads[0];
     info.loads[1] = (dword_t)loads[1];
     info.loads[2] = (dword_t)loads[2];

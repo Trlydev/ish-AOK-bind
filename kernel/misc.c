@@ -1,5 +1,8 @@
 #include <string.h>
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
+#include "kernel/seccomp.h"
+#include "jit/jit.h"
 
 #define PRCTL_SET_PDEATHSIG_ 1
 #define PRCTL_GET_PDEATHSIG_ 2
@@ -33,8 +36,12 @@
 #define PRCTL_SET_MM_ARG_END_ 9
 #define PRCTL_SET_MM_ENV_START_ 10
 #define PRCTL_SET_MM_ENV_END_ 11
+#define PRCTL_SET_MM_AUXV_ 12
+#define PRCTL_SET_MM_MAP_ 14
+#define PRCTL_SET_MM_MAP_SIZE_ 15
+// vm.mmap_min_addr, as fs/proc/sys.c reports it and emu/memory.c enforces it.
+#define PRCTL_MMAP_MIN_ADDR_ 65536
 
-#define PRCTL_CAP_LAST_CAP_ 63
 #define PRCTL_DEFAULT_TIMERSLACK_NS_ 50000
 
 #define KEYCTL_GET_KEYRING_ID_ 0
@@ -47,9 +54,16 @@
 #define ARCH_SET_FS_ 0x1002
 #define ARCH_GET_FS_ 0x1003
 #define ARCH_GET_GS_ 0x1004
+// Linux's TASK_SIZE_MAX under 4-level paging: the 47-bit user half less its
+// top page. ARCH_SET_FS and ARCH_SET_GS refuse a base at or above it (EPERM).
+#define AMD64_TASK_SIZE_MAX_ ((((qword_t) 1) << 47) - PAGE_SIZE)
 
+// Linux's cap_valid: a capability this kernel has, which is what
+// /proc/sys/kernel/cap_last_cap says. libcap finds the number by probing
+// PR_CAPBSET_READ upward until EINVAL when it cannot read that file, so the two
+// must agree -- answering 0 for every bit up to 63 claimed 64 capabilities.
 static bool prctl_cap_valid(uint_t cap) {
-    return cap <= PRCTL_CAP_LAST_CAP_;
+    return cap <= CAP_LAST_CAP_;
 }
 
 static bool prctl_cap_test(const dword_t caps[2], uint_t cap) {
@@ -58,9 +72,54 @@ static bool prctl_cap_test(const dword_t caps[2], uint_t cap) {
     return (caps[cap / 32] & (1u << (cap % 32))) != 0;
 }
 
-int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED(arg4), qword_t UNUSED(arg5)) {
+// riscv64 V control, as Linux's riscv_v_vstate_ctrl_*: off (1), on (2) or
+// the default (0, which is on: abi.riscv_v_default_allow's usual 1)
+#define RV_V_CTRL_OFF 1
+#define RV_V_CTRL_ON 2
+#define RV_V_CTRL_INHERIT (1 << 4)
+#define RV_V_CTRL_MASK 0x1f
+static dword_t riscv64_v_ctrl_get(struct task *task) {
+    dword_t c = task->riscv64_v_ctrl;
+    if ((c & 3) == 0)
+        c |= RV_V_CTRL_ON;
+    return c & RV_V_CTRL_MASK;
+}
+static int_t riscv64_v_ctrl_set(struct task *task, uint_t arg) {
+    if (arg & ~RV_V_CTRL_MASK)
+        return _EINVAL;
+    dword_t cur = riscv64_v_ctrl_get(task) & 3, want = arg & 3, next = (arg >> 2) & 3;
+    if (want == 3 || next == 3)
+        return _EINVAL;
+    if (want == RV_V_CTRL_OFF && cur != RV_V_CTRL_OFF)
+        return _EPERM; // Linux will not turn V off under a running program
+    if (want == RV_V_CTRL_ON && cur == RV_V_CTRL_OFF) {
+        // on again: blocks translated while it was off trap every vector
+        // instruction (gen_riscv64_vector), so drop them
+        struct jit *jit = task->mem != NULL ? task->mem->mmu.jit : NULL;
+        if (jit != NULL)
+            jit_invalidate_all(jit);
+        cur = RV_V_CTRL_ON;
+    }
+    task->riscv64_v_ctrl = cur | next << 2 | (arg & RV_V_CTRL_INHERIT);
+    return 0;
+}
+// at exec: the next setting (or the default) becomes the current one, and
+// is forgotten unless inherited
+void riscv64_v_ctrl_exec(struct task *task) {
+    dword_t c = task->riscv64_v_ctrl, next = (c >> 2) & 3, inherit = c & RV_V_CTRL_INHERIT;
+    dword_t cur = next == 0 ? RV_V_CTRL_ON : next;
+    task->riscv64_v_ctrl = cur | (inherit ? next << 2 : 0) | inherit;
+}
+
+int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t arg4, qword_t arg5) {
     switch (option) {
         case PRCTL_SET_PDEATHSIG_:
+            // Linux's valid_signal(): 0 clears it, 1 to 64 are signals, and
+            // anything else is EINVAL. It was stored unchecked, and do_exit
+            // now sends it -- a number past the last signal would index past
+            // every table the send reads.
+            if (arg2 >= NUM_SIGS)
+                return _EINVAL;
             current->pdeath_signal = (dword_t) arg2;
             return 0;
         case PRCTL_GET_PDEATHSIG_:
@@ -68,10 +127,16 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
                 return _EFAULT;
             return 0;
         case PRCTL_GET_DUMPABLE_:
-            return 1;
+            return atomic_load(&current->group->undumpable) ? 0 : 1;
         case PRCTL_SET_DUMPABLE_:
+            // SUID_DUMP_DISABLE or SUID_DUMP_USER; SUID_DUMP_ROOT (2) is a
+            // sysctl's setting, never prctl's. It was accepted and forgotten,
+            // so ssh-agent and sshd, which set 0 to keep their keys from
+            // being read out by the user's other processes, were readable
+            // through /proc/<pid>/mem and ptrace all along.
             if (arg2 > 1)
                 return _EINVAL;
+            atomic_store(&current->group->undumpable, arg2 == 0);
             return 0;
         case PRCTL_GET_KEEPCAPS_:
             return current->keepcaps ? 1 : 0;
@@ -90,14 +155,13 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
             return 0;
         }
         case PRCTL_GET_SECCOMP_:
-            // Report "disabled" rather than erroring out during helper setup.
-            return 0;
+            return seccomp_prctl_get();
         case PRCTL_SET_SECCOMP_:
-            // Compatibility stub: userland may try to sandbox helpers.
-            // Pretend success instead of returning EINVAL, which newer apt
-            // treats as a startup failure.
-            STRACE("prctl(PR_SET_SECCOMP, %#x)", arg2);
-            return 0;
+            // Real now (kernel/seccomp.c). This used to answer 0 and do
+            // nothing, so every sandbox that asked -- OpenSSH's pre-auth
+            // child, apt's methods, man-db's helpers -- believed it was
+            // confined and was not.
+            return seccomp_prctl_set(arg2, (guest_addr_t) arg3);
         case PRCTL_SET_NAME_: {
             char name[16];
             if (user_read_string((guest_addr_t) arg2, name, sizeof(name) - 1)) {
@@ -121,22 +185,21 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
         case PRCTL_CAPBSET_READ_:
             if (!prctl_cap_valid(arg2))
                 return _EINVAL;
-            // We do not model a separate bounding set. Use the permitted set so
-            // capability probes see a coherent answer instead of EINVAL.
-            return prctl_cap_test(current->cap_permitted, arg2) ? 1 : 0;
+            return prctl_cap_test(current->cap_bounding, arg2) ? 1 : 0;
         case PRCTL_CAPBSET_DROP_:
-            // As above, we don't model a separate bounding set to shrink --
-            // just validate the capability number and accept. Every
-            // process's exec_context capability-dropping sequence
-            // (CapabilityBoundingSet=, systemd's exec_context_apply, PAM's
-            // pam_cap, etc.) calls this once per capability it wants gone
-            // before ever calling capset(); rejecting it outright with
-            // EINVAL aborted the whole spawn ("Failed to drop capabilities")
-            // before the exec'd program ever ran, which blocked every
-            // service using CapabilityBoundingSet= (systemd-logind among
-            // them) during Arch aarch64 boot.
+            // A real bounding set now (struct task's cap_bounding), which exec
+            // consults: a capability dropped here cannot come back from a
+            // file's capabilities, or from root's re-grant at exec -- which is
+            // what systemd's CapabilityBoundingSet=, pam_cap and capsh --drop
+            // mean by it. Accepted-and-forgotten used to be the least bad
+            // answer, because EINVAL aborted every such spawn ("Failed to drop
+            // capabilities" for systemd-logind); now it does what it says.
+            // CAP_SETPCAP first, then the number: Linux's cap_prctl_drop.
+            if (!ns_capable(current_user_ns(), CAP_SETPCAP_))
+                return _EPERM;
             if (!prctl_cap_valid(arg2))
                 return _EINVAL;
+            current->cap_bounding[arg2 / 32] &= ~(1u << (arg2 % 32));
             return 0;
         // Model exactly the SECBIT_KEEP_CAPS bit (1 << 4), mapping it onto
         // the same task->keepcaps flag PR_SET_KEEPCAPS uses -- on Linux the
@@ -157,33 +220,59 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
             return 0;
         case PRCTL_GET_TIMERSLACK_:
             return PRCTL_DEFAULT_TIMERSLACK_NS_;
-        case PRCTL_SET_MM_:
-            if (!superuser())
+        case PRCTL_SET_MM_: {
+            // kernel/sys.c's prctl_set_mm(), for the four fields AOK keeps
+            // (the ranges /proc/<pid>/cmdline and environ read). Its argument
+            // check comes BEFORE the capability check, so a stray arg4 or arg5
+            // is EINVAL even unprivileged -- measured on 6.12.
+            if (arg5 != 0 || (arg4 != 0 && arg2 != PRCTL_SET_MM_AUXV_ &&
+                              arg2 != PRCTL_SET_MM_MAP_ && arg2 != PRCTL_SET_MM_MAP_SIZE_))
+                return _EINVAL;
+            if (!current_capable(CAP_SYS_RESOURCE_))
                 return _EPERM;
+            qword_t addr_max = guest_abi_user_addr_max(current->abi);
+            if (arg3 >= addr_max || arg3 < PRCTL_MMAP_MIN_ADDR_)
+                return _EINVAL;
             lock(&current->general_lock, 0);
             if (current->mm == NULL) {
                 unlock(&current->general_lock);
                 return _EINVAL;
             }
+            guest_addr_t range[4] = {
+                current->mm->argv_start, current->mm->argv_end,
+                current->mm->env_start, current->mm->env_end,
+            };
             switch (arg2) {
-                case PRCTL_SET_MM_ARG_START_:
-                    current->mm->argv_start = (guest_addr_t) arg3;
-                    break;
-                case PRCTL_SET_MM_ARG_END_:
-                    current->mm->argv_end = (guest_addr_t) arg3;
-                    break;
-                case PRCTL_SET_MM_ENV_START_:
-                    current->mm->env_start = (guest_addr_t) arg3;
-                    break;
-                case PRCTL_SET_MM_ENV_END_:
-                    current->mm->env_end = (guest_addr_t) arg3;
-                    break;
+                case PRCTL_SET_MM_ARG_START_: range[0] = (guest_addr_t) arg3; break;
+                case PRCTL_SET_MM_ARG_END_: range[1] = (guest_addr_t) arg3; break;
+                case PRCTL_SET_MM_ENV_START_: range[2] = (guest_addr_t) arg3; break;
+                case PRCTL_SET_MM_ENV_END_: range[3] = (guest_addr_t) arg3; break;
                 default:
                     unlock(&current->general_lock);
                     return _EINVAL;
             }
+            // validate_prctl_map_addr(): every field inside the address space,
+            // and each start at or below its end with the new value in place --
+            // which is why a caller moving a range upward has to set the end
+            // first (systemd's rename_process() does exactly that dance). A
+            // range was accepted inverted, and the /proc readers then saw an
+            // arg_end below arg_start. Not modelled: the EFAULT for an address
+            // with no mapping at or above it.
+            bool valid = range[0] <= range[1] && range[2] <= range[3];
+            for (int i = 0; i < 4; i++)
+                if (range[i] >= addr_max || range[i] < PRCTL_MMAP_MIN_ADDR_)
+                    valid = false;
+            if (!valid) {
+                unlock(&current->general_lock);
+                return _EINVAL;
+            }
+            current->mm->argv_start = range[0];
+            current->mm->argv_end = range[1];
+            current->mm->env_start = range[2];
+            current->mm->env_end = range[3];
             unlock(&current->general_lock);
             return 0;
+        }
         case PRCTL_SET_CHILD_SUBREAPER_:
             if (arg2 > 1)
                 return _EINVAL;
@@ -202,13 +291,23 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
                 return _EFAULT;
             return 0;
         }
+        // Kept, and honoured by exec (exec_setid_plan). It was accepted and
+        // forgotten, so GET said 0 to a sandbox that had just set it, and a
+        // setuid-root binary run from inside one still made root. Linux's
+        // argument rules, measured on 6.12: SET takes exactly (1, 0, 0, 0) --
+        // a 0 is EINVAL too, there being no way to clear it -- and GET takes
+        // (0, 0, 0, 0). Per thread: one created before the SET does not have
+        // it, one created after does, and so do a fork and an exec.
         case PRCTL_SET_NO_NEW_PRIVS_:
-            if (arg2 > 1)
+            STRACE("prctl(PR_SET_NO_NEW_PRIVS, %#llx)", (unsigned long long) arg2);
+            if (arg2 != 1 || arg3 != 0 || arg4 != 0 || arg5 != 0)
                 return _EINVAL;
-            STRACE("prctl(PR_SET_NO_NEW_PRIVS, %#x)", arg2);
+            current->no_new_privs = true;
             return 0;
         case PRCTL_GET_NO_NEW_PRIVS_:
-            return 0;
+            if (arg2 != 0 || arg3 != 0 || arg4 != 0 || arg5 != 0)
+                return _EINVAL;
+            return current->no_new_privs ? 1 : 0;
         // A real ambient set (kernel/task.h cap_ambient), not a no-op:
         // ambient bits survive the root-to-nonroot uid transition into
         // permitted+effective (kernel/getset.c cap_emulate_setxuid), which
@@ -245,6 +344,11 @@ int_t sys_prctl_guest(dword_t option, qword_t arg2, qword_t arg3, qword_t UNUSED
                 default:
                     return _EINVAL;
             }
+        case 69: // PR_RISCV_V_SET_CONTROL
+        case 70: // PR_RISCV_V_GET_CONTROL
+            if (current->abi != GUEST_ABI_RISCV64)
+                return _EINVAL;
+            return option == 70 ? (int_t) riscv64_v_ctrl_get(current) : riscv64_v_ctrl_set(current, arg2);
         default:
             STRACE("prctl(%#x)", option);
             return _EINVAL;
@@ -262,7 +366,12 @@ int_t sys_arch_prctl_guest(int_t code, guest_addr_t addr) {
 
     switch (code) {
         case ARCH_SET_FS_:
+            // Linux writes the base and leaves the FS selector 0, whatever
+            // `mov Sreg, r/m` had loaded.
+            if (addr >= AMD64_TASK_SIZE_MAX_)
+                return _EPERM;
             current->cpu.tls_ptr = addr;
+            current->cpu.amd64_sreg[AMD64_SREG_FS] = 0;
             return 0;
         case ARCH_GET_FS_: {
             qword_t fs_base = current->cpu.tls_ptr;
@@ -271,10 +380,18 @@ int_t sys_arch_prctl_guest(int_t code, guest_addr_t addr) {
             return 0;
         }
         case ARCH_SET_GS_:
-        case ARCH_GET_GS_:
-            // The current long-mode bring-up only has one TLS base, used for
-            // amd64 FS-relative accesses.
-            return _EINVAL;
+            // The same for GS, whose base a 65 prefix adds.
+            if (addr >= AMD64_TASK_SIZE_MAX_)
+                return _EPERM;
+            current->cpu.amd64_gs_base = addr;
+            current->cpu.amd64_sreg[AMD64_SREG_GS] = 0;
+            return 0;
+        case ARCH_GET_GS_: {
+            qword_t gs_base = current->cpu.amd64_gs_base;
+            if (user_put(addr, gs_base))
+                return _EFAULT;
+            return 0;
+        }
         default:
             return _EINVAL;
     }
@@ -282,17 +399,6 @@ int_t sys_arch_prctl_guest(int_t code, guest_addr_t addr) {
 
 int_t sys_arch_prctl(int_t code, addr_t addr) {
     return sys_arch_prctl_guest(code, addr);
-}
-
-int_t sys_rseq(addr_t rseq_addr, dword_t rseq_len, dword_t flags, dword_t sig) {
-    return sys_rseq_guest(rseq_addr, rseq_len, flags, sig);
-}
-
-int_t sys_rseq_guest(guest_addr_t rseq_addr, dword_t rseq_len, dword_t flags, dword_t sig) {
-    STRACE("rseq(%#llx, %u, %#x, %#x)", (unsigned long long) rseq_addr, rseq_len, flags, sig);
-    // Deliberately report rseq as unsupported. Modern glibc falls back cleanly
-    // on ENOSYS, but a fake success here would expose an ABI we do not emulate.
-    return _ENOSYS;
 }
 
 int_t sys_keyctl(dword_t cmd, dword_t arg2, dword_t arg3, dword_t arg4, dword_t arg5) {

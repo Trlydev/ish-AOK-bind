@@ -4,6 +4,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdatomic.h>
 #include "util/ro_locks.h"
 #include "util/rw_locks.h"
 #include "debug.h"
@@ -81,6 +82,10 @@ void cond_destroy(cond_t *cond);
 // _ETIMEDOUT if waiting stopped because the timout expired, 0 otherwise.
 // Will never return _ETIMEDOUT if timeout is NULL.
 int must_check wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout);
+// wait_for, for a timeout that is the caller's own cap on a longer or endless
+// wait rather than a deadline the guest asked for: it may end late, and it
+// costs the host nothing to let it (see deadline_wake in sync.c).
+int must_check wait_for_capped(cond_t *cond, lock_t *lock, struct timespec *timeout);
 // Same as wait_for, except it will never return _EINTR
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout);
 // Wake up all waiters.
@@ -95,12 +100,26 @@ extern __thread bool should_mark_wait_interrupted;
 // A helper function won't work: the compiler refuses to inline functions
 // containing sigsetjmp, so the jmp_buf would point at a dead frame.
 // Use a macro to guarantee in-place expansion at every call site.
+//
+// savemask 0, and it must stay 0. Darwin's siglongjmp restores a saved mask
+// with sigprocmask, and Darwin's sigprocmask sets the mask of EVERY thread in
+// the process, not the caller's (pthread_sigmask is the per-thread one). Every
+// guest task is a host thread of this one process, and each caller arms this
+// with SIGUSR1 blocked, so each poke that unwound a wait blocked SIGUSR1 in
+// every thread of the app: all of them deaf to their next poke. That is the
+// "swallowed poke" util/sync.c and kernel/signal.c defend against, and it grew
+// with activity because every interrupted poll, socket or pipe wait did it
+// once. On an M4 iPad an hour of the regression suite made child exits,
+// SIGALRM and handlers arrive one to two seconds late (signal_process_wake_one,
+// the wake_signals repair counters); tests/manual/wake_mask_isolation.c is the
+// witness. The unwind branch of every caller puts its own mask back with
+// pthread_sigmask(SIG_SETMASK, &oldmask) -- that is the restore, per thread.
 #define sigunwind_start() \
     ({ \
         int __sigunwind_result; \
         /* volatile: read back on the siglongjmp branch, so it must survive */ \
         volatile unsigned __sigunwind_frames = lockstats_depth; \
-        if (sigsetjmp(unwind_buf, 1)) { \
+        if (sigsetjmp(unwind_buf, 0)) { \
             should_unwind = false; \
             /* A siglongjmp abandons every lockstats frame opened since the \
                setjmp -- nothing releases those locks through the hooks, so \
@@ -124,7 +143,22 @@ static inline void sigunwind_end(void) {
 void cond_init(cond_t *cond);
 void cond_destroy(cond_t *cond);
 //static bool is_signal_pending(lock_t *lock); // Not used externally to sync.c, doesn't eneed to be exposed
+// Wait on `cond` for at most about a second at a time. Returns 0 when notified
+// OR when a slice ended with nothing to report -- so, like any condition
+// variable, the caller must re-check what it is waiting for and call again --
+// _ETIMEDOUT once the caller's own deadline has passed, and _EINTR for a
+// pending signal or a checkpoint freeze. `timeout` (NULL: no deadline) is
+// relative and is UPDATED to the time left, so waiting again with the same
+// pointer keeps the original deadline. See sync.c for why it slices.
 int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout);
+// wait_for, for a timeout that is the caller's own cap on a longer or endless
+// wait rather than a deadline the guest asked for: it may end late, and it
+// costs the host nothing to let it (see deadline_wake in sync.c).
+int wait_for_capped(cond_t *cond, lock_t *lock, struct timespec *timeout);
+// wait_for for a syscall the guest is blocked in (msgrcv, semop, io_getevents,
+// a FUSE request): the task reads as sleeping for the wait, and a bare barrier
+// poke is a spurious wakeup (0) rather than _EINTR. See sync.c.
+int wait_for_blocked(cond_t *cond, lock_t *lock, struct timespec *timeout);
 int wait_for_ignore_signals(cond_t *cond, lock_t *lock, struct timespec *timeout);
 void notify(cond_t *cond);
 void notify_once(cond_t *cond);
@@ -150,6 +184,20 @@ bool signal_thread_wake_sigs_unblocked(void);
 // it (which delivers it right here) and return true. Must be called from a
 // normal call stack, never from a signal handler. See sync.c.
 bool signal_thread_unwedge_wake_sigs(void);
+
+// How many threads have been found deaf to their wake signal and repaired,
+// counted separately per blocking site because the two say different things: a
+// sleeper that recovers late is slow, a POLLER that recovers late was hung.
+// Both are read by /proc/ish/wake_signals, which exists because the first
+// occurrence of this is logged and every one after it was only ever counted
+// into a variable no one could reach without a debugger.
+extern _Atomic long sleep_wedged_repairs;   // kernel/time.c
+extern _Atomic long poll_wedged_repairs;    // fs/poll.c
+// Host waits that ended at the self-imposed cap in fs/poll.c rather than at a
+// deadline the guest asked for. Ordinarily ~one per capped wait per second and
+// therefore uninteresting on its own; it is here so the two counters above can
+// be read against the number of chances they had to fire.
+extern _Atomic long poll_capped_waits;      // fs/poll.c
 bool current_is_valid(void);
 
 #endif

@@ -8,10 +8,12 @@
 #import "AboutExternalKeyboardViewController.h"
 #import "UserPreferences.h"
 #import "NSObject+SaneKVO.h"
+#import "UIViewController+Extras.h"
+#import "WorkspaceViewController.h"
 
 const int kCapsLockMappingSection = 0;
 
-@interface AboutExternalKeyboardViewController ()
+@interface AboutExternalKeyboardViewController () <WorkspaceTextScaledPage>
 
 @property (weak, nonatomic) IBOutlet UISwitch *optionMetaSwitch;
 @property (weak, nonatomic) IBOutlet UISwitch *backtickEscapeSwitch;
@@ -25,6 +27,7 @@ const int kCapsLockMappingSection = 0;
 
 - (void)viewDidLoad {
     [super viewDidLoad];
+    ISHSizeTableSectionTitlesOnMac(self.tableView);
     [UserPreferences.shared observe:@[@"capsLockMapping", @"optionMapping"]
                             options:0 owner:self usingBlock:^(typeof(self) self) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -75,6 +78,25 @@ const int kCapsLockMappingSection = 0;
     }
 }
 
+// At the text size of the Workspace window Settings is in; see
+// WorkspaceTextScaledPage. Anywhere else the rows are left as they are.
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+    UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
+    ISHWorkspaceScaleTableViewCell(cell, ISHWorkspaceTextScaleForViewController(self));
+    return cell;
+}
+
+// The switch rows centre their label and switch with nothing above or below,
+// so they stay 44 points tall whatever the text size.
+- (CGFloat)tableView:(UITableView *)tableView heightForRowAtIndexPath:(NSIndexPath *)indexPath {
+    return ISHWorkspaceTextScaledRowHeight([super tableView:tableView heightForRowAtIndexPath:indexPath],
+                                           ISHWorkspaceTextScaleForViewController(self));
+}
+
+- (void)workspaceTextScaleDidChange {
+    ISHWorkspaceRescaleTableView(self.tableView, ISHWorkspaceTextScaleForViewController(self));
+}
+
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     if (section == 0 && ![self.class capsLockMappingSupported])
         return 0;
@@ -83,8 +105,8 @@ const int kCapsLockMappingSection = 0;
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
     if (section == 0 && ![self.class capsLockMappingSupported])
-        return @"Caps Lock mapping is broken in iOS 13.\n\n"
-        @"Since iOS 13.4, Caps Lock can be remapped system-wide in Settings → General → Keyboard → Hardware Keyboard → Modifier Keys.";
+        return NSLocalizedString(@"Caps Lock mapping is broken in iOS 13.\n\n"
+        @"Since iOS 13.4, Caps Lock can be remapped system-wide in Settings → General → Keyboard → Hardware Keyboard → Modifier Keys.", @"External keyboard settings footer when Caps Lock mapping is unsupported");
     return [super tableView:tableView titleForFooterInSection:section];
 }
 

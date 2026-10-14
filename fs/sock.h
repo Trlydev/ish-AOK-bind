@@ -19,6 +19,47 @@
 
 extern const struct fd_ops socket_fdops;
 
+// Build the struct fd for an already-created host socket, without
+// installing it in any descriptor table. See fs/sock.c.
+struct fd *sock_fd_adopt(int sock_fd, int domain, int type, int protocol);
+
+// Whether an error read off a host socket is one Linux never raises there,
+// and so must not reach the guest. See fs/sock.c.
+bool sock_host_error_is_peer_gone(struct fd *fd, int host_err);
+// Netlink, for the kernel's own messages (kernel/mqueue.c's SIGEV_THREAD).
+int netlink_fd_check(struct fd *fd);
+int netlink_deliver_datagram(struct fd *sock, const void *data, size_t len);
+
+// Every open socket of one domain, across every process, each retained once
+// however many descriptors share it: what /proc/net/{tcp,tcp6,udp,udp6,unix}
+// and NETLINK_SOCK_DIAG (ss) list. A type of -1 takes every type. One walk for
+// all of them, so the listings cannot drift apart; see fs/sock.c.
+struct sock_snapshot {
+    struct fd **fds;
+    unsigned count;
+    unsigned cap;
+};
+int sock_snapshot_collect(struct sock_snapshot *snapshot, int domain, int type);
+void sock_snapshot_release(struct sock_snapshot *snapshot);
+
+// A socket's inode number -- fstat's st_ino, and the N in /proc/<pid>/fd's
+// socket:[N] -- and its owner, as every listing of sockets must report them.
+unsigned long sock_inode(const struct fd *sock);
+uid_t_ sock_uid(const struct fd *sock);
+// A TCP socket's state as Linux numbers them (TCP_ESTABLISHED 1 ... TCP_LISTEN
+// 10), and the bytes waiting to be read on a socket.
+int sock_tcp_state(struct fd *sock);
+int sock_recv_queue(struct fd *sock);
+// Whether Linux would list an IP socket, in that state and with that (host)
+// local address, in /proc/net and sock_diag at all.
+bool sock_inet_is_listed(int type, int state, const struct sockaddr *local);
+
+// A host-side service reachable by guests at guest_addr:guest_port, which
+// the loopback NAT maps to 127.0.0.1:host_port (network byte order; type is
+// SOCK_DGRAM_ or SOCK_STREAM_). _EADDRINUSE if a guest already holds it.
+int inet_nat_register_host(uint32_t guest_addr, uint16_t guest_port, uint16_t host_port, int type);
+void inet_nat_unregister_host(uint32_t guest_addr, uint16_t guest_port, int type);
+
 int_t sys_socketcall(dword_t call_num, addr_t args_addr);
 int_t sys_socketcall_guest(dword_t call_num, guest_addr_t args_addr);
 
@@ -582,7 +623,12 @@ static inline int sock_level_to_real(int fake) {
     return fake;
 }
 
+// Where bound guest unix sockets live on the host, as "<prefix>.<id>". The app
+// points it into its own container's tmp. Left NULL (the CLI, the simulator),
+// each process gets a private directory instead -- see fs/sock.c -- which
+// sock_host_dir_cleanup() removes; call that on any exit that skips atexit.
 extern const char *sock_tmp_prefix;
+void sock_host_dir_cleanup(void);
 
 // The host socket path behind a guest AF_UNIX name; see the definition.
 struct inode_data;
@@ -641,3 +687,13 @@ struct tcp_info_ {
 void netlink_link_watch_start(void);
 
 #endif
+
+// Exit records for TASKSTATS_CMD_ATTR_REGISTER_CPUMASK listeners. Collect
+// inside do_exit's locked region (the dying task is still readable there),
+// broadcast after the locks drop (delivery ends in poll_wakeup). Returns
+// false, cheaply, when nothing is listening.
+struct task;
+struct rusage_;
+bool netlink_taskstats_exit_collect(struct task *leader, const struct rusage_ *ru,
+                                    dword_t status);
+void netlink_taskstats_exit_broadcast(void);

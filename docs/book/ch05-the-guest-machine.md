@@ -124,11 +124,22 @@ set-only bitmap saying which roots have chunks at all — added because
 probing 32 KiB of mostly-empty root pointers, and a bit-scan skips the empty
 regions in bulk.
 
+The same lesson applied one level down, later. Each leaf of 1024 entries ends in
+a bitmap of which of them are mapped, and each chunk summarises its leaves as
+*some mapped* and *all mapped*. Before that, the hole finder that every
+`mmap(NULL, ...)` runs found the end of a region by reading the entry of every
+page in it, and entries are 56 bytes: one 2 GiB file mapping made each later
+mmap read 28 MB and take 12 ms instead of 0.02. Leaves are never freed while
+the address space lives, so the cost even outlived the mapping. .NET maps its
+code heap exactly that way, and `dotnet --info` spent most of an hour in the
+walk. Now a region costs a few words however large it is, and an empty leaf
+costs nothing.
+
 ## 5.4 The TLB, and an optimization that was measured and rejected
 
 Every guest load and store goes through a software TLB. It is per-thread, it
-lives on the task thread's stack (`struct tlb tlb = {}` in
-[kernel/task.c:817](../../kernel/task.c#L817)), it has 1024 entries, and an
+lives on the task thread's stack (`struct tlb tlb = {}` in `task_run_current`,
+[kernel/task.c](../../kernel/task.c)), it has 1024 entries, and an
 entry is three words:
 
 ```c
@@ -185,6 +196,27 @@ a series of ordinary misses.
 > written into [emu/tlb.h](../../emu/tlb.h) so the next person to have the idea
 > gets the answer before spending the day.
 
+559 took the multiply out anyway, by a route that kept the 24 bytes: the
+arm64 and riscv64 guests' probe computes the index and the entry's address in
+four instructions with no multiply (times three is an add with a shift, times
+eight another shift), and folds the does-this-cross-a-page test into the tag
+compare, so an aligned 2-, 4- or 8-byte access hits in one compare. They were
+kept because the devices were faster with them, not because they were
+shorter: a fourth change in the same set, which cut another 1% of host
+instructions, made 7-Zip 4% and a Python dict benchmark 12% *slower* on the
+M4, and is not in.
+
+The same release gave a page evicted from its entry a second chance. Two pages
+a program uses in turn can share an index, and then each access evicts the
+other and goes all the way to `tlb_handle_miss` — about 420 host instructions
+where a hit is six — and which pages collide is decided by the guest's ASLR,
+so one Python start in five ran 7.5% more instructions and one in a dozen 26%
+more. The last two pages evicted now wait in a short list beside the table
+(`TLB_VICTIMS`), checked before a miss is taken for real and swapped back in
+from assembly on arm64 and riscv64. The first attempt kept them at a second
+index instead, cured the collisions, and made 7-Zip, whose 55 million misses
+are real, 1.6% slower by probing a cold line on every one.
+
 ## 5.5 Lazy anonymous mmap: reservations, not page tables
 
 `mmap(NULL, 64ULL << 30, PROT_NONE, MAP_ANONYMOUS|MAP_NORESERVE, ...)` is free
@@ -204,22 +236,96 @@ address range recorded in a fixed array on `struct mem`.
 
 ```c
 struct mem_lazy_map { page_t start, end; unsigned flags; };
-#define MEM_LAZY_MAX 32
+#define MEM_LAZY_MAX 64
+#define MEM_LAZY_SPLIT_LIMIT 32
 ```
 
-The design's whole character comes from one invariant, stated in capitals in
-the header: **a reservation is never split.** Materializing a fault takes the
-entire prefix up to the end of the faulting chunk and trims the front, so a
-reservation only ever shrinks from the left or vanishes. Anything that would
-punch a hole in one — an `munmap` in the middle, an `mprotect` of a subrange —
-materializes it in full first, at a call site where mapping is safe.
+Two rules hold it together, and the header states both.
 
-That invariant is doing a lot of work. Without it you need slot allocation when
-a split runs the array out of entries, atomicity for a partial update, and a
-lock-ordering story for the recursion a split provokes. With it, the failure
-modes disappear: the worst case is a fault at the far end of a reservation
-materializing everything before it, which is precisely the old eager behavior
-and no worse.
+**A page is either mapped or reserved, never both.** A reservation is consulted
+only where a page has no page-table entry, so one recorded over existing entries
+is silently ignored. That is how JVMs running `-XX:+UseSerialGC` or
+`-XX:+UseParallelGC` died (issue #572). The JVM reserves its whole heap `PROT_NONE`
+and commits the old generation part way in with `MAP_FIXED`. The commit
+materialized the `PROT_NONE` reservation and then recorded a read-write
+reservation on top of those entries, so `mmap` succeeded and every page of the
+commit faulted `SEGV_ACCERR`. Three paths keep the rule: `pt_map` drops the
+reservation coverage of whatever it maps; `mem_lazy_reserve` drops coverage and
+also unmaps any real entries in its range, which is the half that was missing;
+and `mem_init` clears the table that a fork's whole-struct copy inherited.
+
+**A fault near the front takes the prefix.** Materializing a fault in the first
+32 MB of a reservation takes the entire prefix up to the end of the faulting
+chunk and trims the front, so it only ever shrinks a reservation from the left
+or makes it vanish, needs no free slot and never leaves half an update behind.
+That was once the rule for every fault, and its worst case — a fault at the far
+end materializing everything before it — turned out not to be hypothetical:
+JavaScriptCore reserves 64 GiB and allocates near the top, and a first touch
+39 GiB in built 675 MB of page tables in 1.5 s under the address-space write
+lock. Since 557 a fault further in splits its 2 MB chunk out and leaves both
+sides reserved, and where the slot limit below refuses the split it takes the
+smaller of the prefix and the suffix. OpenCode's server went from 1.08 GB of
+page tables (Linux's `VmPTE`, which `/proc/<pid>/status` now reports) to 18 MB.
+
+Dropping coverage is another matter. The design first shipped with no splits at
+all: anything that would punch a hole in a reservation — an `munmap` in the
+middle, a `MAP_FIXED` commit into it — materialized it in full first, at a call
+site where mapping is safe. For a JVM that means page tables for the whole
+`-Xmx` heap in order to commit its first generation, which is the very cost the
+design exists to avoid. So a drop from the middle now splits the reservation, by
+range arithmetic alone. It maps nothing, so it cannot recurse into a lock, and
+it cannot fail half way.
+
+Splits take slots, though, and slots are what keep large mappings lazy. With
+nothing limiting them, a heap fragmented by non-adjacent commits filled the
+table, and the next large `mmap` found no slot and went eager: 31 commits of
+4 MB into a 4 GB heap, followed by an untouched 32 GB `mmap`, held 544 MB of
+host memory where never splitting held 77 MB. The answer is a limit, not a
+cleverer allocator. The table has 64 slots, and a split may take one only while
+fewer than 32 are in use. Past that the split is refused, and the caller
+materializes the range and the smaller side of the reservation around it —
+until 557 the whole reservation, as every split used to. Once all 64
+slots are in use, at least 32 of the live reservations were made after the last
+split, so the old 32-slot table would have been full as well. Splitting never
+turns a mapping eager that never splitting would have kept lazy, and the same
+probe now holds 24 MB.
+
+Splitting also changed who has to know about reservations. The remainders a
+split leaves stay reserved, where materializing used to give them page-table
+entries, so code that had only ever read entries now met reservations in the
+middle of ordinary address spaces. Three places did, and each broke a JVM-shaped
+address space that had worked before: `mremap` demanded an entry for every
+source page and returned `EFAULT`; a checkpoint walked entries only, so a
+restored process lost its reserved heap and the next `mmap` could land inside
+it; and `/proc/pid/smaps` listed one region where `maps` listed three. `mremap`
+is the instructive one. The obvious fix, materializing the source first as
+`mprotect` then did, spends exactly what the design exists to save, on the path
+`realloc` takes to grow a large block: growing a 256 MB block touched in one
+chunk to 512 MB built page tables for all 512 MB. So `pt_move` carries reserved
+pages to the destination as reservations, a grown tail joins the reserved end
+of its mapping, and a move that would add slots is held to the same limit as a
+split. A checkpoint writes a reservation as a range with no bytes, and the
+restore reserves it again. `mprotect` itself stopped materializing in 557: it
+changes a reservation's protection as a reservation, splitting off the part in
+range under the same limit, because JavaScriptCore's one `mprotect` of 622 MB at
+the top of its 64 GiB built 16 million entries with every guest thread stopped.
+
+Two more readers turned up after that. `mlock` wanted an entry for every page,
+so locking a remainder, or the tail `mremap` grew, returned `ENOMEM` where it
+had worked, and `mlockall` locked only the entries it found. Linux populates
+what `mlock` and `mlockall` lock where it can, so AOK materializes those
+reservations too, and for `mlock` only the range, splitting a reservation around
+it. What Linux leaves unpopulated, a `PROT_NONE` mapping or anything locked on
+fault (`MCL_ONFAULT`, or `mlock2`'s `MLOCK_ONFAULT`), stays reserved with a
+mark, so the entries it materializes later are locked, on fault too where the
+lock was, when they are made. The futex table keyed a shared futex through the
+page-table entry, which a reserved page does not have yet: a thread waiting on
+an untouched page of a shared remainder was keyed one way, and the wake that
+came after the page was written was keyed another, so the waiter slept on. A
+shared anonymous futex is now keyed by the page's `struct data`, which is
+materialized first if it has to be. Keyed by address space, a wake had never
+reached a waiter in another process that shared the memory through `fork`
+either, and this fixes that too.
 
 Two constants set the boundaries, both from measurement rather than taste.
 `MEM_LAZY_MIN_PAGES` is 64 MB: below that the eager path is kept, because
@@ -235,8 +341,11 @@ as a plain range, so reserving it is O(1) and `fork` has nothing extra to walk.
 `pt_is_hole` and `pt_find_hole` treat it as occupied; `sys_brk_guest` claims
 prefixes of it by mapping real pages and advancing the start.
 
-The rule that falls out, and that the header states as an invariant: **a page is
-either mapped or reserved, never both, and a reservation is never split.**
+The rules that fall out, and that the header states: **a page is either mapped or
+reserved, never both. A fault near the front trims a reservation; a fault
+further in, a drop or an `mprotect` splits it, but only while the slot limit
+allows, and a refused split materializes the range and the smaller side
+instead. Anything that reads page-table entries has to read reservations too.**
 
 ## 5.6 Sharing, copying, and three ways a shared mapping stopped being shared
 
@@ -254,6 +363,18 @@ and the tracee was switched to a private duplicate. The poke never reached the
 file. Worse, every store the *tracee itself* made afterwards was lost too, and
 nothing returned an error anywhere. `P_COW` now means what the write fault
 always meant by it: this page is private.
+
+**A poke also left the page writable** (fixed September 2026). The same code
+added `P_WRITE` to get the poke past the protection check, and the
+copy-on-write break mapped the copy with it. After one gdb breakpoint the
+tracee could store to its own code with no `mprotect`, `/proc/<pid>/maps` said
+`rwxp`, and the copy, a new descriptor with no file, printed nameless and split
+its file's line. A read-only *shared* page was written straight through to the
+file. Linux's `FOLL_FORCE` bypasses the check for that one access and grants
+nothing: it copies a private page and writes the copy, which keeps its
+protection, and it refuses a read-only shared page. `mem_write_way` makes that
+decision now, and every copy-on-write break keeps its page's file, offset, name
+and `mlock`. `tests/manual/ptrace_poke_text.c` holds it to Linux 6.12.
 
 **The first `mprotect` ended the sharing.** A `PROT_NONE` `MAP_SHARED`
 anonymous region is reserved with no host backing and one descriptor that every
@@ -345,20 +466,44 @@ sounds. This is one of the few places in the tree where the primary development
 machine cannot validate the code, and the answer is Chapter 35's Linux CI,
 which is also an x86_64 host and runs it in full.
 
+The fast paths 557 added — add, subtract, multiply and divide of two normal
+operands under round-to-nearest, which skip the general code's special cases —
+are checked the way any host can: against that general code, bit for bit, at
+all three precisions (`emu/float80-fast-test.c`, millions of random and edge
+operand pairs). A deliberately wrong tie-break makes it fail thousands of
+times, which is how it is known to be looking.
+
+In 558 the JIT stopped calling any of it. Every x87 instruction, the
+transcendentals included, is now a gadget on both x86 guests
+(`jit/gadgets-aarch64/x87.S`): 80-bit arithmetic in integer registers through
+one rounder that honours rounding and precision control, with a real tag word,
+and every edge — NaN choice, pseudo-denormals, `FPREM`'s partial remainder,
+unmasked exceptions — taken case by case from an AMD Ryzen rather than from the
+SDM's prose. The transcendentals are correctly rounded, which is *better* than
+the hardware: the Ryzen itself is one ulp off in about 2% of cases. `float80`
+in C remains what the interpreter and the x86_64-host backend run, and the
+model the gadgets were checked against.
+
 ## 5.9 Vectors
 
-`union mm_reg mm[8]` and `union xmm_reg xmm[16]` cover MMX and SSE. The arm64
-guest's `V0`–`V31` reuse `union xmm_reg` directly rather than duplicating an
-identical 128-bit union under a new name.
+`union xmm_reg xmm[16]` covers SSE, and the arm64 guest's `V0`–`V31` reuse
+`union xmm_reg` directly rather than duplicating an identical 128-bit union
+under a new name. MMX has no array of its own any more: since 558 `MMn` is the
+significand of x87 register `fp[n]`, one storage as on the hardware, so
+`FXSAVE`, `FNSAVE` and a signal frame see what MMX code wrote, and x87 code that
+follows MMX code without `EMMS` sees the stack it should (`CPU_MMX` in
+`emu/cpu.h`).
 
-AVX is the more interesting piece, because of where it lives. The semantics of
-every VEX and EVEX instruction are implemented in `emu/avx.c` over *flat byte
-buffers*: the functions know nothing about CPU state, the TLB, modrm, or which
-guest is executing. That leaves exactly one implementation of each
-instruction's meaning, shared by two front-ends that decode very differently —
-the amd64 interpreter, which decodes and executes directly, and i386, which is
-JIT-only, decodes at translation time in `jit/gen.c`, and reaches the same
-functions through vector-helper gadgets.
+AVX is the more interesting piece, because of where it has lived. Its semantics
+were first written once, in `emu/avx.c`, over *flat byte buffers*: functions
+that know nothing about CPU state, the TLB, modrm, or which guest is executing,
+shared by the amd64 interpreter and by i386's vector-helper gadgets. In 558 the
+JIT took them over: every VEX and EVEX instruction is now gadgets
+(`jit/gadgets-aarch64/vex.inc`, `evex.inc`) or #UD, in both x86 guests, and
+`emu/avx.c` remains the semantics for the amd64 interpreter and the x86_64-host
+backend. The vector state is advertised accordingly — AVX, AVX2, FMA and the
+AVX-512 families in `CPUID`, carried through signal frames, `ptrace` and `exec`
+as Linux's XSAVE image (`emu/cpuid.h`, `emu/xsave.h`).
 
 The lane rule is the part worth remembering when reading that code: helpers
 that are lane-local (shuffles, packs, unpacks) iterate 128-bit lanes
@@ -378,7 +523,7 @@ implementation of a floating-point format nobody makes hardware for any more.
 Nothing in that list is exotic. What is unusual is how much of the design is
 about *not* materializing things: not computing flags, not building page tables
 for untouched reservations, not padding a struct that profiling says gains
-nothing, not splitting a range because splitting is where the bugs live. The
+nothing, not splitting a range where a split could cost more than it saves. The
 guest machine is defined as much by what it declines to allocate as by what it
 holds.
 

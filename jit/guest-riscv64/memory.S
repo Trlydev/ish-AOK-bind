@@ -17,6 +17,7 @@
 // rd_off in x19 across read_prep for the same reason.
 
 #include "gadgets.h"
+#include "frag.h"
 
 .text
 
@@ -77,6 +78,30 @@ riscv64_segfault_write:
 // free for these routines' own internal use.
 .global riscv64_handle_read_miss
 riscv64_handle_read_miss:
+    // The second chance (emu/tlb.h, TLB_VICTIMS): the page most recently
+    // evicted from the table is the other of two pages that share an entry
+    // and are used in turn. Found, it changes places with the one in the
+    // entry, here, without the trip to C. A real miss pays the four
+    // instructions down to the branch. x27 is this helper's own; x9-x11 are
+    // the probe's scratch.
+    ldur x11, [_tlb, #(TLB_victim - TLB_entries + TLB_ENTRY_page)]
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3          // the page's entry
+    sub x27, _tlb, #(TLB_entries - TLB_victim)
+    .irp field, TLB_ENTRY_page, TLB_ENTRY_page_if_writable, TLB_ENTRY_data_minus_addr
+    ldr x9, [x27, #\field]
+    ldr x11, [x10, #\field]
+    str x9, [x10, #\field]
+    str x11, [x27, #\field]
+    .endr
+    add x7, x9, x7                      // x9: the found entry's data_minus_addr
+    ret
+1:
     save_c
     sub x0, _tlb, #TLB_entries
     mov x1, _addr
@@ -90,6 +115,32 @@ riscv64_handle_read_miss:
 
 .global riscv64_handle_write_miss
 riscv64_handle_write_miss:
+    // The second chance (emu/tlb.h, TLB_VICTIMS): the page most recently
+    // evicted from the table is the other of two pages that share an entry
+    // and are used in turn. Found, it changes places with the one in the
+    // entry, here, without the trip to C. A real miss pays the four
+    // instructions down to the branch. x27 is this helper's own; x9-x11 are
+    // the probe's scratch.
+    // (write_prep has already found the table current and no revalidation due.)
+    ldur x11, [_tlb, #(TLB_victim - TLB_entries + TLB_ENTRY_page_if_writable)]
+    and x9, x7, #0xfffffffffffff000
+    cmp x9, x11
+    b.ne 1f
+    str x9, [_tlb, #(-TLB_entries+TLB_dirty_page)]
+    eor x10, x7, x7, lsr #10
+    ubfx x10, x10, #12, #10
+    add x10, x10, x10, lsl #1
+    add x10, _tlb, x10, lsl #3          // the page's entry
+    sub x27, _tlb, #(TLB_entries - TLB_victim)
+    .irp field, TLB_ENTRY_page, TLB_ENTRY_page_if_writable, TLB_ENTRY_data_minus_addr
+    ldr x9, [x27, #\field]
+    ldr x11, [x10, #\field]
+    str x9, [x10, #\field]
+    str x11, [x27, #\field]
+    .endr
+    add x7, x9, x7                      // x9: the found entry's data_minus_addr
+    ret
+1:
     save_c
     sub x0, _tlb, #TLB_entries
     mov x1, _addr
@@ -182,20 +233,39 @@ riscv64_crosspage_store:
 
 
 // ---- Loads ---------------------------------------------------------------
-.macro load_gadget name, size, id, ld_insn, reg
+.macro load_gadget name, size, lid, ld_insn, reg
+    f_gadget \name
+.endm
+
+// add t, ra, rb ; l{b,h,w,d}[u] rd, imm(t) -- an indexed load, the second
+// instruction consuming the first's sum: [gadget][t_off][ra_off][rb_off][imm]
+// [rd_off][pc_of_load]. t is written before the access, so a fault restarts
+// at the load's own pc (last word, as for every memory gadget) with the add
+// already done, exactly as unfused.
+.macro add_load_gadget name, size, id, ld_insn, reg
 .gadget \name
-    ldr x19, [_ip]            // rd_off (callee-saved across prep)
-    ldr x9, [_ip, #8]         // rs1_off
-    ldr x10, [_ip, #16]       // imm
-    add _ip, _ip, #32         // 3 params + trailing orig_ip (fault restart)
-    ldr x7, [_cpu, x9]
-    add x7, x7, x10           // effective address
+    ldp x9, x10, [_ip]        // t_off, ra_off
+    ldp x11, x12, [_ip, #16]  // rb_off, imm
+    ldr x19, [_ip, #32]       // rd_off (callee-saved across prep)
+    add _ip, _ip, #48
+    ldr x10, [_cpu, x10]
+    ldr x11, [_cpu, x11]
+    add x10, x10, x11
+    str x10, [_cpu, x9]
+    add x7, x10, x12
     read_prep \size, \id
     \ld_insn \reg, [x7]
     str x11, [_cpu, x19]
     gret
     read_bullshit \size, \id
 .endm
+add_load_gadget add_lb,  8,  rvalb,  ldrsb, x11
+add_load_gadget add_lbu, 8,  rvalbu, ldrb,  w11
+add_load_gadget add_lh,  16, rvalh,  ldrsh, x11
+add_load_gadget add_lhu, 16, rvalhu, ldrh,  w11
+add_load_gadget add_lw,  32, rvalw,  ldrsw, x11
+add_load_gadget add_lwu, 32, rvalwu, ldr,   w11
+add_load_gadget add_ld,  64, rvald,  ldr,   x11
 
 load_gadget lb,  8,  rvlb,  ldrsb, x11
 load_gadget lbu, 8,  rvlbu, ldrb,  w11
@@ -206,26 +276,71 @@ load_gadget lwu, 32, rvlwu, ldr,   w11
 load_gadget ld,  64, rvld,  ldr,   x11
 
 // ---- Stores --------------------------------------------------------------
-.macro store_gadget name, size, id, st_insn, reg
-.gadget \name
-    ldr x9, [_ip]             // rs2_off (value)
-    ldr x10, [_ip, #8]        // rs1_off (base)
-    ldr x11, [_ip, #16]       // imm
-    add _ip, _ip, #32
-    ldr x19, [_cpu, x9]       // value survives prep in callee-saved reg
-    ldr x7, [_cpu, x10]
-    add x7, x7, x11
-    write_prep \size, \id
-    \st_insn \reg, [x7]
-    write_done \size, \id
-    gret
-    write_bullshit \size, \id
+.macro store_gadget name, size, lid, st_insn, reg
+    f_gadget \name
 .endm
 
 store_gadget sb, 8,  rvsb, strb, w19
 store_gadget sh, 16, rvsh, strh, w19
 store_gadget sw, 32, rvsw, str,  w19
 store_gadget sd, 64, rvsd, str,  x19
+
+// ---- Pairs: two 64-bit loads, or two 64-bit stores, off one base ----------
+// RV64 has no ldp/stp, so a function's register saves and restores are runs
+// of sd and ld: ld->ld and sd->sd are 12% of adjacent pairs in a gcc compile
+// (tools/jitprof-report.py). gen_riscv64_try_pair folds each pair into one
+// gadget; fld/fsd take part too, through their f-register slot offsets.
+// Code stream: [gadget][r1_off][rs1_off][imm1][r2_off][imm2][pc2][pc1]
+// pc1 is last, as for every memory gadget, so a fault in the first access
+// restarts there. The second access steps _ip back a word first, so a fault
+// in it reports -- and a kernel-resolved one restarts at -- its own pc2, with
+// the first access already done, exactly as unfused. The base register is
+// read once: gen refuses a pair whose first load replaces it.
+.gadget ld_ld
+    ldr x19, [_ip]            // r1_off
+    ldr x9, [_ip, #8]         // rs1_off
+    ldr x10, [_ip, #16]       // imm1
+    ldr x20, [_ip, #24]       // r2_off
+    ldr x22, [_ip, #32]       // imm2
+    add _ip, _ip, #56
+    ldr x21, [_cpu, x9]       // base
+    add x7, x21, x10
+    read_prep 64, rvldld1
+    ldr x11, [x7]
+    str x11, [_cpu, x19]
+    sub _ip, _ip, #8          // [_ip, #-8] = pc2 for the second access
+    add x7, x21, x22
+    read_prep 64, rvldld2
+    ldr x11, [x7]
+    str x11, [_cpu, x20]
+    add _ip, _ip, #8
+    gret
+    read_bullshit 64, rvldld1
+    read_bullshit 64, rvldld2
+
+.gadget sd_sd
+    ldr x9, [_ip]             // r1_off (first value)
+    ldr x10, [_ip, #8]        // rs1_off
+    ldr x11, [_ip, #16]       // imm1
+    ldr x12, [_ip, #24]       // r2_off (second value)
+    ldr x22, [_ip, #32]       // imm2
+    add _ip, _ip, #56
+    ldr x19, [_cpu, x9]       // both values and the base survive prep in
+    ldr x20, [_cpu, x12]      // callee-saved registers
+    ldr x21, [_cpu, x10]
+    add x7, x21, x11
+    write_prep 64, rvsdsd1
+    str x19, [x7]
+    write_done 64, rvsdsd1
+    sub _ip, _ip, #8          // [_ip, #-8] = pc2 for the second access
+    add x7, x21, x22
+    write_prep 64, rvsdsd2
+    str x20, [x7]
+    write_done 64, rvsdsd2
+    add _ip, _ip, #8
+    gret
+    write_bullshit 64, rvsdsd1
+    write_bullshit 64, rvsdsd2
 
 // ---- FP loads/stores (F/D extension) --------------------------------------
 // fld/fsd/fsw reuse the integer ld/sd/sw gadgets directly: gen passes the
@@ -245,3 +360,45 @@ store_gadget sd, 64, rvsd, str,  x19
     str x11, [_cpu, x19]
     gret
     read_bullshit 32, rvflw
+
+// ISH_JIT_PROFILE (jit/jitprof.c): count one entry of this block; see
+// jit/guest-arm64/memory.S. Code stream: [&counter].
+.gadget block_count
+    ldr x8, [_ip], #8
+    ldr x9, [x8]
+    add x9, x9, #1
+    str x9, [x8]
+    gret
+
+// ---- Zicboz: cbo.zero, zero the 64-byte cache block holding rs1 ----------
+// [gadget][rs1_off][pc]; an aligned block never crosses a page, so one
+// write_prep covers it (its size only sizes the page-crossing check).
+.gadget cbo_zero
+    ldr x10, [_ip]            // rs1_off
+    add _ip, _ip, #16
+    ldr x7, [_cpu, x10]
+    and x7, x7, #~63
+    write_prep 512, rvcboz
+    stp xzr, xzr, [x7]
+    stp xzr, xzr, [x7, #16]
+    stp xzr, xzr, [x7, #32]
+    stp xzr, xzr, [x7, #48]
+    write_done 512, rvcboz
+    gret
+    write_bullshit 512, rvcboz
+
+// ---- Zfhmin: flh, a 16-bit load NaN-boxed into an f-register (fsh is the
+// integer sh with the f-register's slot). Stream as flw.
+.gadget flh
+    ldr x19, [_ip]            // fd_off
+    ldr x9, [_ip, #8]         // rs1_off
+    ldr x10, [_ip, #16]       // imm
+    add _ip, _ip, #32
+    ldr x7, [_cpu, x9]
+    add x7, x7, x10
+    read_prep 16, rvflh
+    ldrh w11, [x7]
+    orr x11, x11, #0xffffffffffff0000  // NaN-box
+    str x11, [_cpu, x19]
+    gret
+    read_bullshit 16, rvflh

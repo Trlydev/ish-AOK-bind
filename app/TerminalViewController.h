@@ -25,6 +25,27 @@ typedef NS_ENUM(NSInteger, ISHFreshSessionTerminalDisplayMode) {
 - (void)reconnectSessionFromTerminalUUID:(NSUUID *)uuid;
 - (void)focusTerminal;
 @property (readonly) NSUUID *sessionTerminalUUID; // 0 means invalid
+// The session leader's pid, or 0 when there is no session. This is the ONLY
+// identifier for a session that survives a suspend to disk: a Terminal's UUID
+// dies with the process, and the restore hands out fresh pts numbers, but the
+// checkpoint restores pids. The workspace records it in its saved layout so a
+// window can ask for its own shell back.
+@property (readonly) int sessionPid;
+// The pseudo-terminal this window's own shell runs on, or nil when the window
+// has none (it shows the console, or adopted a terminal it did not start).
+// What the workspace records at suspend: the shell to ask for on resume is
+// this one, whatever the window is displaying.
+@property (readonly, nonatomic) Terminal *sessionTerminal;
+// Set before a session starts to ask for a particular restored session (by the
+// leader pid recorded in the saved layout). 0 means "any". Falls back to the
+// next session in the queue when there is no such session -- see
+// checkpoint_take_restored_session_for_pid.
+@property (nonatomic) int desiredRestoredSessionPid;
+// A window that had no shell of its own when the layout was saved (a System
+// Console showing tty1 with nothing behind it) must not adopt a restored one
+// on the way back: any session it took would be somebody else's, hidden
+// behind the console it displays. The workspace sets this from its layout.
+@property (nonatomic) BOOL declinesRestoredSession;
 @property UISceneSession *sceneSession API_AVAILABLE(ios(13.0));
 @property (nonatomic) BOOL showsWorkspaceDashboardButton;
 @property (nonatomic) BOOL embeddedInWorkspaceWindow;
@@ -37,6 +58,12 @@ typedef NS_ENUM(NSInteger, ISHFreshSessionTerminalDisplayMode) {
 // global UserPreferences fontSize. Forwards to the terminal view; used by the
 // workspace host to persist/restore a window's size in the saved layout.
 @property (nonatomic) CGFloat overrideFontSize;
+// The Cmd+= / Cmd+- / Cmd+0 actions. `command` is unused and may be nil. The
+// workspace calls these when the chord is meant for a terminal window that does
+// not hold first responder.
+- (void)increaseFontSize:(UIKeyCommand *)command;
+- (void)decreaseFontSize:(UIKeyCommand *)command;
+- (void)resetFontSize:(UIKeyCommand *)command;
 // Set by the workspace host for an embedded terminal. Invoked (on the main queue) when the
 // shell session ends, so the host closes the contained window instead of the default relaunch
 // of the login shell. Left nil for the main full-screen terminal, which keeps relaunching.

@@ -8,8 +8,11 @@ is the useful part.
 
 ## 42.1 Wayland, and why it became possible
 
-The most advanced unfinished work is a graphical desktop, and the interesting
-thing is that almost none of it is graphics.
+When this chapter was first written, the most advanced unfinished work was a
+graphical desktop. It has since shipped — Chapter 32 describes it as it is — so
+it stays here as the worked example of something going from *possible* to
+*built*, and because the interesting thing about it is still true: almost none
+of it was graphics.
 
 The architecture keeps every hard problem on the Linux side: a **headless
 `wlroots` compositor plus `wayvnc` running in the guest**, displayed by a VNC
@@ -49,11 +52,19 @@ policy note that says *implement rather than stub unless genuinely harmless*.
 That is what planning looks like when the unknown is conformance rather than
 design.
 
+Both tiers shipped, and the plan held in the way that mattered: the bugs were
+conformance bugs, found one program at a time, and the app stayed a pixel pipe.
+The pipe itself changed once, in 557, when frames began to reach the app from
+the compositor on the GPU instead of through VNC (Chapter 32) — which was the
+one part the plan had not expected to need, because the cost it removed only
+became visible once everything else was fast enough to measure it.
+
 ## 42.2 The display that was built and rejected
 
-External display and AirPlay mirroring exist on a branch and are not merged,
-because the maintainer judged the work flawed (Chapter 41). It stays fenced
-rather than merged or deleted.
+External display support shipped once and was reverted after testing on a
+real iPad and monitor; its last commit, mirroring the Wayland display, exists on
+a branch and is not merged, because the maintainer judged the work flawed
+(Chapter 41). It stays fenced rather than merged or deleted.
 
 Worth restating here only because a "future directions" chapter is exactly where
 an unmerged branch quietly becomes a promise. It is not one.
@@ -67,17 +78,23 @@ The no-copy property is real but conditional on a **blessed allocation** — a
 guest `MAP_SHARED|MAP_ANONYMOUS` mapping that stays one contiguous host region
 across `fork`. Anything else must decline, and the guest shim needs a CPU path
 regardless. The measurement that decides go or no-go has to come from an actual
-iPad, because no available quiet host can produce it: the Linux build host has
-no Metal, and the available Mac has an Intel integrated GPU and a 4 KB page
-size, which makes the 16 KB-page alignment failures an iDevice would hit
-invisible.
+iPad, because when the study was planned no available quiet host could produce
+it: the Linux build host has no Metal, and the Mac of the time had an Intel
+integrated GPU and a 4 KB page size, which makes the 16 KB-page alignment
+failures an iDevice would hit invisible.
 
 And milestone 1 is asymmetric by construction: a naive kernel with a per-call
 `bytesNoCopy` wrap means **a loss is not conclusive while a win is**.
 
-Beyond that sits the standing feature request for 3D acceleration through
-`virglrenderer`, which is a much larger proposition and would need the Wayland
-work to land first.
+Beyond that sat the standing feature request for 3D acceleration through
+`virglrenderer`, a much larger proposition that needed the Wayland work to land
+first. It did, and 557 took the request on the way this chapter recommends: as
+a feasibility gate with numbers attached before any estimate. Venus replaying
+Vulkan onto Metal through MoltenVK passed that gate on an M4 iPad, and the
+result is a GPU render node in every Darwin build and a desktop that composites
+on it (Chapter 32; Chapter 41 lists its edges). The single-`sgemm` study above is
+unaffected: it asks a different question, about compute the guest hands to
+Metal directly.
 
 ## 42.4 Nested AOK, which already works
 
@@ -88,7 +105,7 @@ the arm64 CLI, two levels deep, exiting cleanly:
 
 ```
 HELLO-FROM-THE-NESTED-GUEST
-Linux ... 5.20.66-ish_aok iSH-AOK built 2026-08-31 09:32Z unoptimized aarch64 GNU/Linux
+Linux ... 5.10.0-ish_aok iSH-AOK built 2026-08-31 09:32Z unoptimized aarch64 GNU/Linux
 ```
 
 The cost is exactly what one would predict and worth having measured rather
@@ -115,8 +132,9 @@ It is a **conformance report from outside the project**, produced by somebody
 with different requirements — and the two capabilities it identified as gaps
 were `bind_mount` and FUSE, both of which the kernel now carries. Namespaces
 were explicitly *not* the ask, which matters given Chapter 41: the thing this
-system architecturally cannot do turned out not to be what a multi-distribution
-tool actually needed.
+system architecturally cannot do — be several machines, which 559's namespaces
+made a sandbox but not a container — turned out not to be what a
+multi-distribution tool actually needed.
 
 And the honest status: the probe itself is still unverified from this side. The
 check comes when the tool's author runs the capability dialog against a release
@@ -150,11 +168,18 @@ a convenience, and the configuration surface between them is where features go
 missing (Chapter 34). Nothing else is as expensive to learn late.
 
 **Where the truth lives.** `docs/TODO.md` is a lab notebook, not a task list —
-it holds diagnosed-but-unfixed entries with measurements, closed entries with
-their full investigation, and rejected designs with reasons. The release notes
-are a design record (Chapter 37). And the comments are unusually load-bearing,
-with the caveat of Chapter 40: they make checkable claims, and some of them are
-false.
+it holds diagnosed-but-unfixed entries with measurements and rejected designs
+with reasons, and says nothing about whether anyone intends to do them.
+`docs/roadmap.md`, added during the 554 run, is the other half: it is the one
+document that says what happens next and in what order, and it names what is
+*not* being done as carefully as what is. Between them sat
+`docs/build_<N>_musts.md`, the single-release commitment, through 556; in the
+557 cycle that became the "Queued for a future release" list at the top of
+`docs/TODO.md`, and from 558 the two run together: the musts file is the short
+list a release is held for, and the queue the detail (Chapter 41). The release
+notes are a design record (Chapter 37). And the comments are unusually
+load-bearing, with the caveat of Chapter 40: they make checkable claims, and
+some of them are false.
 
 **The oracles, before writing any code.** Chapter 9's discipline is what
 separates a fix from a plausible change, and the most common expensive mistake
@@ -184,7 +209,7 @@ empty because a completion library turned an option off.
 Each of those was found by somebody running real software and asking why. None
 of them was found by reading the specification. And the system is trustworthy in
 proportion to how many of them have been found — which is why the most valuable
-artifacts in this repository are not the JIT or the shim, but over two hundred
+artifacts in this repository are not the JIT or the shim, but over four hundred
 small programs in `tests/manual/`, each one a thing somebody once believed and
 was wrong about.
 
@@ -193,11 +218,11 @@ the only one that transfers to any system at all: **check the thing itself.**
 
 ---
 
-*Anchors:* [docs/wayland_workspace_plan.md](../../docs/wayland_workspace_plan.md),
+*Anchors:* [docs/historical/wayland_workspace_plan.md](../../docs/historical/wayland_workspace_plan.md),
 [docs/wayland_rotation_resize_plan.md](../../docs/wayland_rotation_resize_plan.md),
 [docs/external_display_plan.md](../../docs/external_display_plan.md),
 [docs/metal_sgemm_milestone1.md](../../docs/metal_sgemm_milestone1.md),
 [docs/wasm_browser_architecture.md](../../docs/wasm_browser_architecture.md),
 [opt/AOK/tools/start-wayland.sh](../../opt/AOK/tools/start-wayland.sh),
 [opt/AOK/tools/setup-wayland.sh](../../opt/AOK/tools/setup-wayland.sh),
-[docs/TODO.md](../../docs/TODO.md).
+[docs/TODO.md](../../docs/TODO.md), [docs/roadmap.md](../../docs/roadmap.md).

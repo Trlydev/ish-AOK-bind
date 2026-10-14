@@ -4,12 +4,14 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include "kernel/user_ns.h"
 #include "kernel/calls.h"
 #include "kernel/errno.h"
 #include "kernel/task.h"
 #include "kernel/fs.h"
 #include "kernel/inotify.h"
 #include "kernel/random.h"
+#include "kernel/xattr.h"
 #include "fs/fd.h"
 #include "fs/inode.h"
 #include "fs/real.h"
@@ -218,11 +220,14 @@ static struct tty *amd64_tty_stdio_trace_tty(fd_t fd_no) {
     if (strcmp(current->comm, "sh") != 0)
         return NULL;
     struct fd *fd = f_get(fd_no);
-    if (fd == NULL || fd->tty == NULL)
+    // Same union hazard as the checkpoint had: ->tty is only a tty on a
+    // descriptor that is one (fs/tty.h).
+    struct tty *tty = fd_tty(fd);
+    if (tty == NULL)
         return NULL;
-    if (fd->tty->type != TTY_CONSOLE_MAJOR || fd->tty->num != 2)
+    if (tty->type != TTY_CONSOLE_MAJOR || tty->num != 2)
         return NULL;
-    return fd->tty;
+    return tty;
 }
 
 static void amd64_tty_stdio_trace(const char *op, fd_t fd_no, guest_addr_t addr,
@@ -356,7 +361,7 @@ static void apply_umask(mode_t_ *mode) {
 // which is how group membership normally works, `usermod -aG` and friends --
 // fell through to the "other" bits and was denied. That breaks the ordinary
 // shared-group setup for both file access and directory search.
-static bool current_in_group(uid_t_ gid) {
+bool current_in_group(uid_t_ gid) {
     if (current->fsgid == gid)
         return true;
     for (unsigned i = 0; current->groups != NULL && i < current->ngroups; i++)
@@ -375,7 +380,14 @@ int access_check(struct statbuf *stat, int check) {
     // read this?". Consulting euid there answered yes for everything, which is
     // the opposite of what the caller wanted to know and exactly the check
     // setuid programs use before opening a file on the user's behalf.
-    if (current != NULL && current->fsuid == 0) {
+    //
+    // In a user namespace the override is a capability held there, and
+    // reaches only files whose owner and group that namespace maps
+    // (kernel/user_ns.h) -- and, as here, only while fsuid is its root.
+    bool override = current != NULL && (current->user_ns == NULL
+            ? current->fsuid == 0
+            : current->fsuid == task_root_kuid(current) && capable_wrt_inode(stat, CAP_DAC_OVERRIDE_));
+    if (override) {
         // Linux's generic_permission(): CAP_DAC_OVERRIDE does not conjure
         // execute permission out of nothing. Root may read or write anything,
         // but X_OK on a regular file still needs at least one execute bit --
@@ -413,22 +425,63 @@ int access_check(struct statbuf *stat, int check) {
 // operations regardless of the file's mode bits, while a size change is an
 // ordinary write. We used to apply no check at all here, so any process could
 // chmod/chown/truncate a file it did not own.
-int setattr_check(struct statbuf *stat, struct attr attr) {
-    if (superuser())
-        return 0;
-    switch (attr.type) {
+//
+// Takes the attr by pointer because a chmod can be ALLOWED and still changed:
+// see the S_ISGID rule in the mode arm.
+int setattr_check(struct statbuf *stat, struct attr *attr) {
+    switch (attr->type) {
         case attr_mode:
-            // Only the owner may change the mode.
-            return current->fsuid == stat->uid ? 0 : _EPERM;
+            // Linux's inode_owner_or_capable(): the owner, or CAP_FOWNER.
+            if (current->fsuid != stat->uid && !capable_wrt_inode(stat, CAP_FOWNER_))
+                return _EPERM;
+            // setattr_prepare()'s "Also check the setgid bit!": a caller
+            // outside the file's group, without CAP_FSETID, cannot set
+            // S_ISGID. The bit is dropped and the chmod still succeeds --
+            // Linux does not fail it. Without this, the owner of a file that
+            // belongs to a group it is not in (root chowned it over) could
+            // make it a program that runs as that group.
+            if ((attr->mode & S_ISGID) && !current_in_group(stat->gid) &&
+                    !capable_wrt_inode(stat, CAP_FSETID_))
+                attr->mode &= ~S_ISGID;
+            return 0;
         case attr_uid:
+            // -1 is "leave the owner alone", and Linux runs no ownership check
+            // for it at all: an unprivileged chown(path, -1, -1) on a
+            // root-owned file succeeds. sys_fchownat_common answers that
+            // without a setattr (generic_setattrat_nochange), so nothing
+            // should reach here with -1 -- but if it ever does, refusing it
+            // would be the wrong answer, not a safe one.
+            if (attr->uid == (uid_t_) -1)
+                return 0;
+            // Linux's chown_ok(): CAP_CHOWN may hand a file to anyone -- in a
+            // user namespace, a file it maps to anyone it maps (the new id
+            // arrived here through its map already).
+            if (capable_wrt_inode(stat, CAP_CHOWN_))
+                return 0;
             // Handing a file to another user needs privilege; "changing" it to
             // the current owner is a no-op Linux permits.
-            if (attr.uid == (uid_t_) -1 || attr.uid == stat->uid)
+            if (attr->uid == stat->uid)
                 return current->fsuid == stat->uid ? 0 : _EPERM;
             return _EPERM;
         case attr_gid:
-            // The owner may change a file's group; anyone else may not.
-            return current->fsuid == stat->uid ? 0 : _EPERM;
+            if (attr->gid == (uid_t_) -1)
+                return 0;
+            // Linux's chgrp_ok(): CAP_CHOWN may give a file any group. The
+            // owner may give it only a group the owner is itself in -- its
+            // fsgid or a supplementary group -- or leave it where it is.
+            //
+            // This allowed the owner ANY group, which is a privilege
+            // escalation with one extra step: copy a program, chgrp it to
+            // shadow, chmod g+s, and it runs with egid shadow and reads
+            // /etc/shadow. Measured on Linux 6.12 as an unprivileged user:
+            // chgrp to a group it is not in is EPERM, to its own is 0.
+            if (capable_wrt_inode(stat, CAP_CHOWN_))
+                return 0;
+            if (current->fsuid != stat->uid)
+                return _EPERM;
+            if (attr->gid == stat->gid || current_in_group(attr->gid))
+                return 0;
+            return _EPERM;
         case attr_size:
             return access_check(stat, AC_W);
     }
@@ -564,6 +617,8 @@ dword_t sys_faccessat(fd_t at_f, addr_t path_addr, mode_t_ mode, dword_t flags) 
 }
 
 static fd_t sys_openat_norm(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ mode, int extra_norm);
+static void file_remove_privs(struct fd *fd);
+static void path_remove_privs(struct fd *at, const char *path);
 
 fd_t sys_openat_guest(fd_t at_f, guest_addr_t path_addr, dword_t flags, mode_t_ mode) {
     return sys_openat_norm(at_f, path_addr, flags, mode, 0);
@@ -576,10 +631,18 @@ static fd_t sys_openat_norm(fd_t at_f, guest_addr_t path_addr, dword_t flags, mo
         return path_err;
     STRACE("openat(%d, \"%s\", 0x%x, 0x%x)", at_f, path, flags, mode);
 
+    // O_PATH beats everything else (Linux's build_open_how). The open skips
+    // the permission check, and kept the other flags: an unprivileged
+    // open(f, O_PATH|O_WRONLY|O_TRUNC) emptied a root-owned 0644 file.
+    if (flags & O_PATH_)
+        flags &= O_PATH_FLAGS_;
+    else if (task_is_64bit(current))
+        flags |= O_LARGEFILE_; // force_o_largefile(); not on O_PATH, as on Linux
     if (flags & O_CREAT_)
         apply_umask(&mode);
 
-    struct fd *at = at_fd_for_path(at_f, path);
+    // RESOLVE_IN_ROOT starts every path at the dirfd, absolute ones included.
+    struct fd *at = (extra_norm & N_IN_ROOT) ? at_fd(at_f) : at_fd_for_path(at_f, path);
     if (at == NULL)
         return _EBADF;
     struct fd *fd;
@@ -592,6 +655,11 @@ static fd_t sys_openat_norm(fd_t at_f, guest_addr_t path_addr, dword_t flags, mo
         fd = ERR_PTR(_ERESTART);
     if (IS_ERR(fd))
         goto out;
+    // open(O_TRUNC) truncates, and so drops what a truncate drops -- measured
+    // on 6.12, a 4755 file opened O_TRUNC by uid 1000 is 0755 before anything
+    // is written. Harmless on a file this open just created.
+    if ((flags & O_TRUNC_) && S_ISREG(fd->type))
+        file_remove_privs(fd);
     fd_t installed = f_install(fd, flags);
     amd64_as_source_trace_open(installed, path, flags);
     http_resolver_trace_path_result("openat", at_f, path, installed, flags);
@@ -645,27 +713,27 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
     if ((how.flags >> 32) != 0 || (how.mode >> 32) != 0)
         return _EINVAL;
 
-    // Every RESOLVE_* bit was rejected outright, so openat2's whole reason for
-    // existing over openat -- constraining how the path is allowed to resolve
-    // -- was unusable.
+    // How the path is allowed to resolve, which is openat2's whole reason for
+    // existing over openat.
     //
-    // The two implemented here are the two AOK can enforce exactly.
-    // NO_SYMLINKS is answered inside path resolution itself, and CACHED's
-    // "only if this is already cached, else EAGAIN" is a promise about speed
-    // that is honest to decline: every caller of it has a slow path, because
-    // on Linux the answer depends on what happens to be in the dcache.
+    // NO_SYMLINKS, NO_MAGICLINKS and IN_ROOT are answered inside path
+    // resolution itself (fs/path.c). IN_ROOT is Linux's "as if the caller had
+    // chroot()ed to dirfd", and it is implemented as exactly that: the walk
+    // that confines a chrooted task, with dirfd as its root. It therefore
+    // holds as well as chroot does here and no better. The walk produces a
+    // path with no symlink and no `..` left in it, and the open that follows
+    // is of that path: on fakefs a guest symlink is a regular file to the
+    // host, so a component swapped for a link between the two fails the open
+    // rather than redirecting it.
     //
-    // BENEATH, IN_ROOT, NO_XDEV and NO_MAGICLINKS stay refused with EINVAL,
-    // which is what a kernel without them says and what every caller already
-    // handles -- openat2 itself is Linux 5.6+, so nothing may assume it. They
-    // are not refused for lack of effort: they are SANDBOXES, and the property
-    // they promise is that no intermediate step of the resolution escaped,
-    // which is a statement about the resolution as it happens. AOK resolves
-    // the path and then opens it in a second pass, so anything checked in
-    // between is checked against a path that could have changed underneath --
-    // exactly the time-of-check-to-time-of-use hole RESOLVE_BENEATH exists to
-    // close. A sandbox that reports success without holding is worse than one
-    // that says it is not available.
+    // CACHED's "only if this is already cached, else EAGAIN" is a promise
+    // about speed that is honest to decline: every caller of it has a slow
+    // path, because on Linux the answer depends on what is in the dcache.
+    //
+    // BENEATH and NO_XDEV stay refused with EINVAL, which is what a kernel
+    // without them says and what every caller handles -- openat2 is Linux
+    // 5.6+, so nothing may assume it. A confinement reported and not held is
+    // worse than one reported as unavailable.
 #define RESOLVE_NO_XDEV_       0x01
 #define RESOLVE_NO_MAGICLINKS_ 0x02
 #define RESOLVE_NO_SYMLINKS_   0x04
@@ -673,12 +741,26 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
 #define RESOLVE_IN_ROOT_       0x10
 #define RESOLVE_CACHED_        0x20
     static const qword_t resolve_implemented =
-        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_;
+        RESOLVE_NO_SYMLINKS_ | RESOLVE_CACHED_ | RESOLVE_NO_MAGICLINKS_ | RESOLVE_IN_ROOT_ |
+        RESOLVE_BENEATH_ | RESOLVE_NO_XDEV_;
     if (how.resolve & ~resolve_implemented)
+        return _EINVAL;
+    // One or the other: they are two answers to the same question.
+    if ((how.resolve & RESOLVE_BENEATH_) && (how.resolve & RESOLVE_IN_ROOT_))
         return _EINVAL;
     if (how.resolve & RESOLVE_CACHED_)
         return _EAGAIN;
-    int extra_norm = (how.resolve & RESOLVE_NO_SYMLINKS_) ? N_NO_SYMLINKS : 0;
+    int extra_norm = 0;
+    if (how.resolve & RESOLVE_NO_SYMLINKS_)
+        extra_norm |= N_NO_SYMLINKS;
+    if (how.resolve & RESOLVE_NO_MAGICLINKS_)
+        extra_norm |= N_NO_MAGICLINKS;
+    if (how.resolve & RESOLVE_IN_ROOT_)
+        extra_norm |= N_IN_ROOT;
+    if (how.resolve & RESOLVE_BENEATH_)
+        extra_norm |= N_BENEATH;
+    if (how.resolve & RESOLVE_NO_XDEV_)
+        extra_norm |= N_NO_XDEV;
 
     dword_t flags = (dword_t) how.flags;
     // The struct is read here rather than at the dispatch site, so plain
@@ -689,6 +771,10 @@ fd_t sys_openat2_guest(fd_t at_f, guest_addr_t path_addr, guest_addr_t how_addr,
     // (i386-derived) values.
     if (current->abi == GUEST_ABI_ARM64)
         flags = arm64_open_flags_to_internal(flags);
+    // openat2 is strict where openat drops: O_PATH with any flag it does not
+    // keep is EINVAL.
+    if ((flags & O_PATH_) && (flags & ~O_PATH_FLAGS_))
+        return _EINVAL;
 
     return sys_openat_norm(at_f, path_addr, flags, (mode_t_) how.mode, extra_norm);
 }
@@ -737,7 +823,7 @@ static dword_t sys_readlinkat_common(fd_t at_f, guest_addr_t path_addr, guest_ad
     if (path[0] == '\0' && fd_is_opath_link(at))
         size = opath_link_readlink(at, buf, bufsize);
     else
-        size = generic_readlinkat(at, path, buf, bufsize);
+        size = generic_readlinkat_shown(at, path, buf, bufsize);
     if (size >= 0) {
         STRACE(" \"%.*s\"", size, buf);
         if (user_write(buf_addr, buf, size))
@@ -767,7 +853,66 @@ dword_t sys_readlinkat(fd_t at_f, addr_t path_addr, addr_t buf_addr, dword_t buf
     return sys_readlinkat_common(at_f, path_addr, buf_addr, bufsize);
 }
 
-static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
+// Linux's do_linkat() takes these two and rejects every other bit.
+#define LINKAT_ALLOWED_FLAGS_ (AT_SYMLINK_FOLLOW_ | AT_EMPTY_PATH_)
+
+// linkat(fd, "", dst_at, dst, AT_EMPTY_PATH): give a second name to the object
+// a descriptor already names, without a path for it. The canonical caller is
+// O_TMPFILE materialisation, which AOK refuses at the open (see
+// tests/manual/open_tmpfile.c), but the idiom stands on its own -- it is how a
+// caller links what it holds open without racing a rename of the path it came
+// from.
+static dword_t sys_linkat_empty_path(fd_t src_at_f, struct fd *src_at, struct fd *dst_at, const char *dst, int_t flags) {
+    // getname_uflags(): the flag is what makes an empty name legal at all, and
+    // without it the name is rejected before do_linkat sees it.
+    if (!(flags & AT_EMPTY_PATH_))
+        return _ENOENT;
+    // AT_FDCWD is not a descriptor, so there are no open-time credentials to
+    // compare and Linux applies no rule: the empty name is simply the current
+    // directory, and a hard link to a directory is EPERM.
+    if (src_at_f == AT_FDCWD_)
+        return generic_linkat(AT_PWD, ".", dst_at, dst, N_SYMLINK_FOLLOW);
+    // LOOKUP_LINKAT_EMPTY's gate. See struct fd's open_creds for what AOK can
+    // and cannot see of Linux's cred-object comparison.
+    if (!current_capable(CAP_DAC_READ_SEARCH_) && !fd_open_creds_match(src_at))
+        return _ENOENT;
+    char src[MAX_PATH];
+    int err = generic_getpath(src_at, src);
+    if (err < 0)
+        return err;
+    // A descriptor that names no filesystem object at all -- a pipe, a socket,
+    // an eventfd, which adhoc_getpath renders as "pipe:[N]" and friends. Its
+    // inode lives on pipefs/sockfs/anon_inodefs, never on the filesystem the
+    // new name would go on, so Linux answers what it answers for any other
+    // cross-filesystem link; measured EXDEV for all three on Linux 6.12.
+    if (!path_is_normalized(src))
+        return _EXDEV;
+    // The path of an unlinked file is the name it had, so it may be another
+    // file's now; linking by it linked that one. Linux will not name an inode
+    // that has no links left at all (vfs_link), which is ENOENT.
+    if (!generic_path_names_fd(src, src_at))
+        return _ENOENT;
+    // generic_getpath's answer already carries any chroot prefix, so it has to
+    // be re-anchored at the REAL root -- see generic_open_realroot -- and for
+    // a file in a mount `umount -l` detached it is a staging point, which the
+    // walk may enter because it is this descriptor's own path
+    // (N_DETACHED_OK). Without that it was ENOENT. NOFOLLOW because the
+    // descriptor already IS the object it names: an O_PATH|O_NOFOLLOW
+    // descriptor on a symlink links the symlink itself.
+    return generic_linkat(AT_PWD, src, dst_at, dst,
+            N_SYMLINK_NOFOLLOW | N_REALROOT | N_DETACHED_OK);
+}
+
+static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags) {
+    // do_linkat() decides the flags before it looks at either name it was
+    // handed, so an unknown bit is EINVAL even when the source does not exist,
+    // the destination already does, the dirfd is not a descriptor, a name is
+    // empty, or a name's pointer is unreadable -- all six measured EINVAL on
+    // Linux 6.12. AOK carried no flags parameter at all: AT_SYMLINK_FOLLOW was
+    // dropped on the floor, and AT_SYMLINK_NOFOLLOW -- which linkat has never
+    // had -- was accepted as though it meant something.
+    if (flags & ~LINKAT_ALLOWED_FLAGS_)
+        return _EINVAL;
     char src[MAX_PATH];
     int path_err = user_read_path(src_addr, src, sizeof(src));
     if (path_err)
@@ -776,27 +921,36 @@ static dword_t sys_linkat_common(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_
     path_err = user_read_path(dst_addr, dst, sizeof(dst));
     if (path_err)
         return path_err;
-    STRACE("linkat(%d, \"%s\", %d, \"%s\")", src_at_f, src, dst_at_f, dst);
+    STRACE("linkat(%d, \"%s\", %d, \"%s\", %#x)", src_at_f, src, dst_at_f, dst, flags);
     struct fd *src_at = at_fd_for_path(src_at_f, src);
     if (src_at == NULL)
         return _EBADF;
     struct fd *dst_at = at_fd_for_path(dst_at_f, dst);
     if (dst_at == NULL)
         return _EBADF;
-    return generic_linkat(src_at, src, dst_at, dst);
+    if (src[0] == '\0')
+        return sys_linkat_empty_path(src_at_f, src_at, dst_at, dst, flags);
+    // AT_SYMLINK_FOLLOW: link what the source POINTS AT rather than the link.
+    // link() is the one member of the family that stops at a final symlink,
+    // and that stays the default -- link("l2f", new) makes a second symlink --
+    // but the flag is how a caller asks for the other thing, and dropping it
+    // meant `linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`, the way a
+    // caller links an inode it holds open, linked the magic symlink instead.
+    int src_norm = flags & AT_SYMLINK_FOLLOW_ ? N_SYMLINK_FOLLOW : N_SYMLINK_NOFOLLOW;
+    return generic_linkat(src_at, src, dst_at, dst, src_norm);
 }
 
-dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr) {
-    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr);
+dword_t sys_linkat_guest(fd_t src_at_f, guest_addr_t src_addr, fd_t dst_at_f, guest_addr_t dst_addr, int_t flags) {
+    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr, flags);
 }
 dword_t sys_link(addr_t src_addr, addr_t dst_addr) {
-    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
 }
 dword_t sys_link_guest(guest_addr_t src_addr, guest_addr_t dst_addr) {
-    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr);
+    return sys_linkat_common(AT_FDCWD_, src_addr, AT_FDCWD_, dst_addr, 0);
 }
-dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr) {
-    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr);
+dword_t sys_linkat(fd_t src_at_f, addr_t src_addr, fd_t dst_at_f, addr_t dst_addr, int_t flags) {
+    return sys_linkat_common(src_at_f, src_addr, dst_at_f, dst_addr, flags);
 }
 
 #define AT_REMOVEDIR_ 0x200
@@ -956,10 +1110,32 @@ dword_t sys_mknodat(fd_t at_f, addr_t path_addr, mode_t_ mode, dev_t_ dev) {
     return sys_mknodat_common(at_f, path_addr, mode, dev);
 }
 
-static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size) {
+// SA_RESTART for the read/write family: an _EINTR from the fd op becomes a
+// restart when the handler that caused it asked for one.
+//
+// Unless the op decided that already (fd_ops.decides_restart), because the
+// decision is not always the handler's to make. signal(7) never restarts a
+// socket wait with SO_RCVTIMEO/SO_SNDTIMEO armed, whatever SA_RESTART says, and
+// only fs/sock.c knows whether the wait that was interrupted had one. It
+// answers _ERESTART or _EINTR itself; converting its _EINTR here too restarted
+// exactly the calls Linux never does. A read with a 600ms SO_RCVTIMEO and an
+// SA_RESTART signal at 150ms came back EAGAIN after ~756ms, having waited the
+// timeout out a second time, where Linux gives EINTR after 150ms. recv,
+// recvfrom and recvmsg never had this: nothing converts their result again.
+//
+// A checkpoint freeze's _EINTR goes through either way unconverted -- no
+// handler asks for a restart -- and syscall_result_should_restart makes it one.
+static int_t io_restart_or_eintr(int_t res, bool fd_decides_restart) {
+    return fd_decides_restart ? res : signal_restart_or_eintr(res);
+}
+
+// *decides_restart reports the fd's fd_ops.decides_restart, for the dispatcher,
+// which never sees the struct fd.
+static ssize_t sys_read_buf(fd_t fd_no, void *buf, size_t size, bool *decides_restart) {
     struct fd *fd = f_get_io(fd_no);
     if (fd == NULL)
         return _EBADF;
+    *decides_restart = fd->ops->decides_restart;
     if (S_ISDIR(fd->type))
         return _EISDIR;
 
@@ -1024,12 +1200,12 @@ static dword_t sys_read_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size) 
     }
     
     int_t res = 0;
+    bool decides_restart = false;
     
     TASK_MAY_BLOCK {
-        res = (int_t)sys_read_buf(fd_no, buf, size);
+        res = (int_t)sys_read_buf(fd_no, buf, size, &decides_restart);
     }
-    if (res == _EINTR && signal_should_restart_syscall())
-        res = _ERESTART;
+    res = io_restart_or_eintr(res, decides_restart);
     amd64_tty_stdio_trace("read", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : 0);
     if (res >= 0) {
         if (user_write(buf_addr, buf, res))
@@ -1089,10 +1265,14 @@ static void file_remove_privs(struct fd *fd) {
     fd->privs_checked = true;
     if (!S_ISREG(fd->type))
         return;
+    if (fd->mount == NULL || fd->mount->fs == NULL || fd->mount->fs->fstat == NULL)
+        return;
+    // The file's capabilities go whoever writes, root included: Linux's
+    // killpriv asks for no capability at all (measured on 6.12). So this is
+    // ahead of the CAP_FSETID exemption, which is for the set-id bits only.
+    xattr_kill_caps_fd(fd);
     // CAP_FSETID is the whole exemption: root writing a setuid file keeps it.
     if (current_capable(CAP_FSETID_))
-        return;
-    if (fd->mount == NULL || fd->mount->fs == NULL || fd->mount->fs->fstat == NULL)
         return;
     struct statbuf stat;
     if (fd->mount->fs->fstat(fd, &stat) < 0)
@@ -1102,9 +1282,32 @@ static void file_remove_privs(struct fd *fd) {
         strip |= S_ISUID;
     if ((stat.mode & S_ISGID) && (stat.mode & S_IXGRP))
         strip |= S_ISGID;
-    if (strip == 0)
+    if (strip == 0 || fd->mount->fs->fsetattr == NULL)
         return;
-    generic_fsetattr(fd, make_attr(mode, stat.mode & ~strip & ~S_IFMT));
+    // Straight to the filesystem, not through generic_fsetattr: that is a
+    // chmod, and asks whether the caller owns the file. Anyone who may write
+    // a file makes it lose its set-id bits -- that is the point -- so a
+    // write to someone else's world-writable setuid file has to strip it too.
+    fd->mount->fs->fsetattr(fd, make_attr(mode, stat.mode & ~strip & ~S_IFMT));
+}
+
+// file_remove_privs for truncate(2), which names a path and holds no
+// descriptor. Linux strips inside the setattr that changes the size, so the
+// file this looks at is the one just truncated.
+static void path_remove_privs(struct fd *at, const char *path) {
+    struct statbuf stat;
+    if (generic_statat(at, path, &stat, 0) < 0 || !S_ISREG(stat.mode))
+        return;
+    xattr_kill_caps_at(at, path, true);
+    if (current_capable(CAP_FSETID_))
+        return;
+    mode_t_ strip = 0;
+    if (stat.mode & S_ISUID)
+        strip |= S_ISUID;
+    if ((stat.mode & S_ISGID) && (stat.mode & S_IXGRP))
+        strip |= S_ISGID;
+    if (strip != 0)
+        generic_setattrat_force(at, path, make_attr(mode, stat.mode & ~strip & ~S_IFMT), true);
 }
 
 static int fsize_limit_check(struct fd *fd, size_t *size) {
@@ -1136,10 +1339,13 @@ static int fsize_limit_check(struct fd *fd, size_t *size) {
     return 0;
 }
 
-static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size) {
+// See sys_read_buf for *decides_restart, which may be NULL here.
+static ssize_t sys_write_buf(fd_t fd_no, void *buf, size_t size, bool *decides_restart) {
     struct fd *fd = f_get_io(fd_no);
     if (fd == NULL)
         return _EBADF;
+    if (decides_restart != NULL)
+        *decides_restart = fd->ops->decides_restart;
 
     int limit_err = fsize_limit_check(fd, &size);
     if (limit_err < 0)
@@ -1204,10 +1410,11 @@ static dword_t sys_write_common(fd_t fd_no, guest_addr_t buf_addr, dword_t size)
 
     STRACE("write(%d, %#llx, %d)", fd_no, (unsigned long long) buf_addr, size);
 
+    bool decides_restart = false;
     TASK_MAY_BLOCK {
-        res = sys_write_buf(fd_no, buf, size);
+        res = sys_write_buf(fd_no, buf, size, &decides_restart);
     }
-    res = (dword_t) signal_restart_or_eintr((int_t) res);
+    res = (dword_t) io_restart_or_eintr((int_t) res, decides_restart);
     amd64_tty_stdio_trace("write", fd_no, buf_addr, size, res, buf, res > 0 ? (size_t) res : size);
 out:
     if (buf != stack_buf) free(buf);
@@ -1221,7 +1428,7 @@ dword_t sys_write(fd_t fd_no, addr_t buf_addr, dword_t size) {
 ssize_t fd_write_host_buf(fd_t fd_no, const void *buf, size_t size) {
     ssize_t res;
     TASK_MAY_BLOCK {
-        res = sys_write_buf(fd_no, (void *) buf, size);
+        res = sys_write_buf(fd_no, (void *) buf, size, NULL);
     }
     return res;
 }
@@ -1263,10 +1470,11 @@ static dword_t sys_readv_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iov
         }
     }
     ssize_t res = 0;
+    bool decides_restart = false;
     TASK_MAY_BLOCK {
-        res = sys_read_buf(fd_no, buf, io_size);
+        res = sys_read_buf(fd_no, buf, io_size, &decides_restart);
     }
-    res = signal_restart_or_eintr((int_t) res);
+    res = io_restart_or_eintr((int_t) res, decides_restart);
     if (res < 0)
         goto error;
 
@@ -1345,10 +1553,11 @@ static dword_t sys_writev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t io
         STRACE(" {base=%#llx, len=%zu}", (unsigned long long) iovec[i].base, iovec[i].len);
         offset += copy_len;
     }
+    bool decides_restart = false;
     TASK_MAY_BLOCK {
-        res = sys_write_buf(fd_no, buf, offset);
+        res = sys_write_buf(fd_no, buf, offset, &decides_restart);
     }
-    res = signal_restart_or_eintr((int_t) res);
+    res = io_restart_or_eintr((int_t) res, decides_restart);
     amd64_tty_stdio_trace("writev", fd_no, iovec_addr, (dword_t) offset, res, buf,
             res > 0 ? (size_t) res : offset);
 error:
@@ -1455,7 +1664,7 @@ dword_t sys_preadv_i386_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec
 }
 
 static dword_t sys_pwritev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
-        off_t_ off, enum guest_abi abi) {
+        off_t_ off, enum fd_pwrite_append append, enum guest_abi abi) {
     STRACE("pwritev(%d, %#llx, %d, %lld)", fd_no, (unsigned long long) iovec_addr,
            iovec_count, (long long) off);
     struct guest_iovec_ *iovec = user_read_iovecs_abi(current, abi, iovec_addr, iovec_count);
@@ -1494,6 +1703,7 @@ static dword_t sys_pwritev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t i
     }
     task_may_block_start();
     lock(&fd->lock, 0);
+    fd->pwrite_append = append;
     uint64_t delay_start = io_delay_start(fd);
     if (fd->ops->pwrite) {
         res = fd->ops->pwrite(fd, buf, offset, off);
@@ -1506,6 +1716,7 @@ static dword_t sys_pwritev_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t i
     } else {
         res = _ESPIPE;
     }
+    fd->pwrite_append = FD_PWRITE_APPEND_DEFAULT;
     io_delay_end(delay_start);
     unlock(&fd->lock);
     task_may_block_end();
@@ -1518,45 +1729,110 @@ out:
 }
 
 dword_t sys_pwritev_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count, off_t_ off) {
-    return sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, GUEST_ABI_AMD64);
+    return sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, FD_PWRITE_APPEND_DEFAULT,
+                              GUEST_ABI_AMD64);
 }
 
 dword_t sys_pwritev_i386_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count, off_t_ off) {
-    return sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, GUEST_ABI_I386);
+    return sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, FD_PWRITE_APPEND_DEFAULT,
+                              GUEST_ABI_I386);
 }
 
 // preadv2/pwritev2: same as preadv/pwritev, but an offset of -1 means "use
 // and advance the current file position" (like plain readv/writev) rather
-// than a positioned access, and there's a trailing RWF_* flags word. The
-// flags (RWF_HIPRI, RWF_DSYNC, RWF_SYNC, RWF_NOWAIT, RWF_APPEND) are
-// performance/durability/append hints with no analog in our fd_ops
-// backends, so they're accepted but ignored, like fadvise64.
-dword_t sys_preadv2_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
-        off_t_ off, uint_t UNUSED(flags)) {
+// than a positioned access, and there's a trailing RWF_* flags word.
+#define RWF_HIPRI_    0x01
+#define RWF_DSYNC_    0x02
+#define RWF_SYNC_     0x04
+#define RWF_NOWAIT_   0x08
+#define RWF_APPEND_   0x10
+#define RWF_NOAPPEND_ 0x20
+#define RWF_ATOMIC_   0x40
+
+// Reads: every flag Linux 6.12 defines is a hint here (no polled I/O, no
+// non-blocking page cache); anything else is EOPNOTSUPP, as on Linux.
+static dword_t sys_preadv2_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
+        off_t_ off, uint_t flags, enum guest_abi abi) {
+    if (flags & ~(RWF_HIPRI_ | RWF_DSYNC_ | RWF_SYNC_ | RWF_NOWAIT_ | RWF_APPEND_ |
+                  RWF_NOAPPEND_ | RWF_ATOMIC_))
+        return _EOPNOTSUPP;
     if (off == (off_t_) -1)
-        return sys_readv_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_AMD64);
-    return sys_preadv_common(fd_no, iovec_addr, iovec_count, off, GUEST_ABI_AMD64);
+        return sys_readv_common(fd_no, iovec_addr, iovec_count, abi);
+    return sys_preadv_common(fd_no, iovec_addr, iovec_count, off, abi);
+}
+
+// Writes honour the flags that change where or how durably data lands:
+// RWF_APPEND writes at end of file and RWF_NOAPPEND at the offset even on an
+// O_APPEND description (both through fd->pwrite_append; with both, append
+// wins, as Linux's kiocb_set_rw_flags has it), and RWF_DSYNC / RWF_SYNC sync
+// after the write. RWF_HIPRI is a polling hint and is ignored. RWF_NOWAIT
+// (AOK cannot promise not to block), RWF_ATOMIC and unknown bits are
+// EOPNOTSUPP, which libcs fall back on. These used to be accepted and
+// ignored, and musl 1.2.6 (Alpine 3.24) sends every pwrite() as
+// pwritev2(..., RWF_NOAPPEND): on an O_APPEND file the data went to the end
+// instead of its offset (tests/manual/pwritev2_flags.c).
+static dword_t sys_pwritev2_common(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
+        off_t_ off, uint_t flags, enum guest_abi abi) {
+    if (flags & ~(RWF_HIPRI_ | RWF_DSYNC_ | RWF_SYNC_ | RWF_APPEND_ | RWF_NOAPPEND_))
+        return _EOPNOTSUPP;
+    enum fd_pwrite_append append = FD_PWRITE_APPEND_DEFAULT;
+    if (flags & RWF_APPEND_)
+        append = FD_PWRITE_APPEND_FORCE;
+    else if (flags & RWF_NOAPPEND_)
+        append = FD_PWRITE_APPEND_NEVER;
+
+    dword_t res;
+    struct fd *fd = f_get_io(fd_no);
+    if (fd == NULL)
+        return _EBADF;
+    if (off != (off_t_) -1) {
+        res = sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, append, abi);
+    } else if (append == FD_PWRITE_APPEND_DEFAULT || fd->ops->lseek == NULL) {
+        res = sys_writev_common(fd_no, iovec_addr, iovec_count, abi);
+    } else {
+        // The file position, with this call's append rule: write there (or at
+        // the end), then leave the position after what was written.
+        lock(&fd->lock, 0);
+        off_t_ pos = fd->ops->lseek(fd, 0, LSEEK_CUR);
+        unlock(&fd->lock);
+        if (pos < 0)
+            return pos;
+        res = sys_pwritev_common(fd_no, iovec_addr, iovec_count, pos, append, abi);
+        if ((int) res > 0) {
+            lock(&fd->lock, 0);
+            if (append == FD_PWRITE_APPEND_FORCE)
+                fd->ops->lseek(fd, 0, LSEEK_END);
+            else
+                fd->ops->lseek(fd, pos + (int) res, LSEEK_SET);
+            unlock(&fd->lock);
+        }
+    }
+    if ((int) res > 0 && (flags & (RWF_DSYNC_ | RWF_SYNC_)) && fd->ops->fsync != NULL) {
+        int err = fd->ops->fsync(fd);
+        if (err < 0)
+            return err;
+    }
+    return res;
+}
+
+dword_t sys_preadv2_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
+        off_t_ off, uint_t flags) {
+    return sys_preadv2_common(fd_no, iovec_addr, iovec_count, off, flags, GUEST_ABI_AMD64);
 }
 
 dword_t sys_pwritev2_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
-        off_t_ off, uint_t UNUSED(flags)) {
-    if (off == (off_t_) -1)
-        return sys_writev_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_AMD64);
-    return sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, GUEST_ABI_AMD64);
+        off_t_ off, uint_t flags) {
+    return sys_pwritev2_common(fd_no, iovec_addr, iovec_count, off, flags, GUEST_ABI_AMD64);
 }
 
 dword_t sys_preadv2_i386_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
-        off_t_ off, uint_t UNUSED(flags)) {
-    if (off == (off_t_) -1)
-        return sys_readv_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_I386);
-    return sys_preadv_common(fd_no, iovec_addr, iovec_count, off, GUEST_ABI_I386);
+        off_t_ off, uint_t flags) {
+    return sys_preadv2_common(fd_no, iovec_addr, iovec_count, off, flags, GUEST_ABI_I386);
 }
 
 dword_t sys_pwritev2_i386_guest(fd_t fd_no, guest_addr_t iovec_addr, dword_t iovec_count,
-        off_t_ off, uint_t UNUSED(flags)) {
-    if (off == (off_t_) -1)
-        return sys_writev_common(fd_no, iovec_addr, iovec_count, GUEST_ABI_I386);
-    return sys_pwritev_common(fd_no, iovec_addr, iovec_count, off, GUEST_ABI_I386);
+        off_t_ off, uint_t flags) {
+    return sys_pwritev2_common(fd_no, iovec_addr, iovec_count, off, flags, GUEST_ABI_I386);
 }
 
 dword_t sys__llseek(fd_t f, dword_t off_high, dword_t off_low, addr_t res_addr, dword_t whence) {
@@ -1878,6 +2154,19 @@ static int fs_try_rebase_path(struct fs_info *fs, char *path) {
     return 0;
 }
 
+int fs_root_path(struct fs_info *fs, char *out) {
+    lock(&fs->lock, 0);
+    struct fd *root = fs->root != NULL ? fd_retain(fs->root) : NULL;
+    unlock(&fs->lock);
+    if (root == NULL) {
+        strcpy(out, "/");
+        return 0;
+    }
+    int err = generic_getpath(root, out);
+    fd_close(root);
+    return err;
+}
+
 // Rebase a mount-absolute path (as returned by generic_getpath) to be
 // relative to `fs`'s chroot root, matching Linux getcwd(2) semantics: the
 // root's own path becomes "/", a path under the root has the root prefix
@@ -1891,19 +2180,16 @@ int fs_rebase_path_to_root(struct fs_info *fs, char *path) {
     return rebased ? 0 : _ENOENT;
 }
 
-// Like fs_rebase_path_to_root, but for readlink() of the magic-symlink
-// targets under /proc/*/{cwd,root,exe,fd/N} -- those are computed via
-// d_path() against the CALLING process's root on real Linux (so callers pass
-// current->fs here even when reading another task's /proc entries), and
-// unlike getcwd(2), d_path() does NOT fail when the target is outside the
-// caller's root: it prefixes the un-rebased absolute path with
-// "(unreachable)" and the readlink still succeeds. Getting this wrong as an
-// outright ENOENT (as fs_rebase_path_to_root does) broke opening another
-// process's /proc/<pid>/exe from inside a chroot entirely -- iSH's open()
-// resolves a followed symlink's target by re-walking the string returned by
-// .readlink() (see __path_normalize in fs/path.c), so a failing readlink()
-// here made the subsequent open() fail too, not just the informational
-// readlink(2) syscall.
+// The WALKABLE text of a /proc/*/{cwd,root,exe,fd/N} link, for a path walk
+// that goes through one: AOK re-walks the string .readlink() returns (see
+// __path_normalize in fs/path.c) where Linux jumps straight to the file. A
+// path under the caller's root is rebased to it. One outside it is prefixed
+// with "(unreachable)", which no walk can resolve: walked as it is, the
+// global path would name whatever that path means INSIDE the chroot, a
+// different file. (Failing the readlink outright instead, as
+// fs_rebase_path_to_root does, broke opening another process's
+// /proc/<pid>/exe from inside a chroot: the open walks this text.) What
+// readlink(2) is SHOWN is fs_rebase_shown_link_path, below.
 int fs_rebase_readlink_path(struct fs_info *fs, char *path) {
     int rebased = fs_try_rebase_path(fs, path);
     if (rebased < 0)
@@ -1919,15 +2205,44 @@ int fs_rebase_readlink_path(struct fs_info *fs, char *path) {
     return 0;
 }
 
+// The text readlink(2) of a /proc/*/{cwd,root,exe,fd/N} link is SHOWN: Linux's
+// d_path() against the caller's root. A path under the root is rebased to it;
+// one outside it is printed from the global root with no marker at all (the
+// "(unreachable)" prefix is getcwd(2)'s, not d_path's); and a name that is not
+// a path -- "socket:[N]", "pipe:[N]", "anon_inode:[...]" -- is printed as it
+// is. Measured on Linux 6.12 in a chroot: "/etc/hostname", "/usr",
+// "/memfd:crl (deleted)" and "socket:[12054799]" for descriptors opened
+// before the chroot.
+int fs_rebase_shown_link_path(struct fs_info *fs, char *path) {
+    if (path[0] != '/')
+        return 0;
+    int rebased = fs_try_rebase_path(fs, path);
+    return rebased < 0 ? rebased : 0;
+}
+
 static dword_t sys_getcwd_common(guest_addr_t buf_addr, dword_t size) {
     STRACE("getcwd(%#x, %#x)", buf_addr, size);
+    // Held, not locked across the call: the path of a cwd in a detached mount
+    // asks for the root, under this same lock.
     lock(&current->fs->lock, 0);
-    struct fd *wd = current->fs->pwd;
-    char pwd[MAX_PATH + 1];
-    int err = generic_getpath(wd, pwd);
+    struct fd *wd = fd_retain(current->fs->pwd);
     unlock(&current->fs->lock);
+    char pwd[MAX_PATH + 1];
+    bool unreachable;
+    int err = generic_getpath_shown(wd, pwd, &unreachable);
+    // A cwd that has been removed has no path: Linux's getcwd is ENOENT for
+    // it (d_unlinked), where AOK gave the name it had -- which another
+    // directory may have taken since.
+    if (err >= 0 && !unreachable && !generic_path_names_fd(pwd, wd))
+        err = _ENOENT;
+    fd_close(wd);
     if (err < 0)
         return err;
+    // A cwd in a lazily unmounted mount is under no root at all. Linux hands
+    // back "(unreachable)/..." and glibc and musl both turn that into ENOENT,
+    // the answer a cwd outside the chroot already gets below.
+    if (unreachable)
+        return _ENOENT;
 
     int rebase_err = fs_rebase_path_to_root(current->fs, pwd);
     if (rebase_err < 0)
@@ -2027,8 +2342,12 @@ dword_t sys_fchdir(fd_t f) {
 static dword_t sys_chroot_common(guest_addr_t path_addr) {
     // Linux requires CAP_SYS_CHROOT. Without this an unprivileged process could
     // chroot itself, which is both unlike Linux and a way to escape a directory
-    // restriction rather than enter one.
-    if (!current_capable(CAP_SYS_CHROOT_))
+    // restriction rather than enter one. In the caller's own user namespace,
+    // as Linux asks it: root of a sandbox may (nix's build sandbox does), and
+    // gains nothing over the machine by it -- a set-id program whose owner
+    // the namespace does not map runs as nobody special (kernel/exec.c), and
+    // a chrooted process can make no further user namespace.
+    if (!ns_capable(current_user_ns(), CAP_SYS_CHROOT_))
         return _EPERM;
     char path[MAX_PATH];
     int path_err = user_read_path(path_addr, path, sizeof(path));
@@ -2045,6 +2364,12 @@ static dword_t sys_chroot_common(guest_addr_t path_addr) {
     unlock(&current->fs->lock);
     return 0;
 }
+// open_dir, for kernel code that sets a task's root or cwd itself
+// (kernel/foreign_exec.c): the same search-permission rule as chdir.
+struct fd *fs_open_dir(const char *path) {
+    return open_dir(path);
+}
+
 dword_t sys_chroot_guest(guest_addr_t path_addr) {
     return sys_chroot_common(path_addr);
 }
@@ -2368,7 +2693,7 @@ static dword_t sys_utime_common(fd_t at_f, guest_addr_t path_addr, struct timesp
     // Linux (setattr_prepare): setting EXPLICIT times requires ownership or
     // CAP_FOWNER, and is EPERM otherwise; setting them to "now" requires
     // ownership OR write permission, and is EACCES otherwise. Both measured.
-    if (!(current != NULL && current->fsuid == 0)) {
+    if (!(current != NULL && current->fsuid == 0 && current->user_ns == NULL)) {
         struct statbuf owner = {};
         int owner_err;
         if (path_addr == 0)
@@ -2588,9 +2913,9 @@ dword_t sys_utime_guest(guest_addr_t path_addr, guest_addr_t times_addr) {
         } times;
         if (user_get(times_addr, times))
             return _EFAULT;
-        atime.tv_sec = times.actime;
+        atime.tv_sec = (sdword_t) times.actime;    // a 32-bit time_t is signed
         atime.tv_nsec = 0;
-        mtime.tv_sec = times.modtime;
+        mtime.tv_sec = (sdword_t) times.modtime;
         mtime.tv_nsec = 0;
     }
     return sys_utime_common(AT_FDCWD_, path_addr, atime, mtime, 0);
@@ -2626,7 +2951,7 @@ static int generic_fsetattr(struct fd *fd, struct attr attr) {
         if (accmode != O_WRONLY_ && accmode != O_RDWR_)
             return _EINVAL;
     } else {
-        err = setattr_check(&stat, attr);
+        err = setattr_check(&stat, &attr);
         if (err < 0)
             return err;
     }
@@ -2710,11 +3035,88 @@ dword_t sys_chmod_guest(guest_addr_t path_addr, dword_t mode) {
     return sys_fchmodat_guest(AT_FDCWD_, path_addr, mode);
 }
 
+// Linux's chown_common(): a successful chown drops the file's setuid bit, and
+// usually its setgid bit with it. A chown is how a setuid binary changes hands,
+// and the bits cannot survive the handover -- the program would go on running
+// as whoever owns it now. Nothing did this, so a user could hand a setuid-root
+// binary to themselves and keep the bit.
+//
+// Measured on Linux 6.12.101, ext4 and tmpfs, 64-bit and -m32, unprivileged and
+// as root -- every leg identical. chown(f, -1, -1), which sets no id at all,
+// strips exactly as much as a chown with real ids: chown_common() adds
+// ATTR_KILL_SUID for any non-directory before it has looked at the ids.
+//
+//   4755 -> 0755   suid always goes...
+//   4644 -> 0644   ...with no execute bit anywhere, too
+//   2711 -> 0711   sgid goes when the group-execute bit is set
+//   2644 -> 2644   ...but not without it: that combination is a mandatory
+//                  locking marker rather than a privilege
+//   6644 -> 2644   the two bits are decided separately
+//   7755 -> 1755   the sticky bit is not a privilege and is never touched
+//   DIR            exempt whatever it is set to, 4755/2755/6755 all survive
+//   FIFO 4644 -> 0644   "not a directory" is the whole test, not "regular"
+//
+// Root is NOT exempt, and that is the trap here. The CAP_FSETID exemption
+// everybody remembers is in the WRITE path -- file_remove_privs() above --
+// not in this one: chown_common() sets the kill flags with no capability test,
+// and a root chown of /usr/bin/passwd really does clear its setuid bit
+// (measured, on the real file). Capability decides one narrow case only, the
+// sgid-without-group-x below.
+//
+// That case is not simply "keep it". setattr_should_drop_sgid() keeps the
+// marker only for a caller who is in the file's group or privileged; for
+// anyone else it goes. Measured: a 2644 file owned by me in a group I am not
+// in comes back 0644, where the same file in my own group stays 2644.
+//
+// The gid it asks about is the file's gid BEFORE the chown, which is the one
+// thing here that cannot be reconstructed afterwards -- a chgrp is exactly
+// what moves a file out of the group being asked about. Measured: a 2644 file
+// owned by me with group daemon, which I am not in, comes back 0644 when I
+// chgrp it to my own group; decided from the new gid it would have kept the
+// bit. So every caller below takes this from a stat made before it sets
+// anything.
+//
+// No permission check here: dropping the bits turns the call into a mode
+// change, and the callers apply it through the ordinary setattr path, so
+// setattr_check()'s chmod arm raises the EPERM at the right point and after
+// the errors that outrank it. That EPERM is the whole reason an unprivileged
+// chown(-1, -1) answers 0 on a plain root-owned file and EPERM on a setuid
+// one -- with no id set there is nothing else left to check.
+static mode_t_ chown_privs_to_drop(struct statbuf *stat) {
+    if (S_ISDIR(stat->mode))
+        return 0;
+    mode_t_ drop = 0;
+    if (stat->mode & S_ISUID)
+        drop |= S_ISUID;
+    if ((stat->mode & S_ISGID) &&
+            ((stat->mode & S_IXGRP) ||
+             (!current_in_group(stat->gid) && !current_capable(CAP_FSETID_))))
+        drop |= S_ISGID;
+    return drop;
+}
+
+// The ids a chown was given, as kernel ids. -1 is "leave it"; an id the
+// caller's user namespace does not map is EINVAL (Linux's chown_common).
+static bool chown_ids_to_kernel(uid_t_ *owner, uid_t_ *group) {
+    if (*owner != (uid_t_) -1 && (*owner = current_make_kuid(*owner)) == USER_NS_INVALID_ID)
+        return false;
+    if (*group != (uid_t_) -1 && (*group = current_make_kgid(*group)) == USER_NS_INVALID_ID)
+        return false;
+    return true;
+}
+
 static dword_t sys_fchown_common(fd_t f, uid_t_ owner, uid_t_ group) {
     STRACE("fchown(%d, %d, %d)", f, owner, group);
+    if (!chown_ids_to_kernel(&owner, &group))
+        return _EINVAL;
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
+    // Before anything is set; see chown_privs_to_drop(). A file we cannot stat
+    // has no mode for us to strip anything from, and leaving drop at 0 keeps
+    // the call exactly as it behaved before rather than inventing an error.
+    struct statbuf pre = {};
+    mode_t_ drop = generic_fstat(fd, &pre) < 0 ? 0 : chown_privs_to_drop(&pre);
     int err;
     if (owner != (uid_t) -1) {
         err = generic_fsetattr(fd, make_attr(uid, owner));
@@ -2726,6 +3128,12 @@ static dword_t sys_fchown_common(fd_t f, uid_t_ owner, uid_t_ group) {
         if (err < 0)
             return err;
     }
+    // chown_common's ATTR_KILL_PRIV: a non-directory loses its capabilities
+    // on any chown that is allowed, even one to the owner it already has.
+    if (!S_ISDIR(pre.mode))
+        xattr_kill_caps_fd(fd);
+    if (drop != 0)
+        return generic_fsetattr(fd, make_attr(mode, pre.mode & ~drop & ~S_IFMT));
     return 0;
 }
 
@@ -2743,6 +3151,8 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
     if (path_err)
         return path_err;
     STRACE("fchownat(%d, \"%s\", %d, %d, %d)", at_f, path, owner, group, flags);
+    if (!chown_ids_to_kernel(&owner, &group))
+        return _EINVAL;
     // Linux: only these two flags exist here, and anything else is EINVAL
     // before any lookup. Accepting an unknown bit and ignoring it tells a
     // caller its request was honoured when it was not.
@@ -2763,6 +3173,13 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
     if (path[0] == '\0') {
         if (!(flags & AT_EMPTY_PATH_))
             return _ENOENT;
+        // Before anything is set; see chown_privs_to_drop(). AT_FDCWD_ here
+        // names the current directory, which is exempt, but it costs nothing
+        // to ask the same question about it as about any other target.
+        struct statbuf pre = {};
+        int pre_err = at_f == AT_FDCWD_ ? generic_statat(AT_PWD, ".", &pre, 0)
+                                        : generic_fstat(at, &pre);
+        mode_t_ drop = pre_err < 0 ? 0 : chown_privs_to_drop(&pre);
         if (owner != (uid_t) -1) {
             err = at_f == AT_FDCWD_ ? generic_setattrat(AT_PWD, ".", make_attr(uid, owner), true)
                                     : generic_fsetattr(at, make_attr(uid, owner));
@@ -2775,7 +3192,49 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
             if (err < 0)
                 return err;
         }
+        // See sys_fchown_common. AT_FDCWD names a directory, which keeps them.
+        if (at_f != AT_FDCWD_ && pre_err >= 0 && !S_ISDIR(pre.mode))
+            xattr_kill_caps_fd(at);
+        if (drop != 0) {
+            struct attr attr = make_attr(mode, pre.mode & ~drop & ~S_IFMT);
+            return at_f == AT_FDCWD_ ? generic_setattrat(AT_PWD, ".", attr, true)
+                                     : generic_fsetattr(at, attr);
+        }
         return 0;
+    }
+
+    // Before anything is set; see chown_privs_to_drop(). When the stat fails
+    // the calls below raise the real error, so the lookup's own errors keep
+    // beating anything this could have decided.
+    struct statbuf pre = {};
+    int pre_err = generic_statat(at, path, &pre, follow_links ? 0 : AT_SYMLINK_NOFOLLOW_);
+    mode_t_ drop = pre_err < 0 ? 0 : chown_privs_to_drop(&pre);
+    struct attr strip = make_attr(mode, pre.mode & ~drop & ~S_IFMT);
+
+    // Both ids -1 is "change nothing", and it used to fall straight out of
+    // here with 0 -- the two blocks below are the only thing that ever
+    // resolved the path, so chown("does-not-exist", -1, -1) succeeded and
+    // lchown("file/", -1, -1) never spent its trailing slash. Linux runs the
+    // whole lookup first and reports what it finds; it just has nothing to set
+    // once it gets there. The shape falls out of any caller that decides the
+    // two ids separately and passes -1 for "leave this one alone" -- when
+    // neither turns out to need changing, the call is still made, and it was
+    // answering 0 for a path that does not exist.
+    //
+    // It still strips, though: the kill flags do not depend on the ids. The
+    // lookup goes first so a read-only mount answers EROFS rather than the
+    // EPERM the strip would raise on the same file.
+    if (owner == (uid_t) -1 && group == (uid_t) -1) {
+        err = generic_setattrat_nochange(at, path, follow_links);
+        if (err < 0)
+            return err;
+        // Even chown(f, -1, -1) takes the capabilities away (measured on
+        // 6.12): the kill does not depend on the ids either.
+        if (pre_err >= 0 && !S_ISDIR(pre.mode))
+            xattr_kill_caps_at(at, path, follow_links);
+        if (drop == 0)
+            return err;
+        return generic_setattrat(at, path, strip, follow_links);
     }
 
     if (owner != (uid_t) -1) {
@@ -2788,6 +3247,10 @@ static dword_t sys_fchownat_common(fd_t at_f, guest_addr_t path_addr, dword_t ow
         if (err < 0)
             return err;
     }
+    if (pre_err >= 0 && !S_ISDIR(pre.mode))
+        xattr_kill_caps_at(at, path, follow_links);
+    if (drop != 0)
+        return generic_setattrat(at, path, strip, follow_links);
     return 0;
 }
 
@@ -2835,7 +3298,14 @@ dword_t sys_truncate64_guest(guest_addr_t path_addr, dword_t size_low, dword_t s
     // dirfd as "bad/closed dirfd" and returning EBADF, passing NULL here made
     // every truncate(2) fail with EBADF on all ABIs. truncate takes no dirfd,
     // so a relative path resolves against the cwd.
-    return generic_setattrat(AT_PWD, path, make_attr(size, size), true);
+    int err = generic_setattrat(AT_PWD, path, make_attr(size, size), true);
+    if (err < 0)
+        return err;
+    // Linux's do_truncate drops what a write drops: the capabilities always,
+    // the set-id bits for a caller without CAP_FSETID. Measured on 6.12 as
+    // uid 1000: truncate() of a 4755 file leaves it 0755. Only ftruncate did.
+    path_remove_privs(AT_PWD, path);
+    return 0;
 }
 dword_t sys_truncate64(addr_t path_addr, dword_t size_low, dword_t size_high) {
     return sys_truncate64_guest(path_addr, size_low, size_high);
@@ -2865,6 +3335,8 @@ dword_t sys_ftruncate(fd_t f, dword_t size) {
     struct fd *fd = f_get(f);
     if (fd == NULL)
         return _EBADF;
+    // As ftruncate64 does: a truncation is a write, and drops what one drops.
+    file_remove_privs(fd);
     return generic_fsetattr(fd, make_attr(size, size));
 }
 
@@ -3158,10 +3630,11 @@ static ssize_t copy_write_chunk(struct fd *fd, const void *buf, size_t size, off
     return res;
 }
 
-// Shared engine for sendfile() and copy_file_range(): move up to count bytes
-// from in_fd to out_fd through a host bounce buffer. in_off/out_off are host
-// copies of the caller's offsets (NULL = use the fd's current position). Returns
-// bytes copied (possibly short, e.g. at EOF or on a signal), or -errno if none.
+// Shared engine for sendfile(), splice() and copy_file_range(): move up to
+// count bytes from in_fd to out_fd through a host bounce buffer. in_off/out_off
+// are host copies of the caller's offsets (NULL = use the fd's current
+// position). Returns bytes copied -- routinely short, see may_drain below --
+// or -errno if none.
 static dword_t fd_copy_range(fd_t in_no, off_t_ *in_off, fd_t out_no, off_t_ *out_off, uint64_t count) {
     struct fd *in_fd = f_get(in_no);
     struct fd *out_fd = f_get(out_no);
@@ -3182,6 +3655,32 @@ static dword_t fd_copy_range(fd_t in_no, off_t_ *in_off, fd_t out_no, off_t_ *ou
     char *buf = malloc(bufsize);
     if (buf == NULL)
         return _ENOMEM;
+
+    // Whether this copy may be driven all the way to `count`. Only a copy
+    // between two regular files can be: every other kind of endpoint blocks.
+    // sendfile(2), splice(2) and copy_file_range(2) are all documented to
+    // return short and every caller loops, so stopping after one chunk is a
+    // legal answer -- whereas looping for bytes that are not coming is a hang.
+    //
+    // GNU cat is the case that found it. Its copy_cat() fast path makes a pipe
+    // of its own and bounces the input through it:
+    //     pipe(p); splice(0, .., p[1], .., 65536); splice(p[0], .., 1, .., 65536)
+    // The second call asks for 65536 bytes from a pipe holding three, whose one
+    // writer is cat itself and which will not write again until this call
+    // returns. Waiting for the other 65533 waits forever: `echo hi | cat`,
+    // `cat <<EOF`, `seq 1 20000 | cat` and five of bash's own regression tests
+    // (alias, builtins, comsub, comsub-eof, comsub-posix) all hung right here.
+    //
+    // An fd whose type was never filled in reads as "not regular" and so takes
+    // the safe path.
+    bool may_drain = S_ISREG(in_fd->type) && S_ISREG(out_fd->type);
+    // A short write to anything but a regular file means the far end is full,
+    // and continuing means blocking until somebody drains it. Bytes already
+    // taken out of the input can only be handed back if the input has a
+    // position to rewind, so only then is stopping mid-chunk safe.
+    bool out_may_block = !S_ISREG(out_fd->type);
+    bool in_rewindable = in_off != NULL ||
+        (S_ISREG(in_fd->type) && in_fd->ops->lseek != NULL);
 
     dword_t total = 0;
     int err = 0;
@@ -3204,6 +3703,13 @@ static dword_t fd_copy_range(fd_t in_no, off_t_ *in_off, fd_t out_no, off_t_ *ou
                 if (nw <= 0) { err = (int) nw; break; }
                 io_account_write(out_fd, nw);
                 chunk_written += nw;
+                // Full output, rewindable input: hand the rest back and return
+                // short. This is splice's own canonical idiom -- file into a
+                // pipe, pipe out to a socket, one thread doing both -- where
+                // the only reader of that pipe is the caller, waiting for this
+                // call to come back.
+                if (chunk_written < nr && out_may_block && in_rewindable)
+                    break;
             }
             total += (dword_t) chunk_written;
             if (chunk_written < nr) {
@@ -3217,6 +3723,8 @@ static dword_t fd_copy_range(fd_t in_no, off_t_ *in_off, fd_t out_no, off_t_ *ou
                 }
                 break;
             }
+            if (!may_drain)
+                break;
         }
     }
 
@@ -3557,48 +4065,3 @@ dword_t sys_copy_file_range_guest(fd_t in_fd, guest_addr_t in_off, fd_t out_fd, 
     return do_copy_file_range(in_fd, in_off, out_fd, out_off, len, flags);
 }
 
-dword_t sys_xattr_stub(addr_t UNUSED(path_addr), addr_t UNUSED(name_addr),
-        addr_t UNUSED(value_addr), dword_t UNUSED(size), dword_t UNUSED(flags)) {
-    return _ENOTSUP;
-}
-
-static dword_t sys_xattr_stub_guest_impl(guest_addr_t UNUSED(path_addr), guest_addr_t UNUSED(name_addr),
-        guest_addr_t UNUSED(value_addr), dword_t UNUSED(size), dword_t UNUSED(flags)) {
-    return _ENOTSUP;
-}
-
-dword_t sys_setxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr,
-        guest_addr_t value_addr, dword_t size, dword_t flags) {
-    return sys_xattr_stub_guest_impl(path_addr, name_addr, value_addr, size, flags);
-}
-
-dword_t sys_fsetxattr_guest(fd_t UNUSED(fd), guest_addr_t name_addr,
-        guest_addr_t value_addr, dword_t size, dword_t flags) {
-    return sys_xattr_stub_guest_impl(0, name_addr, value_addr, size, flags);
-}
-
-dword_t sys_getxattr_guest(guest_addr_t path_addr, guest_addr_t name_addr,
-        guest_addr_t value_addr, dword_t size) {
-    return sys_xattr_stub_guest_impl(path_addr, name_addr, value_addr, size, 0);
-}
-
-dword_t sys_fgetxattr_guest(fd_t UNUSED(fd), guest_addr_t name_addr,
-        guest_addr_t value_addr, dword_t size) {
-    return sys_xattr_stub_guest_impl(0, name_addr, value_addr, size, 0);
-}
-
-dword_t sys_listxattr_guest(guest_addr_t path_addr, guest_addr_t list_addr, dword_t size) {
-    return sys_xattr_stub_guest_impl(path_addr, 0, list_addr, size, 0);
-}
-
-dword_t sys_flistxattr_guest(fd_t UNUSED(fd), guest_addr_t list_addr, dword_t size) {
-    return sys_xattr_stub_guest_impl(0, 0, list_addr, size, 0);
-}
-
-dword_t sys_removexattr_guest(guest_addr_t path_addr, guest_addr_t name_addr) {
-    return sys_xattr_stub_guest_impl(path_addr, name_addr, 0, 0, 0);
-}
-
-dword_t sys_fremovexattr_guest(fd_t UNUSED(fd), guest_addr_t name_addr) {
-    return sys_xattr_stub_guest_impl(0, name_addr, 0, 0, 0);
-}

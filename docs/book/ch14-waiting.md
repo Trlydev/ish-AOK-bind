@@ -21,8 +21,17 @@ is why every threaded program on Linux is, underneath, a futex program: pthread
 mutexes, condition variables, semaphores, Go's scheduler, Rust's `std::sync`,
 Java's monitors.
 
-AOK implements the operation set on a hash table of wait queues keyed by guest
-address. The interesting parts are all in the corners.
+AOK implements the operation set on a hash table of wait queues. A private
+futex is keyed by its address in one address space. A shared one is keyed by
+what the memory is, not by how a process reached it — a file's host device,
+inode and page, a SysV segment and page, or anonymous shared memory's own
+`struct data` and page (`mem_shared_page_id`) — plus the word's offset in the
+page. So a wait and a wake meet through an `mremap` alias, from two processes
+after `fork`, and between two processes that each opened and mapped the file
+themselves, which is what POSIX shm and `sem_open` are. Keyed by the
+`struct fd` the mapping came through, and by the word's offset in the host
+mapping rather than the file, every process-shared lock in such a file slept to
+its deadline. The interesting parts are all in the corners.
 
 > **The bug that taught us this**
 >
@@ -46,6 +55,14 @@ address. The interesting parts are all in the corners.
 > path, so nothing failed, no report was filed, and the only way this was ever
 > going to be found was somebody deliberately writing a probe for an operation
 > nothing currently calls. Some bugs cannot be found by using the system.
+>
+> It had a fourth fault, and that one was worse. A queued waiter holds a
+> reference on its futex, and the requeue moved the waiter without it, so the
+> futex it had just made to move the waiter onto was freed underneath it — an
+> assert every build keeps, and so an abort of the whole app, the first time a
+> `FUTEX_CMP_REQUEUE` moved anyone. The probe never did: it woke one and moved
+> none. The requeue between two processes that finally did was only possible
+> once shared futexes were keyed by the memory rather than the mapping.
 
 Robust futexes tell an even better story, because there the bug was hidden
 behind another bug.
@@ -268,7 +285,139 @@ interval timers whose CPU-time variants are driven by a sampler because the
 underlying timer subsystem only offers monotonic and realtime clocks
 (Chapter 10).
 
-## 14.6 The pattern
+## 14.6 Saying you are asleep
+
+A blocked task owes one thing Chapter 12 did not list: it has to say it is
+blocked. AOK has no scheduler of its own to ask, so "asleep" is a flag,
+`io_block`, which `TASK_MAY_BLOCK` sets around a call that may wait. Three
+things read it. `/proc/<pid>/stat` says `S` for a task with the flag and `R`
+without it. The guest load average counts every task without it. And the
+address-space barrier, which sends SIGUSR1 to a process's other threads when one
+of them maps or unmaps memory so that they let go of the address space, skips a
+task that has it, because a thread parked in a syscall holds nothing to let go
+of.
+
+`read`, `write`, `poll`, `futex`, `wait4` and `nanosleep` set it. `epoll_wait`,
+`msgrcv`, `msgsnd`, `semop`, `io_getevents` and every FUSE request made from
+`stat` or `mkdir` never did. A child idling in `epoll_wait` read `R` for as long
+as anyone looked, and one left there for 65 seconds lifted the 1-minute load
+average from 0.00 to 0.66. Every node, asyncio, dbus or systemd process sitting
+in its event loop added one to `uptime`.
+
+The barrier made the rest worse than untidy. `wait_for` reports a bare SIGUSR1
+as an interruption without asking whether a signal is pending, so a thread in
+`msgrcv` whose siblings called `mmap` failed with `EINTR` a few milliseconds
+into its wait, with nothing sent. (`epoll_wait` was spared only because
+`poll_wait` already ignored a bare poke.) A FUSE `stat` was cut short the same
+way and told the daemon its request had been interrupted. The guest never saw
+that `EINTR`, but only because the path walk looked the name up again.
+
+The fix, `wait_for_blocked`, has two halves, and it needs both. It sets
+`io_block` across the wait, putting back the old value rather than clearing it,
+because a FUSE request can be made from inside `read`, which has set it already.
+And it believes `_EINTR` only when a signal or a checkpoint freeze is actually
+pending, reporting anything else as a spurious wakeup the caller re-checks. The
+flag alone leaves a race, because the barrier can read it just before it is set.
+That race is rare enough to have been seen once in some hundreds of tries, on an
+`inotify` read, so the test forces it: `ISH_TEST_POKE_BLOCKED_TASKS` makes the
+barrier poke a named task even while it is asleep. Forced, it showed which older
+waits trusted the flag alone, and it was nearly all of them. `eventfd`,
+`inotify` and `timerfd` reads, terminal reads and writes, FIFO opens, reads and
+writes, `F_SETLKW` and `flock` all returned `EINTR` within milliseconds, and
+they are on `wait_for_blocked` now too. The signal waits are the exception, and
+not only for scheduling reasons: `rt_sigtimedwait` waits for signals it has
+blocked, whose arrival looks exactly like the mark a poke leaves, so it has to
+look at its set before it can call a wakeup spurious.
+
+The sweep turned up the flag's other failure as well: set and never cleared.
+`TASK_MAY_BLOCK` is a `for` loop, and a `return` from its body skips the
+clearing at the bottom. `flock` returned from inside it on `EAGAIN`, so a
+process whose `LOCK_NB` request found the lock taken went on running with the
+flag still up: `S` in `/proc`, left out of the load average, and not poked by
+the barrier, until its next blocking call. Nothing in the macro can prevent
+that. Only the rule can: leave the body by falling off its end, or by `break`.
+
+> **The test that passed on the bug**
+>
+> A poke sets a flag its target clears only when it next runs guest code, and
+> the barrier skips a thread whose flag is still up. So a thread blocked in a
+> syscall is poked at most once. The first version of `blocked_wait_state`
+> started its mapping thread first and the waiting thread second, and for the
+> FUSE request that one poke was always delivered on the way in, at a host
+> syscall before the wait existed. The check passed on the unfixed kernel.
+> Started the other way round, waiter first and siblings once it is waiting,
+> the poke has nowhere to land but the wait.
+
+## 14.7 Waking on time
+
+Every wait in this chapter that has a deadline ends on a host timer, and for a
+long time nobody asked when. Darwin coalesces timers to save power: a sleep may
+end late by a quarter of the time asked for, up to 5 ms, and by twice that while
+the user is idle. On an idle device the kernel takes all of it. On an M4 iPad a
+5 ms periodic POSIX timer delivered each expiry a millisecond after its
+boundary, and a 50 ms one five milliseconds after. A 40 ms `FUTEX_WAIT` took
+45 ms, and `poll` came back a millisecond after its timeout. Linux, on an
+x86_64 box, was within 15 µs for timers and within its 50 µs of slack for
+sleeps.
+
+It was found by a test that failed one round in twelve, and only on the iPad.
+`timer_conventions` blocks a 5 ms timer's signal, sleeps exactly one second,
+takes the signal and checks that nothing is queued behind it: two hundred
+periods counted on one signal, which is what `si_overrun` is for. On the iPad a
+fresh signal sometimes followed the first by ten microseconds. The nap and the
+200th expiry were due at the same instant, and both host sleeps were late. When
+the nap came out less late, the guest took its signal before the timer thread
+had delivered the expiry that should have been counted on it.
+
+A thread's QoS does not change the leeway, and `mach_wait_until`,
+`pthread_cond_timedwait` and `select` get it too. A kqueue timer marked
+`NOTE_CRITICAL` does not, so that is now how each kind of wait keeps its
+deadline:
+
+- `host_nanosleep_precise` covers the timer thread and `nanosleep`'s slices.
+- For `poll`, `select` and `epoll_wait`, a timer is added to the same `kevent`.
+- The condition-variable waits (`FUTEX_WAIT`, `sigtimedwait`) need a service
+  thread, because a thread cannot wait on a condition and a kqueue at once.
+  Its timer broadcasts the waiter's condition at the deadline.
+
+The old coalesced timeout stays behind each one as a backstop. `timer_lateness`
+checks the signature of coalescing rather than a number: a 40 ms wait must end
+no later than a 2 ms one. Coalescing breaks that by 4 to 10 ms; load does not
+break it.
+
+The test's own assumption outlived the fix, and deserved to. Linux works out a
+timer's overruns from the clock when its signal is taken. AOK counts each expiry
+as its thread delivers it, so an expiry due at the instant of the take can still
+arrive, microseconds later, as a fresh signal. The check now allows one such
+signal and no backlog. It also caught `timer_getoverrun` following the signal
+still queued. Linux latches the count of the signal that was taken.
+
+The latch had one more thing to tell apart. `alarm` and `setitimer` sent their
+signals as `SI_TIMER` with timer id 0, which is exactly what POSIX timer 0's
+signal looks like, and timer 0 is the one `timer_create` with no `sigevent`
+gives a process on SIGALRM. With both in use, timer 0's expiry was counted as an
+overrun onto a waiting itimer SIGALRM, and taking an itimer SIGALRM reset timer
+0's count to zero. Linux sends every itimer's signal as `SI_KERNEL`, with no
+sender, and so does AOK now.
+
+## 14.8 Not sleeping yet
+
+Since 559 some waits do not sleep at first at all. A task that has just
+sent something and waits for the answer usually has it within microseconds,
+and being put to sleep and woken costs more than that: two native processes
+passing a byte each way over a pipe take 4.1 µs a round trip blocked in
+`read`, 2.1 µs retrying the read first, and 7.0 µs the way AOK used to wait.
+So a pipe or file read, a blocking socket call and a queued `FUTEX_WAIT`
+look again for up to 25 µs before they sleep (`util/wait_spin.h`) — bounded
+by time, because a fixed count was too short on one machine and long enough
+on another — and a wait that found nothing skips the looking for the next 1,
+3, 7 … 63 waits, so an idle connection does not pay for it. In the arm64
+guest on the Mac a pipe round trip went from 8.9 µs to 2.8, a unix socket's
+from 9.8 to 3.2. One version kept a wake pipe per task to save two `close`s a
+wait, and on a host allowing 256 descriptors ran the suite out of them; the
+pipe is made per wait again, on what is now the slow path.
+
+## 14.9 The pattern
 
 Every subsystem in this chapter is the same two-part construction: a thing to
 wait on, and a thing to wake it. In every single case, the bugs were in the
@@ -294,7 +443,15 @@ spends most of its time on threads that are asleep when they should not be.
 [kernel/aio.c](../../kernel/aio.c), [kernel/sysvsem.c](../../kernel/sysvsem.c),
 [kernel/sysvmsg.c](../../kernel/sysvmsg.c), [kernel/time.c](../../kernel/time.c),
 [kernel/signal.c](../../kernel/signal.c) (`signalfd_wakeup_task`),
-`tests/manual/futex_robust_requeue.c`, `tests/manual/pidfd_epoll_deadlock.c`,
+[util/sync.c](../../util/sync.c) (`wait_for_blocked`, `deadline_wake_arm`),
+[util/wait_spin.h](../../util/wait_spin.h),
+[util/timer.c](../../util/timer.c) (`host_nanosleep_precise`),
+[kernel/task.c](../../kernel/task.c) (`task_poke_shared_mem`, `guest_count_runnable`),
+[fs/fuse.c](../../fs/fuse.c),
+`tests/manual/futex_robust_requeue.c`, `tests/manual/futex_shared_mapping.c`,
+`tests/manual/pidfd_epoll_deadlock.c`,
+`tests/manual/blocked_wait_state.c`, `tests/manual/timer_lateness.c`,
+`tests/manual/timer_conventions.c`,
 [docs/TODO.md](../../docs/TODO.md).
 
 *Story:* `sudo something >/dev/null` segfaulting before `main` — because Darwin's

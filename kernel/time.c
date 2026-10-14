@@ -2,12 +2,14 @@
 #define _GNU_SOURCE
 #include <sys/resource.h>
 #endif
+#include "kernel/pid_ns.h"
 #include "debug.h"
 #include <time.h>
 #include <signal.h>
 #include <sys/time.h>
 #include <string.h>
 #include "kernel/calls.h"
+#include "kernel/checkpoint.h"
 #include "kernel/errno.h"
 #include "kernel/resource.h"
 #include "kernel/time.h"
@@ -15,6 +17,9 @@
 #include "util/timer.h"
 #include <limits.h>
 #include <sys/poll.h>
+#include "kernel/anonfd_ckpt.h"
+#include "kernel/timer_ckpt.h"
+#include "platform/platform.h"
 
 // Linux encodes a per-process or per-thread CPU clock into a NEGATIVE clockid:
 //
@@ -149,9 +154,9 @@ static struct itimerspec_ timer_spec_from_real(struct timer_spec spec) {
 static struct timer_spec timer_spec_to_real64(struct itimerspec64_ itspec) {
     struct timer_spec spec = {
         .value.tv_sec = itspec.value.sec,
-        .value.tv_nsec = itspec.value.nsec,
+        .value.tv_nsec = timespec64_nsec_from_guest(itspec.value.nsec),
         .interval.tv_sec = itspec.interval.sec,
-        .interval.tv_nsec = itspec.interval.nsec,
+        .interval.tv_nsec = timespec64_nsec_from_guest(itspec.interval.nsec),
     };
     return spec;
 };
@@ -186,10 +191,16 @@ static struct timespec timespec_from_guest(struct timespec_ ts) {
     };
 }
 
+int64_t timespec64_nsec_from_guest(int64_t nsec) {
+    if (current != NULL && !task_is_64bit(current))
+        return (int64_t) (uint32_t) nsec;
+    return nsec;
+}
+
 static struct timespec timespec_from_guest64(struct timespec64_ ts) {
     return (struct timespec) {
         .tv_sec = ts.sec,
-        .tv_nsec = ts.nsec,
+        .tv_nsec = timespec64_nsec_from_guest(ts.nsec),
     };
 }
 
@@ -226,8 +237,10 @@ int read_guest_timeval_abi(enum guest_abi abi, guest_addr_t addr, struct timeval
         struct timeval_ guest;
         if (user_get(addr, guest))
             return _EFAULT;
-        out->tv_sec = guest.sec;
-        out->tv_usec = guest.usec;
+        // compat_timeval's fields are signed 32-bit: a time before 1970 (and a
+        // negative timeout, which callers refuse) keeps its sign
+        out->tv_sec = (sdword_t) guest.sec;
+        out->tv_usec = (sdword_t) guest.usec;
     }
     return 0;
 }
@@ -340,7 +353,18 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
         // delivered while we were between slices, and on the first pass it may
         // predate the sleep entirely.
         struct timespec left = timespec_subtract(deadline, timespec_now(CLOCK_MONOTONIC));
-        if (task_wake_signal_pending()) {
+        // A CHECKPOINT FREEZE breaks the sleep as well as a signal does, and
+        // it has to be asked about separately: a freeze is not a signal, and
+        // this loop is the one blocking path in the kernel that does not go
+        // through wait_for (which consumes wait_interrupted for it).
+        //
+        // Without this a sleeping task never reached a syscall boundary and
+        // the freeze timed out on it -- `sleep 6` was enough. It hid behind
+        // timing for a while: a checkpoint taken the instant after `sleep &`
+        // catches the process still doing its dynamic loading, at a syscall
+        // boundary every few microseconds, and only one taken a second later
+        // finds it actually asleep.
+        if (task_wake_signal_pending() || checkpoint_freeze_pending()) {
             if (timespec_positive(left))
                 *rem = left;
             errno = EINTR;
@@ -361,7 +385,19 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
         // reports having never yielded.
         if (current != NULL)
             current->nvcsw++;
-        TASK_MAY_BLOCK { res = nanosleep(&slice, NULL); }
+        // The end of the sleep with Linux's slack and no more: a plain
+        // nanosleep woke a quarter of the slice late on Darwin, so every guest
+        // sleep of 20ms or more ran up to 5ms long (see
+        // host_nanosleep_precise). The slices before it are only there to look
+        // for signals, and may be as late as Darwin likes -- the deadline is
+        // re-read after each -- so long as the last is left to a precise one:
+        // a coalesced 50ms slice can run up to 10ms over, so the precise ones
+        // take the last 100ms.
+        bool closing = left.tv_sec == 0 && left.tv_nsec <= 2 * SLEEP_SLICE_NS;
+        TASK_MAY_BLOCK {
+            res = closing ? host_nanosleep_precise(slice, HOST_TIMER_SLACK_NS)
+                : nanosleep(&slice, NULL);
+        }
         if (res < 0 && errno != EINTR) {
             // Only EINVAL is possible (a bad slice would be our own bug), but
             // don't silently spin on it.
@@ -379,13 +415,35 @@ static int host_sleep_interruptible(struct timespec req, struct timespec *rem) {
             // long enough to be mistaken for a signal-delivery bug in AOK.
             if (n == 1)
                 printk("WARNING: host thread went deaf to its wake signal while sleeping "
-                       "(pid=%d comm=%s); repaired. Further occurrences are counted, not logged.\n",
+                       "(pid=%d comm=%s); repaired. Further occurrences are counted in "
+                       "/proc/ish/wake_signals, not logged.\n",
                        current->pid, current->comm);
         }
 
         // `left` is recomputed from the deadline every pass, so an EINTR that
         // turns out not to concern the guest costs no sleep time.
     }
+}
+
+// What an interrupted sleep reports: _ERESTART_NOHAND for a job-control stop,
+// as signal_restart_or_eintr_nohand decides, and for a checkpoint freeze too,
+// which arrives here as a bare EINTR.
+//
+// syscall_result_should_restart restarts every call a freeze interrupts, so
+// the EINTR was restarted anyway -- but as the EINTR it was, and the sleep had
+// recorded no deadline for the call that re-executes it. That call slept its
+// whole length again: a plain save two seconds into a six-second nanosleep made
+// it take eight, and across a restore `sleep 5`, frozen three seconds in,
+// slept five more where Linux sleeps the two that were left. Reported as the
+// restart it is, the sleep keeps its deadline like any other restarted one,
+// the checkpoint carries that deadline in the image, and a handler that runs
+// before the call re-executes -- for a signal that came during the freeze --
+// ends it with EINTR, which is what that signal would have done anyway.
+static int sleep_restart_or_eintr(void) {
+    int restarted = signal_restart_or_eintr_nohand(_EINTR);
+    if (restarted == _EINTR && checkpoint_freeze_pending())
+        restarted = _ERESTART_NOHAND;
+    return restarted;
 }
 
 static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespec req,
@@ -465,7 +523,11 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
     }
 
     if (flags & TIMER_ABSTIME_) {
-        req = timespec_subtract(req, timespec_now(clock_id));
+        // The deadline is in the GUEST's clock, so "now" must be too -- the
+        // difference is then an interval, which the host sleep below can use
+        // as-is. Subtracting the host's now made every absolute monotonic
+        // sleep look already expired and return instantly.
+        req = timespec_subtract(req, guest_clock_now(clock, clock_id));
         if (!timespec_positive(req))
             return 0;
     }
@@ -500,24 +562,15 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
     }
     if (res < 0) {
         int err = errno_map();
-        // ERESTARTNOHAND, exactly as for poll: a job-control stop resumes the
-        // sleep transparently (carrying the deadline across), while a handler
-        // actually running still gives the guest its EINTR.
-        if (err == _EINTR) {
-            int restarted = signal_restart_or_eintr_nohand(err);
-            if (restarted == _ERESTART_NOHAND) {
-                if (current != NULL && !(flags & TIMER_ABSTIME_)) {
-                    current->sleep_restart_deadline = sleep_deadline;
-                    current->sleep_restart_valid = true;
-                }
-                return (dword_t) restarted;
-            }
-        }
         // POSIX: an interrupted *relative* sleep reports the time remaining so
         // the caller (or its libc restart logic) can resume. The host nanosleep
         // already populated `rem`; hand it back. Best effort — still report
         // EINTR even if the rem store faults. (iSH previously dropped rem here,
         // so amd64 nanosleep left the caller's buffer untouched on EINTR.)
+        //
+        // Before the restart is decided, not only when there is none: Linux
+        // writes it before returning ERESTART_RESTARTBLOCK too, so a handler
+        // that then cancels the restart still leaves the caller its remainder.
         if (err == _EINTR && rem_addr != 0 && !(flags & TIMER_ABSTIME_)) {
             if (rem_time64) {
                 struct timespec64_ rem_ts = timespec_to_guest64(rem);
@@ -525,6 +578,21 @@ static dword_t clock_nanosleep_common(dword_t clock, int_t flags, struct timespe
             } else {
                 struct timespec_ rem_ts = timespec_to_guest(rem);
                 (void) user_put(rem_addr, rem_ts);
+            }
+        }
+        // ERESTARTNOHAND, exactly as for poll: a job-control stop -- or a
+        // checkpoint freeze -- resumes the sleep transparently, carrying the
+        // deadline across, while a handler actually running still gives the
+        // guest its EINTR.
+        if (err == _EINTR) {
+            int restarted = sleep_restart_or_eintr();
+            if (restarted == _ERESTART_NOHAND) {
+                if (current != NULL && !(flags & TIMER_ABSTIME_)) {
+                    current->sleep_restart_deadline = sleep_deadline;
+                    current->sleep_restart_clock = clock;
+                    current->sleep_restart_valid = true;
+                }
+                return (dword_t) restarted;
             }
         }
         return err;
@@ -591,6 +659,7 @@ dword_t sys_ppoll_time64(addr_t fds, dword_t nfds, addr_t timeout_addr, addr_t s
         struct timespec64_ timeout_timespec;
         if (user_get(timeout_addr, timeout_timespec))
             return _EFAULT;
+        timeout_timespec.nsec = timespec64_nsec_from_guest(timeout_timespec.nsec);
         if (timeout_timespec.sec < 0 || timeout_timespec.nsec < 0 || timeout_timespec.nsec >= 1000000000)
             return _EINVAL;
 
@@ -651,6 +720,54 @@ dword_t sys_clock_gettime(dword_t clock, addr_t tp) {
     return sys_clock_gettime_guest(clock, tp);
 }
 
+// clock_gettime(2) for every clock but the CPU-time ones: the host's reading
+// of the clock under it, moved onto the guest's origin for a boot-relative
+// clock -- on those the host's own reading is the HOST's uptime, which on a
+// Mac up for weeks is weeks (kernel/task.h). The one computation behind both
+// system call bodies below and the vDSO's clock register, so the three cannot
+// come to disagree.
+static int clock_gettime_host_backed(uint_t clock, struct timespec *ts) {
+    clockid_t clock_id;
+    if (clockid_to_real(clock, &clock_id))
+        return _EINVAL;
+    if (clock_gettime(clock_id, ts) < 0)
+        return errno_map();
+    *ts = guest_clock_from_host(clock, *ts);
+#if defined(__APPLE__)
+    // Darwin's wall clock is whole microseconds -- clock_gettime,
+    // clock_gettime_nsec_np and mach_get_times alike -- while APFS stamps a
+    // file in nanoseconds. So a file written in the same microsecond as a
+    // later read was dated after it: on the Mac host, natively, 6969 of 20000
+    // write-then-read pairs, by up to 786 ns, and on the M4 iPad vdso_clock's
+    // "an mtime is never in the future" failed 17 of 300 times. Linux reads
+    // REALTIME in nanoseconds and stamps files from a coarse clock, so there a
+    // stamp is never ahead of a later read.
+    //
+    // Each read is reported at the END of its microsecond, which no stamp
+    // made within it can pass (0 of 20000 on the same host). Still whole
+    // microseconds apart and never decreasing; at most 999 ns ahead of the
+    // host and never behind it, so a REALTIME deadline the guest computes from
+    // it cannot come due early. gettimeofday reports the same microsecond.
+    if (clock_id == CLOCK_REALTIME)
+        ts->tv_nsec = ts->tv_nsec / 1000 * 1000 + 999;
+#endif
+    return 0;
+}
+
+int64_t vdso_clock_ns(uint32_t clock) {
+    // The CPU-time clocks are the system call's, as Linux's vDSO leaves them
+    // to its kernel: usage is the kernel's bookkeeping. (The dynamic ids
+    // glibc builds for them fail clockid_to_real and land there too.)
+    if (clock == CLOCK_PROCESS_CPUTIME_ID_ || clock == CLOCK_THREAD_CPUTIME_ID_)
+        return -1;
+    struct timespec ts;
+    if (clock_gettime_host_backed(clock, &ts) < 0)
+        return -1;
+    if (ts.tv_sec < 0 || ts.tv_sec >= INT64_MAX / 1000000000)
+        return -1;
+    return (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
 static dword_t sys_clock_gettime_guest_abi(dword_t clock, guest_addr_t tp, enum guest_abi abi) {
     STRACE("clock_gettime(%d, 0x%x)", clock, tp);
 
@@ -670,11 +787,9 @@ static dword_t sys_clock_gettime_guest_abi(dword_t clock, guest_addr_t tp, enum 
         ts.tv_sec = usec / 1000000;
         ts.tv_nsec = (usec % 1000000) * 1000;
     } else {
-        clockid_t clock_id;
-        if (clockid_to_real(clock, &clock_id)) return _EINVAL;
-        int err = clock_gettime(clock_id, &ts);
+        int err = clock_gettime_host_backed(clock, &ts);
         if (err < 0)
-            return errno_map();
+            return err;
     }
     if (write_guest_timespec_abi(abi, tp, &ts))
         return _EFAULT;
@@ -716,11 +831,9 @@ dword_t sys_clock_gettime64_guest(dword_t clock, guest_addr_t tp) {
         ts.tv_sec = usec / 1000000;
         ts.tv_nsec = (usec % 1000000) * 1000;
     } else {
-        clockid_t clock_id;
-        if (clockid_to_real(clock, &clock_id)) return _EINVAL;
-        int err = clock_gettime(clock_id, &ts);
+        int err = clock_gettime_host_backed(clock, &ts);
         if (err < 0)
-            return errno_map();
+            return err;
     }
     struct timespec64_ t = timespec_to_guest64(ts);
     
@@ -853,7 +966,7 @@ static dword_t clock_settime_common(dword_t clock, guest_addr_t tp, bool time64)
         if (user_get(tp, guest_ts))
             return _EFAULT;
         ts.tv_sec = (time_t) guest_ts.sec;
-        ts.tv_nsec = (long) guest_ts.nsec;
+        ts.tv_nsec = (long) timespec64_nsec_from_guest(guest_ts.nsec);
     } else if (read_guest_timespec_abi(current->abi, tp, &ts)) {
         return _EFAULT;
     }
@@ -865,6 +978,20 @@ static dword_t clock_settime_common(dword_t clock, guest_addr_t tp, bool time64)
 }
 
 dword_t sys_clock_settime(dword_t clock, addr_t tp) {
+    if (clock != CLOCK_REALTIME_ && clock != CLOCK_REALTIME_ALARM_)
+        return clock_settime_errno(clock);
+    return clock_settime_common(clock, tp, false);
+}
+
+// Same call with the pointer at its real width. clock_settime_common has always
+// taken a guest_addr_t; it was the addr_t in the wrapper above that threw the
+// top half away, and the native dispatchers for the 64-bit ABIs called through
+// it. A timespec on the stack survived, because a guest stack address fits in
+// 32 bits -- one in an mmap'd page (which is where a heap allocation lands) did
+// not, and the call came back EFAULT instead of the EPERM it had earned.
+// Measured the same way on all three 64-bit guests: amd64 0x7ffffdfc7000,
+// arm64 0x7fffbdffd000, riscv64 0x3fbdf64000.
+dword_t sys_clock_settime_guest(dword_t clock, guest_addr_t tp) {
     if (clock != CLOCK_REALTIME_ && clock != CLOCK_REALTIME_ALARM_)
         return clock_settime_errno(clock);
     return clock_settime_common(clock, tp, false);
@@ -1002,27 +1129,52 @@ static bool time_warning_trace_enabled(void) {
 // if that thread had it blocked, and the callback dereferenced a FREED task if
 // that thread exited while the timer was still armed. The group is safe to
 // hold: exit_tgroup frees these timers when the group dies.
-static void itimer_notify(struct tgroup *group) {
-    struct siginfo_ info = {
-        .code = SI_TIMER_,
-    };
-    send_signal_to_group(group, SIGALRM_, info);
+//
+// SI_KERNEL, with no sender and no timer: Linux sends every itimer's signal
+// as SEND_SIG_PRIV (measured on 6.12: alarm, ITIMER_REAL, ITIMER_VIRTUAL and
+// ITIMER_PROF all arrive with si_code 128, si_pid 0, si_uid 0). This said
+// SI_TIMER, which is what makes a signal a POSIX timer's -- and with timer id
+// 0 it was POSIX timer 0's, the timer timer_create(clock, NULL, ...) gives a
+// process its first SIGALRM from. That timer's next expiry was then counted
+// as an overrun onto a queued SIGALRM (signal_timer_count_overrun), and
+// taking one reset its timer_getoverrun to 0 (signal_timer_taken).
+//
+// Missed periods (`expirations` > 1) are not counted: SIGALRM is a standard
+// signal, pending at most once, and carries no overrun.
+static void itimer_notify(void *data, uint64_t UNUSED(expirations)) {
+    struct tgroup *group = data;
+    send_signal_to_group(group, SIGALRM_, SIGINFO_NIL);
 }
 
 // ITIMER_VIRTUAL/PROF: neither has a native CPU-time clock this codebase's
 // timer subsystem can wait on (util/timer.h's struct timer only supports
-// CLOCK_MONOTONIC/CLOCK_REALTIME), so a CLOCK_MONOTONIC sampler ticks at a
-// fixed period, comparing accumulated CPU time (via rusage_get_group_of,
-// summed across the whole thread group like real Linux's VIRTUAL/PROF
-// clocks) against a deadline, firing SIGVTALRM/SIGPROF and rearming from
-// the interval like a real CPU-time timer would. This trades exact
-// delivery timing for zero added cost on the syscall/context-switch hot
-// path -- only processes that actually call setitimer(VIRTUAL/PROF) pay
-// for the sampler thread, and even then only a fixed, coarse tick rate.
+// CLOCK_MONOTONIC/CLOCK_REALTIME), so a CLOCK_MONOTONIC sampler ticks,
+// comparing accumulated CPU time (via rusage_get_group_cpu_of, summed across
+// the whole thread group like real Linux's VIRTUAL/PROF clocks) against a
+// deadline, firing SIGVTALRM/SIGPROF and rearming from the interval like a
+// real CPU-time timer would. This trades exact delivery timing for zero added
+// cost on the syscall/context-switch hot path -- only processes that
+// actually call setitimer(VIRTUAL/PROF) pay for the sampler.
+//
+// The tick has to keep up with the timer, and it did not. It was a fixed
+// 20 ms, a tick fires a timer at most once (the signal does not queue), and a
+// fire re-armed from the moment it was seen rather than from the deadline --
+// so a 10 ms interval fired every 20 ms of wall time at best: half the rate
+// asked for with one busy thread, a quarter with two (their CPU time runs at
+// twice wall time), a fifth at 4 ms. A sampling profiler scaled every figure
+// it printed by that much. Now the deadline advances by one interval per
+// fire, so a timer that fell behind catches up rather than losing the
+// difference -- which also absorbs the 10 ms steps a spinning thread's Darwin
+// CPU clock moves in -- and while a periodic timer is armed the tick is its
+// interval divided by the CPU count, since that many busy threads owe that
+// many signals. Linux looks on every scheduler tick (camd: HZ 250) and
+// delivers 0.99-1.00 of them (tests/manual/itimer_prof_rate).
 #define ITIMER_VPROF_SAMPLE_MS 20
+#define ITIMER_VPROF_MIN_TICK_NS 1000000L
+// The same sampler when all it has to do is RLIMIT_CPU (cpu_limit_watch).
+#define CPU_LIMIT_SAMPLE_MS 50
 
-static struct timespec cpu_time_now_of(struct tgroup *group, bool include_system) {
-    struct rusage_ rusage = rusage_get_group_of(group);
+static struct timespec cpu_time_of(struct rusage_ rusage, bool include_system) {
     long usec = rusage.utime.usec + (include_system ? rusage.stime.usec : 0);
     struct timespec ts = {
         .tv_sec = rusage.utime.sec + (include_system ? rusage.stime.sec : 0),
@@ -1035,6 +1187,13 @@ static struct timespec cpu_time_now_of(struct tgroup *group, bool include_system
     return ts;
 }
 
+static struct timespec cpu_time_now_of(struct tgroup *group, bool include_system) {
+    // The CPU-only read: this is asked every tick of a process's sampler, and
+    // the full rusage also walks every thread's address space for maxrss,
+    // which none of these callers use.
+    return cpu_time_of(rusage_get_group_cpu_of(group), include_system);
+}
+
 // Must be called with group->lock held.
 static bool itimer_vprof_maybe_fire(struct cpu_itimer_state *state, struct timespec cpu_now) {
     if (!state->armed)
@@ -1042,31 +1201,106 @@ static bool itimer_vprof_maybe_fire(struct cpu_itimer_state *state, struct times
     struct timespec remaining = timespec_subtract(state->deadline, cpu_now);
     if (timespec_positive(remaining))
         return false;
+    // From the deadline, not from now: see the comment above.
     if (timespec_positive(state->interval))
-        state->deadline = timespec_add(cpu_now, state->interval);
+        state->deadline = timespec_add(state->deadline, state->interval);
     else
         state->armed = false;
     return true;
 }
 
-// Same as itimer_notify: the group, not a thread. SIGVTALRM/SIGPROF are
-// process-directed too.
-static void itimer_vprof_sampler_notify(void *data) {
+// The sampler's period for what is armed now. Called with group->lock held.
+static long itimer_vprof_tick_ns(struct tgroup *group) {
+    long long tick = ITIMER_VPROF_SAMPLE_MS * 1000000LL;
+    long long ncpu = get_cpu_count();
+    if (ncpu < 1)
+        ncpu = 1;
+    const struct cpu_itimer_state *armed[] = {&group->itimer_virtual, &group->itimer_prof};
+    for (unsigned i = 0; i < 2; i++) {
+        if (!armed[i]->armed || !timespec_positive(armed[i]->interval))
+            continue;
+        long long interval = (long long) armed[i]->interval.tv_sec * 1000000000LL +
+                             armed[i]->interval.tv_nsec;
+        if (interval / ncpu < tick)
+            tick = interval / ncpu;
+    }
+    if (tick < ITIMER_VPROF_MIN_TICK_NS)
+        tick = ITIMER_VPROF_MIN_TICK_NS;
+    return (long) tick;
+}
+
+// Same as itimer_notify: the group, not a thread, and SI_KERNEL. SIGVTALRM/
+// SIGPROF are process-directed too.
+// Only a tick: what is due is decided from the CPU clocks, not from how many
+// ticks there were.
+static void itimer_vprof_sampler_notify(void *data, uint64_t UNUSED(expirations)) {
     struct tgroup *group = data;
 
-    struct timespec cpu_user = cpu_time_now_of(group, false);
-    struct timespec cpu_total = cpu_time_now_of(group, true);
+    // One reading for both clocks: each walks every thread of the group.
+    struct rusage_ usage = rusage_get_group_cpu_of(group);
+    struct timespec cpu_user = cpu_time_of(usage, false);
+    struct timespec cpu_total = cpu_time_of(usage, true);
 
     lock(&group->lock, 0);
     bool fire_virtual = itimer_vprof_maybe_fire(&group->itimer_virtual, cpu_user);
     bool fire_prof = itimer_vprof_maybe_fire(&group->itimer_prof, cpu_total);
+    // RLIMIT_CPU, on the same clock as ITIMER_PROF: user plus system.
+    int limit_sig = rlimit_cpu_due_locked(group,
+            (uint64_t) cpu_total.tv_sec * 1000000000ull + (uint64_t) cpu_total.tv_nsec);
     unlock(&group->lock);
 
-    struct siginfo_ info = { .code = SI_TIMER_ };
     if (fire_virtual)
-        send_signal_to_group(group, SIGVTALRM_, info);
+        send_signal_to_group(group, SIGVTALRM_, SIGINFO_NIL);
     if (fire_prof)
-        send_signal_to_group(group, SIGPROF_, info);
+        send_signal_to_group(group, SIGPROF_, SIGINFO_NIL);
+    // Process-directed with si_code SI_KERNEL, as Linux sends them.
+    if (limit_sig != 0)
+        send_signal_to_group(group, limit_sig, SIGINFO_NIL);
+}
+
+// Start the tick that drives both, if it is not running. Called with
+// group->lock held.
+static long itimer_vprof_sampler_start_locked(struct tgroup *group) {
+    if (group->itimer_vprof_sampler == NULL) {
+        struct timer *sampler = timer_new(CLOCK_MONOTONIC, itimer_vprof_sampler_notify, group);
+        if (IS_ERR(sampler))
+            return PTR_ERR(sampler);
+        group->itimer_vprof_sampler = sampler;
+    }
+    // (Re-)arm the sampler's own recurring tick; harmless if already
+    // running. Left running for the group's lifetime once started rather
+    // than paused when both VIRTUAL and PROF are disarmed -- see the
+    // struct field comment on itimer_vprof_sampler in kernel/task.h -- but
+    // at the relaxed period again then, so a profiler that has stopped does
+    // not leave a millisecond tick behind.
+    long tick = itimer_vprof_tick_ns(group);
+    struct timer_spec sample_spec = {
+        .value = {.tv_nsec = tick},
+        .interval = {.tv_nsec = tick},
+    };
+    timer_set(group->itimer_vprof_sampler, sample_spec, NULL);
+    return 0;
+}
+
+void cpu_limit_watch(struct tgroup *group) {
+    lock(&group->lock, 0);
+    // Already ticking for an interval timer, or for an earlier limit: that
+    // tick asks about the limit too.
+    if (group->itimer_vprof_sampler == NULL) {
+        struct timer *sampler = timer_new(CLOCK_MONOTONIC, itimer_vprof_sampler_notify, group);
+        if (!IS_ERR(sampler)) {
+            group->itimer_vprof_sampler = sampler;
+            // Coarser than the interval timers' tick: a CPU limit is in
+            // seconds, and a `ulimit -t` session gives every process one. An
+            // interval timer armed later re-arms it at ITIMER_VPROF_SAMPLE_MS.
+            struct timer_spec spec = {
+                .value = {.tv_nsec = CPU_LIMIT_SAMPLE_MS * 1000000},
+                .interval = {.tv_nsec = CPU_LIMIT_SAMPLE_MS * 1000000},
+            };
+            timer_set(sampler, spec, NULL);
+        }
+    }
+    unlock(&group->lock);
 }
 
 // Must be called with group->lock held (matches itimer_set's caller).
@@ -1101,28 +1335,15 @@ static long itimer_vprof_set(struct tgroup *group, int which, struct timer_spec 
     state->interval = spec.interval;
     if (timespec_is_zero(spec.value)) {
         state->armed = false;
+        // Back to the relaxed tick, if the sampler was ticking for this one.
+        if (group->itimer_vprof_sampler != NULL)
+            return itimer_vprof_sampler_start_locked(group);
         return 0;
     }
 
     state->armed = true;
     state->deadline = timespec_add(cpu_now, spec.value);
-
-    if (group->itimer_vprof_sampler == NULL) {
-        struct timer *sampler = timer_new(CLOCK_MONOTONIC, itimer_vprof_sampler_notify, group);
-        if (IS_ERR(sampler))
-            return PTR_ERR(sampler);
-        group->itimer_vprof_sampler = sampler;
-    }
-    // (Re-)arm the sampler's own recurring tick; harmless if already
-    // running. Left running for the group's lifetime once started rather
-    // than paused when both VIRTUAL and PROF are disarmed -- see the
-    // struct field comment on itimer_vprof_sampler in kernel/task.h.
-    struct timer_spec sample_spec = {
-        .value = {.tv_nsec = ITIMER_VPROF_SAMPLE_MS * 1000000},
-        .interval = {.tv_nsec = ITIMER_VPROF_SAMPLE_MS * 1000000},
-    };
-    timer_set(group->itimer_vprof_sampler, sample_spec, NULL);
-    return 0;
+    return itimer_vprof_sampler_start_locked(group);
 }
 
 static long itimer_set(struct tgroup *group, int which, struct timer_spec spec, struct timer_spec *old_spec) {
@@ -1132,7 +1353,7 @@ static long itimer_set(struct tgroup *group, int which, struct timer_spec spec, 
         return _EINVAL;
 
     if (!group->itimer) {
-        struct timer *timer = timer_new(CLOCK_REALTIME, (timer_callback_t) itimer_notify, group);
+        struct timer *timer = timer_new(CLOCK_REALTIME, itimer_notify, group);
         if (IS_ERR(timer))
             return PTR_ERR(timer);
         group->itimer = timer;
@@ -1402,21 +1623,25 @@ static dword_t sys_nanosleep_guest_abi(guest_addr_t req_addr, guest_addr_t rem_a
     }
     if (res < 0) {
         int err = errno_map();
-        // ERESTARTNOHAND: a job-control stop resumes the sleep transparently,
-        // carrying the deadline across; a handler running still gives EINTR.
+        // On EINTR report the remaining time (Linux does); best effort. Before
+        // the restart is decided, as in clock_nanosleep_common.
+        if (err == _EINTR && rem_addr != 0)
+            (void) write_guest_timespec_abi(abi, rem_addr, &rem);
+        // ERESTARTNOHAND: a job-control stop or a checkpoint freeze resumes
+        // the sleep transparently, carrying the deadline across; a handler
+        // running still gives EINTR.
         if (err == _EINTR) {
-            int restarted = signal_restart_or_eintr_nohand(err);
+            int restarted = sleep_restart_or_eintr();
             if (restarted == _ERESTART_NOHAND) {
                 if (current != NULL) {
                     current->sleep_restart_deadline = sleep_deadline;
+                    // Linux's nanosleep is CLOCK_MONOTONIC's.
+                    current->sleep_restart_clock = CLOCK_MONOTONIC_;
                     current->sleep_restart_valid = true;
                 }
                 return (dword_t) restarted;
             }
         }
-        // On EINTR report the remaining time (Linux does); best effort.
-        if (err == _EINTR && rem_addr != 0)
-            (void) write_guest_timespec_abi(abi, rem_addr, &rem);
         return err;
     }
     // A completed sleep does not touch rmtp -- see the same rule and the same
@@ -1565,37 +1790,57 @@ dword_t sys_adjtimex_guest(guest_addr_t tx_addr) {
 // gone reports its clock as far in the future, so an armed timer stops
 // counting down rather than firing spuriously -- Linux disarms such a timer,
 // and never firing is the same observable outcome.
+//
+// In nanoseconds, as the host keeps it. This counted in jiffies (USER_HZ 100),
+// /proc's unit, and timer_set takes "now" from here at the arming: a 5ms
+// one-shot armed at 7.3ms of CPU was anchored at 0, and due as soon as this
+// read 10ms. The timer thread samples after napping the time left on the wall
+// clock, so a thread that sleeps between bursts of work, using less CPU than
+// that, got its signal with as little as 0.2ms of the 5ms used
+// (tests/manual/timer_thread_cpu_early.c). A 1ms periodic timer saw the clock
+// move in 10ms jumps, and its expiries come ten at a time. Linux never fires a
+// thread CPU timer before the thread has used the time asked for.
+//
+// It can still be late. Darwin moves its figure for a thread that is running
+// only when that thread enters the kernel, and a guest thread in JIT code can
+// go a whole 10ms quantum without: read from the timer thread, the clock
+// stands still that long and then jumps (measured with thread_info on a
+// spinning thread). Late by up to that, as Linux is by up to a tick.
 static struct timespec posix_timer_thread_cpu_now(void *data) {
     struct posix_timer *timer = data;
-    struct task *task = pid_get_task_ref(timer->cpu_clock_pid);
+    struct task *task = pid_get_task_global_ref(timer->cpu_clock_pid);
     if (task == NULL) {
         struct timespec forever = { .tv_sec = INT64_MAX / 2, .tv_nsec = 0 };
         return forever;
     }
-    unsigned long utime = 0, stime = 0;
-    task_thread_cpu_time(task, &utime, &stime);
+    uint64_t user_ns = 0, system_ns = 0;
+    task_thread_cpu_time_ns(task, &user_ns, &system_ns);
     task_ref_cnt_mod(task, -1);
-    // task_thread_cpu_time counts in jiffies at USER_HZ = 100.
-    unsigned long ticks = utime + stime;
+    uint64_t ns = user_ns + system_ns;
     struct timespec now = {
-        .tv_sec = (time_t) (ticks / 100),
-        .tv_nsec = (long) ((ticks % 100) * 10000000L),
+        .tv_sec = (time_t) (ns / 1000000000),
+        .tv_nsec = (long) (ns % 1000000000),
     };
     return now;
 }
 
-static void posix_timer_callback(struct posix_timer *timer) {
+static void posix_timer_callback(void *data, uint64_t expirations) {
+    struct posix_timer *timer = data;
     if (timer->tgroup == NULL)
         return;
+    // A signal queued now stands for every expiry this call delivers: the
+    // first, and each period missed since as an overrun on it. Linux's count
+    // saturates at INT_MAX (DELAYTIMER_MAX).
+    uint64_t missed = expirations - 1;
     struct siginfo_ info = {
         .code = SI_TIMER_,
         .timer.timer = timer->timer_id,
-        .timer.overrun = 0,
+        .timer.overrun = missed > INT_MAX ? INT_MAX : (int_t) missed,
         .timer.value = timer->sig_value,
     };
     struct task *thread = NULL;
     if (timer->thread_pid != 0) {
-        thread = pid_get_task_ref(timer->thread_pid);
+        thread = pid_get_task_global_ref(timer->thread_pid);
     } else if (timer->tgroup->leader != NULL) {
         // SIGEV_SIGNAL targets the process, so fall back to the thread-group leader.
         thread = timer->tgroup->leader;
@@ -1607,15 +1852,18 @@ static void posix_timer_callback(struct posix_timer *timer) {
                thread != NULL ? thread->pid : 0, thread != NULL);
     // TODO: solve pid reuse. currently we have two ways of referring to a task: pid_t_ and struct task *. pids get reused. task struct pointers get freed on exit or reap. need a third option for cases like this, like a refcount layer.
     if (thread != NULL) {
-        // If the last signal from this timer is still queued, this expiration
-        // is an overrun, not a second signal. See
-        // signal_timer_count_overrun.
-        int overrun = signal_timer_count_overrun(thread, timer->signal, timer->timer_id);
-        if (overrun >= 0) {
-            timer->last_overrun = overrun;
-        } else {
-            timer->last_overrun = 0;
-            send_signal(thread, timer->signal, info);
+        // If the last signal from this timer is still queued, these
+        // expirations are overruns on it, not a second signal. See
+        // signal_timer_count_overrun. What timer_getoverrun reports is left
+        // alone: it changes when a signal is taken (signal_timer_taken).
+        if (signal_timer_count_overrun(thread, timer->signal, timer->timer_id,
+                                       expirations) < 0) {
+            // SIGEV_THREAD_ID to its thread; SIGEV_SIGNAL to the process,
+            // where any thread that can take it does (Linux's
+            // send_sigqueue with PIDTYPE_TGID). As the timer's own signal,
+            // which is queued even behind a pending one of its number that
+            // something else sent (see deliver_signal_unlocked_locked).
+            send_timer_signal(thread, timer->thread_pid != 0, timer->signal, info);
         }
         task_ref_cnt_mod(thread, -1);
     }
@@ -1667,7 +1915,7 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
         // process's CPU clock only for a process you already control, and
         // nothing in the guest asks for it; EINVAL is what it answers when the
         // clock names someone else.
-        if (cpu_pid != 0 && cpu_pid != current->tgid && cpu_pid != current->pid)
+        if (cpu_pid != 0 && current_pid_global(cpu_pid) != current->tgid && current_pid_global(cpu_pid) != current->pid)
             return _EINVAL;
         real_clockid = cpu_perthread ? CLOCK_THREAD_CPUTIME_ID
                                      : CLOCK_PROCESS_CPUTIME_ID;
@@ -1753,7 +2001,11 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
     // The documented default carries the timer id as sival_int.
     if (default_sigevent)
         sigev.value.sv_ptr = timer_id;
-    timer->timer = timer_new(real_clockid, (timer_callback_t) posix_timer_callback, timer);
+    timer->timer = timer_new(real_clockid, posix_timer_callback, timer);
+    timer->clock = clock;
+    timer->abstime = false;
+    // Not whatever the slot's last timer had latched.
+    timer->last_overrun = 0;
     // CLOCK_THREAD_CPUTIME_ID belongs to ONE thread, and the timer runs on its
     // own -- which is asleep, so its thread clock never advances and the
     // deadline never arrives. The timer was created and armed and reported
@@ -1773,7 +2025,9 @@ static int_t sys_timer_create_guest_abi(dword_t clock, guest_addr_t sigevent_add
         timer->thread_pid = 0;
     } else if (sigev.method == SIGEV_THREAD_ID_) {
         timer->tgroup = group;
-        timer->thread_pid = sigev.tid;
+        // The machine's number (kernel/pid_ns.h): the timer fires on a
+        // thread that is in no pid namespace.
+        timer->thread_pid = current_pid_global(sigev.tid);
     }
     unlock(&group->lock);
     return 0;
@@ -1886,9 +2140,16 @@ static int_t sys_timer_settime_common(dword_t timer_id, int_t flags, guest_addr_
     }
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
-        struct timespec now = timespec_now(timer->timer->clockid);
+        // Guest deadline minus guest now; the interval that comes out is what
+        // the host-clock timer thread arms on. See clock_nanosleep above.
+        struct timespec now = guest_clock_now(timer->clock, timer->timer->clockid);
         spec.value = timespec_subtract(spec.value, now);
     }
+    // Remembered because the arming itself is not: see posix_timer.abstime.
+    timer->abstime = (flags & TIMER_ABSTIME_) != 0;
+    // Setting a timer, armed or disarmed, forgets the count timer_getoverrun
+    // latched (Linux's common_timer_set; 0 after either, measured on 6.12).
+    timer->last_overrun = 0;
     int err = timer_set(timer->timer, spec, &old_spec);
     unlock(&current->group->lock);
     if (err < 0)
@@ -1950,14 +2211,18 @@ int_t sys_timer_delete(dword_t timer_id) {
     timer_free(timer->timer);
     timer->timer = NULL;
     unlock(&current->group->lock);
+    signal_timer_disown(current->group, (int) timer_id);
     return 0;
 }
 
 static struct fd_ops timerfd_ops;
 
-static void timerfd_callback(struct fd *fd) {
+// Every expiry counts, missed periods too: a read returns them all, as Linux's
+// does (timerfd_read's hrtimer_forward_now).
+static void timerfd_callback(void *data, uint64_t expirations) {
+    struct fd *fd = data;
     lock(&fd->lock, 0);
-    fd->timerfd.expirations++;
+    fd->timerfd.expirations += expirations;
     notify(&fd->cond);
     unlock(&fd->lock);
     poll_wakeup(fd, POLL_READ);
@@ -1993,7 +2258,9 @@ fd_t sys_timerfd_create(int_t clockid, int_t flags) {
     if (fd == NULL)
         return _ENOMEM;
 
-    fd->timerfd.timer = timer_new(real_clockid, (timer_callback_t) timerfd_callback, fd);
+    fd->timerfd.timer = timer_new(real_clockid, timerfd_callback, fd);
+    fd->timerfd.clock = (uint_t) clockid;
+    fd->timerfd.abstime = false;
     return f_install(fd, flags);
 }
 
@@ -2055,11 +2322,14 @@ static int_t sys_timerfd_settime_common(fd_t f, int_t flags, guest_addr_t new_va
 
     struct timer_spec old_spec;
     if (flags & TIMER_ABSTIME_) {
-        struct timespec now = timespec_now(fd->timerfd.timer->clockid);
+        // Guest deadline minus guest now. See clock_nanosleep above.
+        struct timespec now = guest_clock_now(fd->timerfd.clock,
+                                              fd->timerfd.timer->clockid);
         spec.value = timespec_subtract(spec.value, now);
     }
 
     lock(&fd->lock, 0);
+    fd->timerfd.abstime = (flags & TIMER_ABSTIME_) != 0;
     err = timer_set(fd->timerfd.timer, spec, &old_spec);
     // Linux timerfd_settime resets the expiration counter on EVERY call,
     // armed or disarmed -- so a disarm (it_value = 0) also clears readiness.
@@ -2151,7 +2421,7 @@ static ssize_t timerfd_read(struct fd *fd, void *buf, size_t bufsize) {
             unlock(&fd->lock);
             return _EAGAIN;
         }
-        int err = wait_for(&fd->cond, &fd->lock, NULL);
+        int err = wait_for_blocked(&fd->cond, &fd->lock, NULL);
         if (err < 0) {
             unlock(&fd->lock);
             return err;
@@ -2177,8 +2447,374 @@ static int timerfd_close(struct fd *fd) {
 }
 
 static struct fd_ops timerfd_ops = {
-    .anon_inode_class = "timerfd",
+    .name = "timerfd",
+    .anon_inode_class = "[timerfd]",
     .read = timerfd_read,
     .poll = timerfd_poll,
     .close = timerfd_close,
 };
+
+// ---- checkpoint (kernel/timer_ckpt.h, kernel/anonfd_ckpt.h) ---------------
+
+// Saturating at TIMER_CKPT_NEVER (kernel/timer_ckpt.h), a few centuries out.
+static int64_t timespec_ns(struct timespec ts) {
+    if (ts.tv_sec >= INT64_MAX / 1000000000 - 1)
+        return TIMER_CKPT_NEVER;
+    if (ts.tv_sec < 0)
+        return 0;
+    return (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static struct timespec ns_timespec(int64_t ns) {
+    if (ns < 0)
+        ns = 0;
+    return (struct timespec) {
+        .tv_sec = (time_t) (ns / 1000000000),
+        .tv_nsec = (long) (ns % 1000000000),
+    };
+}
+
+// The same two for a time that may be negative: how long ago a deadline that
+// is overdue was due (timer_read). Normalised as timespec_subtract leaves one,
+// the seconds negative and the nanoseconds not, which is what timer_set adds.
+static int64_t timespec_ns_signed(struct timespec ts) {
+    if (ts.tv_sec >= 0)
+        return timespec_ns(ts);
+    if (ts.tv_sec <= -(INT64_MAX / 1000000000 - 1))
+        return -(INT64_MAX / 1000000000 - 1) * 1000000000;
+    return (int64_t) ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+
+static struct timespec ns_timespec_signed(int64_t ns) {
+    if (ns >= 0)
+        return ns_timespec(ns);
+    struct timespec ts = {.tv_sec = (time_t) (ns / 1000000000), .tv_nsec = (long) (ns % 1000000000)};
+    if (ts.tv_nsec < 0) {
+        ts.tv_nsec += 1000000000;
+        ts.tv_sec--;
+    }
+    return ts;
+}
+
+enum timer_ckpt_clock timer_ckpt_clock_for(uint_t clock, bool abstime) {
+    pid_t_ pid;
+    bool perthread;
+    if (clock == CLOCK_PROCESS_CPUTIME_ID_ || clock == CLOCK_THREAD_CPUTIME_ID_ ||
+            cpuclock_decode(clock, &pid, &perthread))
+        return TIMER_CKPT_CPU;
+    switch (clock) {
+        case CLOCK_BOOTTIME_:
+        case CLOCK_BOOTTIME_ALARM_:
+            return TIMER_CKPT_BOOTTIME;
+        // Kept on their own base whether armed relative or not: Linux turns a
+        // relative arming into an instant on it (alarm_timer_arm, and
+        // hrtimer_init only moves CLOCK_REALTIME itself onto MONOTONIC).
+        case CLOCK_REALTIME_ALARM_:
+        case CLOCK_TAI_:
+            return TIMER_CKPT_REALTIME;
+        case CLOCK_REALTIME_:
+        case CLOCK_REALTIME_COARSE_:
+            return abstime ? TIMER_CKPT_REALTIME : TIMER_CKPT_MONOTONIC;
+        default:
+            return TIMER_CKPT_MONOTONIC;
+    }
+}
+
+// Now, on the clock a carried value is measured on.
+static int64_t timer_ckpt_now_ns(enum timer_ckpt_clock kind) {
+    clockid_t host = CLOCK_MONOTONIC;
+    switch (kind) {
+        case TIMER_CKPT_MONOTONIC:
+            return timespec_ns(guest_clock_now(CLOCK_MONOTONIC_, CLOCK_MONOTONIC));
+        case TIMER_CKPT_BOOTTIME:
+            clockid_to_real(CLOCK_BOOTTIME_, &host);
+            return timespec_ns(guest_clock_now(CLOCK_BOOTTIME_, host));
+        case TIMER_CKPT_REALTIME:
+            return timespec_ns(timespec_now(CLOCK_REALTIME));
+        case TIMER_CKPT_CPU:
+        default:
+            return 0;
+    }
+}
+
+int64_t timer_ckpt_carry(enum timer_ckpt_clock kind, int64_t left_ns) {
+    int64_t now = timer_ckpt_now_ns(kind);
+    if (left_ns >= TIMER_CKPT_NEVER - now)
+        return TIMER_CKPT_NEVER;
+    return now + left_ns;
+}
+
+int64_t timer_ckpt_left(enum timer_ckpt_clock kind, int64_t value_ns) {
+    if (value_ns == TIMER_CKPT_NEVER)
+        return TIMER_CKPT_NEVER;
+    return value_ns - timer_ckpt_now_ns(kind);
+}
+
+// A timer as it stands, carried on `kind`'s clock. An expiry due and not yet
+// delivered is carried as the deadline it was, in the past: see
+// timer_ckpt_spec.
+static void timer_ckpt_describe_timer(struct timer *t, enum timer_ckpt_clock kind,
+        struct timer_ckpt *out) {
+    struct timer_spec spec;
+    bool armed = timer_read(t, &spec);
+    *out = (struct timer_ckpt) {
+        .clock = (uint32_t) kind,
+        .interval_ns = timespec_ns(spec.interval),
+    };
+    if (armed) {
+        out->armed = 1;
+        out->value_ns = timer_ckpt_carry(kind, timespec_ns_signed(spec.value));
+    }
+}
+
+// What to arm a rebuilt timer with. A deadline already passed -- by the stop,
+// on a clock that counts it, or by the save and the restore themselves -- is
+// armed overdue by as much: it fires at once, and a periodic timer counts
+// every period since and stays on its grid (util/timer.c), as Linux's does
+// after a hibernation. Exactly now is a nanosecond, because a zero value would
+// disarm it. "Never" is armed at TIME_T_MAX, which timer_set pins, as the
+// original was.
+static struct timer_spec timer_ckpt_spec(const struct timer_ckpt *d) {
+    int64_t left = timer_ckpt_left((enum timer_ckpt_clock) d->clock, d->value_ns);
+    struct timespec value = left == TIMER_CKPT_NEVER
+        ? (struct timespec) {.tv_sec = INT64_MAX, .tv_nsec = 0}
+        : ns_timespec_signed(left != 0 ? left : 1);
+    return (struct timer_spec) {
+        .value = value,
+        .interval = ns_timespec(d->interval_ns),
+    };
+}
+
+// ITIMER_VIRTUAL or ITIMER_PROF: armed or not, CPU time left and the interval.
+// Called with group->lock held, `cpu_now` read before it was taken.
+static void cpu_itimer_ckpt_describe(const struct cpu_itimer_state *state,
+        struct timespec cpu_now, struct timer_ckpt *out) {
+    *out = (struct timer_ckpt) {
+        .clock = TIMER_CKPT_CPU,
+        .interval_ns = timespec_ns(state->interval),
+    };
+    if (state->armed) {
+        int64_t left = timespec_ns(timespec_subtract(state->deadline, cpu_now));
+        out->armed = 1;
+        out->value_ns = left > 0 ? left : 1;
+    }
+}
+
+// A thread group's CPU time as its own threads have run it.
+//
+// Not through `current`: cpu_time_now_of asks the CALLING thread for the CPU
+// time of whichever member is current, which is right for a syscall and wrong
+// here -- the checkpoint's writer and its restorer both set `current` to the
+// task they are working on without being its thread. Measured that way, a
+// profiler with a minute of CPU behind it was carried as though it had a minute
+// of ITIMER_PROF still to run, and a restore in the app based pid 1's deadline
+// on the app thread's own CPU time.
+static struct timespec group_cpu_now(struct tgroup *group, bool include_system) {
+    struct task *saved = current;
+    current = NULL;
+    struct timespec now = cpu_time_now_of(group, include_system);
+    current = saved;
+    return now;
+}
+
+static void cpu_itimer_ckpt_arm(struct cpu_itimer_state *state, struct timespec cpu_now,
+        const struct timer_ckpt *d) {
+    state->interval = ns_timespec(d->interval_ns);
+    state->armed = d->armed != 0;
+    if (state->armed)
+        state->deadline = timespec_add(cpu_now, ns_timespec(d->value_ns > 0 ? d->value_ns : 1));
+}
+
+void group_timers_ckpt_describe(struct tgroup *group, struct group_timers_ckpt *out,
+        struct posix_timer_ckpt *posix) {
+    *out = (struct group_timers_ckpt) {0};
+    lock(&group->lock, 0);
+    struct timer *sampler = group->itimer_vprof_sampler;
+    unlock(&group->lock);
+
+    // The fields under the lock, the timers after it: a CPU-clock timer reads
+    // its thread's clock through pid_get_task_ref, which takes pids_lock, and
+    // that comes BEFORE group->lock. Nothing can change the array meanwhile --
+    // every task that could is frozen -- and the timers are read under their
+    // own locks.
+    //
+    // ITIMER_VIRTUAL and ITIMER_PROF are the sampler's: a tick decides under
+    // group->lock that one is due, disarms a one-shot, and only then, unlocked,
+    // sends the signal. Read in that gap, the timer is gone and its signal not
+    // yet queued. So the state is read with no tick in between -- the sampler's
+    // count of finished ticks the same before and after -- and a tick that
+    // lands in the reading means reading it again.
+    struct timer *posix_timers[TIMERS_MAX];
+    unsigned n = 0;
+    struct timer *real;
+    for (int tries = 0; ; tries++) {
+        uint64_t ticks = sampler != NULL ? timer_settle(sampler) : 0;
+        // Before group->lock, which rusage_get_group_of takes itself.
+        struct timespec cpu_user = group_cpu_now(group, false);
+        struct timespec cpu_total = group_cpu_now(group, true);
+        lock(&group->lock, 0);
+        real = group->itimer;
+        cpu_itimer_ckpt_describe(&group->itimer_virtual, cpu_user, &out->virt);
+        cpu_itimer_ckpt_describe(&group->itimer_prof, cpu_total, &out->prof);
+        unlock(&group->lock);
+        if (sampler == NULL || timer_settle(sampler) == ticks || tries >= 100)
+            break;
+    }
+    lock(&group->lock, 0);
+    for (unsigned id = 0; id < TIMERS_MAX; id++) {
+        struct posix_timer *pt = &group->posix_timers[id];
+        if (pt->timer == NULL)
+            continue;
+        struct posix_timer_ckpt *d = &posix[n];
+        *d = (struct posix_timer_ckpt) {
+            .timer_id = (int32_t) id,
+            .clock = pt->clock,
+            .real_clockid = (uint32_t) pt->timer->clockid,
+            .signal = pt->signal,
+            .thread_pid = pt->thread_pid,
+            .notify = pt->tgroup != NULL,
+            .cpu_clock_pid = pt->cpu_clock_pid,
+            .last_overrun = pt->last_overrun,
+            .abstime = pt->abstime,
+        };
+        memcpy(&d->sig_value, &pt->sig_value,
+               sizeof(pt->sig_value) < sizeof(d->sig_value)
+                   ? sizeof(pt->sig_value) : sizeof(d->sig_value));
+        posix_timers[n++] = pt->timer;
+    }
+    out->n_posix = n;
+    unlock(&group->lock);
+
+    // ITIMER_REAL is kept on MONOTONIC, as Linux keeps it.
+    if (real != NULL)
+        timer_ckpt_describe_timer(real, TIMER_CKPT_MONOTONIC, &out->real);
+    else
+        out->real = (struct timer_ckpt) {.clock = TIMER_CKPT_MONOTONIC};
+    for (unsigned i = 0; i < n; i++) {
+        timer_ckpt_describe_timer(posix_timers[i],
+                                  timer_ckpt_clock_for(posix[i].clock, posix[i].abstime != 0),
+                                  &posix[i].t);
+        // last_overrun needs no second look after the expiries in flight: an
+        // expiry counts onto the signal still queued, which the image carries,
+        // and only a signal being taken changes it (signal_timer_taken).
+    }
+}
+
+unsigned group_timers_ckpt_arm(struct tgroup *group, const struct group_timers_ckpt *d,
+        const struct posix_timer_ckpt *posix) {
+    unsigned failed = 0;
+
+    // ITIMER_REAL, made the way itimer_set makes it.
+    if (d->real.armed) {
+        lock(&group->lock, 0);
+        if (group->itimer == NULL)
+            group->itimer = timer_new(CLOCK_REALTIME, itimer_notify, group);
+        struct timer *real = group->itimer;
+        unlock(&group->lock);
+        if (real == NULL || timer_set(real, timer_ckpt_spec(&d->real), NULL) < 0)
+            failed++;
+    }
+
+    // ITIMER_VIRTUAL and ITIMER_PROF: CPU time left, against what this group
+    // has run since it was rebuilt -- its CPU clocks start again with its host
+    // threads -- and the sampler that watches them, if either is armed.
+    struct timespec cpu_user = group_cpu_now(group, false);
+    struct timespec cpu_total = group_cpu_now(group, true);
+    lock(&group->lock, 0);
+    cpu_itimer_ckpt_arm(&group->itimer_virtual, cpu_user, &d->virt);
+    cpu_itimer_ckpt_arm(&group->itimer_prof, cpu_total, &d->prof);
+    if ((d->virt.armed || d->prof.armed) && itimer_vprof_sampler_start_locked(group) < 0)
+        failed++;
+    unlock(&group->lock);
+
+    // The POSIX timers, each back in the slot whose number the guest holds.
+    for (uint32_t i = 0; i < d->n_posix && i < TIMERS_MAX; i++) {
+        const struct posix_timer_ckpt *r = &posix[i];
+        bool signals = r->notify != 0;
+        if (r->timer_id < 0 || r->timer_id >= TIMERS_MAX ||
+                (signals && (r->signal < 1 || r->signal >= NUM_SIGS))) {
+            failed++;
+            continue;
+        }
+        struct posix_timer *pt = &group->posix_timers[r->timer_id];
+        lock(&group->lock, 0);
+        if (pt->timer != NULL) {
+            unlock(&group->lock);
+            failed++;
+            continue;
+        }
+        struct timer *t = timer_new((clockid_t) r->real_clockid,
+                                    posix_timer_callback, pt);
+        if (t == NULL) {
+            unlock(&group->lock);
+            failed++;
+            continue;
+        }
+        pt->timer_id = r->timer_id;
+        pt->clock = r->clock;
+        pt->abstime = r->abstime != 0;
+        pt->signal = r->signal;
+        memset(&pt->sig_value, 0, sizeof(pt->sig_value));
+        memcpy(&pt->sig_value, &r->sig_value,
+               sizeof(pt->sig_value) < sizeof(r->sig_value)
+                   ? sizeof(pt->sig_value) : sizeof(r->sig_value));
+        pt->thread_pid = r->thread_pid;
+        pt->last_overrun = r->last_overrun;
+        pt->cpu_clock_pid = r->cpu_clock_pid;
+        // Before it is armed, as timer_set_clock_source asks: see
+        // posix_timer_thread_cpu_now for why a thread's CPU clock needs one.
+        if (r->real_clockid == (uint32_t) CLOCK_THREAD_CPUTIME_ID)
+            timer_set_clock_source(t, posix_timer_thread_cpu_now, pt);
+        pt->tgroup = signals ? group : NULL;
+        pt->timer = t;
+        unlock(&group->lock);
+        // Outside group->lock: a thread CPU clock's sampler takes pids_lock.
+        if (r->t.armed && timer_set(t, timer_ckpt_spec(&r->t), NULL) < 0)
+            failed++;
+    }
+    return failed;
+}
+
+bool timerfd_fd_is(struct fd *fd) {
+    return fd != NULL && fd->ops == &timerfd_ops;
+}
+
+// Through timer_read rather than timerfd_current_spec: an armed timer whose
+// expiry is due but whose callback has not run yet reports no time remaining
+// there, and describing that as disarmed would bring a periodic timer back
+// stopped.
+void timerfd_ckpt_describe(struct fd *fd, struct timerfd_ckpt *out) {
+    struct timer *t = fd->timerfd.timer;
+    *out = (struct timerfd_ckpt) {0};
+    out->real_clockid = (uint32_t) t->clockid;
+    out->clock = fd->timerfd.clock;
+    out->abstime = fd->timerfd.abstime;
+    timer_ckpt_describe_timer(t, timer_ckpt_clock_for(fd->timerfd.clock, fd->timerfd.abstime),
+                              &out->t);
+    lock(&fd->lock, 0);
+    out->expirations = fd->timerfd.expirations;
+    unlock(&fd->lock);
+}
+
+struct fd *timerfd_ckpt_new(const struct timerfd_ckpt *d) {
+    struct fd *fd = adhoc_fd_create(&timerfd_ops);
+    if (fd == NULL)
+        return ERR_PTR(_ENOMEM);
+    fd->timerfd.timer = timer_new((clockid_t) d->real_clockid,
+                                  timerfd_callback, fd);
+    if (fd->timerfd.timer == NULL) {
+        fd_close(fd);
+        return ERR_PTR(_ENOMEM);
+    }
+    fd->timerfd.expirations = d->expirations;
+    fd->timerfd.clock = d->clock;
+    fd->timerfd.abstime = d->abstime != 0;
+    // Armed now, while its process is still being rebuilt: expiring counts on
+    // the descriptor and signals nobody.
+    if (d->t.armed)
+        timer_set(fd->timerfd.timer, timer_ckpt_spec(&d->t), NULL);
+    else
+        timer_set(fd->timerfd.timer,
+                  (struct timer_spec) {.interval = ns_timespec(d->t.interval_ns)}, NULL);
+    return fd;
+}

@@ -10,8 +10,12 @@
 #endif
 
 #include <limits.h>
+#include <stdint.h>
+#include <time.h>
 #include <string.h>
 #include <pthread.h>
+#include "kernel/user_ns.h"
+#include "kernel/pid_ns.h"
 #include "kernel/calls.h"
 #include "platform/platform.h"
 #include "util/sync.h"
@@ -37,6 +41,10 @@ static int rlimit_set(struct task *task, int resource, struct rlimit_ limit) {
     lock(&group->lock, 0);
     group->limits[resource] = limit;
     unlock(&group->lock);
+    // A CPU limit is watched by the process's CPU sampler; see
+    // rlimit_cpu_due_locked.
+    if (resource == RLIMIT_CPU_ && limit.cur != RLIM_INFINITY_)
+        cpu_limit_watch(group);
     // The stack bound is cached in the address space, because the page-fault
     // path cannot take group->lock (see struct mem's stack_top comment), so a
     // change to RLIMIT_STACK has to be pushed there. gnulib's "working
@@ -44,13 +52,47 @@ static int rlimit_set(struct task *task, int resource, struct rlimit_ limit) {
     // overflows on purpose -- so honouring it only at exec would miss the
     // case this exists for.
     //
-    // Only for the calling task: reading another task's ->mm here would need
-    // general_lock, and prlimit64 against a third party is rare enough that
-    // picking the change up at its next exec is the better trade. Its stack
-    // stays bounded by the guard gap meanwhile.
-    if (resource == RLIMIT_STACK_ && task == current && current->mm != NULL)
-        mem_set_stack_bounds(&current->mm->mem, 0,
-                             limit.cur == RLIM_INFINITY_ ? 0 : (uint64_t) limit.cur);
+    // Pushed for every target, not just the caller, since Linux applies it at
+    // once: it reads the rlimit at fault time. Until build 556 a third party's
+    // change waited for the target's next exec. That covered prlimit64 on
+    // another process, and also on the caller's own tgid from a non-leader
+    // thread, which resolves to the leader and so never looked like `current`.
+    //
+    // RLIMIT_MEMLOCK is cached there as well, and for the same reason: a
+    // locked stack may not grow past it (struct mem's memlock_limit_pages).
+    if (resource == RLIMIT_MEMLOCK_) {
+        bool unlimited = limit.cur == RLIM_INFINITY_;
+        if (task == current) {
+            if (current->mm != NULL)
+                mem_set_memlock_limit(&current->mm->mem, (uint64_t) limit.cur, unlimited);
+        } else if (task_lock_unless_exiting(task)) {
+            // As for RLIMIT_STACK below.
+            if (task->mm != NULL)
+                mem_set_memlock_limit(&task->mm->mem, (uint64_t) limit.cur, unlimited);
+            unlock(&task->general_lock);
+        }
+    }
+    if (resource == RLIMIT_STACK_) {
+        uint64_t bytes = limit.cur == RLIM_INFINITY_ ? 0 : (uint64_t) limit.cur;
+        if (task == current) {
+            if (current->mm != NULL)
+                mem_set_stack_bounds(&current->mm->mem, 0, bytes);
+        } else {
+            // general_lock keeps task->mm alive for the store: exit releases
+            // it and exec replaces it under the same lock. The store itself
+            // is one atomic, so a fault on another CPU needs nothing more.
+            // exec re-reads the limit after installing the new space (see
+            // elf_exec), so a change racing an exec is not lost either way.
+            // Not a plain lock: prlimit64 holds a reference on the target,
+            // which an exiting target waits for with this lock held
+            // (task_lock_unless_exiting, kernel/task.c).
+            if (task_lock_unless_exiting(task)) {
+                if (task->mm != NULL)
+                    mem_set_stack_bounds(&task->mm->mem, 0, bytes);
+                unlock(&task->general_lock);
+            }
+        }
+    }
     return 0;
 }
 
@@ -59,6 +101,42 @@ rlim_t_ rlimit(int resource) {
     if (rlimit_get(current, resource, &limit) != 0)
         die("invalid resource %d", resource);
     return limit.cur;
+}
+
+struct rlimit_ rlimit_both(int resource) {
+    struct rlimit_ limit;
+    if (rlimit_get(current, resource, &limit) != 0)
+        die("invalid resource %d", resource);
+    return limit;
+}
+
+// RLIMIT_CPU: Linux's check_process_timers. At the hard limit the process is
+// sent SIGKILL; at the soft limit, SIGXCPU, and the soft limit goes up by a
+// second so the next SIGXCPU comes a second of CPU later -- which getrlimit
+// then reports, as it does on Linux. When soft and hard are equal (bash's
+// `ulimit -t`) the hard check comes first and SIGKILL is all there is.
+//
+// Nothing enforced it: a 1 s limit was still not reached after 4 s of CPU.
+// The process's CPU sampler (kernel/time.c, the one ITIMER_PROF uses) asks
+// this, and sends what it answers; a guest thread's own timer tick is not
+// enough, because the amd64 engine can run a tight loop that makes syscalls
+// without ever taking one. Call with group->lock held; returns the signal
+// due, or 0.
+int rlimit_cpu_due_locked(struct tgroup *group, uint64_t used_ns) {
+    rlim_t_ soft = group->limits[RLIMIT_CPU_].cur;
+    rlim_t_ hard = group->limits[RLIMIT_CPU_].max;
+    if (soft == RLIM_INFINITY_)
+        return 0;
+    // Seconds, and a limit too large to count in nanoseconds is one nothing
+    // will reach.
+    const uint64_t max_s = UINT64_MAX / 1000000000ull;
+    if (hard != RLIM_INFINITY_ && hard <= max_s && used_ns >= hard * 1000000000ull)
+        return SIGKILL_;
+    if (soft <= max_s && used_ns >= soft * 1000000000ull) {
+        group->limits[RLIMIT_CPU_].cur = soft + 1;
+        return SIGXCPU_;
+    }
+    return 0;
 }
 
 static int do_getrlimit32(int resource, struct rlimit32_ *rlimit32) {
@@ -120,7 +198,13 @@ dword_t sys_old_getrlimit32(dword_t resource, addr_t rlim_addr) {
 // another process, and the "may not raise your own hard limit" rule is about
 // the TARGET's ceiling.
 static int check_setrlimit_task(struct task *task, int resource, struct rlimit_ new_limit) {
-    if (superuser())
+    // Linux's do_prlimit, before anything else: a soft limit above the hard
+    // one is EINVAL. Accepting it let any process raise its soft limit past
+    // a hard limit an administrator had set -- and the soft limit is the one
+    // enforced, so the hard limit meant nothing.
+    if (new_limit.cur > new_limit.max)
+        return _EINVAL;
+    if (current_capable(CAP_SYS_RESOURCE_))
         return 0;
     struct rlimit_ old_limit;
     int err = rlimit_get(task, resource, &old_limit);
@@ -178,8 +262,15 @@ dword_t sys_prlimit64_guest(pid_t_ pid, dword_t resource, guest_addr_t new_limit
             return _ESRCH;
         release = true;
         // Another process's limits are readable and writable only by a
-        // matching real uid, or CAP_SYS_RESOURCE.
-        if (!current_capable(CAP_SYS_RESOURCE_) && task->uid != current->uid) {
+        // caller whose real ids are ALL of the target's -- real, effective
+        // and saved uid and gid -- or with CAP_SYS_RESOURCE: Linux's
+        // check_prlimit_permission. Comparing the real uid alone let a user
+        // change the limits of a setuid program it had started, which runs
+        // as someone else, and make it fail wherever it chose.
+        if (!current_capable(CAP_SYS_RESOURCE_) &&
+                (current->uid != task->uid || current->uid != task->euid ||
+                 current->uid != task->suid || current->gid != task->gid ||
+                 current->gid != task->egid || current->gid != task->sgid)) {
             task_ref_cnt_mod(task, -1);
             return _EPERM;
         }
@@ -232,9 +323,12 @@ static size_t maxrss_plausible_pages(void) {
     return cached;
 }
 
-// Peak resident size in KB. Samples the address space's current mapped-page
-// count and folds it into the high-water mark kept on the mm, so a later read
-// never reports less than an earlier one saw -- which is what "max" means.
+// Peak resident size in KB: the address space's own high-water mark (VmHWM,
+// mem_rss_pages_peak), folded into the one kept on the mm and the task, so a
+// later read never reports less than an earlier one saw -- which is what "max"
+// means -- and an exec, which replaces the mm, does not forget the old one. It
+// was the mapped-page count at whenever someone asked, which counted pages the
+// process never used and missed any peak nobody sampled.
 size_t task_maxrss_kb(struct task *task) {
     // The address space is PINNED for the walk, and reading task->mm without
     // doing so was a use-after-free that killed the emulator.
@@ -277,13 +371,13 @@ size_t task_maxrss_kb(struct task *task) {
         return task->maxrss_kb;     // mid-exit; the latched value is the answer
     struct mm *mm = task->mm;
     if (mm != NULL) {
-        size_t pages = mem_mapped_page_count(&mm->mem);
-        // That walk is deliberately lock-free (see proc_mem_count_pages): a
-        // stale count is fine for /proc. It is NOT fine here, because this is
-        // a high-water mark -- a latch. One torn read of a page table another
-        // thread is mutating becomes the permanent answer for the life of the
-        // address space, and then, because a forked child used to inherit it,
-        // for every descendant too.
+        size_t pages = mem_rss_pages_peak(&mm->mem);
+        // This used to be a lock-free page-table walk, and it is a high-water
+        // mark -- a latch. One torn read of a page table another thread was
+        // mutating became the permanent answer for the life of the address
+        // space, and then, because a forked child used to inherit it, for
+        // every descendant too. The counter cannot tear that way, but the
+        // bound below costs nothing and stays.
         //
         // Seen on device: ru_maxrss reporting 2,819,362,696 KB -- 2.7 TB --
         // from a process whose real peak was about 4 MB, reproducibly for
@@ -330,7 +424,8 @@ static void rusage_fill_task_counters(struct rusage_ *rusage, struct task *task)
     rusage->maxrss = (dword_t) task_maxrss_kb(task);
 }
 
-struct rusage_ rusage_get_current(void) {
+// The calling host thread's user and system time, and nothing else.
+static struct rusage_ cpu_usage_self(void) {
     struct rusage_ rusage;
     memset(&rusage, 0, sizeof(rusage));
 
@@ -348,7 +443,16 @@ struct rusage_ rusage_get_current(void) {
 #elif __APPLE__
     thread_basic_info_data_t info;
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-    if (thread_info(mach_thread_self(), THREAD_BASIC_INFO, (thread_info_t) &info, &count) != KERN_SUCCESS) {
+    // pthread_mach_thread_np, not mach_thread_self: the latter hands back a
+    // new send right every call, and this never gave it back. do_exit asks
+    // here for every thread that exits, so each guest thread ever created left
+    // one dead port name behind -- and iOS kills an app that holds too many.
+    // On the M4 iPad the regression suite's churn reached the limit about four
+    // roots in: EXC_RESOURCE, "Exceeded system-wide per-process Port Limit
+    // (114882 ports)", the app gone mid-run. /proc/ish/host_ports counts them;
+    // tests/manual/host_port_leak.c is the witness.
+    if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO,
+                (thread_info_t) &info, &count) != KERN_SUCCESS) {
         // Handle error appropriately
         printk("ERROR: thread_info failed (rusage_get_current()\n");
         return rusage;
@@ -357,25 +461,35 @@ struct rusage_ rusage_get_current(void) {
     rusage.utime.usec = info.user_time.microseconds;
     rusage.stime.sec = info.system_time.seconds;
     rusage.stime.usec = info.system_time.microseconds;
+    // An older kernel's thread_info leaves out the calling thread's current
+    // run on the CPU (host_thread_cpu_ns_self, kernel/task.c): count it, as
+    // user time, so getrusage and times() agree with the thread's own clock.
+    uint64_t own_usec = host_thread_cpu_ns_self() / 1000;
+    uint64_t sys_usec = (uint64_t) rusage.stime.sec * 1000000 + (uint64_t) rusage.stime.usec;
+    uint64_t user_usec = (uint64_t) rusage.utime.sec * 1000000 + (uint64_t) rusage.utime.usec;
+    if (own_usec > user_usec + sys_usec) {
+        user_usec = own_usec - sys_usec;
+        rusage.utime.sec = user_usec / 1000000;
+        rusage.utime.usec = user_usec % 1000000;
+    }
 #endif
+    return rusage;
+}
+
+struct rusage_ rusage_get_current(void) {
+    struct rusage_ rusage = cpu_usage_self();
     rusage_fill_task_counters(&rusage, current);
     return rusage;
 }
 
-
-// Usage for a live thread other than the caller. rusage_get_current() can
-// only report the *calling* host thread's own usage (getrusage(RUSAGE_THREAD)
-// and mach_thread_self() are both self-only) -- summing across a whole thread
-// group needs a way to query a different thread's host pthread from here.
-struct rusage_ rusage_get_task(struct task *task) {
-    if (task == current)
-        return rusage_get_current();
-
+// A live thread other than the caller: its user and system time, and nothing
+// else. cpu_usage_self() can only report the *calling* host thread's own usage
+// (getrusage(RUSAGE_THREAD) and mach_thread_self() are both self-only) --
+// summing across a whole thread group needs a way to query a different
+// thread's host pthread from here.
+static struct rusage_ cpu_usage_other(struct task *task) {
     struct rusage_ rusage;
     memset(&rusage, 0, sizeof(rusage));
-    // The non-CPU counters live on the task and are readable from here; only
-    // the user/system split needs the host thread.
-    rusage_fill_task_counters(&rusage, task);
 #if __linux__
     // pthread_getcpuclockid's clock only reports combined user+system time --
     // unlike getrusage(RUSAGE_THREAD), there's no Linux API to read another
@@ -406,6 +520,17 @@ struct rusage_ rusage_get_task(struct task *task) {
     rusage.stime.sec = info.system_time.seconds;
     rusage.stime.usec = info.system_time.microseconds;
 #endif
+    return rusage;
+}
+
+// Usage for a live thread other than the caller.
+struct rusage_ rusage_get_task(struct task *task) {
+    if (task == current)
+        return rusage_get_current();
+    struct rusage_ rusage = cpu_usage_other(task);
+    // The non-CPU counters live on the task and are readable from here; only
+    // the user/system split needs the host thread.
+    rusage_fill_task_counters(&rusage, task);
     return rusage;
 }
 
@@ -446,10 +571,26 @@ void rusage_add(struct rusage_ *dst, struct rusage_ *src) {
 // Takes an explicit group rather than assuming current->group, so it can be
 // called from a context with no meaningful `current` (e.g. the setitimer
 // VIRTUAL/PROF sampler, which runs on its own bare timer thread).
-struct rusage_ rusage_get_group_of(struct tgroup *group) {
-    complex_lockt(&pids_lock, 0);
+//
+// With `counters` false, only utime and stime are summed and filled. That is
+// the half /proc/<pid>/stat prints, and the other half is not free: the
+// maxrss sample in rusage_fill_task_counters trylocks each thread and walks
+// its address space's page table, and ps, top and htop read that file for
+// every process on every refresh.
+//
+// `children` adds what the process's reaped descendants used, which is
+// Linux's RUSAGE_BOTH. The caller holds pids_lock (group_usage takes it).
+static struct rusage_ group_usage_pids_locked(struct tgroup *group, bool counters,
+        bool children) {
     lock(&group->lock, 0);
-    struct rusage_ rusage = group->rusage;
+    struct rusage_ rusage;
+    memset(&rusage, 0, sizeof(rusage));
+    if (counters) {
+        rusage = group->rusage;
+    } else {
+        rusage.utime = group->rusage.utime;
+        rusage.stime = group->rusage.stime;
+    }
     struct task *t;
     list_for_each_entry(&group->threads, t, group_links) {
         // An exiting thread is on this list for a long stretch AFTER do_exit
@@ -464,6 +605,7 @@ struct rusage_ rusage_get_group_of(struct tgroup *group) {
         if (t->exit_rusage_counted)
             continue;
         struct rusage_ live;
+        memset(&live, 0, sizeof(live));
         // The mirror image at the other end of a thread's life: a clone is
         // linked into this list by copy_task() well before task_start() gives
         // it a host thread, and until then task->thread still holds the
@@ -477,17 +619,64 @@ struct rusage_ rusage_get_group_of(struct tgroup *group) {
         // task->thread (which is how pid 1, whose host thread predates
         // task_start, still reports its own CPU).
         if (t == current || t->host_thread_started) {
-            live = rusage_get_task(t);
-        } else {
+            if (counters)
+                live = rusage_get_task(t);
+            else
+                live = t == current ? cpu_usage_self() : cpu_usage_other(t);
+        } else if (counters) {
             // No CPU of its own yet, but the non-CPU counters are readable
             // and are what pid 1 contributes on the sampler-thread path.
-            memset(&live, 0, sizeof(live));
             rusage_fill_task_counters(&live, t);
         }
         rusage_add(&rusage, &live);
     }
+    if (children)
+        rusage_add(&rusage, &group->children_rusage);
     unlock(&group->lock);
+    return rusage;
+}
+
+static struct rusage_ group_usage(struct tgroup *group, bool counters) {
+    complex_lockt(&pids_lock, 0);
+    struct rusage_ rusage = group_usage_pids_locked(group, counters, false);
     unlock(&pids_lock);
+    return rusage;
+}
+
+struct rusage_ rusage_get_group_both_pids_locked(struct tgroup *group) {
+    return group_usage_pids_locked(group, true, true);
+}
+
+struct rusage_ rusage_get_group_of(struct tgroup *group) {
+    return group_usage(group, true);
+}
+
+struct rusage_ rusage_get_group_cpu_of(struct tgroup *group) {
+    return group_usage(group, false);
+}
+
+// One thread's own user and system time: /proc/<pid>/task/<tid>/stat. Asked
+// of its host thread only when the group walk above would ask it -- never
+// before task_start has given the task a host thread of its own, when
+// task->thread is still its creator's and the creator's whole balance would
+// show up here and then vanish. And not once do_exit has rolled the thread's
+// final usage into group->rusage: that is when it recorded exit_utime and
+// exit_stime, and from then on those are the answer, as a zombie's times are
+// on Linux. The host thread is on its way out by then, and a pthread_t that
+// has exited can come to name a different thread.
+struct rusage_ rusage_get_thread_cpu(struct task *task) {
+    struct rusage_ rusage;
+    memset(&rusage, 0, sizeof(rusage));
+    lock(&task->group->lock, 0);
+    if (task->exit_rusage_counted) {
+        rusage.utime = task->exit_utime;
+        rusage.stime = task->exit_stime;
+    } else if (task == current) {
+        rusage = cpu_usage_self();
+    } else if (task->host_thread_started) {
+        rusage = cpu_usage_other(task);
+    }
+    unlock(&task->group->lock);
     return rusage;
 }
 
@@ -568,10 +757,10 @@ int_t sys_sched_getaffinity_guest(pid_t_ pid, dword_t cpusetsize, guest_addr_t c
         task_ref_cnt_mod(task, -1);
     }
 
-    // Report the scheduler-visible CPU count (may reserve host cores for the
-    // UI), not the raw host core count or the /proc/cpuinfo topology. The Go
-    // runtime sizes GOMAXPROCS from this, and nproc reports it.
-    long cpus = get_cpu_count_for_affinity();
+    // The CPUs a task may run on, 0..N-1: on iOS fewer than /proc/cpuinfo and
+    // /sys list, as under a cpuset (see get_cpu_count_allowed). The Go runtime
+    // sizes GOMAXPROCS from this, and nproc reports it.
+    long cpus = get_cpu_count_allowed();
 
     // The real kernel returns a cpumask whose length is a multiple of the
     // guest's sizeof(long): 8 bytes on amd64, 4 on i386. Returning a
@@ -625,14 +814,18 @@ int_t sys_sched_setaffinity_guest(pid_t_ pid, dword_t cpusetsize, guest_addr_t c
 #define PRIO_USER_    2
 
 static bool prio_target_matches(struct task *task, int_t which, pid_t_ who) {
+    // Only what the caller's pid namespace holds, by the numbers and ids its
+    // namespaces know (kernel/pid_ns.h, kernel/user_ns.h).
+    if (!task_visible(task))
+        return false;
     switch (which) {
         case PRIO_PROCESS_:
-            return who == 0 ? task == current : task->pid == who;
+            return who == 0 ? task == current : task->pid == current_pid_global(who);
         case PRIO_PGRP_:
-            return task->group->pgid == (who == 0 ? current->group->pgid : (pid_t_) who);
+            return task->group->pgid == (who == 0 ? current->group->pgid : current_pid_global(who));
         case PRIO_USER_:
             // The REAL uid, as Linux matches it.
-            return task->uid == (who == 0 ? current->uid : (uid_t_) who);
+            return task->uid == (who == 0 ? current->uid : current_make_kuid((uid_t_) who));
     }
     return false;
 }
@@ -649,7 +842,7 @@ int_t sys_getpriority(int_t which, pid_t_ who) {
     bool found = false;
     lock(&pids_lock, 0);
     for (dword_t p = 1; p < MAX_PID; p++) {
-        struct task *task = pid_get_task(p);
+        struct task *task = pid_get_task_global(p);
         if (task == NULL || !prio_target_matches(task, which, who))
             continue;
         if (!found || task->nice < best)
@@ -681,7 +874,7 @@ int_t sys_setpriority(int_t which, pid_t_ who, int_t prio) {
     bool privileged = current_capable(CAP_SYS_NICE_);
     lock(&pids_lock, 0);
     for (dword_t p = 1; p < MAX_PID; p++) {
-        struct task *task = pid_get_task(p);
+        struct task *task = pid_get_task_global(p);
         if (task == NULL || !prio_target_matches(task, which, who))
             continue;
         found = true;

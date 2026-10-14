@@ -15,14 +15,23 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
   - 제품명 `iSH-AOK`
   - 번들 루트 `app.ish.iSH-AOK`
 - **네 가지 게스트 아키텍처**, 모두 JIT 기반: `i386`, `amd64`(x86_64), `arm64`(aarch64), `riscv64`.
-- **네이티브 프로그램**: bash, zsh, 그리고 OpenSSH(`ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id`)와 Nextvi 편집기를 품고 있는 SmallCLUE 의 busybox 스타일 도구 모음이 호스트 코드로 앱에 컴파일되어 들어가며, 게스트의 `execve` 에서 `/AOK/native/<이름>` 을 통해 디스패치됩니다. 이들은 게스트 바이너리가 아니라 게스트 태스크 스레드 위에서 도는 호스트 함수이므로, 명령어 단위로 변환되지 않고 전속력으로 실행됩니다.
+- **네이티브 프로그램**: zsh, dash(프로비저닝이 이를 `sh` 로 만듭니다), 그리고 OpenSSH(`ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id`), Nextvi 편집기, GNU 호환 `sed`, `grep`, `find`, `ls`, `tar`, `gzip`, `diff`, `awk` 및 coreutils 대부분을 품고 있는 SmallCLUE 의 busybox 스타일 도구 모음이 호스트 코드로 앱에 컴파일되어 들어가며, 게스트의 `execve` 에서 `/AOK/native/<이름>` 을 통해 디스패치됩니다. 이들은 게스트 바이너리가 아니라 게스트 태스크 스레드 위에서 도는 호스트 함수이므로, 명령어 단위로 변환되지 않고 전속력으로 실행됩니다. bash 도 동일한 네이티브 구현이 있지만, 배포되는 빌드에는 556 부터 포함되지 않습니다 — [네이티브 bash와 라이선스](#네이티브-bash와-라이선스) 참고.
+- **네이티브 모드**(558): 리눅스 배포판이 전혀 없는 루트입니다. `/bin` 과 `/usr/bin` 은 네이티브 프로그램들 — 일상 명령 약 140개, ssh, git, curl, 편집기 — 이고, SmallCLUE 의 `init` 이 pid 1 로서 runit 방식의 서비스를 돌리며, 로그인 셸은 네이티브 zsh 입니다. 아무것도 내려받지 않습니다: 공식 배포판 아래에서 **iSH-AOK Native** 를 고르면 됩니다. 패키지 관리자가 필요하면 배포판을 그 옆에 설치하십시오. `/AOK/docs/native-mode.md` 참고.
 - `/AOK`, 읽기 전용 인앱 파일시스템(`/AOK/docs`, `/AOK/tools`, `/AOK/tests`, `/AOK/native`). `fs/aok-*.manifest` 와 `tools/gen-aokfs.py` 를 통해 빌드 시점에 `opt/AOK/` 에서 만들어 넣습니다.
-- 앱 빌드에 번들된 루트 파일시스템(Alpine 3.23.3과 Devuan 6, `aarch64` 전용), 그리고 `i386`, `x86_64`, `riscv64` 용 다운로드 이미지.
+- 앱 빌드에 번들된 루트 파일시스템(Alpine 3.24.2와 Devuan 6, `aarch64` 전용), 그리고 `i386`, `x86_64`, `riscv64` 용 다운로드 이미지.
+- **게스트에서 쓰는 기기의 GPU**: `/dev/dri/renderD128`, 프로세스 안에서 MoltenVK 위의 virglrenderer Venus 렌더러가 뒷받침하는 virtio-gpu 렌더 노드입니다. 그래서 Mesa 의 Venus Vulkan 드라이버(와 그 위의 zink)가 Metal 로 그립니다. 게스트 쪽은 `/AOK/tools/setup-gpu.sh` 가 설치합니다. `/AOK/docs/workspace.md` 참고.
+- **Wayland 데스크톱**(labwc, foot, waybar; 자체 데스크톱 네 개 — labwc 대신 Wayfire 나 Xfce 도 가능): GPU 에서 합성되고, `/AOK/native/wl-present` 를 통해 앱에 전달됩니다 — 한쪽으로는 프레임이, 다른 쪽으로는 키보드, 포인터, 클립보드, 크기 변경이 오가며, VNC 는 대체 경로입니다. `/AOK/tools/setup-games.sh` 는 검증된 게임 묶음을 설치합니다. `/AOK/docs/workspace.md` 참고.
+- **LLM Chat**: 앱 내장 채팅 클라이언트(OpenAI 호환 서버, Anthropic, Gemini, Apple 온디바이스 모델). 허용/확인/거부 권한 아래에서 게스트의 파일을 읽고 고치고 명령을 실행할 수 있으며, MCP 서버를 쓰고, 여러 채팅을 백그라운드 에이전트로 동시에 돌립니다. API 키는 키체인에 보관됩니다. `/AOK/docs/llm-chat.md` 참고.
+- **디스크로 서스펜드**: 프로세스, 열린 파일, 터미널까지 세션 전체를 저장했다가 앱이 종료된 뒤에도 이어서 재개합니다. 기본값은 꺼짐. `/AOK/docs/suspend.md` 참고.
+- **한국어와 다른 언어**: 앱 인터페이스가 기기 언어를 따르며, 영어 외에 한국어, 간체·번체 중국어, 일본어, 스페인어, 프랑스어, 독일어, 브라질 포르투갈어, 러시아어를 지원합니다. 터미널은 입력기 입력을 받습니다. 한글은 음절을 그 자리에서 조합해 입력하고, 중국어 병음과 일본어는 조합 중인 글자를 커서 위치에 표시하며 후보 창을 그 옆에 띄웁니다. 화상 키보드와 하드웨어 키보드 모두 해당됩니다. `/AOK/tools/setup-locale.sh` 는 루트 파일시스템에도 기기 언어를 설정합니다(프로그램 번역은 Devuan 에 들어 있습니다). `/AOK/docs/roots.md` 참고.
 - iOS를 통해 게스트 파일을 노출하는 File Provider 지원.
-- **FUSE**: `/dev/fuse` 와 `fuse` 파일시스템 타입(프로토콜 7.31)을 제공하므로, 게스트의 `libfuse2`/`libfuse3` 데몬이 수정 없이 파일시스템을 마운트하고 제공합니다. 게스트가 이미 fake-root 이므로 setuid `fusermount` 는 쓰이지 않고, libfuse 가 `mount(2)` 를 직접 호출합니다. `/AOK/docs/fuse.md` 참고.
+- **FUSE**: `/dev/fuse` 와 `fuse` 파일시스템 타입(프로토콜 7.31)을 제공하므로, 게스트의 `libfuse2`/`libfuse3` 데몬이 수정 없이 파일시스템을 마운트하고 제공합니다. root 일 때 libfuse 는 `mount(2)` 를 직접 호출하고, 일반 사용자는 리눅스와 마찬가지로 배포판의 `fusermount3` 를 거칩니다. `/AOK/docs/fuse.md` 참고.
+- **네임스페이스**(559, 실험적): user, mount, pid, network 네임스페이스. 그래서 `unshare`, bubblewrap, Codex CLI 의 명령 샌드박스(`codex sandbox`)가 시작되고 실제로 격리하며, systemd 의 `PrivateTmp=` 등도 실제로 동작합니다. 비공개 네트워크 네임스페이스는 자체 루프백과 `veth`/`dummy` 링크를 가지며, 호스트의 네트워크에는 절대 닿지 않습니다. `/AOK/docs/namespaces.md` 참고.
 - **Apple 단축어(Shortcuts) 액션** (iOS 16+): 앱을 열지 않고도 네이티브 zsh로 게스트에서 명령을 실행하고 그 출력을 단축어로 돌려주는 "Run Command" 액션과, Siri 문구가 지원되는 "Open iSH-AOK" 대상들. `/AOK/docs/shortcuts.md` 참고.
 - **`/dev/url`**: 게스트가 URL을 써 넣으면 그 URL을 iOS가 열도록 넘겨주는 문자 장치. `shortcuts://` 링크도 되므로 게스트 스크립트가 단축어를 실행할 수 있습니다. `app/URLDevice.m` 참고.
-- 선택적 가속기: 자주 쓰이는 libc 루틴의 네이티브 대체, 암호화 및 pixman 오프로드.
+- **시뮬레이션 스왑**: 대부분 유휴 상태인 큰 작업 집합이 실제 메모리를 쓰지 않고도 존재할 수 있도록 하는 선택적 스왑 영역 — 기기의 플래시를 소모하므로 24시간 쓰기 예산, 스래싱 가드, 일시 중단 게이트가 함께 있습니다. 기본값은 꺼짐이며, iOS 설정 앱의 iSH-AOK → Simulated Swap에서 켭니다(스위치와 크기를 모두 지정해야 하며 다음 실행 시 적용됩니다). 게스트는 `/proc/meminfo`, `free`, `vmstat`, `/proc/swaps` 및 실제 `/dev/aokswap0`을 통해 봅니다. `/AOK/docs/swap.md` 참고.
+- **`binfmt_misc`**: 리눅스와 동일하게 매직 넘버나 파일 확장자에 인터프리터를 등록하면 `execve`가 이를 따릅니다. `/AOK/docs/binfmt-misc.md` 참고.
+- 가속기: 자주 쓰이는 libc 루틴의 네이티브 대체(기본 켜짐), 그리고 선택적인 암호화 및 pixman 오프로드.
 - 이 포크 전용의 추가 진단 및 운영 관련 변경 사항.
 
 ## 게스트 아키텍처
@@ -34,10 +43,13 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
 
 | 게스트 | 상태 |
 |---|---|
-| `i386` | 최초의 게스트, JIT 전용 |
-| `amd64` | 지원됨, JIT |
+| `i386` | 최초의 게스트, JIT 전용. AVX/AVX2/FMA 와 AVX-512 를 CPUID 에 표시(558) |
+| `amd64` | 지원됨, JIT. x86-64-v4(AVX-512 포함)를 CPUID 에 표시(558) |
 | `arm64` | 지원됨, JIT |
-| `riscv64` | 지원됨, JIT |
+| `riscv64` | 지원됨, JIT. V 벡터 유닛을 포함한 RVA23(558) — Ubuntu 25.10 이 실행됩니다 |
+
+각 게스트가 소프트웨어에 알리는 내용 — `CPUID`, `AT_HWCAP`, `riscv_hwprobe`,
+`/proc/cpuinfo` — 은 `/AOK/docs/guest-cpus.md` 에 있습니다.
 
 게스트별 회귀 테스트 스위트는 기기에서 네 아키텍처 모두 통과합니다. 인터프리터는
 레거시이며 제거될 예정이므로, 새 작업은 JIT를 대상으로 해야 합니다.
@@ -47,14 +59,17 @@ Testflight: https://testflight.apple.com/join/X1flyiqE
 - [jit/gen.c](jit/gen.c) 모든 게스트의 명령어 변환
 - [jit/jit.c](jit/jit.c) 블록 캐시와 디스패치
 - [kernel/calls.c](kernel/calls.c) ABI별 시스템 콜 테이블
-- [docs/amd64_port_plan.md](docs/amd64_port_plan.md)
+- [docs/historical/amd64_port_plan.md](docs/historical/amd64_port_plan.md)
 - [docs/aarch64_guest_plan.md](docs/aarch64_guest_plan.md)
 
 ## 성능
 
-엔진은 gadget 디스패치당 약 6.8 ns로 디스패치 바운드 상태이며, 따라서 비용은 게스트
-명령어 수에 비례합니다. 측정 방법과 수치는
-[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md)에 있습니다.
+엔진은 디스패치 바운드 상태이며, 따라서 비용은 게스트 명령어 수에 비례합니다. 2026년
+8월의 측정에서는 gadget 디스패치 하나가 약 6.8 ns였습니다. 그 뒤의 디스패치 작업으로
+더 저렴해졌지만, 같은 방법으로 다시 측정하지는 않았습니다. 측정 방법과 수치는
+[docs/perf_benchmarks_2026_08.md](docs/perf_benchmarks_2026_08.md)에 있습니다. 559 부터는
+arm64 와 riscv64 게스트가 자주 함께 나오는 명령어 쌍을 gadget 하나, 디스패치 하나로
+융합하기도 합니다.
 
 명령어 퓨전과 리턴 캐시는 A/B 측정을 위해 게스트별로 런타임에 전환할 수 있습니다.
 
@@ -69,26 +84,41 @@ echo all=1 > /proc/ish/riscv64_jit_fuse
 별도의 프로세스로 수행하세요. [tests/manual/jit_fuse_ab.sh](tests/manual/jit_fuse_ab.sh)는
 교차 실행 A/B를 자동화하며 종료 시 마스크를 원래대로 복원합니다.
 
+시간이 어디에 쓰이는지 알려 주는 도구가 둘 있습니다. `ISH_JIT_PROFILE=<파일>` 은
+어느 게스트든 동적 명령어 구성을 기록하고,
+[tools/jitprof-report.py](tools/jitprof-report.py)가 이를 요약합니다.
+`/proc/ish/jit_timing` 은 CLI 뿐 아니라 앱 안에서도 변환에 쓰인 시간을 잽니다
+(`echo 1 > /proc/ish/jit_timing`, 작업 실행, 그다음 `cat`). `/proc/ish/host_vm` 은
+GPU 를 포함해 앱 자신의 메모리를 분류해 보여 줍니다.
+
+**변환된 코드 캐시 (arm64)**(559, 기본값 꺼짐)는 프로그램이 끝난 뒤에도 변환 결과를
+남겨 두어, 같은 코드를 불러오는 다음 프로그램이 더 빨리 시작하게 합니다 — 짧은
+프로그램을 많이 실행하는 스크립트와 빌드에서 약 5분의 1 빨라집니다. 캐시된 블록은
+주소로 찾기 때문에, 켜져 있는 동안 게스트의 ASLR 은 꺼집니다. 앱 설정의 스위치이며,
+게스트에서는 `/proc/ish/jit_cache`, CLI 에서는 `ISH_JIT_XCACHE=1` 입니다(CLI 는 ASLR 을
+건드리지 않습니다).
+
 ## 선택적 가속기
 
-셋 다 **기본적으로 꺼져 있으며** 명시적으로 켜야 합니다.
+HLE 는 557 부터 **기본적으로 켜져 있고**, 나머지 둘은 기본적으로 꺼져 있으며 명시적으로 켜야 합니다.
 
 | 기능 | CLI | 동작 |
 |---|---|---|
-| HLE | `ISH_HLE=1` | 자주 쓰이는 libc 루틴(`memcpy`, `strlen`, `memcmp` 등)을 네이티브 코드로 대체 — **arm64와 riscv64 게스트 전용** |
+| HLE | 켜짐; `ISH_HLE=0` 으로 끔 | 자주 쓰이는 libc 루틴(`memcpy`, `strlen`, `memcmp` 등)을 네이티브 코드로 대체 — **arm64와 riscv64 게스트 전용** |
 | 암호화 | `ISH_CRYPTO_ACCEL=1` | AES-GCM 및 ChaCha20-Poly1305 오프로드 |
 | Pixman | `ISH_PIX_ACCEL=1` | pixman 합성 오프로드 |
 
 HLE의 영향이 가장 크지만, arm64와 riscv64 게스트에 한정됩니다. `jit/jit.c`가 이 둘에만
-게이트를 걸어 두었기 때문에 i386이나 amd64 게스트는 이 경로를 아예 타지 않으며,
-그곳에서는 `ISH_HLE=1`을 줘도 조용히 아무 일도 일어나지 않습니다. 같은 빌드에서 끈
+게이트를 걸어 두었기 때문에 i386이나 amd64 게스트는 이 경로를 아예 타지 않습니다. 같은 빌드에서 끈
 상태와 비교해 memcpy/memset/memcmp/strlen 루프로 측정한 값은 256 B에서 1.23배,
 4 KB에서 3.16배, 64 KB에서 7.17배, 1 MB에서 6.68배입니다
 ([docs/performance-optimizations-2026-07.md](docs/performance-optimizations-2026-07.md)).
 게스트 명령어마다 디스패치를 하는 대신 네이티브 호출 한 번 안에서 작업이 이루어지므로,
 데이터 이동이 많은 코드에는 도움이 되고 프로그램 자신의 산술 연산이 지배적인 경우에는
 중립적입니다. 이는 순수한 빠른 경로입니다. 인식되지 않는 libc는 매칭되지 않고 일반
-변환으로 넘어갑니다. `ISH_HLE_STATS=1`은 함수별 호출 횟수를 출력합니다.
+변환으로 넘어갑니다. 가로챈 호출이 디스패처가 아니라 리턴 캐시를 통해 돌아오게 된
+뒤로 기본값이 되었으며, 켰을 때 느려진 측정은 없었습니다. `/proc/ish/hle` 로 실행 중에
+전환할 수 있고, `ISH_HLE_STATS=1`은 함수별 호출 횟수를 출력합니다.
 
 ## 저장소 구조
 
@@ -116,8 +146,8 @@ cd ish-AOK
 git submodule update --init --recursive
 ```
 
-`--recursive` 는 `deps/bash` 를 포함하므로 기본 빌드가 GPLv3 빌드가 된다는 점에
-유의하세요. 결과물을 배포할 생각이라면
+`--recursive` 는 `deps/bash` 도 받아 온다는 점에 유의하세요. 그래도 기본 빌드는
+이를 넣지 않습니다. 배포하는 빌드에서 켜기 전에
 [네이티브 bash와 라이선스](#네이티브-bash와-라이선스) 를 읽어 보십시오.
 
 ## 빌드 요구 사항
@@ -199,25 +229,32 @@ ninja -C build
 아래의 경로를 `execve` 하면 게스트 이미지를 적재하는 대신 iSH-AOK 내부의 함수로
 디스패치되며, 호출한 쪽은 그 차이를 알 수 없습니다. `/AOK/native` 에는
 레지스트리(`kernel/native.c`)에 등록된 프로그램마다 항목이 하나씩 있고 —
-`smallclue`, `motepad`, `bmm`, `bmt`, `hx`, `rust-probe`, `bash`, `zsh`,
-`zsh-multio` — 나머지는 모두 그중 하나를 가리키는 심볼릭 링크입니다. busybox 와 똑같이 링크
+`smallclue`, `sudo`, `su`, `passwd`, `motepad`, `ktop`, `wl-present`, `bmm`,
+`bmt`, `rust-probe`, `hx`, `bash`, `zsh`, `zsh-multio`, `dash`, `sh`, 각각 빌드에
+포함된 경우에만 — 나머지는 모두 그중 하나를 가리키는 심볼릭 링크입니다. busybox 와 똑같이 링크
 이름이 애플릿을 고릅니다:
 
 | 프로그램 | 설명 |
 |---|---|
-| `/AOK/native/smallclue` | busybox 스타일 멀티콜 도구 모음, `argv[0]` 으로 애플릿 선택 |
+| `/AOK/native/smallclue` | busybox 스타일 멀티콜 도구 모음, `argv[0]` 으로 애플릿 선택. 배포판 도구를 대신하는 애플릿은 GNU 의 것과(`awk` 는 mawk 와) 대조해 검증됩니다 |
 | `ssh`, `scp`, `sftp`, `ssh-keygen`, `ssh-copy-id` | OpenSSH, SmallCLUE 의 애플릿 (OpenSSL 없이 빌드) |
 | `vi` | Nextvi 편집기, SmallCLUE 의 애플릿 |
+| `git` | libgit2 기반 SmallCLUE 의 git (558+; HTTPS 는 SecureTransport 경유, OpenSSL 없음) |
 | `/AOK/native/motepad` | 모드가 없는 터미널 텍스트 편집기, Workspace 의 MotePad 애플릿에 대응 |
 | `/AOK/native/bmm`, `/AOK/native/bmt` | `/AOK/tools` 의 벤치마크를 호스트 코드로 컴파일해 넣은 것. 같은 작업을 에뮬레이션이 있을 때와 없을 때로 재어 볼 수 있습니다 (`kernel/native_bench.c`) |
 | `/AOK/native/hx` | [helix](https://helix-editor.com), 구문 강조를 지원하는 모달 편집기. MPL-2.0 이라 bash 처럼 빌드 스위치(`-Dnative_helix`)가 있으며, 문법 파일은 `/AOK/native/libs` 에 있습니다 |
 | `/AOK/native/rust-probe` | `hx` 가 딛고 있는 Rust-온-shim 경로를 검증하는 프로브. 직접 쓸 일은 없습니다 |
+| `/AOK/native/sudo`, `su`, `passwd` | SmallCLUE 의 것을 별도의 **setuid-root** 프로그램으로 둔 것. 부팅된 루트 자신의 `/etc/shadow` 와 `/etc/sudoers` 를 확인합니다 |
+| `/AOK/native/ktop` | 프로세스 뷰어, `/AOK/tools/ktop` 과 같은 소스 |
+| `/AOK/native/wl-present` | VNC 없이 앱에 Wayland 데스크톱을 보여 줌. `start-wayland.sh` 가 실행합니다 |
 | `/AOK/native/bash` | [네이티브 bash와 라이선스](#네이티브-bash와-라이선스) 참고 |
 | `/AOK/native/zsh` | [네이티브 zsh](#네이티브-zsh) 참고 |
+| `/AOK/native/dash`, `/AOK/native/sh` | dash, BSD 라이선스. `native-links.sh` 가 그냥 `sh` 라고 치면 이것이 되도록 만듭니다 |
 
 `/AOK/tools/native-links.sh` 는 애플릿을 `PATH` 에 올리는 심볼릭 링크 묶음을
-만들고, `--shell bash|zsh|/path` 로 로그인 셸을 바꿉니다. `--remove` 는 둘 다
-되돌립니다. 앱 안의 문서는 `/AOK/docs/native-programs.md`(무엇인가)와
+`/usr/local/native-bin` 과 `/usr/local/bin` 에 만들고, `--shell bash|zsh|/path` 로
+로그인 셸을 바꿉니다. `--remove` 는 둘 다 되돌립니다. 프로비저닝 스크립트가 이를
+대신 실행합니다. 앱 안의 문서는 `/AOK/docs/native-programs.md`(무엇인가)와
 `/AOK/docs/native-setup.md`(설정 방법)에 있고, 원본은
 [opt/AOK/docs/](opt/AOK/docs) 아래에 있습니다.
 
@@ -237,10 +274,34 @@ ninja -C build
 > [Native bash and licensing](README.md#native-bash-and-licensing) 이 정본입니다.
 > 아래는 이해를 돕기 위한 번역입니다.
 
-bash 는 네이티브 프로그램으로 앱에 컴파일되어 들어갑니다. 이득은 fork 가 아니라
-해석(interpretation)에 있습니다. 산술 루프는 에뮬레이트되는 셸보다 약 16배 빠르고,
-서브셸과 명령 치환은 거의 같은 수준입니다. 네이티브 프로그램은 `fork` 를 할 수
-없어 자기 자신을 다시 띄우기 때문입니다. 수치와 측정 방법은
+> **네이티브 bash 는 빌드 556 기준으로 포함되지 않습니다.** bash 는 GPLv3 이고
+> App Store 제출물에 포함될 수 없으므로, 출시되는 셸은 zsh 입니다 — 라이선스가
+> 허용적이고, 네이티브 구현도 둘 중 더 완성도가 높습니다. 포트 자체는 손대지
+> 않은 채 트리에 남아 있습니다: `-Dnative_bash=enabled`(Xcode 빌드는
+> `AOK_NATIVE_BASH=YES`)를 주면 이미 `deps/bash` 를 받아 둔 체크아웃을
+> 포함해 원하는 사람은 여전히 컴파일해 넣을 수 있습니다. 네이티브 bash 는
+> 끝내 체크포인트 지원을 갖추지 못했습니다: 자기 상태를 기록할 수 없으므로,
+> 서스펜드는 bash 를 원래 있던 자리로 되돌리는 대신 명령줄에서 다시 실행하고
+> 그렇게 했다고 보고합니다. 세션을 그대로 담은 채 돌아오는 네이티브 프로그램은
+> zsh 하나뿐입니다. `/AOK/native/bash` 를
+> 가리키는 로그인 셸은 `native-links.sh` 가 게스트 자체의 bash 로 자동
+> 변환하므로, 이미 그것을 쓰던 사람이 이번 변경으로 로그인하지 못하게 되는
+> 일은 없습니다. 558 부터는 커널이 부팅할 때마다 이를 고치기도 합니다: 빌드에
+> 없는 `/AOK/native` 아래의 로그인 셸은 루트 자신의 같은 이름 프로그램으로, 없으면
+> 네이티브 zsh, 그것도 없으면 `/bin/sh` 로 바뀌고 `dmesg` 에 한 줄이 남습니다 —
+> sshd, `login`, `su` 는 모두 셸이 없는 계정을 거부하기 때문입니다.
+> [docs/historical/shell_transition_plan.md](docs/historical/shell_transition_plan.md) 을 참고하십시오.
+
+**libgit2**(SmallCLUE 의 `git`, 558 부터 내장)는 *링크 예외가 붙은* GPLv2 입니다
+(`COPYING` 참고). 저작자들은 컴파일된 라이브러리를 어떤 프로그램에든 링크하고 그
+결과물을 GPL 의 조건 없이 배포하는 것을 허락합니다. bash 에 없는 바로 그 허락이므로,
+이것은 함께 출시됩니다.
+
+bash 는 네이티브 프로그램으로 앱에 컴파일해 넣을 수 있지만(`-Dnative_bash=enabled`),
+배포되는 빌드에는 556 부터 포함되지 않습니다. 컴파일해 넣었을 때의 이득은 fork 가
+아니라 해석(interpretation)에 있습니다. 산술 루프는 에뮬레이트되는 셸보다 약 16배
+빠르고, 서브셸과 명령 치환은 거의 같은 수준입니다. 네이티브 프로그램은 `fork` 를 할
+수 없어 자기 자신을 다시 띄우기 때문입니다. 수치와 측정 방법은
 [docs/bash_native_plan.md](docs/bash_native_plan.md) 에 있습니다. 동시에 이는
 바이너리에 GPLv3 코드를 넣는 일이기도 합니다. bash 자체, 함께 들어가는 readline,
 그리고 GNU termcap 입니다.
@@ -259,8 +320,8 @@ Go](https://www.theregister.com/2010/05/27/gnu_go_fsf_apple_itunes/) 와 2011년
 그래서 빌드 옵션입니다:
 
 ```bash
-meson setup build .                          # auto: deps/bash 가 있으면 켜짐
-meson setup build . -Dnative_bash=disabled   # 바이너리에 서드파티 GPL 없음
+meson setup build .                          # 기본값이 disabled -- 바이너리에 서드파티 GPL 없음
+meson setup build . -Dnative_bash=disabled   # 위와 동일, 명시적으로 지정
 meson setup build . -Dnative_bash=enabled    # deps/bash 가 없으면 실패
 ```
 
@@ -284,7 +345,33 @@ GPL 도구와 동일한 단순 병합(mere aggregation) 입장입니다.
 이를 제거합니다.
 
 바이너리의 나머지에는 서드파티 GPL 이 없습니다. SmallCLUE 는 MIT, OpenSSH 와
-libarchive 는 BSD, liblzma 는 퍼블릭 도메인입니다.
+libarchive 는 BSD, liblzma 는 퍼블릭 도메인이며, GPU 스택인 virglrenderer 와
+MoltenVK 는 각각 MIT 와 Apache-2.0 입니다.
+
+**각주가 필요한 쪽은 dash 이며, 이는 실수가 아니라 의도된 것입니다.** dash 는
+BSD-3-Clause 입니다 — 단 `src/mksignames.c` 만은 GPL-2+ 이고, 그 *출력물* 이
+바이너리에 링크됩니다. 데비안 자신의 copyright 파일이 바로 그 점을 명시합니다:
+
+```
+Files: src/mksignames.c
+Comment: This file is not directly linked with dash.  However, its output is.
+License: GPL-2+
+```
+
+**iSH-AOK 는 그 파일을 빌드하지 않습니다.** 이것은 빌드 시점 생성기이며, 그
+출력물 전체가 시그널 이름과 번호의 테이블로서 플랫폼 자신의 `signal.h` 에서
+유도할 수 있습니다. AOK 는 그 테이블을 스스로 생성하며 `mksignames.c` 를 결코
+컴파일하지 않습니다. 편의를 위해 되살리고 싶은 사람은 이 문단을 먼저
+읽으십시오 — 서른 줄이면 만들 수 있는 테이블을 위해 GPL 파생 콘텐츠를 다시
+바이너리에 넣는 일이 됩니다.
+
+**여기서 GPL-2+ 가 GPLv3 보다 무른 입장인 것은 아닙니다.** 그렇게 가정하기
+쉬우므로 짚어 둘 가치가 있습니다. 위의 App Store 제거 사례 두 건은 모두
+GPLv2 였고, FSF 가 밝힌 분석은 모든 GPL 버전에 적용됩니다. `+` 는 "또는 그 이후
+버전"을 뜻하며 수령자에게 버전 선택권을 줄 뿐, 스토어 이용 약관과의 충돌을
+완화하지 않습니다.
+
+이는 무엇을 링크할 것인가에 대한 엔지니어링 판단이며, 법률 자문이 아닙니다.
 
 ## 네이티브 zsh
 
@@ -321,7 +408,7 @@ MULTIOS 리다이렉션은 동반 네이티브 프로그램인 `zsh-multio` 를 
 필요한데 Alpine 이미지에는 없어서 그곳에서는 에뮬레이트되는 `/bin/bash` 에서도
 똑같이 실패하고, `/dev/fd` 가 `/proc/self/fd` 심볼릭 링크인 Devuan 에서는 두 셸
 모두 동작합니다. *셸 자체의* 알려진 결함 두 가지는
-[docs/release-notes-since-iSH-AOK_549.md](docs/release-notes-since-iSH-AOK_549.md)
+[docs/release-notes/release-notes-since-iSH-AOK_549.md](docs/release-notes/release-notes-since-iSH-AOK_549.md)
 의 *Known gaps* 에 적혀 있습니다. 패턴이 처음 쓰일 때 컴파일되어 파스 트리에
 캐시되는데 그때 어떤 옵션이 켜져 있었는지는 어디에도 기록되지 않아, 다시 띄워진
 자식이 부모와 다른 옵션으로 컴파일할 수 있다는 것, 그리고 multio 아래의
@@ -356,7 +443,7 @@ x86_64 호스트에서는 전부 실행됩니다.
 
 게스트 측 스위트가 주된 회귀 게이트입니다. [tests/manual/](tests/manual)에 있으며
 게스트 안에서는 `/AOK/tests`에 읽기 전용으로 제공됩니다. 시그널, futex, 프로세스
-라이프사이클, 파일시스템 계층, JIT, 아키텍처별 명령어 동작을 다루는 약 200개의
+라이프사이클, 파일시스템 계층, JIT, 아키텍처별 명령어 동작을 다루는 500개가 넘는
 프로그램으로 구성되어 있습니다. 각 프로그램은 실패 시 0이 아닌 값으로 종료하며 `-v`를
 지원합니다.
 
@@ -380,11 +467,14 @@ sh /AOK/tests/setup-regressions.sh --only fs_conformance,futex_core --run
 
 ## 루트 파일시스템 다루기
 
-앱에 번들된 것: Alpine 3.23.3과 Devuan 6(excalibur), `aarch64` 전용. Xcode 의
+앱에 번들된 것: Alpine 3.24.2와 Devuan 6(excalibur), `aarch64` 전용. Xcode 의
 "Download Root" 단계가 이 두 아카이브를 설치하고 Resources 에서 i386 과 x86_64
 아카이브를 지우므로, 무언가를 내려받기 전까지는 이 둘만 존재합니다. 같은 두 배포판의
-`i386`, `x86_64`, `riscv64` 판과 Arch 는 앱 안에서 내려받을 수 있으며, 카탈로그는
-[deps/rootfs-manifest](deps/rootfs-manifest)에 있습니다.
+`i386`, `x86_64`, `riscv64` 판(Alpine 은 3.24.2 와 3.23.3 둘 다), 그리고 Arch 와
+PSCAL + SmallCLUE 는 앱 안에서 내려받을 수 있으며, 카탈로그는
+[deps/rootfs-manifest](deps/rootfs-manifest)에 있습니다. 실행 환경의
+`ISH_BOOT_ROOT=<이름>` 은 기본값을 바꾸지 않고 한 번의 실행 동안만 지정한 루트로
+부팅하며, 기기 테스트가 루트마다 차례로 부팅하는 방법이 이것입니다.
 
 루트 선택 UI와 메타데이터 처리는 다음에 있습니다.
 
@@ -396,6 +486,10 @@ sh /AOK/tests/setup-regressions.sh --only fs_conformance,futex_core --run
 - 앱은 가져온 루트마다 게스트 ABI를 기록합니다.
 - 설치된 모든 루트는 부팅된 게스트에서 `/AOK/roots/<이름>`에 읽기·쓰기로 노출되므로,
   다른 아키텍처의 userland로 chroot할 수 있습니다.
+- 다른 루트의 동적 링크 프로그램을 경로로 실행하면(`/AOK/roots/<이름>/usr/bin/tmux`)
+  기본적으로 그 프로그램의 루트 안에서 실행되고, 그 루트의 라이브러리를 써서 지금
+  루트에서 실행할 수도 있습니다 — 설정 → 다른 파일 시스템 → 다른 루트의 프로그램,
+  `/proc/ish/foreign_exec`, CLI 에서는 `ISH_FOREIGN_EXEC`.
 - 관리되는 루트에 대해 File Provider 도메인이 동기화됩니다.
 
 ## 로깅과 진단
@@ -438,7 +532,7 @@ ISH_LOG = verbose strace
 Ruby/Bundler/Fastlane 환경과 서명 및 인증 시크릿이 필요합니다.
 
 릴리스 자체는 `CURRENT_PROJECT_VERSION`을 올리고,
-`docs/release-notes-since-iSH-AOK_<N>.md`와 `docs/release-summary-iSH-AOK_<N>.md`를
+`docs/release-notes/release-notes-since-iSH-AOK_<N>.md`를
 추가한 뒤, 해당 커밋에 `builds/iSH-AOK_<N>` 태그를 붙여 만듭니다. 태그 이름은 그 자체로
 동작에 관여합니다. `.github/workflows/build-release-ipa.yml`이 `builds/iSH-AOK_*`에서
 트리거되므로, 다르게 이름 붙인 태그는 릴리스 빌드를 만들지 않습니다.
@@ -464,6 +558,26 @@ iSH-AOK는 업스트림 iSH를 기반으로 하지만 의도적으로 분기되�
 `upstream` 리모트가 있는 클론에서 `gh` CLI를 쓸 때는 `--repo emkey1/ish-AOK`를
 전달하세요. 그렇지 않으면 `gh`는 `ish-app/ish`로 해석되어 이 포크가 아니라 업스트림의
 워크플로, 릴리스, 태그에 대해 답합니다.
+
+## LLM 코딩 에이전트와 작업하기
+
+이 트리는 LLM 코딩 에이전트와 함께 활발히 개발되고 있습니다. 이 저장소를 포크해서
+에이전트(Claude 든 다른 것이든)를 이곳에 붙이려 한다면
+[docs/llm_onboarding.md](docs/llm_onboarding.md)부터 읽히세요. 이 트리의 회귀
+스위트, 디버깅 도구(게스트 코드용 디버거는 없습니다), 그리고 `docs/TODO.md` 협업
+흐름에 익숙해지는 과정을 줄이기 위해 만든 문서입니다.
+
+`.gitignore` 는 이 프로젝트가 접한 도구별 에이전트 설정 파일(`CLAUDE.md`,
+`AGENTS.md`, `.claude/`, `.cursor/`, `.clinerules`, `.gemini/`, `.windsurfrules`,
+`opencode.json`...)을 일부러 모두 제외합니다. 이들은 `.vscode/` 나 `.prettierrc` 와
+같은 부류인, 체크아웃마다 다른 개인 도구 설정으로 취급되며 공유되는 저장소 내용이
+아닙니다. 커밋되는 도구 중립적 진입점은 `docs/llm_onboarding.md` 하나뿐입니다.
+쓰는 도구가 자체 포인터 파일을 원한다면 로컬에 두고, 내용을 복제하지 말고 그 문서를
+가리키게 하세요.
+
+Claude Code 를 쓴다면 [`CLAUDE.md.template`](CLAUDE.md.template)을 켜 두어도
+좋습니다. `CLAUDE.md` 로 복사하면(`cp CLAUDE.md.template CLAUDE.md`) Claude Code 가
+매 세션마다 핵심 요약을 자동으로 불러오며, 그 파일은 추적되거나 커밋되지 않습니다.
 
 ## 감사의 말
 

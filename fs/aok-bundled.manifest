@@ -1,0 +1,62 @@
+# Files served read-only at /AOK/bundled, embedded into the kernel by
+# tools/gen-aokfs.py at build time (see meson.build's aok_libs_groups).
+#
+# Programs and libraries built AHEAD OF TIME for guest roots, so that a setup
+# script links them in rather than compiling on the device -- wf-panel's
+# build ran an A10X iPad out of memory, and the shims want a compiler most
+# roots do not have. tools/build-bundled.sh builds them on a Mac, in the CLI's
+# guest roots, with the same scripts a device would run; the results are
+# committed under opt/AOK/bundled/.
+#
+# One directory per target: a distro release and architecture for what links
+# against a distro's own libraries (devuan6-aarch64, devuan6-x86_64 and devuan6-riscv64: wayvnc
+# 0.10.2 with its own neatvnc and aml, in place of Devuan's 0.9.1, which
+# start-wayland.sh prefers; devuan6-aarch64: wf-panel, good only for
+# the wf-shell version in wf-panel.source; arm64 only, the fastest guest -- a
+# Devuan root of another architecture runs it with the arm64 builds of the
+# packages in wf-panel.depends, installed through multiarch), a libc and
+# architecture for what links only against libc (glibc-x86_64: the shims,
+# which are preloaded into every program and so are carried for all four
+# guest architectures, on glibc and on musl).
+#
+# Each line: <path> [mode]   read from opt/AOK/bundled/<path>.
+devuan6-aarch64/wf-panel 0555
+devuan6-aarch64/wf-panel.source
+devuan6-aarch64/wf-panel.depends
+devuan6-aarch64/wayvnc 0555
+devuan6-aarch64/wayvncctl 0555
+devuan6-aarch64/libneatvnc.so.1 0555
+devuan6-aarch64/libaml.so.1 0555
+devuan6-aarch64/wayvnc.source
+devuan6-aarch64/wayvnc.depends
+devuan6-aarch64/wayvnc.COPYING
+devuan6-x86_64/wayvnc 0555
+devuan6-x86_64/wayvncctl 0555
+devuan6-x86_64/libneatvnc.so.1 0555
+devuan6-x86_64/libaml.so.1 0555
+devuan6-x86_64/wayvnc.source
+devuan6-x86_64/wayvnc.depends
+devuan6-x86_64/wayvnc.COPYING
+devuan6-riscv64/wayvnc 0555
+devuan6-riscv64/wayvncctl 0555
+devuan6-riscv64/libneatvnc.so.1 0555
+devuan6-riscv64/libaml.so.1 0555
+devuan6-riscv64/wayvnc.source
+devuan6-riscv64/wayvnc.depends
+devuan6-riscv64/wayvnc.COPYING
+glibc-aarch64/libish-wl-release-guard.so 0555
+glibc-aarch64/libish-pixman.so 0555
+glibc-x86_64/libish-wl-release-guard.so 0555
+glibc-x86_64/libish-pixman.so 0555
+musl-aarch64/libish-wl-release-guard.so 0555
+musl-aarch64/libish-pixman.so 0555
+musl-x86_64/libish-wl-release-guard.so 0555
+musl-x86_64/libish-pixman.so 0555
+glibc-i386/libish-wl-release-guard.so 0555
+glibc-i386/libish-pixman.so 0555
+glibc-riscv64/libish-wl-release-guard.so 0555
+glibc-riscv64/libish-pixman.so 0555
+musl-i386/libish-wl-release-guard.so 0555
+musl-i386/libish-pixman.so 0555
+musl-riscv64/libish-wl-release-guard.so 0555
+musl-riscv64/libish-pixman.so 0555

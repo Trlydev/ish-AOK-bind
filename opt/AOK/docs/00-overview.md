@@ -31,11 +31,15 @@ Everything else under `/AOK` is baked into the app at build time:
 /AOK/docs/                this documentation set, and book/ -- the whole book
 /AOK/tools/               scripts and utilities (native-links.sh, persist-links.sh,
                           manage-roots.sh, mount-root.sh, ktop, benchmarks,
-                          provisioning, Wayland)
+                          provisioning, Wayland, setup-gpu.sh, setup-games.sh,
+                          setup-locale.sh)
 /AOK/tests/               the guest-side regression suite
-/AOK/fixes/               canned fixes for known upstream-distro bugs
+/AOK/fixes/               canned fixes for known upstream problems (Devuan, Arch, Codex)
 /AOK/native/              programs compiled into the app -- exec'ing one runs host
                           code instead of translated guest code (native-programs.md)
+/AOK/bundled/             guest programs and libraries built ahead of time, per distro
+                          or libc and CPU, which the setup scripts link in instead
+                          of compiling on the device
 /AOK/persist/             writable, host-backed, survives everything (see persist.md)
 /AOK/fakefs/              writable, survives everything, keeps full Linux metadata
 /AOK/roots/               other installed roots, exposed read-write (see roots.md)
@@ -52,9 +56,12 @@ at runtime:
 - Test sources live under `tests/manual/`.
 - Native-program support files live under `deps/helix/runtime/`, and are
   served at `/AOK/native/libs`.
+- Prebuilt guest binaries live under `opt/AOK/bundled/` (built by
+  `tools/build-bundled.sh`), and are served at `/AOK/bundled`.
 
-Four manifest files (`fs/aok-docs.manifest`, `fs/aok-tools.manifest`,
-`fs/aok-tests.manifest`, and `fs/aok-libs.manifest` for `/AOK/native/libs`)
+Manifest files (`fs/aok-docs.manifest`, `fs/aok-tools.manifest`,
+`fs/aok-tests.manifest`, `fs/aok-libs.manifest` for `/AOK/native/libs`, and
+`fs/aok-bundled.manifest` for `/AOK/bundled`, among others)
 list exactly which files get shipped. At build time, `tools/gen-aokfs.py`
 reads each manifest and embeds the listed files' contents directly into the
 compiled emulator as C string tables, which `fs/aok.c` then serves at
@@ -69,6 +76,11 @@ A couple of things fall out of that:
 - If you're building iSH-AOK from source and want to see a new doc or tool
   show up under `/AOK`, it has to be listed in the matching manifest file,
   or it won't be embedded.
+- Files under `/AOK` can be mapped, the way `ld.so` maps every library — an
+  `LD_PRELOAD` of a library in `/AOK/bundled` works. An embedded file maps as
+  a private copy, so a writable shared mapping of one is `EACCES`. Exec of a
+  program on a filesystem that cannot be mapped at all fails with `ENOEXEC`,
+  as on Linux, rather than crashing.
 
 `/AOK/native` is different again: its program entries have no manifest. Each is
 one program compiled into the app and registered in `kernel/native.c`, and
@@ -85,12 +97,39 @@ derived from the listed paths rather than declared in `fs/aok.c`.
 
 ## A note on `/proc`, `/sys`, and `/dev`
 
-iSH-AOK has no mount or PID namespaces — there's exactly one Linux kernel
+iSH-AOK is one machine — there's exactly one Linux kernel
 underneath everything, so `/proc`, `/sys`, and `/dev` always reflect the
 single true system state no matter which root or chroot you're looking at
 them from. That's what makes tools like [ktop](ktop.md) useful from outside
 a chroot: they see every process across every currently-mounted root,
 labeled by guest architecture.
+
+## What the app opens with
+
+**Settings → Startup Mode** decides what a fresh launch shows you. Five choices:
+
+| mode | what you get |
+| --- | --- |
+| Session Shell (pts/1) | a login shell on a pty, the usual terminal — the default |
+| Plain Terminal | a terminal with no login session behind it |
+| Workspace | the in-app windowed desktop ([workspace.md](workspace.md)) |
+| Wayland Display | the Wayland output, for guests running a graphical session |
+| Choose Filesystem | the root-filesystem picker ([roots.md](roots.md)) |
+
+The distinction that matters most is the first two. **Session Shell** boots the
+guest through `init`, so the services in `/etc/service` start, `sshd` comes up if
+you have it, and you land in a login shell on `pts/1` — a machine that has
+booted. **Plain Terminal** gives you a shell and nothing else, which starts
+faster and is what you want when the guest's own init is the thing you are
+debugging.
+
+Whichever you choose, the other windows are still reachable once you are in;
+Startup Mode only picks the first one.
+
+To override it once, long-press the app's icon on the Home Screen (from build
+559): the menu offers **Workspace**, **Wayland Display**, **Session Shell** and
+**System Console**, and works whether or not the app is already running. The
+menu appears once the app has been opened at least once.
 
 ## The rest of this documentation set
 
@@ -104,20 +143,26 @@ six of them were not linked from anywhere at all.
 | --- | --- |
 | [roots.md](roots.md) | installing, switching between and chrooting into several Linux root filesystems |
 | [persist.md](persist.md) | `/AOK/persist` and `/AOK/fakefs` — the two places that survive root switches, app updates and reinstalls |
-| [networking.md](networking.md) | reaching the device from another machine, and what the guest can and cannot listen on |
+| [networking.md](networking.md) | reaching the device from another machine, what the guest can and cannot listen on, and the DNS relay |
+| [namespaces.md](namespaces.md) | sandboxes inside the guest — `unshare`, bubblewrap, Codex CLI's command sandbox — and what a private network is here |
 | [files-app-integration.md](files-app-integration.md) | the File Provider extension, and how iSH-AOK appears in the iOS Files app |
 | [shortcuts.md](shortcuts.md) | driving iSH-AOK from Apple's Shortcuts app |
+| [swap.md](swap.md) | the simulated swap area — turning it on, what it costs, and what it will not do |
+| [suspend.md](suspend.md) | suspend to disk — keeping the session across the app being killed |
 
 **The app around the emulator**
 
 | file | what it covers |
 | --- | --- |
-| [workspace.md](workspace.md) | the in-app multi-window desktop, its applets and saved layouts |
+| [workspace.md](workspace.md) | the in-app multi-window desktop, its applets and saved layouts — and the Wayland desktop, the GPU and the games set |
 | [file-browser.md](file-browser.md) | the quick file picker on the keyboard bar (Cmd-B) |
+| [keyboard-shortcuts.md](keyboard-shortcuts.md) | every hardware-keyboard shortcut: desktops, windows, the terminal, MotePad, the Wayland desktop |
+| [keyboard-toolbar.md](keyboard-toolbar.md) | arranging the keys above the keyboard, and adding your own |
+| [snippets.md](snippets.md) | saved command lines you put on the prompt with one tap |
 | [motepad.md](motepad.md) | the built-in text editor |
 | [md.md](md.md) | the Markdown viewer |
 | [themes.md](themes.md) | the fourteen bundled themes and writing your own |
-| [llm-chat.md](llm-chat.md) | the in-app LLM chat client |
+| [llm-chat.md](llm-chat.md) | the in-app LLM chat client — providers, file and shell tools, MCP servers, background agents |
 | [ktop.md](ktop.md) | the bundled process viewer, and building it from the source shipped here |
 
 **Going faster, and going native**
@@ -125,10 +170,12 @@ six of them were not linked from anywhere at all.
 | file | what it covers |
 | --- | --- |
 | [native-programs.md](native-programs.md) | what a native program is and why one is not emulated |
+| [native-mode.md](native-mode.md) | a root with no distribution: only the native programs, init and services, reaching other roots |
 | [native-setup.md](native-setup.md) | putting the native programs on your `PATH` |
+| [binfmt-misc.md](binfmt-misc.md) | teaching the kernel to run other formats through an interpreter |
 | [crypto-accel.md](crypto-accel.md) | routing OpenSSL through the host's crypto instructions |
 | [benchmarks.md](benchmarks.md) | the bundled microbenchmarks, and how to run them |
-| [tuning-knobs.md](tuning-knobs.md) | `ISH_GUEST_CPU_COUNT` and friends, for the CLI build and Xcode schemes |
+| [tuning-knobs.md](tuning-knobs.md) | `ISH_GUEST_CPU_COUNT` and friends, for the CLI build and Xcode schemes — plus the resource limits and hardening enforced unconditionally |
 
 **The book**
 
@@ -143,6 +190,7 @@ browser is exactly who it was written for. Start at
 
 | file | what it covers |
 | --- | --- |
-| [proc-ish.md](proc-ish.md) | `/proc/ish` — the build, the settings, and the guest-side preference surface |
+| [proc-ish.md](proc-ish.md) | `/proc/ish` — the build, the settings, the JIT switches, the app's own memory, and the guest-side preference surface |
+| [guest-cpus.md](guest-cpus.md) | what each guest CPU reports to software — x86's AVX and AVX-512, arm64's MOPS, riscv64's RVA23 and vector unit |
 | [fuse.md](fuse.md) | the FUSE implementation, `/dev/fuse`, and what it supports |
 | [riscv64-vendor-extensions.md](riscv64-vendor-extensions.md) | how non-standard riscv64 vendor extensions are handled |

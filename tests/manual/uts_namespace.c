@@ -112,7 +112,10 @@ static int child_shared_ns_writes_through(void) {
 // how UTS support stayed invisible to systemd even once it worked, with
 // every ProtectHostname= unit logging that the kernel has no UTS namespaces.
 static void check_ns_probe(void) {
-    static const char *types[] = {"uts", "mnt", "pid", "net", "ipc", "user", "cgroup", "time"};
+    // Not "net", "cgroup" or "time": each of those files exists exactly when
+    // its kind can be made, which namespace_errno.c checks -- it is the same
+    // probe, and AOK answers no for cgroup and time.
+    static const char *types[] = {"uts", "mnt", "pid", "ipc", "user"};
     for (size_t i = 0; i < sizeof(types) / sizeof(types[0]); i++) {
         char path[64];
         snprintf(path, sizeof(path), "/proc/self/ns/%s", types[i]);
@@ -152,13 +155,15 @@ static void check_ns_probe(void) {
 //   unshare: unshare failed: Invalid argument
 //
 // Reported from a device, and the -T is what decided the message.
+//
+// CLONE_NEWIPC left this list when IPC namespaces became real (kernel/ipc_ns.h)
+// -- as root it now succeeds here, as the UTS namespace does -- and
+// CLONE_NEWNS when mount namespaces did (kernel/mnt_ns.h), CLONE_NEWUSER
+// with user namespaces (kernel/user_ns.h), CLONE_NEWPID with pid namespaces
+// (kernel/pid_ns.h), and CLONE_NEWNET with network namespaces
+// (kernel/net_ns.h). What is left is cgroup and time.
 #define UNSHARE_NEWTIME 0x00000080
-#define UNSHARE_NEWNS 0x00020000
 #define UNSHARE_NEWCGROUP 0x02000000
-#define UNSHARE_NEWIPC 0x08000000
-#define UNSHARE_NEWUSER 0x10000000
-#define UNSHARE_NEWPID 0x20000000
-#define UNSHARE_NEWNET 0x40000000
 
 // 0 if the unshare succeeded, else the errno. Run in a child, because a
 // namespace this kernel DOES create must not follow us out of the check.
@@ -183,12 +188,7 @@ static void check_unshare_consistency(void) {
         const char *name;
         int flag;
     } ns[] = {
-        {"CLONE_NEWNS", UNSHARE_NEWNS},
         {"CLONE_NEWCGROUP", UNSHARE_NEWCGROUP},
-        {"CLONE_NEWIPC", UNSHARE_NEWIPC},
-        {"CLONE_NEWUSER", UNSHARE_NEWUSER},
-        {"CLONE_NEWPID", UNSHARE_NEWPID},
-        {"CLONE_NEWNET", UNSHARE_NEWNET},
         {"CLONE_NEWTIME", UNSHARE_NEWTIME},
     };
     int first = unshare_result(ns[0].flag);

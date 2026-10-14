@@ -2,6 +2,7 @@
 #include <string.h>
 
 #include "emu/vec.h"
+#include "emu/fpenv.h"
 #include "emu/cpu.h"
 
 union vec {
@@ -378,6 +379,21 @@ void vec_single_ucomi64(struct cpu_state *cpu, const double *src, const double *
     vec_set_ucomi_flags(cpu, unordered, *src == *dst, *dst < *src);
 }
 
+// COMISS/COMISD: the same flags, but a signalling compare -- a quiet NaN is an
+// invalid operation too. The quiet host compares above already raise it for a
+// signalling one; emu/fpenv.c carries it into MXCSR.
+void vec_single_comi32(struct cpu_state *cpu, const float *src, const float *dst) {
+    if (isnan(*src) || isnan(*dst))
+        fpenv_raise_invalid();
+    vec_single_ucomi32(cpu, src, dst);
+}
+
+void vec_single_comi64(struct cpu_state *cpu, const double *src, const double *dst) {
+    if (isnan(*src) || isnan(*dst))
+        fpenv_raise_invalid();
+    vec_single_ucomi64(cpu, src, dst);
+}
+
 #define VEC_PACKED_OP(name, op, field, size, n) \
     void vec_##name##size(NO_CPU, union xmm_reg *src, union xmm_reg *dst) { \
         for (int i = 0; i < n; ++i) { \
@@ -453,6 +469,12 @@ void vec_fcmp_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t 
         dst->qw[i] = cmpd(dst->f64[i], src->f64[i], type) ? -1 : 0;
     }
 }
+// (the x86_64 host's CMPPS; an aarch64 host runs math.S amd64_xf_cmpps_r)
+void vec_fcmp_p32(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t type) {
+    for (size_t i = 0; i < sizeof(dst->f32) / sizeof(*dst->f32); ++i) {
+        dst->u32[i] = cmps(dst->f32[i], src->f32[i], type) ? -1 : 0;
+    }
+}
 
 // come to the dark side of macros
 #define _ISNAN_int32_t(x) false
@@ -468,14 +490,18 @@ void vec_fcmp_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t 
 // (e.g. (int32_t)1e30 -> 0x7fffffff), whereas x86 yields 0x80000000 for overflow
 // in BOTH directions. Range-check explicitly, matching amd64_cvtt_scalar_to_int
 // (emu/amd64_interp.c). Every user of this macro has an int32_t destination.
+// The indefinite is an invalid operation, which no host instruction ran to
+// raise, so it is raised here; an inexact truncation raises its own flag.
 #define VEC_TRUNC_INT(src, dst, src_t, dst_t, n) \
     do { \
         for (int i = 0; i < n; ++i) { \
             src_t _v = ((src_t *)src)[i]; \
-            if (isnan(_v) || _v >= 2147483648.0 || _v < -2147483648.0) \
+            if (isnan(_v) || _v >= 2147483648.0 || _v < -2147483648.0) { \
                 ((dst_t *)dst)[i] = INT32_MIN; \
-            else \
+                fpenv_raise_invalid(); \
+            } else { \
                 ((dst_t *)dst)[i] = (dst_t) _v; \
+            } \
         } \
     } while (0)
 
@@ -496,8 +522,20 @@ void vec_fcmp_p64(NO_CPU, const union xmm_reg *src, union xmm_reg *dst, uint8_t 
         memset(dst->dst_field + n, 0, sizeof(*dst) - n * sizeof(*dst->dst_field)); \
     }
 
+// cvtsd2si/cvtss2si: rounded by MXCSR.RC, which is the host's mode while
+// guest code runs (emu/fpenv.c) -- rint rounds in it and raises inexact --
+// then the same indefinite rule as the truncating forms. They were missing
+// from the i386 decoder altogether, so both raised SIGILL.
+#define VEC_CVTR(name, src_t, dst_t) \
+    void vec_cvt##name(NO_CPU, const src_t *src, dst_t *dst) { \
+        src_t r = (src_t) rint(*src); \
+        VEC_TRUNC_INT(&r, dst, src_t, dst_t, 1); \
+    }
+
 VEC_CVT(si2sd32, int32_t, double)
 VEC_CVTT(tsd2si64, double, int32_t)
+VEC_CVTR(sd2si64, double, int32_t)
+VEC_CVTR(ss2si32, float, int32_t)
 VEC_CVT(sd2ss64, double, float)
 VEC_CVT(si2ss32, int32_t, float)
 VEC_CVTT(tss2si32, float, int32_t)
@@ -505,6 +543,39 @@ VEC_CVT(ss2sd32, float, double)
 
 PACKED_VEC_CVTT(tpd2dq64, f64, u32, double, int32_t, 2)
 PACKED_VEC_CVTT(tps2dq32, f32, u32, float, int32_t, 4)
+
+// RCPPS/RCPSS/RSQRTPS/RSQRTSS for the x86_64 host (an aarch64 host runs
+// math.S amd64_xf_rcp*/rsqrt*): the exact reciprocal is within the
+// approximation's bound.
+void vec_rcpps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 4; i++)
+        dst->f32[i] = 1.0f / src->f32[i];
+}
+void vec_rsqrtps128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    for (int i = 0; i < 4; i++)
+        dst->f32[i] = 1.0f / sqrtf(src->f32[i]);
+}
+void vec_rcpss32(NO_CPU, const float *src, union xmm_reg *dst) {
+    dst->f32[0] = 1.0f / *src;
+}
+void vec_rsqrtss32(NO_CPU, const float *src, union xmm_reg *dst) {
+    dst->f32[0] = 1.0f / sqrtf(*src);
+}
+
+// CVTPS2DQ / CVTPD2DQ: rounded by MXCSR.RC (the host's mode), then the
+// truncating forms' indefinite rule -- for the x86_64 host; an aarch64 host
+// runs math.S amd64_xf_cvtps2dq_r / cvtpd2dq_r.
+void vec_cvtps2dq128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    float r[4];
+    for (int i = 0; i < 4; i++)
+        r[i] = rintf(src->f32[i]);
+    VEC_TRUNC_INT(r, dst->u32, float, int32_t, 4);
+}
+void vec_cvtpd2dq128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    double r[2] = {rint(src->f64[0]), rint(src->f64[1])};
+    VEC_TRUNC_INT(r, dst->u32, double, int32_t, 2);
+    dst->qw[1] = 0;
+}
 
 // cvtdq2pd: two packed signed int32 from the low 64 bits of src -> two
 // doubles in dst. Read both source dwords before writing any result: src and
@@ -678,6 +749,18 @@ void vec_insert_w128(NO_CPU, const uint32_t *src, union xmm_reg *dst, uint8_t in
 }
 void vec_extract_w128(NO_CPU, const union xmm_reg *src, uint32_t *dst, uint8_t index) {
     *dst = src->u16[index % 8];
+}
+// MOVHLPS / MOVLHPS for the x86_64 host (an aarch64 host runs math.S
+// amd64_v_movhlps_reg / amd64_v_movlhps_reg)
+void vec_movhl128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    dst->qw[0] = src->qw[1];
+}
+void vec_movlh128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
+    dst->qw[1] = src->qw[0];
+}
+// (the x86_64 host's PEXTRW r32, mm; an aarch64 host runs math.S amd64_mmx_pextrw)
+void vec_extract_w64(NO_CPU, const union mm_reg *src, uint32_t *dst, uint8_t index) {
+    *dst = (uint16_t) (src->qw >> (16 * (index % 4)));
 }
 
 void vec_avg_b128(NO_CPU, const union xmm_reg *src, union xmm_reg *dst) {
