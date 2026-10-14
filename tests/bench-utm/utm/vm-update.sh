@@ -1,8 +1,9 @@
 #!/bin/sh
-# vm-update.sh -- bring a "Devuan Ultimate" machine's AOK tools up to the repository's, in place. In the
-# machine, as its user:
+# vm-update.sh -- bring an AOK VM machine's AOK tools up to the repository's, in place: a "Devuan Ultimate"
+# machine, or one of the base machines (iSH-AOK's Alpine or Devuan root as a machine of its own, aok-vm's
+# aok/images). In the machine, as root:
 #     wget -qO- https://raw.githubusercontent.com/emkey1/ish-AOK/working/tests/bench-utm/utm/vm-update.sh | sudo sh
-# (a machine built after 2026-10-12 has it as `sudo aok-update`).
+# (a machine built after 2026-10-12 has it as `aok-update`, with sudo where there is a user).
 #
 # From its first boot a machine's disk is its user's (a password, keys, packages), so a fix to the scripts
 # cannot reach it as a new image. This fetches the scripts of /AOK/tools again, replaces one only if what
@@ -13,7 +14,9 @@ set -e
 [ "$(id -u)" = 0 ] || { echo "aok-update: run it as root (sudo)"; exit 1; }
 [ -d /proc/ish ] && { echo "aok-update: for a VM; an AOK root has /AOK/tools from the app"; exit 1; }
 base=${AOK_UPDATE_URL:-https://raw.githubusercontent.com/emkey1/ish-AOK/working}
-tools="start-wayland.sh setup-wayland.sh provision-ultimate-devuan.sh setup-games.sh aok-sdl-game"
+# The distribution's own provisioning script: Alpine's or Devuan's.
+os=devuan; [ -f /etc/alpine-release ] && os=alpine
+tools="start-wayland.sh setup-wayland.sh provision-ultimate-$os.sh setup-games.sh aok-sdl-game"
 t=$(mktemp -d)
 trap 'rm -rf "${t:?}"' EXIT
 for f in $tools vm-update.sh; do
@@ -100,7 +103,7 @@ if ! mountpoint -q /AOK/persist; then
 fi
 # Vulkan: the engine offers it since 2026-10-13 (venus); the guest's half is Mesa's virtio driver, which
 # images before that did not carry.
-if ! dpkg -s mesa-vulkan-drivers vulkan-tools > /dev/null 2>&1; then
+if [ "$os" = devuan ] && ! dpkg -s mesa-vulkan-drivers vulkan-tools > /dev/null 2>&1; then
     echo "  mesa-vulkan-drivers, vulkan-tools: installing (Vulkan in the guest) ..."
     export DEBIAN_FRONTEND=noninteractive
     if apt-get update -qq > /dev/null 2>&1 &&
