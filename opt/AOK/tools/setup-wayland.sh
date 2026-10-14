@@ -29,8 +29,9 @@
 #   or  doas sh /AOK/tools/setup-wayland.sh
 #
 # Devuan (apt) and Alpine (apk) both run the desktop: Devuan 6 on amd64 and
-# arm64, in the CLI harness and on-device, and Alpine 3.23 arm64 (labwc 0.9.2)
-# start to finish in the harness, menu and X11 programs included. Arch (pacman)
+# arm64, in the CLI harness and on-device, Alpine 3.23 arm64 (labwc 0.9.2)
+# start to finish in the harness, menu and X11 programs included, and Alpine
+# 3.24 arm64 in an AOK VM machine (the user, 2026-10-14). Arch (pacman)
 # installs the same stack under the same names and its packages resolve, but
 # nobody has run a session on it.
 #
@@ -136,7 +137,7 @@ elif command -v pacman >/dev/null 2>&1; then
 
 elif command -v apk >/dev/null 2>&1; then
     log "Alpine (apk) detected"
-    note "Alpine was last run on 3.23 arm64 -- please report back what breaks."
+    note "Alpine was last run on 3.24 arm64 -- please report back what breaks."
     # font-dejavu: on Devuan and Arch the stack pulls in a text font, and on
     # Alpine nothing does. With only the icon font waybar brings below, every
     # window title, menu and foot terminal was drawn in Font Awesome.
@@ -176,6 +177,47 @@ if [ "$IN_AOK" = 0 ]; then
         rc-service seatd start >/dev/null 2>&1 || true
         seat_group=seat
     fi
+    # The keyboard and the pointer: libinput takes only the input devices a
+    # udev daemon has recorded, and AOK VM's base machines run none (busybox's
+    # init on Alpine, and Devuan's root as iSH-AOK ships it has no eudev).
+    if command -v apt-get >/dev/null 2>&1; then
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends eudev >/dev/null 2>&1 \
+            || note "warning: eudev did not install; the desktop may find no keyboard or pointer"
+    elif command -v apk >/dev/null 2>&1; then
+        apk_add eudev || note "warning: eudev did not install; the desktop may find no keyboard or pointer"
+    fi
+    # `desktop`: the desktop on this machine's display, as the Ultimate machines
+    # have it. It starts udevd and seatd itself where nothing else has (AOK
+    # VM's Alpine machines boot with busybox's init, no OpenRC to run them).
+    # `desktop soft`: composited without the GPU, for a display whose GL path
+    # does not show.
+    mkdir -p /usr/local/bin
+    cat > /usr/local/bin/desktop <<'D'
+#!/bin/sh
+# desktop -- the Wayland desktop on this machine's display (setup-wayland.sh).
+# desktop soft: composited without the GPU.
+[ "$1" = soft ] && { shift; export WLR_RENDERER=pixman; }
+if [ "$(id -u)" = 0 ]; then
+    # udev, for libinput to find the keyboard and the pointer
+    if ! pidof udevd systemd-udevd >/dev/null 2>&1; then
+        for u in /sbin/udevd /usr/sbin/udevd /lib/systemd/systemd-udevd /usr/lib/systemd/systemd-udevd; do
+            [ -x "$u" ] || continue
+            "$u" --daemon && udevadm trigger --action=add && udevadm settle --timeout=5
+            break
+        done
+    fi
+    # seatd, for the compositor to take the display and the input devices
+    if command -v seatd >/dev/null 2>&1 && ! pidof seatd >/dev/null 2>&1; then
+        seatd -g SEAT_GROUP >/dev/null 2>&1 &
+        n=0; while [ ! -S /run/seatd.sock ] && [ $n -lt 20 ]; do sleep 0.1; n=$((n + 1)); done
+    fi
+elif ! pidof seatd >/dev/null 2>&1; then
+    echo "desktop: seatd is not running; run desktop as root once, or start seatd (seatd -g SEAT_GROUP &)" >&2
+fi
+exec sh /AOK/tools/start-wayland.sh "$@"
+D
+    sed -i "s/SEAT_GROUP/$seat_group/g" /usr/local/bin/desktop
+    chmod 755 /usr/local/bin/desktop
     for _u in $(awk -F: '$3 >= 1000 && $3 < 2000 { print $1 }' /etc/passwd); do
         if command -v usermod >/dev/null 2>&1; then
             usermod -a -G "$seat_group" "$_u" 2>/dev/null
@@ -348,7 +390,7 @@ note "labwc, sway, wofi, foot, and wayvnc are installed."
 if [ "$IN_AOK" = 1 ]; then
     note "The Display applet will launch the stack automatically from here on."
 else
-    note "Start the desktop on this machine's display with:  sh /AOK/tools/start-wayland.sh"
+    note "Start the desktop on this machine's display with:  desktop"
 fi
 note "Games, desktop tools and X11 support are optional extras:"
 note "  sudo sh /AOK/tools/setup-wayland-extras.sh games tools x11"
