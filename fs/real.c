@@ -29,6 +29,18 @@
 #include "util/sync.h"
 #include "emu/memory.h"
 
+// No symlink is followed on the host below a mount's root: see
+// realfs_parent_at.
+#if defined(O_NOFOLLOW_ANY) && defined(AT_SYMLINK_NOFOLLOW_ANY) && defined(RENAME_NOFOLLOW_ANY)
+#define REALFS_O_NOFOLLOW O_NOFOLLOW_ANY
+#define REALFS_AT_NOFOLLOW AT_SYMLINK_NOFOLLOW_ANY
+#define REALFS_NOFOLLOW_ANY 1
+#else
+#define REALFS_O_NOFOLLOW 0
+#define REALFS_AT_NOFOLLOW AT_SYMLINK_NOFOLLOW
+#define REALFS_NOFOLLOW_ANY 0
+#endif
+
 struct realfs_io_stats realfs_io_stats;
 
 static inline void realfs_count_read(ssize_t res) {
@@ -169,7 +181,7 @@ static void realfs_trace_path_stat(const char *op, struct mount *mount, const ch
         return;
 
     struct stat st;
-    int err = fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW);
+    int err = fstatat(mount->root_fd, fix_path(path), &st, REALFS_AT_NOFOLLOW);
     if (err < 0) {
         fprintf(stderr,
                 "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s result=%d errno=%d\n",
@@ -198,7 +210,7 @@ static void realfs_trace_task_path_stat(const char *op, struct mount *mount, con
         return;
 
     struct stat st;
-    int err = fstatat(mount->root_fd, fix_path(path), &st, AT_SYMLINK_NOFOLLOW);
+    int err = fstatat(mount->root_fd, fix_path(path), &st, REALFS_AT_NOFOLLOW);
     if (err < 0) {
         fprintf(stderr,
                 "ish-dpkg-realfs:%s-stat pid=%d comm=%s path=%s fix=%s result=%d errno=%d\n",
@@ -503,6 +515,57 @@ static int getpath(int fd, char *buf) {
 #endif
 }
 
+// Host lookups below a mount's root follow no symlink, anywhere in the path.
+// What reaches realfs is already resolved: fs/path.c walks the guest's
+// symlinks component by component, reading each with readlink, against the
+// guest's root (chroot, RESOLVE_IN_ROOT, RESOLVE_BENEATH and the rest). A
+// host lookup that followed links would follow one put in place of a
+// directory between that walk and this call -- out of a chroot, or out of
+// the mount to wherever on the host the link points. So every call here uses
+// Darwin's NOFOLLOW_ANY forms (macOS 11, iOS 14): any symlink in the path is
+// ELOOP, and a final one is acted on itself, never followed (measured: fstatat,
+// fchmodat, fchownat, utimensat, linkat, unlinkat and renameatx_np take a
+// final link as themselves; openat refuses one, as O_NOFOLLOW does). The
+// calls with no flags go through the parent directory, opened that way
+// (realfs_parent_at). Other hosts keep the plain flags (REALFS_O_NOFOLLOW and
+// friends, at the top of this file).
+
+// The directory a (fix_path'd) path is in, reached with no symlink on the
+// way, and the name in it: *leaf points into `path`. The mount's own root_fd
+// for a name directly in it (*owned false); otherwise a descriptor the
+// caller closes. -1 with errno set on failure.
+static int realfs_parent_at(struct mount *mount, const char *path, const char **leaf, bool *owned) {
+    *owned = false;
+    const char *slash = strrchr(path, '/');
+    if (slash == NULL || !REALFS_NOFOLLOW_ANY) {
+        *leaf = path;
+        return mount->root_fd;
+    }
+    char parent[MAX_PATH];
+    size_t len = (size_t) (slash - path);
+    if (len >= sizeof(parent)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(parent, path, len);
+    parent[len] = '\0';
+    int fd = openat(mount->root_fd, len == 0 ? "." : parent,
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC | REALFS_O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    *owned = true;
+    *leaf = slash + 1;
+    return fd;
+}
+
+static void realfs_parent_done(int fd, bool owned) {
+    if (owned) {
+        int saved = errno;
+        close(fd);
+        errno = saved;
+    }
+}
+
 // temporarily change directory and block other threads from doing so
 // useful for simulating mknodat on ios, dealing with long unix socket paths, etc
 lock_t fchdir_lock;
@@ -551,7 +614,7 @@ struct fd *realfs_open(struct mount *mount, const char *path, int flags, int mod
     // checkpoint freeze may end the open, as for realfs reads and writes.
     int fd_no;
     for (;;) {
-        fd_no = openat(mount->root_fd, fix_path(path), real_flags, mode);
+        fd_no = openat(mount->root_fd, fix_path(path), real_flags | REALFS_O_NOFOLLOW, mode);
         if (fd_no >= 0 || errno != EINTR || current == NULL)
             break;
         // The pending test takes a lock and can clobber errno.
@@ -653,7 +716,7 @@ static bool realfs_shared_chown(struct mount *mount, struct attr attr, int *err)
 
 int realfs_stat(struct mount *mount, const char *path, struct statbuf *fake_stat) {
     struct stat real_stat;
-    if (fstatat(mount->root_fd, fix_path(path), &real_stat, AT_SYMLINK_NOFOLLOW) < 0)
+    if (fstatat(mount->root_fd, fix_path(path), &real_stat, REALFS_AT_NOFOLLOW) < 0)
         return errno_map();
     copy_stat(fake_stat, &real_stat);
     realfs_shared_owner(mount, fake_stat, &real_stat);
@@ -1301,7 +1364,13 @@ int realfs_mmap(struct fd *fd, struct mem *mem, page_t start, pages_t pages, off
 }
 
 ssize_t realfs_readlink(struct mount *mount, const char *path, char *buf, size_t bufsize) {
-    ssize_t size = readlinkat(mount->root_fd, fix_path(path), buf, bufsize);
+    const char *leaf;
+    bool owned;
+    int dir = realfs_parent_at(mount, fix_path(path), &leaf, &owned);
+    if (dir < 0)
+        return errno_map();
+    ssize_t size = readlinkat(dir, leaf, buf, bufsize);
+    realfs_parent_done(dir, owned);
     if (size < 0)
         return errno_map();
     return size;
@@ -1319,7 +1388,8 @@ int realfs_getpath(struct fd *fd, char *buf) {
 }
 
 int realfs_link(struct mount *mount, const char *src, const char *dst) {
-    int res = linkat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst), 0);
+    int res = linkat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst),
+            REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0);
     if (res < 0) {
         realfs_trace_task_path_event("link-src", src, res, 0);
         realfs_trace_task_path_event("link-dst", dst, res, 0);
@@ -1335,7 +1405,7 @@ int realfs_link(struct mount *mount, const char *src, const char *dst) {
 }
 
 int realfs_unlink(struct mount *mount, const char *path) {
-    int res = unlinkat(mount->root_fd, fix_path(path), 0);
+    int res = unlinkat(mount->root_fd, fix_path(path), REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0);
     if (res < 0) {
         realfs_trace_path_event("unlink", path, res, 0);
         realfs_trace_path_stat("unlink", mount, path);
@@ -1347,14 +1417,18 @@ int realfs_unlink(struct mount *mount, const char *path) {
 }
 
 int realfs_rmdir(struct mount *mount, const char *path) {
-    int err = unlinkat(mount->root_fd, fix_path(path), AT_REMOVEDIR);
+    int err = unlinkat(mount->root_fd, fix_path(path), AT_REMOVEDIR | (REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0));
     if (err < 0)
         return errno_map();
     return 0;
 }
 
 int realfs_rename(struct mount *mount, const char *src, const char *dst) {
+#if REALFS_NOFOLLOW_ANY
+    int err = renameatx_np(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst), RENAME_NOFOLLOW_ANY);
+#else
     int err = renameat(mount->root_fd, fix_path(src), mount->root_fd, fix_path(dst));
+#endif
     if (err < 0) {
         realfs_trace_path_event("rename-src", src, err, 0);
         realfs_trace_path_event("rename-dst", dst, err, 0);
@@ -1368,7 +1442,12 @@ int realfs_rename(struct mount *mount, const char *src, const char *dst) {
 }
 
 int realfs_symlink(struct mount *mount, const char *target, const char *link) {
-    int err = symlinkat(target, mount->root_fd, fix_path(link));
+    const char *leaf;
+    bool owned;
+    int dir = realfs_parent_at(mount, fix_path(link), &leaf, &owned);
+    int err = dir < 0 ? -1 : symlinkat(target, dir, leaf);
+    if (dir >= 0)
+        realfs_parent_done(dir, owned);
     if (err < 0) {
         realfs_trace_symlink_event(mount, target, link, err);
         return errno_map();
@@ -1381,11 +1460,17 @@ int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNU
     int err;
     mode_t_ perm = mode & ~S_IFMT;
     if (S_ISFIFO(mode)) {
-        lock_fchdir(mount->root_fd);
-        err = mkfifo(fix_path(path), perm);
+        const char *leaf;
+        bool owned;
+        int dir = realfs_parent_at(mount, fix_path(path), &leaf, &owned);
+        if (dir < 0)
+            return errno_map();
+        lock_fchdir(dir);
+        err = mkfifo(leaf, perm);
         unlock_fchdir();
+        realfs_parent_done(dir, owned);
     } else if (S_ISREG(mode)) {
-        err = openat(mount->root_fd, fix_path(path), O_CREAT|O_EXCL|O_RDONLY, perm);
+        err = openat(mount->root_fd, fix_path(path), O_CREAT|O_EXCL|O_RDONLY|REALFS_O_NOFOLLOW, perm);
         if (err >= 0)
             err = close(err);
     } else {
@@ -1397,7 +1482,7 @@ int realfs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev_t_ UNU
 }
 
 int realfs_truncate(struct mount *mount, const char *path, off_t_ size) {
-    int fd = openat(mount->root_fd, fix_path(path), O_RDWR);
+    int fd = openat(mount->root_fd, fix_path(path), O_RDWR | REALFS_O_NOFOLLOW);
     if (fd < 0)
         return errno_map();
     int err = 0;
@@ -1411,24 +1496,27 @@ int realfs_setattr(struct mount *mount, const char *path, struct attr attr) {
     path = fix_path(path);
     int root = mount->root_fd;
     int err;
+    // (The path is resolved; its final component, when it is a link, is
+    // the link: never followed on the host.)
+    int nofollow = REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : 0;
     if (realfs_shared_chown(mount, attr, &err)) {
-        if (err == 0 && fchownat(root, path, getuid(), (gid_t) -1, 0) < 0)
+        if (err == 0 && fchownat(root, path, getuid(), (gid_t) -1, nofollow) < 0)
             return errno_map();
         return err;
     }
     switch (attr.type) {
         case attr_uid:
-            err = fchownat(root, path, attr.uid, -1, 0);
+            err = fchownat(root, path, attr.uid, -1, nofollow);
             break;
         case attr_gid:
             // The group is chown's THIRD argument. This passed it as the
             // owner, so every chgrp on a realfs mount was a chown to the uid
             // with the group's number -- EPERM for an ordinary host user,
             // and the wrong owner for a privileged one.
-            err = fchownat(root, path, -1, attr.gid, 0);
+            err = fchownat(root, path, -1, attr.gid, nofollow);
             break;
         case attr_mode:
-            err = fchmodat(root, path, attr.mode, 0);
+            err = fchmodat(root, path, attr.mode, nofollow);
             break;
         case attr_size:
             return realfs_truncate(mount, path, attr.size);
@@ -1470,7 +1558,9 @@ int realfs_fsetattr(struct fd *fd, struct attr attr) {
 
 int realfs_utime(struct mount *mount, const char *path, struct timespec atime, struct timespec mtime, bool follow_links) {
     struct timespec times[2] = {atime, mtime};
-    int flags = follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
+    // (generic_utime resolved the path as follow_links asked: what is left
+    // to follow on the host is nothing.)
+    int flags = REALFS_NOFOLLOW_ANY ? REALFS_AT_NOFOLLOW : follow_links ? 0 : AT_SYMLINK_NOFOLLOW;
     realfs_trace_path_stat("utime-before", mount, path);
     int err = utimensat(mount->root_fd, fix_path(path), times, flags);
     if (err < 0) {
@@ -1491,7 +1581,12 @@ int realfs_futime(struct fd *fd, struct timespec atime, struct timespec mtime) {
 }
 
 int realfs_mkdir(struct mount *mount, const char *path, mode_t_ mode) {
-    int err = mkdirat(mount->root_fd, fix_path(path), mode);
+    const char *leaf;
+    bool owned;
+    int dir = realfs_parent_at(mount, fix_path(path), &leaf, &owned);
+    int err = dir < 0 ? -1 : mkdirat(dir, leaf, mode);
+    if (dir >= 0)
+        realfs_parent_done(dir, owned);
     if (err < 0)
         return errno_map();
     return 0;
