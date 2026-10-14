@@ -47,3 +47,10 @@
 ## 2024-09-26 - Add VoiceOver hints to file manager navigation buttons
 **Learning:** Icon-only navigation buttons in toolbars (like Back, Forward, Up, More Actions) often only have short `accessibilityLabel`s which lack context for screen readers. In iOS, these buttons can benefit greatly from an `accessibilityHint` to provide clearer action descriptions.
 **Action:** When evaluating toolbars with icon-only buttons, ensure an `accessibilityHint` is provided alongside the `accessibilityLabel` if the label alone is not sufficiently descriptive of the resulting action (e.g., "Navigates to the previously visited folder." instead of just "Back").
+## 2024-05-31 - Missing Accessibility Hints in Standard Toolbars
+**Learning:** Adding an `accessibilityLabel` or having an implicit label on a text button allows a screen reader to announce its name, but if its outcome isn't totally obvious, VoiceOver users won't know what action will result from activating it. This applies to simple text-based toolbar buttons like "Reset" or "Duplicate".
+**Action:** Always provide an `accessibilityHint` that concisely describes the outcome of activating the element for applet toolbars (e.g., "Creates a copy of the current theme for editing.").
+
+## 2024-05-14 - Add accessibilityHint to New Tab button
+**Learning:** Icon-only buttons with an `accessibilityLabel` benefit from an `accessibilityHint` to clarify the action. Screen reader users hear the label ("New Tab") and then the hint ("Opens a new terminal tab.") to explain the outcome. This is especially important for buttons that have complex actions or lack visual text.
+**Action:** When adding or verifying accessibility labels for icon-only buttons, especially those using system icons, always ensure there is an accompanying `accessibilityHint` to provide full context on what the button will do.
