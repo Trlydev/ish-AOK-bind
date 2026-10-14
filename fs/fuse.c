@@ -55,6 +55,8 @@
 #include "kernel/errno.h"
 #include "kernel/fs.h"
 #include "kernel/task.h"
+#include "kernel/pid_ns.h"
+#include "kernel/user_ns.h"
 #include "fs/fd.h"
 #include "fs/dev.h"
 #include "fs/devices.h"
@@ -412,6 +414,21 @@ struct fuse_conn {
     // takes poll locks) never runs under ->lock; never held nested with it.
     lock_t dev_fd_lock;
     struct fd *dev_fd;
+
+    // The namespaces the connection speaks in (Linux's fc->user_ns and
+    // fc->pid_ns): a request carries its sender's ids as `user_ns` has them
+    // and its thread's number as `pid_ns` has it, and the ids a reply gives
+    // are read back through `user_ns`. Those of whoever opened /dev/fuse
+    // (user_ns) and of the mounter (pid_ns), which mount() holds to be the
+    // same user namespace. References, set once.
+    struct user_namespace *user_ns;
+    struct pid_namespace *pid_ns;
+    bool mounted;
+    // Who may use the mount (fuse_allows_current): the mount's user_id and
+    // group_id, kernel ids, unless allow_other.
+    uid_t_ user_id;
+    uid_t_ group_id;
+    bool allow_other;
 };
 
 struct fuse_req {
@@ -477,6 +494,8 @@ static void fuse_conn_release(struct fuse_conn *conn) {
         fuse_cache_free(cache);
     }
     cond_destroy(&conn->cond);
+    user_ns_release(conn->user_ns);
+    pid_ns_release(conn->pid_ns);
     free(conn);
 }
 
@@ -556,10 +575,25 @@ static int fuse_conn_call(struct fuse_conn *conn, uint32_t opcode, uint64_t node
         .len = (uint32_t) in_len,
         .opcode = opcode,
         .nodeid = nodeid,
-        .uid = current != NULL ? current->fsuid : 0,
-        .gid = current != NULL ? current->fsgid : 0,
-        .pid = current != NULL ? (uint32_t) current->pid : 0,
     };
+    // Who asks, as the connection's namespaces have it (fuse_fill_in_header):
+    // fsuid and fsgid through its user namespace, the thread's id through
+    // its pid namespace (0 for one it cannot see). An id that namespace has
+    // no number for cannot be told to the daemon at all, and the request is
+    // EOVERFLOW, as fuse_simple_request answers. INIT, DESTROY, FORGET and
+    // INTERRUPT carry no sender (args->nocreds).
+    if (current != NULL && opcode != FUSE_INIT && !fuse_opcode_no_reply(opcode)) {
+        uid_t_ uid = user_ns_from_kuid(conn->user_ns, current->fsuid);
+        uid_t_ gid = user_ns_from_kgid(conn->user_ns, current->fsgid);
+        if (uid == USER_NS_INVALID_ID || gid == USER_NS_INVALID_ID) {
+            free(req->in);
+            free(req);
+            return _EOVERFLOW;
+        }
+        hdr->uid = uid;
+        hdr->gid = gid;
+        hdr->pid = (uint32_t) pid_ns_shown(conn->pid_ns, current->pid);
+    }
     if (len1 > 0)
         memcpy(req->in + sizeof(*hdr), arg1, len1);
     if (len2 > 0)
@@ -833,6 +867,10 @@ static int fuse_dev_open_fd(int major, int minor, struct fd *fd) {
     list_init(&conn->caches);
     conn->max_write = FUSE_MAX_TRANSFER;
     conn->dev_fd = fd;
+    // Whoever opens the device names the user namespace the connection
+    // speaks in (the opener's f_cred->user_ns, which fuse_fill_super holds
+    // the mount's to).
+    conn->user_ns = user_ns_retain(current_user_ns());
     fd->data = conn;
     return 0;
 }
@@ -854,6 +892,65 @@ static struct fuse_conn *fuse_mount_conn(struct mount *mount) {
     return mount->data;
 }
 
+// fuse_allow_current_process: with allow_other, anyone in the connection's
+// user namespace or one below it; otherwise only a task whose uid, euid and
+// suid are all the mount's user_id and whose gid, egid and sgid are all its
+// group_id. Everyone else is refused the mount (EACCES), root included --
+// a daemon is its user's, and one that hangs or lies hangs or lies to nobody
+// else. (Linux's allow_sys_admin_access, off by default, is not here.)
+static bool fuse_allows_current(struct fuse_conn *conn) {
+    if (current == NULL)
+        return true;
+    if (conn->allow_other)
+        return user_ns_in(current_user_ns(), conn->user_ns);
+    return current->uid == conn->user_id && current->euid == conn->user_id &&
+        current->suid == conn->user_id && current->gid == conn->group_id &&
+        current->egid == conn->group_id && current->sgid == conn->group_id;
+}
+
+// The mount's connection, for one of the operations that reach the daemon on
+// the caller's behalf: NULL with *err ENOTCONN or EACCES.
+static struct fuse_conn *fuse_mount_conn_for_current(struct mount *mount, int *err) {
+    struct fuse_conn *conn = fuse_mount_conn(mount);
+    if (conn == NULL) {
+        *err = _ENOTCONN;
+        return NULL;
+    }
+    if (!fuse_allows_current(conn)) {
+        *err = _EACCES;
+        return NULL;
+    }
+    return conn;
+}
+
+// One mount option's number, or false when it is not there.
+static bool fuse_mount_option(const char *info, const char *name, unsigned long *out) {
+    size_t len = strlen(name);
+    for (const char *at = info; at != NULL && *at != '\0'; ) {
+        if (strncmp(at, name, len) == 0 && at[len] == '=') {
+            char *end;
+            *out = strtoul(at + len + 1, &end, 10);
+            return end != at + len + 1;
+        }
+        at = strchr(at, ',');
+        if (at != NULL)
+            at++;
+    }
+    return false;
+}
+
+static bool fuse_mount_flag(const char *info, const char *name) {
+    size_t len = strlen(name);
+    for (const char *at = info; at != NULL && *at != '\0'; ) {
+        if (strncmp(at, name, len) == 0 && (at[len] == ',' || at[len] == '\0'))
+            return true;
+        at = strchr(at, ',');
+        if (at != NULL)
+            at++;
+    }
+    return false;
+}
+
 // Mount data is libfuse's "fd=7,rootmode=40000,user_id=0,group_id=0[,...]".
 static int fusefs_mount(struct mount *mount) {
     const char *info = mount->info != NULL ? mount->info : "";
@@ -873,12 +970,36 @@ static int fusefs_mount(struct mount *mount) {
     if (dev->ops != &fuse_dev.fd)
         return _EINVAL;
     struct fuse_conn *conn = dev->data;
+    // The device's opener and the mounter speak for one user namespace
+    // (fuse_fill_super: EINVAL otherwise), and one connection serves one
+    // mount.
+    if (conn->user_ns != current_user_ns())
+        return _EINVAL;
+    // user_id= and group_id= are the mounter's namespace's ids; libfuse and
+    // fusermount always give them. Without them, the mounter's own.
+    unsigned long id;
+    uid_t_ user_id = current->fsuid, group_id = current->fsgid;
+    if (fuse_mount_option(info, "user_id", &id) &&
+            (user_id = user_ns_make_kuid(conn->user_ns, (uid_t_) id)) == USER_NS_INVALID_ID)
+        return _EINVAL;
+    if (fuse_mount_option(info, "group_id", &id) &&
+            (group_id = user_ns_make_kgid(conn->user_ns, (uid_t_) id)) == USER_NS_INVALID_ID)
+        return _EINVAL;
 
     lock(&conn->lock, 0);
     if (conn->dead) {
         unlock(&conn->lock);
         return _ENOTCONN;
     }
+    if (conn->mounted) {
+        unlock(&conn->lock);
+        return _EINVAL;
+    }
+    conn->mounted = true;
+    conn->user_id = user_id;
+    conn->group_id = group_id;
+    conn->allow_other = fuse_mount_flag(info, "allow_other");
+    conn->pid_ns = pid_ns_retain(current->pid_ns);
     fuse_conn_retain(conn); // the mount's reference
     unlock(&conn->lock);
     mount->data = conn;
@@ -915,13 +1036,16 @@ static int fusefs_umount(struct mount *mount) {
     return 0;
 }
 
-static void fuse_attr_to_statbuf(const struct fuse_wire_attr *attr, struct statbuf *stat) {
+// (The daemon's ids are its namespace's: read through it, and one that names
+// nobody there is nobody here -- the overflow id a stat shows, as Linux's
+// make_kuid gives INVALID_UID.)
+static void fuse_attr_to_statbuf(struct fuse_conn *conn, const struct fuse_wire_attr *attr, struct statbuf *stat) {
     memset(stat, 0, sizeof(*stat));
     stat->inode = attr->ino;
     stat->mode = attr->mode;
     stat->nlink = attr->nlink;
-    stat->uid = attr->uid;
-    stat->gid = attr->gid;
+    stat->uid = user_ns_make_kuid(conn->user_ns, attr->uid);
+    stat->gid = user_ns_make_kgid(conn->user_ns, attr->gid);
     stat->rdev = attr->rdev;
     stat->size = attr->size;
     stat->blksize = attr->blksize != 0 ? attr->blksize : 4096;
@@ -1091,14 +1215,15 @@ static int fuse_resolve_parent(struct fuse_conn *conn, const char *path,
 }
 
 static int fusefs_stat(struct mount *mount, const char *path, struct statbuf *stat) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     struct fuse_wire_attr attr;
     int err = fuse_resolve(conn, path, NULL, &attr);
     if (err < 0)
         return err;
-    fuse_attr_to_statbuf(&attr, stat);
+    fuse_attr_to_statbuf(conn, &attr, stat);
     return 0;
 }
 
@@ -1867,7 +1992,7 @@ static int fusefs_fstat(struct fd *fd, struct statbuf *stat) {
     int err = fuse_getattr(conn, file->nodeid, file->fh_valid, file->fh, &attr);
     if (err < 0)
         return err;
-    fuse_attr_to_statbuf(&attr, stat);
+    fuse_attr_to_statbuf(conn, &attr, stat);
     return 0;
 }
 
@@ -1891,11 +2016,15 @@ static int fuse_setattr_from_attr(struct fuse_conn *conn, uint64_t nodeid,
     switch (attr.type) {
         case attr_uid:
             in.valid |= FATTR_UID;
-            in.uid = attr.uid;
+            in.uid = user_ns_from_kuid(conn->user_ns, attr.uid);
+            if (in.uid == USER_NS_INVALID_ID)
+                return _EOVERFLOW;
             break;
         case attr_gid:
             in.valid |= FATTR_GID;
-            in.gid = attr.gid;
+            in.gid = user_ns_from_kgid(conn->user_ns, attr.gid);
+            if (in.gid == USER_NS_INVALID_ID)
+                return _EOVERFLOW;
             break;
         case attr_mode:
             in.valid |= FATTR_MODE;
@@ -1912,9 +2041,10 @@ static int fuse_setattr_from_attr(struct fuse_conn *conn, uint64_t nodeid,
 }
 
 static int fusefs_setattr(struct mount *mount, const char *path, struct attr attr) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t nodeid;
     int err = fuse_resolve(conn, path, &nodeid, NULL);
     if (err < 0)
@@ -1935,9 +2065,10 @@ static int fusefs_fsetattr(struct fd *fd, struct attr attr) {
 static int fusefs_utime(struct mount *mount, const char *path,
         struct timespec atime, struct timespec mtime, bool follow_links) {
     (void) follow_links; // path resolution already followed what it should
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t nodeid;
     int err = fuse_resolve(conn, path, &nodeid, NULL);
     if (err < 0)
@@ -1997,9 +2128,10 @@ int fuse_fd_msync_writeback(struct fd *fd) {
 }
 
 static struct fd *fusefs_open(struct mount *mount, const char *path, int flags, int mode) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return ERR_PTR(_ENOTCONN);
+        return ERR_PTR(conn_err);
 
     struct fuse_wire_attr attr;
     uint64_t nodeid = 0;
@@ -2146,9 +2278,10 @@ err_release:
 }
 
 static ssize_t fusefs_readlink(struct mount *mount, const char *path, char *buf, size_t bufsize) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t nodeid;
     int err = fuse_resolve(conn, path, &nodeid, NULL);
     if (err < 0)
@@ -2170,9 +2303,10 @@ static ssize_t fusefs_readlink(struct mount *mount, const char *path, char *buf,
 // The shared shape of every parent-directory + name operation.
 static int fuse_dirop(struct mount *mount, uint32_t opcode, const char *path,
         const void *arg, size_t arg_len) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t dir;
     const char *name;
     int err = fuse_resolve_parent(conn, path, &dir, &name);
@@ -2212,9 +2346,10 @@ static int fusefs_mknod(struct mount *mount, const char *path, mode_t_ mode, dev
 }
 
 static int fusefs_rename(struct mount *mount, const char *src, const char *dst) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t src_dir, dst_dir;
     const char *src_name, *dst_name;
     int err = fuse_resolve_parent(conn, src, &src_dir, &src_name);
@@ -2247,9 +2382,10 @@ static int fusefs_rename(struct mount *mount, const char *src, const char *dst) 
 }
 
 static int fusefs_symlink(struct mount *mount, const char *target, const char *link) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t dir;
     const char *name;
     int err = fuse_resolve_parent(conn, link, &dir, &name);
@@ -2278,9 +2414,10 @@ static int fusefs_symlink(struct mount *mount, const char *target, const char *l
 }
 
 static int fusefs_link(struct mount *mount, const char *src, const char *dst) {
-    struct fuse_conn *conn = fuse_mount_conn(mount);
+    int conn_err;
+    struct fuse_conn *conn = fuse_mount_conn_for_current(mount, &conn_err);
     if (conn == NULL)
-        return _ENOTCONN;
+        return conn_err;
     uint64_t src_node;
     int err = fuse_resolve(conn, src, &src_node, NULL);
     if (err < 0)
@@ -2297,6 +2434,13 @@ static int fusefs_statfs(struct mount *mount, struct statfsbuf *stat) {
     struct fuse_conn *conn = fuse_mount_conn(mount);
     if (conn == NULL)
         return _ENOTCONN;
+    // Someone the mount is not for learns what it is and nothing more
+    // (fuse_statfs), so that df over every mount does not fail on it.
+    if (!fuse_allows_current(conn)) {
+        memset(stat, 0, sizeof(*stat));
+        stat->type = FUSE_SUPER_MAGIC;
+        return 0;
+    }
     void *out = NULL;
     size_t out_len = 0;
     int err = fuse_conn_call(conn, FUSE_STATFS, FUSE_ROOT_ID, NULL, 0, NULL, 0,

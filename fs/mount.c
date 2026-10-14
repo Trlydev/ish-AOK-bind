@@ -1633,11 +1633,15 @@ static bool current_may_mount(void) {
 
 // The filesystems a caller without the machine's CAP_SYS_ADMIN may mount
 // afresh (Linux's FS_USERNS_MOUNT): ones that are made of nothing but memory
-// and the kernel's own state. Never one that is a window onto storage --
-// that is how a sandbox would mount its way to files it was not given.
+// and the kernel's own state, and FUSE, whose files are whatever a daemon of
+// the caller's own says (fs/fuse.c speaks to it in the caller's user
+// namespace, and lets no one else in without allow_other, and then only that
+// namespace). Never one that is a window onto storage -- that is how a
+// sandbox would mount its way to files it was not given.
 static bool fs_type_unprivileged_ok(const char *type) {
     return strcmp(type, "tmpfs") == 0 || strcmp(type, "proc") == 0 ||
-        strcmp(type, "sysfs") == 0 || strcmp(type, "devpts") == 0;
+        strcmp(type, "sysfs") == 0 || strcmp(type, "devpts") == 0 ||
+        strcmp(type, "fuse") == 0;
 }
 
 bool mnt_ns_has_point(const struct mnt_namespace *ns, const char *point) {
@@ -2673,6 +2677,12 @@ dword_t sys_mount_guest(guest_addr_t source_addr, guest_addr_t point_addr, guest
     if (!(flags & (MS_MOVE_ | MS_REMOUNT_)) && !current_capable(CAP_SYS_ADMIN_) &&
             !fs_type_unprivileged_ok(type))
         return _EPERM;
+    // A daemon's device nodes are not devices to anyone it was not mounted
+    // by the machine for: Linux marks a mount made in a user namespace
+    // SB_I_NODEV, and here that is nodev.
+    if (!(flags & (MS_MOVE_ | MS_REMOUNT_)) && !current_capable(CAP_SYS_ADMIN_) &&
+            strcmp(type, "fuse") == 0)
+        flags |= MS_NODEV_;
 
     // Before taking the lock: both helpers resolve guest paths, which re-enters
     // mount_find() and takes mounts_lock (it isn't recursive). MS_MOVE/MS_REMOUNT
