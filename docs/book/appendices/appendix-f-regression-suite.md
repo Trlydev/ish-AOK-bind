@@ -4,7 +4,7 @@
 
 # Appendix F. The regression suite, annotated
 
-606 C programs in `tests/manual/`, of which **558 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
+617 C programs in `tests/manual/`, of which **569 are listed in `fs/aok-tests.manifest`** and therefore reach the device at `/AOK/tests`.
 
 A row with a directory prefix is a per-architecture or accelerator test, kept
 in a subdirectory of `tests/manual/` and registered under that same prefix.
@@ -82,6 +82,7 @@ does not say what it is for.
 | `clone_error_cleanup.c` | yes | clone_error_cleanup.c — regression for the clone() error-path session/pgroup corruption (issue #423 Tier 2). |
 | `concurrent_dir_futex.c` | yes | Two read-modify-writes that were not atomic against other threads. |
 | `concurrent_exec_tlb.c` | yes | concurrent_exec_tlb.c — regression for the stale-TLB use-after-free on execve (issue #469: arm64 cargo/rustc SIGILL at pc 0, host SIGSEGV). |
+| `connect_refused_adjacent.c` | yes | A TCP connect to a loopback port nobody listens on is ECONNREFUSED, the first time as every time. |
 | `copy_file_range.c` | yes | copy_file_range(): real data-copy behavior, including offset semantics. |
 | `counter_ns.c` | yes | counter_ns.c -- the guest's cycle counter: x86 RDTSC (i386: EDX:EAX; amd64: RAX/RDX, their upper halves zero), arm64 MRS CNTVCT_EL0 with... |
 | `cpu_count_agree.c` | yes | The CPU counts are shaped like Linux's: the CPUs online, and the ones this task may run on. |
@@ -154,6 +155,7 @@ does not say what it is for.
 | `fuse_basic.c` | yes | fuse_basic.c — self-checking regression lock for iSH-AOK's FUSE support (fs/fuse.c): the /dev/fuse device, the "fuse" filesystem type, and the... |
 | `fuse_fsopen.c` | yes | fuse_fsopen.c -- a FUSE filesystem mounted with the new mount API: fsopen, fsconfig (fd, rootmode, user_id, group_id, CREATE), fsmount,... |
 | `fuse_threaded_daemon.c` | yes | fuse_threaded_daemon.c — the FUSE daemon is a THREAD of the process using the mount, rather than a separate process. |
+| `fuse_userns.c` | yes | FUSE in a user namespace: a sandbox's root may mount a filesystem served by its own daemon, and the conversation is in the sandbox's terms. |
 | `futex_core.c` | yes |  |
 | `futex_pi.c` | yes | PI futexes: FUTEX_LOCK_PI, LOCK_PI2, TRYLOCK_PI and UNLOCK_PI, by raw syscall (so musl runs it too), and glibc's PTHREAD_PRIO_INHERIT mutexes on... |
 | `futex_robust_requeue.c` | yes | Three futex defects, one of which disabled an entire POSIX feature. |
@@ -209,16 +211,19 @@ does not say what it is for.
 | `mmap_shared_integrity.c` | yes | Three ways a MAP_SHARED mapping quietly stopped being shared. |
 | `mmap_truncate_sigbus.c` | yes | mmap-then-truncate-then-access => guest SIGBUS (not emulator crash). |
 | `mmap_validation.c` | yes | mmap/mremap/membarrier argument handling, and three things AOK got wrong in ways a caller could not detect. |
+| `mntns_basic.c` | yes | Mount namespaces: a process with its own mount table. |
 | `modify.c` | — |  |
 | `mount_bind_busy.c` | yes | A bind mount is busy while anything is using it, and a lazily unmounted one keeps working for whoever is still inside it. |
 | `mount_bind_getpath.c` | yes | A path read back from a descriptor opened through a bind mount names the bind, not the directory the bind shows. |
 | `mount_bind_id.c` | yes | A bind mount is a mount of its own: statx, /proc/self/fdinfo and /proc/self/mountinfo must all name it by its own ID, and mountinfo must say which... |
 | `mount_bind_rbind.c` | yes | mount_bind_rbind.c — self-checking regression lock for non-directory bind mounts and recursive binds (MS_REC), the two bind behaviors... |
+| `mount_cover_setattr.c` | yes | What a sandbox does to a mount tree besides unsharing it: mounting over mounts, mount_setattr, and pivot_root(".", "."). |
 | `mount_cross_dev.c` | yes | (st_dev, st_ino) must uniquely identify a file ACROSS mounts, not just within one. |
 | `mount_fake_long_source.c` | yes | mount_fake_long_source.c — a guest-reachable buffer overflow in fakefs_mount. |
 | `mount_flag_perms.c` | yes | What the per-mount flags MEAN, and lazy unmount. |
 | `mount_flags.c` | yes | mount_flags.c — self-checking regression lock for the mount(2) flag work. Asserts the behavior AOK now implements: |
 | `mount_lazy_detached.c` | yes | A lazily unmounted mount is still what a cwd or a dirfd inside it reaches. |
+| `mount_propagation.c` | yes | Mount propagation: shared, slave, private and unbindable mounts. |
 | `mount_stdev.c` | yes | st_dev semantics for virtual filesystem mounts (tmpfs, proc, binds). |
 | `mountinfo_epollet.c` | yes | /proc/self/mountinfo must generate an epoll EPOLLIN\|EPOLLET edge on every mount-table change -- the exact contract libmount's kernel mount monitor... |
 | `mountinfo_tree.c` | yes | /proc/self/mountinfo's mount IDs and parent IDs must form a tree. |
@@ -242,6 +247,8 @@ does not say what it is for.
 | `netlink_audit.c` | yes | netlink_audit.c — regression lock for minimal NETLINK_AUDIT support. |
 | `netlink_blocking_recv.c` | yes | netlink_blocking_recv.c -- a BLOCKING receive on an AF_NETLINK socket with nothing queued must wait, the way Linux's skb_recv_datagram does,... |
 | `netlink_route.c` | yes | netlink_route.c — self-checking regression lock for AF_NETLINK rtnetlink dumps issued through the bare read()/write() (and readv()/writev()) path. |
+| `netns_basic.c` | yes | Network namespaces: a network of a process's own -- which, for a sandbox, means none. |
+| `netns_veth.c` | yes | A second interface in a network namespace: veth pairs and dummy links. |
 | `notify_parent_cldstop.c` | yes | notify_parent_cldstop.c -- a child's stop and continue, and a tracee's ptrace stops, are announced with SIGCHLD, whatever signal the child was... |
 | `null_page_fault.c` | yes | A dereference of an unmapped low address must fault, and must NOT be quietly turned into a fresh zero page by the stack's MAP_GROWSDOWN region. |
 | `nx_enforce.c` | yes | Memory mapped without PROT_EXEC does not execute (NX). |
@@ -259,6 +266,7 @@ does not say what it is for.
 | `pidfd_open.c` | yes | pidfd_open (and the io_uring stub family) must not SIGSYS on amd64. |
 | `pidfd_self_exit_deadlock.c` | yes | A task that opens a pidfd on ITSELF and never closes it before exiting must not deadlock. Two related bugs found booting Arch Linux ARM's aarch64... |
 | `pidfd_zombie.c` | yes | pidfd_open(2) on a task that has exited but not been reaped. |
+| `pidns_basic.c` | yes | Pid namespaces: a set of processes that see only each other, the first of them as pid 1. |
 | `pixman_accel.c` | yes | Differential test for the AOK pixman accelerator (ISH_SYS_PIXOP syscall, kernel/ish_accel_pix.c): every FILL/COPY/OVER result the accelerator... |
 | `pixman_shim.c` | yes | Differential test for the pixman accelerator's guest shim (opt/AOK/tools/pixman/ish_pixman_shim.c), the layer pixman_accel.c does not reach: which... |
 | `poll_default_mask.c` | yes | What poll and select say about files that have no poll operation, and how many results they count. |
@@ -348,6 +356,7 @@ does not say what it is for.
 | `seccomp_filter.c` | yes | seccomp: strict mode and BPF filters actually confine. |
 | `sendfile_vhangup.c` | yes | amd64 sendfile real copy (+ no SIGSYS on 64-bit count), and vhangup wired. |
 | `setns_join.c` | yes | setns_join.c -- setns(2) joins the namespace a /proc/<pid>/ns/* fd names, or those of a pidfd's process, with Linux's errors. |
+| `setns_sandbox.c` | yes | setns into a sandbox: joining the user, pid, network and UTS namespaces of a process that is in namespaces of its own, which is what nsenter does. |
 | `setsid_thread_group.c` | yes | A group signal must reach a process whose session was created by a NON-LEADER THREAD. |
 | `sgid_inherit.c` | yes | A setgid directory hands its group to everything created inside it. |
 | `shm_rmid_attach.c` | yes | SysV shm: a segment marked IPC_RMID stays attachable for as long as it exists. |
@@ -449,6 +458,8 @@ does not say what it is for.
 | `unix_seqpacket_msgs.c` | yes | unix_seqpacket_msgs: AF_UNIX SOCK_SEQPACKET delivers messages, not bytes. |
 | `unix_sock_host_isolation.c` | yes | Guest unix sockets, as the host backs them. |
 | `unix_unconnected_poll.c` | — | unix_unconnected_poll.c -- poll() on a unix stream socket with no live peer never blocks. Linux reports POLLIN\|POLLHUP once a connected peer is... |
+| `userns_basic.c` | yes | User namespaces: a process that is root in a world of its own, and nobody new in the real one. |
+| `userns_nproc.c` | yes | RLIMIT_NPROC across a user namespace: what a namespace's processes may number is bounded by its creator's limit outside, as it was when the... |
 | `utimensat_fd.c` | yes | utimensat(fd, NULL, ...) -- the futimens() form -- must operate on the open fd directly with NO path resolution, like Linux's do_utimes_fd(). |
 | `utimensat_omit.c` | yes | utimensat's two tv_nsec sentinels, and the validation around them. |
 | `uts_namespace.c` | yes | uts_namespace.c — regression for UTS namespace support (issue #527). |

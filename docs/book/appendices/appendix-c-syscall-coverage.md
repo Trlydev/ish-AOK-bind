@@ -13,9 +13,9 @@ so a NULL check passes — editing it changes nothing.
 
 | table | entries | implemented | native dispatch | stubs |
 |---|--:|--:|--:|--:|
-| i386 | 379 | 344 | 0 | 35 |
-| amd64 | 349 | 313 | 3 | 33 |
-| arm64 / riscv64 | 324 | 250 | 4 | 70 |
+| i386 | 380 | 346 | 0 | 34 |
+| amd64 | 350 | 315 | 3 | 32 |
+| arm64 / riscv64 | 324 | 252 | 4 | 68 |
 
 riscv64 shares arm64's table: both are asm-generic ABIs with identical
 numbering (Chapter 7).
@@ -185,6 +185,7 @@ numbering (Chapter 7).
 | 214 | `sys_setgid` | implemented |  |
 | 215 | `sys_setfsuid` | implemented |  |
 | 216 | `sys_setfsgid` | implemented |  |
+| 217 | `sys_pivot_root` | implemented |  |
 | 218 | `sys_mincore` | implemented |  |
 | 219 | `sys_madvise` | implemented |  |
 | 220 | `sys_getdents64` | implemented |  |
@@ -375,7 +376,7 @@ numbering (Chapter 7).
 | 439 | `sys_faccessat` | implemented | faccessat2 |
 | 440 | `sys_process_madvise` | implemented | 64-bit ABIs dispatch it natively |
 | 441 | `sys_epoll_pwait2` | implemented | epoll_pwait2 |
-| 442 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
+| 442 | `sys_mount_setattr` | implemented |  |
 | 443 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
 | 444 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
 | 445 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
@@ -559,6 +560,7 @@ numbering (Chapter 7).
 | 151 | `sys_mlockall` | implemented |  |
 | 152 | `sys_munlockall` | implemented |  |
 | 153 | `syscall_success_stub` | implemented | vhangup (tty-cleanup no-op) |
+| 155 | `sys_pivot_root` | implemented | (its paths go through the native handler) |
 | 157 | `sys_prctl` | implemented |  |
 | 158 | `sys_arch_prctl` | implemented |  |
 | 159 | `sys_adjtimex` | implemented | adjtimex (pointer arg goes through the native handler) |
@@ -729,7 +731,7 @@ numbering (Chapter 7).
 | 439 | `sys_faccessat` | implemented |  |
 | 440 | `sys_process_madvise` | implemented | 64-bit ABIs dispatch it natively |
 | 441 | `sys_epoll_pwait2` | implemented |  |
-| 442 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
+| 442 | `sys_mount_setattr` | implemented |  |
 | 443 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
 | 444 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
 | 445 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
@@ -803,7 +805,7 @@ numbering (Chapter 7).
 | 38 | `sys_renameat` | implemented |  |
 | 39 | `sys_umount2` | implemented |  |
 | 40 | `sys_mount` | implemented |  |
-| 41 | `syscall_stub` | stub | returns ENOSYS, logged |
+| 41 | `sys_pivot_root` | implemented | (its paths go through the 64-bit switch) |
 | 42 | `syscall_stub` | stub | returns ENOSYS, logged |
 | 43 | `sys_statfs_amd64` | implemented |  |
 | 44 | `sys_fstatfs_amd64` | implemented |  |
@@ -1058,7 +1060,7 @@ numbering (Chapter 7).
 | 439 | `sys_faccessat` | implemented | faccessat2 reuses sys_faccessat, matches i386/amd64 tables |
 | 440 | `sys_process_madvise` | implemented | 64-bit ABIs dispatch it natively |
 | 441 | `sys_epoll_pwait2` | implemented |  |
-| 442 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
+| 442 | `sys_mount_setattr` | implemented |  |
 | 443 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
 | 444 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |
 | 445 | `syscall_stub_silent` | stub (silent) | returns ENOSYS, not logged |

@@ -133,6 +133,7 @@ by the app; several have app-side equivalents under `/proc/ish/defaults`
 | `ISH_SWAP_NO_MPROTECT` | `emu/memory.c` |
 | `ISH_TASK_DUMP_ALL_THREADS` | `kernel/task.c` |
 | `ISH_TASK_DUMP_EVERY` | `kernel/task.c` |
+| `ISH_TEST_DETACH_TREE` | `main.c` |
 | `ISH_TEST_FAIL_TASK_START_AFTER` | `kernel/task.c` |
 | `ISH_TEST_GUEST_CMD` | `main.c` |
 | `ISH_TEST_GUEST_LINES` | `main.c` |
